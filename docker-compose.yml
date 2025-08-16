@@ -1,0 +1,82 @@
+services:
+  tts-service:
+    build: ./tts-service
+    ports:
+      - "5000:8000"
+    environment:
+      # Piper TTS specific settings
+      TTS_LANGUAGE: ${TTS_LANGUAGE:-en}
+      PIPER_MODELS_DIR: /app/models
+      # Performance settings
+      WORKERS: 1
+    volumes:
+      - "./models:/app/models"  # Model caching for Piper
+    depends_on:
+      - voice-cloning-service
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s  # Piper loads faster than XTTS
+      retries: 3
+
+  voice-cloning-service:
+    build: ./voice-cloning-service
+    ports:
+      - "5002:5001"
+    environment:
+      # OpenVoice specific settings
+      CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-0}
+      PYTORCH_CUDA_ALLOC_CONF: max_split_size_mb:512
+    volumes:
+      - "./cloned_voices:/app/cloned_voices"  # Persistent voice storage
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s  # OpenVoice models take time to download
+      retries: 3
+    # Uncomment for GPU support (recommended for voice cloning)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  stt-service:
+    build: ./stt-service
+    ports:
+      - "5001:8000"
+    environment:
+      # Hardware acceleration settings
+      USE_CUDA: ${USE_CUDA:-auto}  # auto, true, false
+      FORCE_ACCELERATION: ${FORCE_ACCELERATION:-}  # cuda, rocm, cpu (optional override)
+      # Whisper specific settings
+      WHISPER_MODEL_SIZE: ${WHISPER_MODEL_SIZE:-tiny}  # tiny, base, small, medium, large-v3
+      # Performance settings
+      WORKERS: 1
+    volumes:
+      - "./models:/app/models"  # Model caching
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s  # Give model time to load
+      retries: 3
+    # Uncomment for GPU support
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+networks:
+  default:
+    name: tts-stt-network

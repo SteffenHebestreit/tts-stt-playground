@@ -1,0 +1,12 @@
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+# PyTorch - will be installed based on hardware availability in Dockerfile
+# torch>=2.1.0 (installed separately to detect hardware)
+# torchaudio>=2.1.0 (installed separately to detect hardware)
+faster-whisper==0.10.0
+# Essential dependencies for Faster Whisper
+ctranslate2>=3.8.0
+tokenizers>=0.13.0
+huggingface-hub>=0.13.0
+onnxruntime>=1.13.0
