@@ -1,0 +1,33 @@
+# Usage:
+#   docker-compose -f docker-compose.yml -f tests/docker-compose.test.yml up --build test-runner
+#
+# This extends the main docker-compose.yml to add a test runner service.
+# All backend services must be healthy before tests start.
+
+services:
+  test-runner:
+    build:
+      context: ./tests
+      dockerfile: Dockerfile
+    environment:
+      PIPER_TTS_URL: http://piper-tts-service:5000
+      STT_URL: http://stt-service:8000
+      TRAINING_URL: http://piper-training-service:8080
+      QWEN3_TTS_URL: http://qwen3-tts-service:5004
+      QWEN3_ASR_URL: http://qwen3-asr-service:5002
+      FRONTEND_URL: http://frontend-service:3000
+    depends_on:
+      piper-tts-service:
+        condition: service_healthy
+      stt-service:
+        condition: service_healthy
+      piper-training-service:
+        condition: service_healthy
+      qwen3-tts-service:
+        condition: service_healthy
+      qwen3-asr-service:
+        condition: service_healthy
+      frontend-service:
+        condition: service_healthy
+    networks:
+      - tts-stt-network
