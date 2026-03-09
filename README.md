@@ -1,345 +1,194 @@
-# TTS-STT Services
+# TTS-STT Platform
 
-A production-ready Text-to-Speech (TTS), Speech-to-Text (STT), and Voice Cloning service with intelligent hardware acceleration support for CUDA, ROCm, and CPU.
+A self-hosted, Docker-based platform for text-to-speech synthesis, speech-to-text transcription, custom voice training, and voice cloning.
 
-## Features
+## Services
 
-🚀 **Hardware Acceleration**
-- Automatic detection of NVIDIA CUDA, AMD ROCm, and Apple Silicon
-- Intelligent fallback to CPU if GPU acceleration fails
-- Configurable hardware override options
-
-🎯 **TTS Service (Text-to-Speech)**
-- Piper TTS with high-quality voices
-- Fast synthesis with low latency
-- Streaming audio responses
-- Multiple language support
-
-🎭 **Voice Cloning Service**
-- OpenVoice integration for voice cloning
-- Custom voice creation from audio samples
-- Voice synthesis with cloned voices
-- Persistent voice storage
-
-🎤 **STT Service (Speech-to-Text)**
-- Faster-Whisper for optimized inference
-- Multiple model sizes (tiny to large-v3)
-- Voice Activity Detection (VAD)
-- Transcription and translation support
-- 99+ language support
-
-📊 **Production Ready**
-- Health checks and monitoring endpoints
-- Error handling with graceful fallbacks
-- Docker containerization
-- Resource optimization
-- Comprehensive logging
+| Service | Port | Description |
+|---------|------|-------------|
+| **Frontend** | 3000 | Web UI and API documentation hub |
+| **PiperTTS** | 5000 | Text-to-speech with 40+ voices and custom model support |
+| **STT (Whisper)** | 5001 | Speech-to-text transcription and audio segmentation |
+| **Piper Training** | 8080 | VITS neural network voice training pipeline |
+| **Qwen3-TTS** | 5004 | Voice cloning and multilingual TTS (replaces XTTS) |
+| **Qwen3-ASR** | 5002 | Fast multilingual speech recognition |
 
 ## Quick Start
 
-### Prerequisites
-- Docker and Docker Compose
-- (Optional) NVIDIA GPU with CUDA drivers for GPU acceleration
-- (Optional) AMD GPU with ROCm drivers for AMD acceleration
-
-### 1. Clone and Setup
-
 ```bash
-git clone <your-repo>
-cd tts-stt
-```
+# Clone and start all services
+docker-compose up -d
 
-### 2. Configure Hardware Acceleration
+# Check service health
+docker-compose ps
 
-Edit `.env` file to configure hardware:
-
-```bash
-# Automatic detection (recommended)
-USE_CUDA=auto
-
-# Force specific acceleration
-# USE_CUDA=true         # Force CUDA
-# FORCE_ACCELERATION=rocm  # Force AMD ROCm
-# FORCE_ACCELERATION=cpu   # Force CPU only
-```
-
-### 3. Choose Model Sizes
-
-Configure model sizes based on your needs:
-
-```bash
-# TTS: High-quality Piper models 
-TTS_LANGUAGE=en
-
-# STT: Choose model size vs accuracy trade-off
-WHISPER_MODEL_SIZE=tiny    # Fast, basic accuracy
-# WHISPER_MODEL_SIZE=base   # Balanced
-# WHISPER_MODEL_SIZE=small  # Good accuracy
-# WHISPER_MODEL_SIZE=medium # Better accuracy
-# WHISPER_MODEL_SIZE=large-v3 # Best accuracy, slower
-```
-
-### 4. Launch Services
-
-```bash
-# Build and start services
-docker-compose up --build
-
-# Or run in background
-docker-compose up --build -d
-```
-
-### 5. Verify Services
-
-Check service status:
-```bash
-# TTS Service health
-curl http://localhost:5000/health
-
-# STT Service health  
-curl http://localhost:5001/health
-
-# Voice Cloning Service health
-curl http://localhost:5002/health
-
-# Detailed service info
-curl http://localhost:5000/info
-curl http://localhost:5001/info
-```
-
-## API Usage
-
-### Text-to-Speech (TTS)
-
-**Endpoint:** `POST http://localhost:5000/synthesize`
-
-**Basic Text Synthesis:**
-```bash
-curl -X POST "http://localhost:5000/synthesize" \
-  -F "text=Hello, this is a test of the text to speech system!" \
-  -F "language=en" \
-  --output synthesized_audio.wav
-```
-
-**Voice Cloning with Speaker Audio:**
-```bash
-curl -X POST "http://localhost:5000/synthesize" \
-  -F "text=Hello, this will sound like the speaker sample!" \
-  -F "speaker_wav=@speaker_sample.wav" \
-  -F "language=en" \
-  --output cloned_voice.wav
-```
-
-**Supported Languages:**
-- English (en), Spanish (es), French (fr), German (de), Italian (it)
-- Portuguese (pt), Polish (pl), Turkish (tr), Russian (ru), Dutch (nl)
-- Czech (cs), Arabic (ar), Chinese (zh-cn), Japanese (ja), Hungarian (hu)
-- Korean (ko), Hindi (hi) and many more...
-
-### Speech-to-Text (STT)
-
-**Endpoint:** `POST http://localhost:5001/transcribe`
-
-**Basic Transcription:**
-```bash
-curl -X POST "http://localhost:5001/transcribe" \
-  -F "audio=@audio_file.wav" \
-  -F "language=en"
-```
-
-**Advanced Transcription with Parameters:**
-```bash
-curl -X POST "http://localhost:5001/transcribe" \
-  -F "audio=@audio_file.wav" \
-  -F "language=auto" \
-  -F "task=transcribe" \
-  -F "beam_size=5" \
-  -F "best_of=5"
-```
-
-**Translation to English:**
-```bash
-curl -X POST "http://localhost:5001/transcribe" \
-  -F "audio=@foreign_audio.wav" \
-  -F "task=translate"
-```
-
-**Response Format:**
-```json
-{
-  "text": "Transcribed text here",
-  "language": "en",
-  "language_probability": 0.99,
-  "duration": 5.2,
-  "segments": [
-    {
-      "start": 0.0,
-      "end": 2.5,
-      "text": "First segment",
-      "avg_logprob": -0.3,
-      "no_speech_prob": 0.1
-    }
-  ],
-  "task": "transcribe"
-}
-```
-
-## Hardware Acceleration Setup
-
-### NVIDIA CUDA
-
-1. Install NVIDIA drivers and CUDA toolkit
-2. Install nvidia-docker2:
-```bash
-# Ubuntu/Debian
-sudo apt-get install nvidia-docker2
-sudo systemctl restart docker
-```
-
-3. Update docker-compose.yml to enable GPU:
-```yaml
-services:
-  tts-service:
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-```
-
-4. Set environment:
-```bash
-USE_CUDA=true
-FORCE_ACCELERATION=cuda
-```
-
-### AMD ROCm
-
-1. Install ROCm drivers
-2. Set environment:
-```bash
-USE_CUDA=false
-FORCE_ACCELERATION=rocm
-```
-
-### CPU Optimization
-
-For CPU-only deployment:
-```bash
-USE_CUDA=false
-FORCE_ACCELERATION=cpu
-```
-
-## Model Information
-
-### TTS Models
-- **XTTS v2**: Multilingual model supporting voice cloning
-- **Languages**: 50+ languages supported
-- **Quality**: High-quality neural synthesis
-
-### STT Models
-- **tiny**: ~39 MB, ~32x speed, basic accuracy
-- **base**: ~74 MB, ~16x speed, good accuracy  
-- **small**: ~244 MB, ~6x speed, better accuracy
-- **medium**: ~769 MB, ~2x speed, high accuracy
-- **large-v3**: ~1550 MB, ~1x speed, best accuracy
-
-## Performance Tuning
-
-### Memory Optimization
-```bash
-# Use smaller models for lower memory usage
-WHISPER_MODEL_SIZE=tiny
-
-# Limit workers
-WORKERS=1
-```
-
-### GPU Memory
-```bash
-# Monitor GPU usage
-nvidia-smi
-
-# For multiple GPUs, models will use GPU 0 by default
-```
-
-### CPU Optimization
-```bash
-# Services automatically detect CPU count
-# Uses optimized compute types (int8 for CPU)
-```
-
-## Monitoring and Debugging
-
-### Health Checks
-```bash
-# Service status
-curl http://localhost:5000/health
-curl http://localhost:5001/health
-
-# Detailed info
-curl http://localhost:5000/info
-curl http://localhost:5001/info
-
-# Available STT models
-curl http://localhost:5001/models
-```
-
-### Logs
-```bash
-# View service logs
-docker-compose logs tts-service
-docker-compose logs stt-service
-
-# Follow logs
+# View logs
 docker-compose logs -f
+
+# Stop services
+docker-compose down
 ```
 
-### Common Issues
+Open **http://localhost:3000** for the web interface or **http://localhost:3000/api-docs** for API documentation.
 
-**Model Loading Errors:**
-- Check available memory (models require 2-8GB)
-- Try smaller model sizes
-- Check GPU drivers if using acceleration
+## Prerequisites
 
-**Audio Format Issues:**
-- Supported formats: WAV, MP3, M4A, FLAC
-- Recommended: WAV, 16kHz, 16-bit
+- Docker and Docker Compose
+- NVIDIA GPU with CUDA drivers (recommended for training and Qwen3 services)
+- NVIDIA Container Toolkit (`nvidia-docker2`)
+- 16 GB+ RAM recommended
 
-**Performance Issues:**
-- Use appropriate model sizes for your hardware
-- Monitor GPU/CPU usage
-- Consider batch processing for multiple files
+CPU-only mode works for PiperTTS and STT but training and Qwen3 services require a GPU.
 
-## API Documentation
+## Features
 
-### TTS Endpoints
-- `POST /synthesize` - Generate speech from text
-- `GET /health` - Service health check
-- `GET /info` - Service information
+### Text-to-Speech (PiperTTS)
+- 40+ pre-trained voices across English, German, French, Spanish, Italian, Dutch
+- Intelligent voice selection by language, quality, and gender
+- Custom trained model support (ONNX format)
+- Adjustable speech speed
 
-### STT Endpoints  
-- `POST /transcribe` - Transcribe audio to text
-- `GET /health` - Service health check
-- `GET /info` - Service information
-- `GET /models` - Available models and languages
+### Speech-to-Text (Whisper)
+- Multiple model sizes: tiny, base, small, medium, large-v3
+- Automatic language detection
+- Audio segmentation for training data preparation
 
-## Security Notes
+### Voice Training (Piper Training)
+- VITS neural network architecture
+- Automatic audio preprocessing and transcription via STT service
+- FP32 training with automatic batch size adjustment on OOM
+- Checkpoint saving and recovery after each epoch
+- ONNX model export for PiperTTS deployment
+- GPU acceleration with CPU fallback
 
-- Services run on localhost by default
-- For production deployment, add authentication
-- Use reverse proxy for SSL termination
-- Validate file uploads and sizes
+### Voice Cloning (Qwen3-TTS)
+- Upload a short voice sample (3-10 seconds) and generate speech in that voice
+- Cross-lingual cloning across 13 languages
+- Replaces the previous XTTS service
 
-## Contributing
+### Speech Recognition (Qwen3-ASR)
+- Fast multilingual speech recognition
+- Language detection
 
-1. Fork the repository
-2. Create feature branch
-3. Add tests for new features
-4. Submit pull request
+## API Endpoints
 
-## License
+### PiperTTS (port 5000)
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/tts` | Generate speech (JSON body: text, language, quality, gender, speed) |
+| POST | `/synthesize` | Generate speech with a specific voice |
+| POST | `/upload_model` | Upload a custom ONNX model |
+| GET | `/voices` | List available voices |
+| GET | `/health` | Health check |
 
-MIT License - see LICENSE file for details
+### STT (port 5001 -> 8000 internal)
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/transcribe` | Transcribe audio file |
+| POST | `/detect_language` | Detect spoken language |
+| GET | `/health` | Health check |
+
+### Piper Training (port 8080)
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/train` | Start training (multipart: model_name, language, audio_files) |
+| GET | `/status/{job_id}` | Training progress |
+| GET | `/jobs` | List all training jobs |
+| POST | `/export/{job_id}` | Export model to ONNX |
+| GET | `/download/{job_id}` | Download trained model |
+| DELETE | `/job/{job_id}` | Cancel training job |
+| DELETE | `/model/{job_id}` | Delete trained model |
+
+### Qwen3-TTS (port 5004)
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/tts` | Generate speech with built-in speaker |
+| POST | `/clone` | Clone voice from audio sample |
+| GET | `/status` | Model and GPU status |
+| GET | `/health` | Health check |
+
+### Qwen3-ASR (port 5002)
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/transcribe` | Transcribe audio |
+| POST | `/detect_language` | Detect language |
+| GET | `/health` | Health check |
+
+## Configuration
+
+Copy `.env.example` to `.env` and adjust as needed. Key settings:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WHISPER_MODEL_SIZE` | small | STT model: tiny, base, small, medium, large-v3 |
+| `CUDA_VISIBLE_DEVICES` | 0 | GPU device index |
+| `QWEN3_TTS_MODEL` | Qwen/Qwen3-TTS-12Hz-1.7B-Base | Qwen3 TTS model ID |
+| `QWEN3_ASR_MODEL` | Qwen/Qwen3-ASR-1.7B | Qwen3 ASR model ID |
+| `ALLOWED_ORIGINS` | * | CORS allowed origins |
+
+## Project Structure
+
+```
+tts-stt/
+├── docker-compose.yml
+├── .env.example
+├── frontend-service/          # Web UI (FastAPI + Jinja2)
+│   ├── app.py
+│   ├── templates/index.html
+│   └── static/
+├── piper-tts-service/         # PiperTTS synthesis
+│   └── app.py
+├── piper-training-service/    # VITS training pipeline
+│   ├── app.py
+│   ├── training_pipeline.py
+│   ├── vits_model.py
+│   ├── data_processor.py
+│   ├── model_exporter.py
+│   ├── dataset.py
+│   └── training_utils.py
+├── stt-service/               # Whisper STT
+│   └── app.py
+├── qwen3-tts-service/         # Qwen3 TTS + voice cloning
+│   └── app.py
+├── qwen3-asr-service/         # Qwen3 ASR
+│   └── app.py
+└── models/                    # Shared model storage (gitignored)
+```
+
+## Troubleshooting
+
+```bash
+# Check GPU availability inside a container
+docker exec tts-stt-piper-training-service-1 nvidia-smi
+
+# Monitor training progress
+curl http://localhost:8080/jobs
+
+# Check individual service health
+curl http://localhost:5000/health   # PiperTTS
+curl http://localhost:5001/health   # STT (mapped from internal 8000)
+curl http://localhost:8080/health   # Training
+curl http://localhost:5004/health   # Qwen3-TTS
+curl http://localhost:5002/health   # Qwen3-ASR
+curl http://localhost:3000/health   # Frontend
+
+# Rebuild a single service
+docker-compose build piper-tts-service
+docker-compose up -d piper-tts-service
+```
+
+Common issues:
+- **CUDA not available**: Install NVIDIA Container Toolkit and restart Docker
+- **Out of memory**: Reduce `training-batch-size` or use a smaller Whisper model
+- **Slow first start**: Models are downloaded on first launch (several GB for Qwen3)
+- **Port conflicts**: Check that ports 3000, 5000-5004, 8080 are free
+
+## Local Development
+
+Service source files are bind-mounted in `docker-compose.yml`, so code changes are reflected on container restart without rebuilding:
+
+```bash
+docker-compose restart piper-tts-service
+```
+
+All processing happens locally. No data is sent to external services.

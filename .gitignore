@@ -3,27 +3,58 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
-.Python
+*.egg-info/
+*.egg
+.installed.cfg
+MANIFEST
 build/
-develop-eggs/
 dist/
-downloads/
+develop-eggs/
 eggs/
 .eggs/
-lib/
-lib64/
-parts/
 sdist/
-var/
 wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# Virtual environments
 venv/
 env/
 ENV/
+
+# Models and large binaries
+models/
+voice_models/
+*.onnx
+*.onnx.json
+*.pth
+*.pt
+*.npy
+
+# Audio files
+*.wav
+*.mp3
+*.m4a
+*.flac
+
+# Output audio files
+output/
+
+# Voice example files
+voice-example/
+
+# Training runtime data
+training/
+cache/
+checkpoints/
+cloned_voices/
+.numba_cache/
+piper-training-service/data/
+piper-training-service/checkpoints/
+piper-training-service/models/
+piper-training-service/configs/
+
+# Environment
+.env
+.env.local
+.env.*
+!.env.example
 
 # IDE
 .vscode/
@@ -32,16 +63,38 @@ ENV/
 *.swo
 *~
 
+# Claude Code
+.claude/
+
 # OS
 .DS_Store
 Thumbs.db
+
+# Docker
+.docker/
+docker-compose.override.yml
 
 # Logs
 *.log
 logs/
 
-# Docker
-docker-compose.override.yml
+# Temporary files
+temp/
+tmp/
+*.tmp
+tmp_*.json
+
+# Test artifacts
+.pytest_cache/
+htmlcov/
+.coverage
+test_*.wav
+*_test.wav
+
+# Frontend
+.cache/
+node_modules/
+*.lock
 
 # Backup files
 *.backup
@@ -50,21 +103,3 @@ docker-compose.override.yml
 *_backup*
 *_old*
 *.new
-
-# Models (too large for git)
-models/*.onnx
-voice_models/
-
-# Temporary files
-temp/
-tmp/
-*.tmp
-
-# Audio files (except reference samples)
-*.wav
-*.mp3
-*.flac
-!cloned_voices/*/reference.wav
-
-# Environment variables
-.env.local

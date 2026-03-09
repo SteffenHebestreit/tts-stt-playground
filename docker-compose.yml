@@ -1,82 +1,231 @@
+name: ttstt
+
 services:
-  tts-service:
-    build: ./tts-service
+  # PiperTTS service with default and custom model support
+  piper-tts-service:
+    build:
+      context: ./piper-tts-service
+      dockerfile: Dockerfile
     ports:
-      - "5000:8000"
+      - "${PIPER_TTS_PORT:-5000}:5000"
     environment:
-      # Piper TTS specific settings
-      TTS_LANGUAGE: ${TTS_LANGUAGE:-en}
-      PIPER_MODELS_DIR: /app/models
-      # Performance settings
-      WORKERS: 1
+      PIPER_DATA_DIR: /app/models
+      PIPER_OUTPUT_DIR: /app/output
     volumes:
-      - "./models:/app/models"  # Model caching for Piper
-    depends_on:
-      - voice-cloning-service
+      - "./models:/app/models"
+      - "./output:/app/output"
+      - "./piper-tts-service/app.py:/app/app.py"
+      - "./piper-tts-service/requirements.txt:/app/requirements.txt"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
       interval: 30s
       timeout: 10s
-      start_period: 30s  # Piper loads faster than XTTS
+      start_period: 60s
       retries: 3
+    networks:
+      - tts-stt-network
 
-  voice-cloning-service:
-    build: ./voice-cloning-service
+  # PiperTTS Training service for custom voice models
+  piper-training-service:
+    build:
+      context: ./piper-training-service
+      dockerfile: Dockerfile
     ports:
-      - "5002:5001"
+      - "${TRAINING_PORT:-8080}:8080"
     environment:
-      # OpenVoice specific settings
       CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-0}
-      PYTORCH_CUDA_ALLOC_CONF: max_split_size_mb:512
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+      PYTHONUNBUFFERED: 1
+      STT_SERVICE_URL: http://stt-service:8000
     volumes:
-      - "./cloned_voices:/app/cloned_voices"  # Persistent voice storage
+      - "./piper-training-service/data:/app/data"
+      - "./piper-training-service/models:/app/models"
+      - "./piper-training-service/checkpoints:/app/checkpoints"
+      - "./piper-training-service/configs:/app/configs"
+      - "./models:/app/shared_models"
+      - "./piper-training-service/app.py:/app/app.py"
+      - "./piper-training-service/training_pipeline.py:/app/training_pipeline.py"
+      - "./piper-training-service/dataset.py:/app/dataset.py"
+      - "./piper-training-service/vits_model.py:/app/vits_model.py"
+      - "./piper-training-service/training_utils.py:/app/training_utils.py"
+      - "./piper-training-service/data_processor.py:/app/data_processor.py"
+      - "./piper-training-service/model_exporter.py:/app/model_exporter.py"
+      - "./piper-training-service/stt_processor.py:/app/stt_processor.py"
+      - "./piper-training-service/audio_segmenter.py:/app/audio_segmenter.py"
+      - "./piper-training-service/requirements.txt:/app/requirements.txt"
+    shm_size: 2gb
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 30s
       timeout: 10s
-      start_period: 120s  # OpenVoice models take time to download
+      start_period: 120s
       retries: 3
-    # Uncomment for GPU support (recommended for voice cloning)
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              count: 1
+    networks:
+      - tts-stt-network
+    depends_on:
+      - stt-service
 
+  # Whisper STT service (used for training transcription)
   stt-service:
-    build: ./stt-service
+    build:
+      context: ./stt-service
     ports:
-      - "5001:8000"
+      - "${STT_PORT:-5001}:8000"
     environment:
-      # Hardware acceleration settings
-      USE_CUDA: ${USE_CUDA:-auto}  # auto, true, false
-      FORCE_ACCELERATION: ${FORCE_ACCELERATION:-}  # cuda, rocm, cpu (optional override)
-      # Whisper specific settings
-      WHISPER_MODEL_SIZE: ${WHISPER_MODEL_SIZE:-tiny}  # tiny, base, small, medium, large-v3
-      # Performance settings
+      USE_CUDA: "true"
+      FORCE_ACCELERATION: ${FORCE_ACCELERATION:-cuda}
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+      WHISPER_MODEL_SIZE: ${WHISPER_MODEL_SIZE:-medium}
       WORKERS: 1
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
+      ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
-      - "./models:/app/models"  # Model caching
+      - "./models:/app/models"
+      - "./.cache:/root/.cache"
+      - pip-cache:/root/.cache/pip
+      - "./stt-service/app.py:/app/app.py"
+      - "./stt-service/requirements.txt:/app/requirements.txt"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
-      start_period: 60s  # Give model time to load
+      start_period: 120s
       retries: 3
-    # Uncomment for GPU support
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              count: 1
+    networks:
+      - tts-stt-network
+
+  # Qwen3-ASR service (fast multilingual speech recognition)
+  qwen3-asr-service:
+    build:
+      context: ./qwen3-asr-service
+      dockerfile: Dockerfile
+    ports:
+      - "${QWEN3_ASR_PORT:-5002}:5002"
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+      QWEN3_ASR_MODEL: ${QWEN3_ASR_MODEL:-Qwen/Qwen3-ASR-1.7B}
+    volumes:
+      - qwen3-asr-cache:/root/.cache
+      - "./qwen3-asr-service/app.py:/app/app.py"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              count: 1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5002/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 3
+    networks:
+      - tts-stt-network
+
+  # Qwen3-TTS service (voice cloning + TTS, replaces XTTS)
+  qwen3-tts-service:
+    build:
+      context: ./qwen3-tts-service
+      dockerfile: Dockerfile
+    ports:
+      - "${QWEN3_TTS_PORT:-5004}:5004"
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+      QWEN3_TTS_MODEL: ${QWEN3_TTS_MODEL:-Qwen/Qwen3-TTS-12Hz-1.7B-Base}
+      QWEN3_ASR_SERVICE_URL: http://qwen3-asr-service:5002
+    volumes:
+      - qwen3-tts-cache:/root/.cache
+      - qwen3-tts-voices:/app/voices
+      - "./qwen3-tts-service/app.py:/app/app.py"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              count: 1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5004/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 3
+    depends_on:
+      - qwen3-asr-service
+    networks:
+      - tts-stt-network
+
+  # Frontend Service - Modern web interface
+  frontend-service:
+    build:
+      context: ./frontend-service
+      dockerfile: Dockerfile
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    environment:
+      # Internal service URLs (container-to-container, don't change these)
+      TTS_SERVICE_URL: http://piper-tts-service:5000
+      STT_SERVICE_URL: http://stt-service:8000
+      VOICE_TRAINING_URL: http://piper-training-service:8080
+      QWEN3_TTS_SERVICE_URL: http://qwen3-tts-service:5004
+      QWEN3_ASR_SERVICE_URL: http://qwen3-asr-service:5002
+      # Browser-facing URLs (uses host ports for the browser to connect)
+      BROWSER_TTS_URL: http://localhost:${PIPER_TTS_PORT:-5000}
+      BROWSER_STT_URL: http://localhost:${STT_PORT:-5001}
+      BROWSER_TRAINING_URL: http://localhost:${TRAINING_PORT:-8080}
+      BROWSER_QWEN3_TTS_URL: http://localhost:${QWEN3_TTS_PORT:-5004}
+      BROWSER_QWEN3_ASR_URL: http://localhost:${QWEN3_ASR_PORT:-5002}
+    volumes:
+      - "./frontend-service/app.py:/app/app.py"
+      - "./frontend-service/static:/app/static"
+      - "./frontend-service/templates:/app/templates"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 10s
+      retries: 3
+    networks:
+      - tts-stt-network
+    depends_on:
+      - piper-tts-service
+      - stt-service
 
 networks:
-  default:
-    name: tts-stt-network
+  tts-stt-network:
+    driver: bridge
+
+volumes:
+  pip-cache:
+    driver: local
+  qwen3-asr-cache:
+    driver: local
+  qwen3-tts-cache:
+    driver: local
+  qwen3-tts-voices:
+    driver: local

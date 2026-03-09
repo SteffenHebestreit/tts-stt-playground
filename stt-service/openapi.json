@@ -1,0 +1,428 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "STT Service API",
+    "description": "Whisper-powered speech-to-text transcription service with intelligent segmentation and multi-language support",
+    "version": "1.0.0"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:5001",
+      "description": "STT Service (External Port)"
+    }
+  ],
+  "paths": {
+    "/transcribe": {
+      "post": {
+        "summary": "Transcribe audio to text",
+        "description": "Convert audio file to text using Whisper with optional segmentation for training data preparation",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "audio_file": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "Audio file to transcribe"
+                  },
+                  "language": {
+                    "type": "string",
+                    "description": "Target language code (auto-detect if not specified)",
+                    "example": "en"
+                  },
+                  "model": {
+                    "type": "string",
+                    "enum": ["tiny", "base", "small", "medium", "large"],
+                    "default": "medium",
+                    "description": "Whisper model size"
+                  },
+                  "segment_length": {
+                    "type": "integer",
+                    "description": "Segment length in seconds for training data",
+                    "default": 10
+                  },
+                  "overlap": {
+                    "type": "number",
+                    "description": "Overlap between segments in seconds",
+                    "default": 1.0
+                  }
+                },
+                "required": ["audio_file"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful transcription",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TranscriptionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/transcribe-stream": {
+      "post": {
+        "summary": "Stream transcription with real-time results",
+        "description": "Real-time transcription streaming for long audio files",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "audio_file": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "Audio file to transcribe"
+                  },
+                  "language": {
+                    "type": "string",
+                    "description": "Target language code",
+                    "example": "en"
+                  }
+                },
+                "required": ["audio_file"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Streaming transcription",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "description": "Server-sent events stream with transcription updates"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/detect_language": {
+      "post": {
+        "summary": "Detect audio language",
+        "description": "Automatically detect the language of provided audio file",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "audio_file": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "Audio file for language detection"
+                  }
+                },
+                "required": ["audio_file"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Language detection result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LanguageDetectionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "summary": "Health check",
+        "description": "Check service health and model status",
+        "responses": {
+          "200": {
+            "description": "Service is healthy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/info": {
+      "get": {
+        "summary": "Service information",
+        "description": "Get detailed service and model information",
+        "responses": {
+          "200": {
+            "description": "Service information",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InfoResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/models": {
+      "get": {
+        "summary": "List available models",
+        "description": "Get list of available Whisper models",
+        "responses": {
+          "200": {
+            "description": "Available models",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelsResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/tasks": {
+      "get": {
+        "summary": "List active tasks",
+        "description": "Get list of currently running transcription tasks",
+        "responses": {
+          "200": {
+            "description": "Active tasks",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TasksResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "TranscriptionResponse": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "Complete transcribed text"
+          },
+          "segments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TranscriptionSegment"
+            },
+            "description": "Segmented transcription with timestamps"
+          },
+          "language": {
+            "type": "string",
+            "description": "Detected or specified language"
+          },
+          "duration": {
+            "type": "number",
+            "description": "Audio duration in seconds"
+          },
+          "processing_time": {
+            "type": "number",
+            "description": "Processing time in seconds"
+          }
+        }
+      },
+      "TranscriptionSegment": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "description": "Segment identifier"
+          },
+          "start": {
+            "type": "number",
+            "description": "Start time in seconds"
+          },
+          "end": {
+            "type": "number",
+            "description": "End time in seconds"
+          },
+          "text": {
+            "type": "string",
+            "description": "Segment text"
+          },
+          "confidence": {
+            "type": "number",
+            "description": "Transcription confidence score"
+          }
+        }
+      },
+      "LanguageDetectionResponse": {
+        "type": "object",
+        "properties": {
+          "language": {
+            "type": "string",
+            "description": "Detected language code"
+          },
+          "confidence": {
+            "type": "number",
+            "description": "Detection confidence score"
+          },
+          "probabilities": {
+            "type": "object",
+            "description": "Language probabilities",
+            "additionalProperties": {
+              "type": "number"
+            }
+          }
+        }
+      },
+      "HealthResponse": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": ["healthy", "unhealthy"],
+            "description": "Service health status"
+          },
+          "model_loaded": {
+            "type": "boolean",
+            "description": "Whether Whisper model is loaded"
+          },
+          "model_name": {
+            "type": "string",
+            "description": "Currently loaded model name"
+          },
+          "gpu_available": {
+            "type": "boolean",
+            "description": "Whether GPU acceleration is available"
+          }
+        }
+      },
+      "InfoResponse": {
+        "type": "object",
+        "properties": {
+          "service": {
+            "type": "string",
+            "description": "Service name"
+          },
+          "version": {
+            "type": "string",
+            "description": "Service version"
+          },
+          "whisper_version": {
+            "type": "string",
+            "description": "Whisper library version"
+          },
+          "device": {
+            "type": "string",
+            "description": "Processing device (cuda/cpu)"
+          },
+          "supported_languages": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Supported language codes"
+          }
+        }
+      },
+      "ModelsResponse": {
+        "type": "object",
+        "properties": {
+          "models": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Available model names"
+          },
+          "current_model": {
+            "type": "string",
+            "description": "Currently loaded model"
+          }
+        }
+      },
+      "TasksResponse": {
+        "type": "object",
+        "properties": {
+          "active_tasks": {
+            "type": "integer",
+            "description": "Number of active transcription tasks"
+          },
+          "tasks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TaskInfo"
+            },
+            "description": "List of active tasks"
+          }
+        }
+      },
+      "TaskInfo": {
+        "type": "object",
+        "properties": {
+          "task_id": {
+            "type": "string",
+            "description": "Task identifier"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["processing", "completed", "failed"],
+            "description": "Task status"
+          },
+          "progress": {
+            "type": "number",
+            "description": "Progress percentage (0-100)"
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Task start time"
+          }
+        }
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "Error message"
+          },
+          "details": {
+            "type": "string",
+            "description": "Detailed error information"
+          }
+        }
+      }
+    }
+  }
+}

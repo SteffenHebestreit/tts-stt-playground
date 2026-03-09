@@ -1,0 +1,295 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "PiperTTS Service API",
+    "description": "Neural text-to-speech service with multi-language support and intelligent voice selection",
+    "version": "1.0.0"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:5000",
+      "description": "PiperTTS Service"
+    }
+  ],
+  "paths": {
+    "/tts": {
+      "post": {
+        "summary": "Generate speech from text",
+        "description": "Convert text to speech using PiperTTS with intelligent voice selection based on language, quality, and gender preferences",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TTSRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully generated speech",
+            "content": {
+              "audio/wav": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/analyze_audio": {
+      "post": {
+        "summary": "Analyze audio file",
+        "description": "Analyze audio file using FFmpeg to get detailed format information",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "audio_file": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "Audio file to analyze"
+                  }
+                },
+                "required": ["audio_file"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Audio analysis results",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AudioAnalysis"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/voices": {
+      "get": {
+        "summary": "List available voices",
+        "description": "Get list of all available voice models including default and custom voices",
+        "responses": {
+          "200": {
+            "description": "List of available voices",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Voice"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "summary": "Health check",
+        "description": "Check if the service is running properly",
+        "responses": {
+          "200": {
+            "description": "Service is healthy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthStatus"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "TTSRequest": {
+        "type": "object",
+        "required": ["text"],
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "Text to convert to speech",
+            "example": "Hello, this is a test of the PiperTTS system."
+          },
+          "voice": {
+            "type": "string",
+            "description": "Specific voice ID to use (optional, auto-selected if not provided)",
+            "example": "en_US-lessac-medium"
+          },
+          "language": {
+            "type": "string",
+            "description": "Target language for voice selection",
+            "enum": ["auto", "en", "de", "fr", "es", "it", "nl"],
+            "default": "auto",
+            "example": "en"
+          },
+          "quality": {
+            "type": "string",
+            "description": "Voice quality level",
+            "enum": ["x_low", "low", "medium", "high"],
+            "default": "medium",
+            "example": "high"
+          },
+          "gender": {
+            "type": "string",
+            "description": "Preferred voice gender",
+            "enum": ["any", "male", "female"],
+            "default": "any",
+            "example": "female"
+          },
+          "speed": {
+            "type": "number",
+            "description": "Speech speed multiplier",
+            "minimum": 0.5,
+            "maximum": 2.0,
+            "default": 1.0,
+            "example": 1.0
+          },
+          "output_format": {
+            "type": "string",
+            "description": "Audio output format",
+            "enum": ["wav", "mp3"],
+            "default": "wav",
+            "example": "wav"
+          }
+        }
+      },
+      "Voice": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Unique voice identifier",
+            "example": "en_US-lessac-medium"
+          },
+          "name": {
+            "type": "string",
+            "description": "Human-readable voice name",
+            "example": "Lessac"
+          },
+          "language": {
+            "type": "string",
+            "description": "Voice language code",
+            "example": "en"
+          },
+          "gender": {
+            "type": "string",
+            "description": "Voice gender",
+            "enum": ["male", "female", "neutral"],
+            "example": "female"
+          },
+          "quality": {
+            "type": "string",
+            "description": "Voice quality level",
+            "enum": ["x_low", "low", "medium", "high"],
+            "example": "medium"
+          },
+          "type": {
+            "type": "string",
+            "description": "Voice type",
+            "enum": ["default", "custom"],
+            "example": "default"
+          }
+        }
+      },
+      "AudioAnalysis": {
+        "type": "object",
+        "properties": {
+          "format": {
+            "type": "string",
+            "description": "Audio format",
+            "example": "wav"
+          },
+          "duration": {
+            "type": "number",
+            "description": "Duration in seconds",
+            "example": 15.3
+          },
+          "sample_rate": {
+            "type": "integer",
+            "description": "Sample rate in Hz",
+            "example": 22050
+          },
+          "channels": {
+            "type": "integer",
+            "description": "Number of audio channels",
+            "example": 1
+          },
+          "bitrate": {
+            "type": "integer",
+            "description": "Bitrate in bits per second",
+            "example": 352800
+          },
+          "codec": {
+            "type": "string",
+            "description": "Audio codec",
+            "example": "pcm_s16le"
+          },
+          "file_size": {
+            "type": "integer",
+            "description": "File size in bytes",
+            "example": 675456
+          }
+        }
+      },
+      "HealthStatus": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "example": "healthy"
+          },
+          "service": {
+            "type": "string",
+            "example": "PiperTTS Service"
+          },
+          "version": {
+            "type": "string",
+            "example": "1.0.0"
+          },
+          "available_voices": {
+            "type": "integer",
+            "example": 12
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "properties": {
+          "detail": {
+            "type": "string",
+            "description": "Error message",
+            "example": "Invalid language specified"
+          }
+        }
+      }
+    }
+  }
+}

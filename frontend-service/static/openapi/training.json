@@ -1,0 +1,333 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "Universal AI Training Service API",
+    "description": "Next-generation VITS neural network training with comprehensive AI acceleration support including AMD NPU (Strix Halo AI Max 395), NVIDIA GPU, AMD GPU, Apple Metal, and CPU fallback. Features progressive fallback system for 100% training reliability.",
+    "version": "2.0.0"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8080",
+      "description": "PiperTTS Training Service"
+    }
+  ],
+  "paths": {
+    "/train": {
+      "post": {
+        "summary": "Start AI-accelerated voice training",
+        "description": "Start VITS neural network training with automatic device detection and optimization. Automatically selects the best available hardware: AMD NPU (Strix Halo AI Max 395 - 50 TOPS) → NVIDIA GPU → AMD GPU → Apple Metal → CPU with intelligent memory management and progressive fallback.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/TrainingRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Training started successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TrainingResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/training_status/{session_id}": {
+      "get": {
+        "summary": "Get training status",
+        "description": "Check the progress and status of a training session",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Training session ID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Training status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TrainingStatus"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/process_audio": {
+      "post": {
+        "summary": "Process audio for training",
+        "description": "Preprocess and segment audio files for training data preparation",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "audio_file": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "Audio file to process"
+                  },
+                  "voice_name": {
+                    "type": "string",
+                    "description": "Voice model name"
+                  }
+                },
+                "required": ["audio_file", "voice_name"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Audio processed successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProcessResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "summary": "Health check",
+        "description": "Check if the training service is running properly",
+        "responses": {
+          "200": {
+            "description": "Service is healthy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthStatus"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "TrainingRequest": {
+        "type": "object",
+        "required": ["voice_name"],
+        "properties": {
+          "voice_name": {
+            "type": "string",
+            "description": "Unique identifier for the voice model being trained",
+            "example": "my_custom_voice"
+          },
+          "language": {
+            "type": "string",
+            "description": "Target language for the voice model",
+            "default": "en",
+            "example": "en"
+          },
+          "sample_rate": {
+            "type": "integer",
+            "description": "Audio sample rate in Hz",
+            "enum": [16000, 22050, 44100],
+            "default": 22050,
+            "example": 22050
+          },
+          "quality": {
+            "type": "string",
+            "description": "Training quality level - affects model complexity and training time",
+            "enum": ["low", "medium", "high"],
+            "default": "medium",
+            "example": "medium"
+          },
+          "speaker_name": {
+            "type": "string",
+            "description": "Optional speaker identifier for multi-speaker models",
+            "example": "speaker_01"
+          },
+          "audio_files": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "binary"
+            },
+            "description": "Training audio files - minimum 10 minutes of clean speech recommended. Supports WAV, MP3, FLAC formats."
+          }
+        }
+      },
+      "TrainingResponse": {
+        "type": "object",
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "description": "Unique training session identifier",
+            "example": "train_20250829_142530_abc123"
+          },
+          "voice_name": {
+            "type": "string",
+            "description": "Voice model name",
+            "example": "my_custom_voice"
+          },
+          "status": {
+            "type": "string",
+            "description": "Initial training status",
+            "enum": ["started", "preparing"],
+            "example": "started"
+          },
+          "total_files": {
+            "type": "integer",
+            "description": "Number of audio files uploaded",
+            "example": 5
+          },
+          "estimated_duration": {
+            "type": "string",
+            "description": "Estimated training duration",
+            "example": "2-4 hours"
+          }
+        }
+      },
+      "TrainingStatus": {
+        "type": "object",
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "description": "Training session ID",
+            "example": "train_20250829_142530_abc123"
+          },
+          "status": {
+            "type": "string",
+            "description": "Current training status",
+            "enum": ["preparing", "running", "completed", "failed"],
+            "example": "running"
+          },
+          "progress": {
+            "type": "number",
+            "description": "Training progress percentage",
+            "minimum": 0,
+            "maximum": 100,
+            "example": 45.5
+          },
+          "current_epoch": {
+            "type": "integer",
+            "description": "Current training epoch",
+            "example": 455
+          },
+          "total_epochs": {
+            "type": "integer",
+            "description": "Total training epochs",
+            "example": 1000
+          },
+          "current_loss": {
+            "type": "number",
+            "description": "Current training loss",
+            "example": 0.1234
+          },
+          "best_loss": {
+            "type": "number",
+            "description": "Best training loss achieved",
+            "example": 0.0987
+          },
+          "eta": {
+            "type": "string",
+            "description": "Estimated time remaining",
+            "example": "1h 23m"
+          },
+          "model_path": {
+            "type": "string",
+            "description": "Path to trained model (when completed)",
+            "example": "/models/custom/my_custom_voice.onnx"
+          }
+        }
+      },
+      "ProcessResponse": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "example": "success"
+          },
+          "segments_created": {
+            "type": "integer",
+            "description": "Number of audio segments created",
+            "example": 24
+          },
+          "total_duration": {
+            "type": "number",
+            "description": "Total duration of processed audio",
+            "example": 127.5
+          },
+          "output_path": {
+            "type": "string",
+            "description": "Path to processed audio segments",
+            "example": "/data/my_custom_voice/"
+          }
+        }
+      },
+      "HealthStatus": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "example": "healthy"
+          },
+          "service": {
+            "type": "string",
+            "example": "PiperTTS Training Service"
+          },
+          "version": {
+            "type": "string",
+            "example": "1.0.0"
+          },
+          "gpu_available": {
+            "type": "boolean",
+            "example": true
+          },
+          "active_trainings": {
+            "type": "integer",
+            "description": "Number of currently running training sessions",
+            "example": 1
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "properties": {
+          "detail": {
+            "type": "string",
+            "description": "Error message",
+            "example": "Voice name already exists"
+          }
+        }
+      }
+    }
+  }
+}

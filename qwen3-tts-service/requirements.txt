@@ -1,0 +1,10 @@
+# Qwen3-TTS dependencies
+# torch is installed separately in Dockerfile with CUDA support
+qwen-tts>=0.1.0
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+soundfile>=0.12.0
+numpy>=1.24.0,<2.0.0
+aiofiles>=23.1.0
+httpx>=0.25.0

@@ -10,3 +10,4 @@ ctranslate2>=3.8.0
 tokenizers>=0.13.0
 huggingface-hub>=0.13.0
 onnxruntime>=1.13.0
+librosa

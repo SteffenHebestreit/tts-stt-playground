@@ -1,4 +1,4 @@
-FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04
 
 WORKDIR /app
 
@@ -9,14 +9,8 @@ RUN apt-get update && apt-get install -y \
     python3-pip \
     curl \
     git \
+    build-essential \
     ffmpeg \
-    libavformat-dev \
-    libavcodec-dev \
-    libavdevice-dev \
-    libavutil-dev \
-    libavfilter-dev \
-    libswscale-dev \
-    libswresample-dev \
     libffi-dev \
     libssl-dev \
     pkg-config \
@@ -32,7 +26,7 @@ RUN mkdir -p /root/.cache/pip && chmod 777 /root/.cache/pip
 RUN pip3 install --upgrade pip wheel setuptools
 RUN pip3 install -r requirements.txt
 
-# Install PyTorch with CUDA 12.1 support
+# Install PyTorch with CUDA support
 RUN pip3 install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
 
 # Copy startup script and application
@@ -45,8 +39,9 @@ RUN mkdir -p /app/models && chmod 755 /app/models
 
 EXPOSE 8000
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+# Health check - DISABLED: Causes container restarts during long transcriptions
+# Docker Compose healthcheck can't override Dockerfile HEALTHCHECK
+# HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+#     CMD curl -f http://localhost:8000/health || exit 1
 
 CMD ["/app/start.sh"]

@@ -1,0 +1,493 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TTS-STT Platform - API Documentation</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+            color: #333;
+            line-height: 1.6;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        
+        h1 {
+            text-align: center;
+            color: white;
+            margin-bottom: 40px;
+            font-size: 2.5em;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
+        
+        .services-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 30px;
+            margin-bottom: 40px;
+        }
+        
+        .service-card {
+            background: white;
+            border-radius: 15px;
+            padding: 30px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+        
+        .service-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 15px 40px rgba(0,0,0,0.3);
+        }
+        
+        .service-card h2 {
+            color: #2a5298;
+            margin-bottom: 15px;
+            font-size: 1.5em;
+            border-bottom: 3px solid #2a5298;
+            padding-bottom: 10px;
+        }
+        
+        .service-info {
+            margin-bottom: 20px;
+        }
+        
+        .service-info p {
+            margin-bottom: 10px;
+            color: #666;
+        }
+        
+        .endpoint-list {
+            list-style: none;
+        }
+        
+        .endpoint-list li {
+            margin-bottom: 8px;
+            padding: 8px 12px;
+            background: #f8f9fa;
+            border-radius: 6px;
+            border-left: 4px solid #2a5298;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9em;
+        }
+        
+        .method {
+            font-weight: bold;
+            text-transform: uppercase;
+            margin-right: 10px;
+            padding: 2px 6px;
+            border-radius: 4px;
+            color: white;
+        }
+        
+        .get { background-color: #28a745; }
+        .post { background-color: #007bff; }
+        .delete { background-color: #dc3545; }
+        
+        .code-example {
+            margin: 15px 0;
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            border: 1px solid #e9ecef;
+        }
+        
+        .code-example h4 {
+            color: #2a5298;
+            margin-bottom: 10px;
+            font-size: 1em;
+        }
+        
+        .code-example pre {
+            background: #343a40;
+            color: #f8f9fa;
+            padding: 15px;
+            border-radius: 6px;
+            overflow-x: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 0.85em;
+            margin: 0;
+        }
+        
+        .api-links {
+            margin-top: 20px;
+            text-align: center;
+        }
+        
+        .api-link {
+            display: inline-block;
+            background: #2a5298;
+            color: white;
+            text-decoration: none;
+            padding: 10px 20px;
+            border-radius: 8px;
+            margin: 5px;
+            transition: background 0.3s ease;
+        }
+        
+        .api-link:hover {
+            background: #1e3c72;
+        }
+        
+        .health-status {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 0.8em;
+            font-weight: bold;
+            margin-left: 10px;
+            transition: all 0.3s ease;
+        }
+        
+        .healthy {
+            background-color: #d4edda;
+            color: #155724;
+        }
+        
+        .error {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+        
+        .loading {
+            background-color: #fff3cd;
+            color: #856404;
+            animation: pulse 1.5s infinite;
+        }
+        
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.6; }
+            100% { opacity: 1; }
+        }
+        
+        .footer {
+            text-align: center;
+            color: white;
+            margin-top: 40px;
+            padding: 20px;
+            background: rgba(0,0,0,0.2);
+            border-radius: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎤 TTS-STT Platform - API Documentation</h1>
+        
+        <div class="services-grid">
+            <!-- Frontend Service -->
+            <div class="service-card">
+                <h2>🌐 Frontend Service</h2>
+                <div class="service-info">
+                    <p><strong>Port:</strong> 3000</p>
+                    <p><strong>Description:</strong> Modern web interface with multi-language voice selection</p>
+                    <p><strong>Status:</strong> <span class="health-status healthy">Healthy</span></p>
+                </div>
+                <ul class="endpoint-list">
+                    <li><span class="method get">GET</span> / - Main demo page with voice selection</li>
+                    <li><span class="method get">GET</span> /health - Health check</li>
+                    <li><span class="method get">GET</span> /api-docs - This documentation</li>
+                </ul>
+                <div class="api-links">
+                    <a href="http://localhost:3000" class="api-link" target="_blank">Open Interface</a>
+                </div>
+            </div>
+            
+            <!-- PiperTTS Service -->
+            <div class="service-card">
+                <h2>🔊 PiperTTS Service</h2>
+                <div class="service-info">
+                    <p><strong>Port:</strong> 5000</p>
+                    <p><strong>Description:</strong> Neural TTS with multi-language support & voice selection</p>
+                    <p><strong>Status:</strong> <span id="tts-status" class="health-status healthy">Healthy</span></p>
+                    <p><strong>Languages:</strong> EN, DE, FR, ES, IT, NL | <strong>Models:</strong> ONNX | <strong>Quality:</strong> High</p>
+                </div>
+                <ul class="endpoint-list">
+                    <li><span class="method post">POST</span> /tts - Generate speech with voice selection</li>
+                    <li><span class="method post">POST</span> /analyze_audio - Analyze audio with FFmpeg</li>
+                    <li><span class="method get">GET</span> /voices - List available voices and models</li>
+                    <li><span class="method get">GET</span> /health - Service health check</li>
+                </ul>
+                <div class="code-example">
+                    <h4>Enhanced TTS Request:</h4>
+                    <pre>{
+  "text": "Hello, this is a test",
+  "language": "en",
+  "quality": "medium",
+  "gender": "female",
+  "speed": 1.0,
+  "output_format": "wav"
+}</pre>
+                </div>
+                <div class="api-links">
+                    <a href="http://localhost:5000/docs" class="api-link" target="_blank">FastAPI Docs</a>
+                    <a href="/static/openapi/pipertts.json" class="api-link" target="_blank">OpenAPI Spec</a>
+                    <a href="http://localhost:5000/health" class="api-link" target="_blank">Health Check</a>
+                </div>
+            </div>
+            
+            <!-- PiperTTS Training Service -->
+            <div class="service-card">
+                <h2>🎯 Piper Training Service</h2>
+                <div class="service-info">
+                    <p><strong>Port:</strong> 8080</p>
+                    <p><strong>Description:</strong> VITS neural network voice training with GPU acceleration</p>
+                    <p><strong>Status:</strong> <span id="training-status" class="health-status healthy">Healthy</span></p>
+                    <p><strong>Export:</strong> ONNX for PiperTTS deployment</p>
+                </div>
+                <ul class="endpoint-list">
+                    <li><span class="method post">POST</span> /train - Start VITS training pipeline</li>
+                    <li><span class="method get">GET</span> /status/{job_id} - Get training progress</li>
+                    <li><span class="method get">GET</span> /jobs - List all training jobs</li>
+                    <li><span class="method post">POST</span> /export/{job_id} - Export model to ONNX</li>
+                    <li><span class="method get">GET</span> /download/{job_id} - Download trained model</li>
+                    <li><span class="method delete">DELETE</span> /job/{job_id} - Cancel training job</li>
+                    <li><span class="method get">GET</span> /health - Service health check</li>
+                </ul>
+                <div class="code-example">
+                    <h4>Training Request:</h4>
+                    <pre>{
+  "audio_file": "voice_sample.wav",
+  "voice_name": "my_voice",
+  "epochs": 1000,
+  "batch_size": 32,
+  "learning_rate": 0.0002
+}</pre>
+                </div>
+                <div class="api-links">
+                    <a href="http://localhost:8080/docs" class="api-link" target="_blank">FastAPI Docs</a>
+                    <a href="/static/openapi/training.json" class="api-link" target="_blank">OpenAPI Spec</a>
+                    <a href="http://localhost:8080/health" class="api-link" target="_blank">Health Check</a>
+                </div>
+            </div>
+            
+            <!-- STT Service -->
+            <div class="service-card">
+                <h2>🎙️ STT Service (Whisper)</h2>
+                <div class="service-info">
+                    <p><strong>Port:</strong> 5001</p>
+                    <p><strong>Description:</strong> Speech-to-text with hardware acceleration & audio segmentation</p>
+                    <p><strong>Status:</strong> <span id="stt-status" class="health-status healthy">Healthy</span></p>
+                    <p><strong>Device:</strong> CUDA | <strong>Model:</strong> Medium | <strong>Precision:</strong> Float16</p>
+                </div>
+                <ul class="endpoint-list">
+                    <li><span class="method post">POST</span> /transcribe - Convert speech to text</li>
+                    <li><span class="method post">POST</span> /detect_language - Detect spoken language</li>
+                    <li><span class="method get">GET</span> /health - Service health check</li>
+                </ul>
+                <div class="api-links">
+                    <a href="http://localhost:5001/docs" class="api-link" target="_blank">API Docs</a>
+                    <a href="/static/openapi/stt.json" class="api-link" target="_blank">OpenAPI Spec</a>
+                    <a href="http://localhost:5001/health" class="api-link" target="_blank">Health Check</a>
+                </div>
+            </div>
+            
+            <!-- Qwen3-TTS Service -->
+            <div class="service-card">
+                <h2>🎤 Qwen3-TTS Service (Voice Cloning)</h2>
+                <div class="service-info">
+                    <p><strong>Port:</strong> 5004</p>
+                    <p><strong>Description:</strong> Voice cloning and multilingual TTS using Qwen3-TTS</p>
+                    <p><strong>Status:</strong> <span id="xtts-status" class="health-status healthy">Healthy</span></p>
+                    <p><strong>Model:</strong> Qwen3-TTS-1.7B | <strong>Languages:</strong> 13 supported</p>
+                </div>
+                <ul class="endpoint-list">
+                    <li><span class="method post">POST</span> /tts - Generate speech with built-in speaker</li>
+                    <li><span class="method post">POST</span> /clone - Voice cloning with reference audio</li>
+                    <li><span class="method post">POST</span> /clone-with-ref-text - Clone with reference text</li>
+                    <li><span class="method get">GET</span> /speakers - List available speakers</li>
+                    <li><span class="method get">GET</span> /status - System status and GPU info</li>
+                    <li><span class="method get">GET</span> /health - Service health check</li>
+                </ul>
+                <div class="code-example">
+                    <h4>Voice Cloning Example:</h4>
+                    <pre>curl -X POST "http://localhost:5004/clone" \
+  -F "file=@reference_voice.wav" \
+  -F "text=Hello, this is my cloned voice!" \
+  -F "lang=en" \
+  --output cloned_speech.wav</pre>
+                </div>
+                <div class="api-links">
+                    <a href="http://localhost:5004/docs" class="api-link" target="_blank">FastAPI Docs</a>
+                    <a href="http://localhost:5004/health" class="api-link" target="_blank">Health Check</a>
+                    <a href="http://localhost:5004/status" class="api-link" target="_blank">System Status</a>
+                </div>
+            </div>
+
+            <!-- Qwen3-ASR Service -->
+            <div class="service-card">
+                <h2>🧠 Qwen3-ASR Service</h2>
+                <div class="service-info">
+                    <p><strong>Port:</strong> 5002</p>
+                    <p><strong>Description:</strong> Fast multilingual speech recognition using Qwen3-ASR</p>
+                    <p><strong>Status:</strong> <span id="asr-status" class="health-status healthy">Healthy</span></p>
+                    <p><strong>Model:</strong> Qwen3-ASR-1.7B</p>
+                </div>
+                <ul class="endpoint-list">
+                    <li><span class="method post">POST</span> /transcribe - Transcribe audio to text</li>
+                    <li><span class="method post">POST</span> /detect_language - Detect spoken language</li>
+                    <li><span class="method post">POST</span> /transcribe-batch - Batch transcription</li>
+                    <li><span class="method get">GET</span> /status - Model and device status</li>
+                    <li><span class="method get">GET</span> /health - Service health check</li>
+                </ul>
+                <div class="code-example">
+                    <h4>Transcription Example:</h4>
+                    <pre>curl -X POST "http://localhost:5002/transcribe" \
+  -F "audio=@speech.wav"
+
+# Returns:
+{
+  "text": "Hello, how are you?",
+  "language": "en",
+  "segments": [...]
+}</pre>
+                </div>
+                <div class="api-links">
+                    <a href="http://localhost:5002/docs" class="api-link" target="_blank">FastAPI Docs</a>
+                    <a href="http://localhost:5002/health" class="api-link" target="_blank">Health Check</a>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Enhanced Features Section -->
+        <div class="service-card" style="margin-bottom: 30px;">
+            <h2>🚀 Enhanced Features</h2>
+            
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 30px; margin-top: 20px;">
+                <div>
+                    <h3 style="color: #2a5298; margin-bottom: 15px;">🌍 Multi-Language Support</h3>
+                    <ul style="list-style: none; padding-left: 0;">
+                        <li>🇺🇸 <strong>English:</strong> lessac, amy, alan</li>
+                        <li>🇩🇪 <strong>German:</strong> thorsten, eva_k</li>
+                        <li>🇫🇷 <strong>French:</strong> siwis</li>
+                        <li>🇪🇸 <strong>Spanish:</strong> mls_9972</li>
+                        <li>🇮🇹 <strong>Italian:</strong> riccardo</li>
+                        <li>🇳🇱 <strong>Dutch:</strong> mls_5809</li>
+                    </ul>
+                </div>
+                
+                <div>
+                    <h3 style="color: #2a5298; margin-bottom: 15px;">⚙️ Voice Selection Parameters</h3>
+                    <ul style="list-style: none; padding-left: 0;">
+                        <li><strong>Language:</strong> Auto-detect or specify (en, de, fr, es, it, nl)</li>
+                        <li><strong>Quality:</strong> x_low, low, medium, high</li>
+                        <li><strong>Gender:</strong> male, female, any</li>
+                        <li><strong>Speed:</strong> 0.5x to 2.0x multiplier</li>
+                        <li><strong>Format:</strong> WAV, MP3 output</li>
+                    </ul>
+                </div>
+            </div>
+            
+            <div class="code-example" style="margin-top: 25px;">
+                <h4>Complete TTS Request Example:</h4>
+                <pre>curl -X POST "http://localhost:5000/tts" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Bonjour! Comment allez-vous?",
+    "language": "fr",
+    "quality": "high",
+    "gender": "female",
+    "speed": 1.0,
+    "output_format": "wav"
+  }' \
+  --output speech.wav</pre>
+            </div>
+            
+            <div class="code-example">
+                <h4>Audio Analysis Example:</h4>
+                <pre>curl -X POST "http://localhost:5000/analyze_audio" \
+  -F "audio_file=@sample.wav"
+
+# Returns:
+{
+  "format": "wav",
+  "duration": 15.3,
+  "sample_rate": 22050,
+  "channels": 1,
+  "bitrate": 352800,
+  "codec": "pcm_s16le"
+}</pre>
+            </div>
+        </div>
+        
+        <div class="footer">
+            <h3>📋 TTS-STT Platform Overview</h3>
+            <p><strong>Architecture:</strong> Modern microservices with Docker containerization</p>
+            <p><strong>Frontend:</strong> FastAPI + Enhanced Web UI with voice selection</p>
+            <p><strong>TTS Engine:</strong> PiperTTS with ONNX models and multi-language support</p>
+            <p><strong>Training:</strong> VITS neural network training with GPU acceleration</p>
+            <p><strong>STT Engine:</strong> OpenAI Whisper + Qwen3-ASR</p>
+            <p><strong>Voice Cloning:</strong> Qwen3-TTS multilingual voice cloning</p>
+            <p><strong>Languages:</strong> English, German, French, Spanish, Italian, Dutch</p>
+            <p><strong>Last Updated:</strong> <span id="timestamp"></span></p>
+        </div>
+    </div>
+    
+    <script>
+        // Update timestamp
+        document.getElementById('timestamp').textContent = new Date().toLocaleString();
+        
+        // Check service health status periodically
+        async function checkHealth() {
+            const services = [
+                {name: 'tts', url: 'http://localhost:5000/health', element: 'tts-status'},
+                {name: 'training', url: 'http://localhost:8080/health', element: 'training-status'},
+                {name: 'stt', url: 'http://localhost:5001/health', element: 'stt-status'},
+                {name: 'qwen3-tts', url: 'http://localhost:5004/health', element: 'xtts-status'},
+                {name: 'qwen3-asr', url: 'http://localhost:5002/health', element: 'asr-status'}
+            ];
+            
+            for (const service of services) {
+                const element = document.getElementById(service.element);
+                if (element) {
+                    // Set loading state
+                    element.classList.remove('healthy', 'error');
+                    element.classList.add('loading');
+                    element.textContent = 'Checking...';
+                    
+                    try {
+                        const response = await fetch(service.url, { 
+                            signal: AbortSignal.timeout(5000),
+                            mode: 'cors'
+                        });
+                        
+                        if (response.ok) {
+                            element.classList.remove('loading', 'error');
+                            element.classList.add('healthy');
+                            element.textContent = 'Healthy';
+                        } else {
+                            throw new Error('Service unhealthy');
+                        }
+                    } catch (error) {
+                        element.classList.remove('loading', 'healthy');
+                        element.classList.add('error');
+                        element.textContent = 'Offline';
+                        console.log(`${service.name} service: offline - ${error.message}`);
+                    }
+                }
+            }
+        }
+        
+        // Check health on load
+        checkHealth();
+        
+        // Check health every 30 seconds
+        setInterval(checkHealth, 30000);
+    </script>
+</body>
+</html>
+    
