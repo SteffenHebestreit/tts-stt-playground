@@ -63,7 +63,9 @@ docker-compose -f docker-compose.yml -f docker-compose.rocm.yml --profile qwen3-
 
 The overlay switches base images to `rocm/dev-ubuntu-22.04:6.2-complete`, installs ROCm PyTorch wheels, and replaces NVIDIA device reservations with `/dev/kfd` + `/dev/dri` mounts.
 
-**Strix Halo (gfx1201 / RDNA 4 iGPU):** ROCm 6.2 supports gfx1201 natively. If GPU detection fails, set `HSA_OVERRIDE_GFX_VERSION=11.0.0` in your `.env` file.
+**Strix Halo (gfx1201 / RDNA 4 iGPU):** gfx1201 is not in ROCm 6.2's official support list. The compose overlay defaults `HSA_OVERRIDE_GFX_VERSION=11.0.0` which makes ROCm treat it as gfx1100 (RDNA 3) — this works correctly on RDNA 4. The `PYTORCH_HIP_ALLOC_CONF=expandable_segments:True` setting is also applied automatically to prevent fragmentation of the unified LPDDR5x memory pool.
+
+> **WSL2 note:** AMD ROCm GPU passthrough is not available in Docker Desktop's WSL2 backend (`/dev/kfd` is not exposed). The ROCm compose file requires native Linux or a Linux VM with direct PCIe GPU access.
 
 ## Features
 
@@ -91,9 +93,18 @@ The overlay switches base images to `rocm/dev-ubuntu-22.04:6.2-complete`, instal
 - Cross-lingual cloning across 13 languages
 - Replaces the previous XTTS service
 
+### Speech Recognition (Whisper STT)
+- Multiple model sizes: tiny, base, small, medium, large-v3 (all multilingual)
+- `distil-large-v3` available for English-only use cases (fastest)
+- Configurable VAD filter (`vad_filter`, `vad_threshold`) — disable if short clips are being filtered out
+- Streaming transcription via SSE (`/transcribe-stream`)
+- Language detection (`/detect_language`)
+- `/health` returns `multilingual` flag to avoid accidentally using an English-only model
+
 ### Speech Recognition (Qwen3-ASR)
-- Fast multilingual speech recognition
+- Fast multilingual speech recognition via Qwen3-ASR-1.7B
 - Language detection
+- Requires GPU (CUDA/ROCm) for practical use; CPU inference is very slow
 
 ## API Endpoints
 
@@ -109,9 +120,14 @@ The overlay switches base images to `rocm/dev-ubuntu-22.04:6.2-complete`, instal
 ### STT (port 5001 -> 8000 internal)
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/transcribe` | Transcribe audio file |
+| POST | `/transcribe` | Transcribe audio (form: `audio`, `task`, `language`, `beam_size`, `vad_filter`, `vad_threshold`, `no_speech_threshold`) |
+| POST | `/transcribe-stream` | SSE streaming transcription (same params as `/transcribe`) |
 | POST | `/detect_language` | Detect spoken language |
-| GET | `/health` | Health check |
+| GET | `/health` | Health check — includes `multilingual` and `model_size` fields |
+| GET | `/models` | List available models with size and multilingual flag |
+| GET | `/tasks` | Describe `transcribe` vs `translate` tasks |
+
+**Model selection:** Use a multilingual model (`medium`, `large-v3`) for non-English languages. `distil-large-v3` is English-only and will silently output English regardless of the `language` parameter.
 
 ### Piper Training (port 8080)
 | Method | Endpoint | Description |

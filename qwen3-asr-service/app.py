@@ -3,7 +3,11 @@ import time
 import uuid
 import tempfile
 import json
+import logging
 from pathlib import Path
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 import torch
 import numpy as np
@@ -45,26 +49,34 @@ def get_model():
     """Load or return cached Qwen3-ASR model."""
     global asr_model, model_loaded
     if asr_model is None:
-        print("Loading Qwen3-ASR model...")
+        logger.info("Loading Qwen3-ASR model...")
         try:
             from qwen_asr import Qwen3ASRModel
 
-            model_name = os.getenv(
-                "QWEN3_ASR_MODEL",
-                "Qwen/Qwen3-ASR-1.7B"
-            )
+            model_name = os.getenv("QWEN3_ASR_MODEL", "Qwen/Qwen3-ASR-1.7B")
+
+            # Prefer bfloat16 on CUDA; fall back to float16 (ROCm/older GPUs),
+            # then float32 on CPU.
+            if device == "cuda":
+                if torch.cuda.is_bf16_supported():
+                    dtype = torch.bfloat16
+                else:
+                    logger.warning("bfloat16 not supported on this GPU, using float16")
+                    dtype = torch.float16
+            else:
+                dtype = torch.float32
 
             asr_model = Qwen3ASRModel.from_pretrained(
                 model_name,
-                dtype=torch.bfloat16 if device == "cuda" else torch.float32,
+                dtype=dtype,
                 device_map=f"{device}:0" if device == "cuda" else "cpu",
                 max_inference_batch_size=32,
                 max_new_tokens=512,
             )
             model_loaded = True
-            print(f"Qwen3-ASR model loaded on {device}")
+            logger.info(f"Qwen3-ASR model loaded on {device} ({dtype})")
         except Exception as e:
-            print(f"Failed to load Qwen3-ASR model: {e}")
+            logger.error(f"Failed to load Qwen3-ASR model: {e}", exc_info=True)
             raise
     return asr_model
 
@@ -75,7 +87,7 @@ async def startup():
     try:
         get_model()
     except Exception as e:
-        print(f"Warning: Could not preload model: {e}")
+        logger.warning(f"Could not preload model: {e}")
 
 
 @app.get("/health")
@@ -122,7 +134,7 @@ async def transcribe_audio(
         tmp_path, content = await _save_upload(audio)
 
         file_size_mb = len(content) / (1024 * 1024)
-        print(f"Transcribing: {audio.filename} ({file_size_mb:.1f}MB), language={language}")
+        logger.info(f"Transcribing: {audio.filename} ({file_size_mb:.1f}MB), language={language}")
 
         # Get audio duration
         duration = librosa.get_duration(path=tmp_path)
@@ -161,7 +173,7 @@ async def transcribe_audio(
                 "confidence": 1.0,
             })
 
-        print(f"Transcription complete: {len(segments)} segments in {processing_time:.2f}s")
+        logger.info(f"Transcription complete: {len(segments)} segments in {processing_time:.2f}s")
 
         return JSONResponse(content={
             "text": text,
@@ -175,7 +187,7 @@ async def transcribe_audio(
         })
 
     except Exception as e:
-        print(f"Transcription error: {e}")
+        logger.error(f"Transcription error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if tmp_path and os.path.exists(tmp_path):
@@ -216,7 +228,7 @@ async def detect_language(
         }
 
     except Exception as e:
-        print(f"Language detection error: {e}")
+        logger.error(f"Language detection error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if tmp_path and os.path.exists(tmp_path):

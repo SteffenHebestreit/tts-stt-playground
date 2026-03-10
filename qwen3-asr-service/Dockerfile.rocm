@@ -18,10 +18,12 @@ RUN ln -sf /usr/bin/python3.11 /usr/bin/python3 && \
 
 RUN pip3 install --upgrade pip setuptools wheel
 
-RUN pip3 install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/rocm6.2
-
+# Install non-torch deps first (requirements.txt has no torch line)
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
+
+# Install ROCm-enabled PyTorch LAST so it is not overwritten by any dep
+RUN pip3 install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/rocm6.2
 
 COPY app.py .
 

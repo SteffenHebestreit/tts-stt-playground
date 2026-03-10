@@ -66,30 +66,47 @@ class SafeJSONResponse(JSONResponse):
 # Hardware detection and optimization (re-check after startup)
 def detect_hardware():
     """Detect and configure hardware acceleration"""
-    # Re-import torch to get latest version after potential upgrade
     import torch
-    
+
+    force_accel = os.getenv("FORCE_ACCELERATION", "").lower()
+
+    if force_accel == "rocm":
+        # ROCm presents as CUDA to PyTorch; ctranslate2 4.x+ required for GPU use.
+        # If ctranslate2 was not compiled with HIP support, fall back gracefully to CPU.
+        try:
+            import ctranslate2
+            providers = ctranslate2.get_supported_compute_types("cuda")
+            if "float16" in providers:
+                device = "cuda"
+                compute_type = "float16"
+                logger.info(f"ROCm mode: using GPU (ctranslate2 HIP). GPU: {torch.cuda.get_device_name(0)}")
+            else:
+                raise RuntimeError("ctranslate2 has no float16 CUDA/HIP support")
+        except Exception as e:
+            logger.warning(f"ROCm requested but ctranslate2 HIP unavailable ({e}); falling back to CPU int8")
+            device = "cpu"
+            compute_type = "int8"
+        return device, compute_type
+
+    # Explicit CPU override
+    if os.getenv("USE_CUDA", "").lower() == "false":
+        logger.info("Hardware acceleration disabled via USE_CUDA=false")
+        return "cpu", "int8"
+
     if torch.cuda.is_available():
         device = "cuda"
         compute_type = "float16"
         logger.info(f"CUDA available with {torch.cuda.device_count()} GPU(s)")
         logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
     elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-        device = "cpu"  # Faster-whisper doesn't support MPS yet
+        device = "cpu"  # faster-whisper doesn't support MPS
         compute_type = "int8"
-        logger.info("Apple Silicon detected, using optimized CPU")
+        logger.info("Apple Silicon detected, using optimized CPU int8")
     else:
         device = "cpu"
         compute_type = "int8"
-        logger.info("Using CPU")
-    
-    # Check environment override
-    env_device = os.getenv("USE_CUDA", "").lower()
-    if env_device == "false":
-        device = "cpu"
-        compute_type = "int8"
-        logger.info("Hardware acceleration disabled via environment")
-    
+        logger.info("Using CPU int8")
+
     return device, compute_type
 
 # Defer hardware detection until first use
@@ -174,7 +191,9 @@ async def transcribe_audio(
     initial_prompt: str = Form(""),
     condition_on_previous_text: bool = Form(True),
     compression_ratio_threshold: float = Form(2.4),
-    no_speech_threshold: float = Form(0.6)
+    no_speech_threshold: float = Form(0.6),
+    vad_filter: bool = Form(True),
+    vad_threshold: float = Form(0.5),
 ):
     """Transcribe audio file to text"""
     logger.info(f"Transcription request - task: {task}, language: {language}")
@@ -223,13 +242,14 @@ async def transcribe_audio(
         # Process each file sequentially
         for afile in file_list:
             safe_filename = os.path.basename(afile.filename or "audio.wav")
-            temp_audio_path = f"/tmp/{uuid.uuid4().hex[:12]}_{safe_filename}"
-            with open(temp_audio_path, "wb") as f:
+            suffix = os.path.splitext(safe_filename)[1] or ".wav"
+            tmp_fd, temp_audio_path = tempfile.mkstemp(suffix=suffix)
+            with os.fdopen(tmp_fd, "wb") as f:
                 content = await afile.read()
                 f.write(content)
             logger.info(f"Saved audio file: {temp_audio_path}, size: {os.path.getsize(temp_audio_path)} bytes")
 
-            logger.info(f"Starting transcription for file {afile.filename}...")
+            logger.info(f"Starting transcription for file {afile.filename} (vad_filter={vad_filter}, vad_threshold={vad_threshold})...")
             start_time = time.time()
             segments, info = whisper_model.transcribe(
                 temp_audio_path,
@@ -244,13 +264,13 @@ async def transcribe_audio(
                 condition_on_previous_text=condition_on_previous_text,
                 compression_ratio_threshold=compression_ratio_threshold,
                 no_speech_threshold=no_speech_threshold,
-                vad_filter=True,
+                vad_filter=vad_filter,
                 vad_parameters={
-                    "threshold": 0.6,
+                    "threshold": vad_threshold,
                     "min_speech_duration_ms": 500,
                     "min_silence_duration_ms": 1500,
                     "speech_pad_ms": 300,
-                }
+                } if vad_filter else None,
             )
 
             segments_list = []
@@ -350,7 +370,11 @@ async def transcribe_audio_stream(
     audio: UploadFile = File(...),
     language: str = Form(None),
     task: str = Form("transcribe"),
-    target_language: str = Form("english")
+    target_language: str = Form("english"),
+    beam_size: int = Form(5),
+    vad_filter: bool = Form(True),
+    vad_threshold: float = Form(0.5),
+    no_speech_threshold: float = Form(0.6),
 ):
     """Stream transcription results as they become available"""
     if not model_loaded:
@@ -361,9 +385,10 @@ async def transcribe_audio_stream(
     # Save uploaded file to a temporary location first
     try:
         audio_content = await audio.read()
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
+        suffix = os.path.splitext(audio.filename or "audio.wav")[1] or ".wav"
+        tmp_fd, tmp_file_path = tempfile.mkstemp(suffix=suffix)
+        with os.fdopen(tmp_fd, "wb") as tmp_file:
             tmp_file.write(audio_content)
-            tmp_file_path = tmp_file.name
         logger.info(f"[{req_id}] Saved temp file for streaming: {tmp_file_path}")
     except Exception as e:
         logger.error(f"[{req_id}] Failed to save temp file: {e}")
@@ -388,15 +413,15 @@ async def transcribe_audio_stream(
             def run_transcription():
                 return whisper_model.transcribe(
                     tmp_file_path,
-                    beam_size=5,
-                    best_of=5,
+                    beam_size=beam_size,
+                    best_of=beam_size,
                     temperature=(0.0, 0.2, 0.4, 0.6, 0.8),
-                    log_prob_threshold=-1.0,
                     compression_ratio_threshold=2.4,
+                    no_speech_threshold=no_speech_threshold,
                     language=language,
                     task=task,
-                    vad_filter=True,
-                    vad_parameters=dict(min_silence_duration_ms=300, threshold=0.5)
+                    vad_filter=vad_filter,
+                    vad_parameters=dict(min_silence_duration_ms=300, threshold=vad_threshold) if vad_filter else None,
                 )
             
             loop = asyncio.get_running_loop()
@@ -461,15 +486,19 @@ async def transcribe_audio_stream(
         }
     )
 
+ENGLISH_ONLY_MODELS = {"tiny.en", "base.en", "small.en", "medium.en", "distil-large-v2", "distil-large-v3", "distil-medium.en", "distil-small.en"}
+
 @app.get("/health", response_class=SafeJSONResponse)
 async def health_check():
     """Health check endpoint"""
+    current_model = model_size_loaded or os.getenv("WHISPER_MODEL_SIZE", "large-v3")
     return {
         "status": "ok",
         "model_loaded": model_loaded,
         "device": device,
         "compute_type": compute_type,
-        "model_size": model_size_loaded or os.getenv("WHISPER_MODEL_SIZE", "large-v3"),
+        "model_size": current_model,
+        "multilingual": current_model not in ENGLISH_ONLY_MODELS,
         "torch_version": torch.__version__,
         "cuda_available": torch.cuda.is_available()
     }
@@ -494,9 +523,18 @@ async def available_models():
     """List available Whisper models"""
     return {
         "available_models": [
-            "tiny", "tiny.en", "base", "base.en", 
-            "small", "small.en", "medium", "medium.en",
-            "large-v1", "large-v2", "large-v3"
+            {"name": "tiny",            "multilingual": True,  "size_mb": 75},
+            {"name": "tiny.en",         "multilingual": False, "size_mb": 75},
+            {"name": "base",            "multilingual": True,  "size_mb": 145},
+            {"name": "base.en",         "multilingual": False, "size_mb": 145},
+            {"name": "small",           "multilingual": True,  "size_mb": 490},
+            {"name": "small.en",        "multilingual": False, "size_mb": 490},
+            {"name": "medium",          "multilingual": True,  "size_mb": 1500},
+            {"name": "medium.en",       "multilingual": False, "size_mb": 1500},
+            {"name": "large-v1",        "multilingual": True,  "size_mb": 2900},
+            {"name": "large-v2",        "multilingual": True,  "size_mb": 2900},
+            {"name": "large-v3",        "multilingual": True,  "size_mb": 3100},
+            {"name": "distil-large-v3", "multilingual": False, "size_mb": 1500, "note": "English-only, fastest"},
         ],
         "current_model": os.getenv("WHISPER_MODEL_SIZE", "large-v3"),
         "supported_languages": [
@@ -558,10 +596,10 @@ async def detect_language(
             raise HTTPException(status_code=503, detail="Model not available")
 
     safe_filename = os.path.basename(file.filename or "audio.wav")
-    temp_audio_path = f"/tmp/{uuid.uuid4().hex[:12]}_{safe_filename}"
+    suffix = os.path.splitext(safe_filename)[1] or ".wav"
+    tmp_fd, temp_audio_path = tempfile.mkstemp(suffix=suffix)
     try:
-        # Save audio file
-        with open(temp_audio_path, "wb") as f:
+        with os.fdopen(tmp_fd, "wb") as f:
             content = await file.read()
             f.write(content)
 

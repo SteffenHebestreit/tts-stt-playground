@@ -2,7 +2,6 @@ FROM rocm/dev-ubuntu-22.04:6.2-complete
 
 WORKDIR /app
 
-# Install Python and system dependencies
 RUN apt-get update && apt-get install -y \
     python3 \
     python3-dev \
@@ -25,12 +24,19 @@ RUN apt-get update && apt-get install -y \
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
-COPY requirements.txt .
 RUN mkdir -p /root/.cache/pip && chmod 777 /root/.cache/pip
 RUN pip3 install --upgrade pip wheel setuptools
+
+# Install ROCm-enabled PyTorch FIRST so ctranslate2 can detect HIP at install time
+RUN pip3 install torch torchaudio --index-url https://download.pytorch.org/whl/rocm6.2
+
+# Install non-torch deps from requirements (torch line is commented out there)
+COPY requirements.txt .
 RUN pip3 install -r requirements.txt
 
-RUN pip3 install torch torchaudio --index-url https://download.pytorch.org/whl/rocm6.2
+# Upgrade ctranslate2 to 4.x+ which has experimental HIP/ROCm support.
+# Falls back to CPU gracefully if HIP is unavailable at runtime (handled in app.py).
+RUN pip3 install --upgrade "ctranslate2>=4.0.0" || echo "ctranslate2 4.x unavailable, keeping existing version"
 
 COPY start.sh /app/start.sh
 RUN chmod +x /app/start.sh && sed -i 's/\r$//' /app/start.sh
