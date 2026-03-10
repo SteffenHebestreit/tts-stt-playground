@@ -1,0 +1,90 @@
+# ROCm override for AMD GPU support (ROCm 6.2+, tested on RDNA 3/4 including Strix Halo)
+#
+# Usage:
+#   docker-compose -f docker-compose.yml -f docker-compose.rocm.yml --profile <profile> up -d
+#
+# Examples:
+#   docker-compose -f docker-compose.yml -f docker-compose.rocm.yml --profile all up -d
+#   docker-compose -f docker-compose.yml -f docker-compose.rocm.yml --profile qwen3-asr up -d
+#
+# Strix Halo (gfx1201): if ROCm fails to detect the GPU, set HSA_OVERRIDE_GFX_VERSION=11.0.0
+# in your .env file.
+
+services:
+  piper-training-service:
+    build:
+      dockerfile: Dockerfile.rocm
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ""
+      NVIDIA_DRIVER_CAPABILITIES: ""
+      HIP_VISIBLE_DEVICES: ${HIP_VISIBLE_DEVICES:-0}
+      HSA_OVERRIDE_GFX_VERSION: ${HSA_OVERRIDE_GFX_VERSION:-}
+      PYTORCH_HIP_ALLOC_CONF: max_split_size_mb:512
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+      - render
+    deploy:
+      resources:
+        reservations:
+          devices: []
+
+  stt-service:
+    build:
+      dockerfile: Dockerfile.rocm
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ""
+      NVIDIA_DRIVER_CAPABILITIES: ""
+      FORCE_ACCELERATION: rocm
+      HIP_VISIBLE_DEVICES: ${HIP_VISIBLE_DEVICES:-0}
+      HSA_OVERRIDE_GFX_VERSION: ${HSA_OVERRIDE_GFX_VERSION:-}
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+      - render
+    deploy:
+      resources:
+        reservations:
+          devices: []
+
+  qwen3-asr-service:
+    build:
+      dockerfile: Dockerfile.rocm
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ""
+      NVIDIA_DRIVER_CAPABILITIES: ""
+      HIP_VISIBLE_DEVICES: ${HIP_VISIBLE_DEVICES:-0}
+      HSA_OVERRIDE_GFX_VERSION: ${HSA_OVERRIDE_GFX_VERSION:-}
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+      - render
+    deploy:
+      resources:
+        reservations:
+          devices: []
+
+  qwen3-tts-service:
+    build:
+      dockerfile: Dockerfile.rocm
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ""
+      NVIDIA_DRIVER_CAPABILITIES: ""
+      HIP_VISIBLE_DEVICES: ${HIP_VISIBLE_DEVICES:-0}
+      HSA_OVERRIDE_GFX_VERSION: ${HSA_OVERRIDE_GFX_VERSION:-}
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+      - render
+    deploy:
+      resources:
+        reservations:
+          devices: []

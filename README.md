@@ -44,11 +44,26 @@ Open **http://localhost:3000** for the web interface or **http://localhost:3000/
 ## Prerequisites
 
 - Docker and Docker Compose
-- NVIDIA GPU with CUDA drivers (recommended for training and Qwen3 services)
-- NVIDIA Container Toolkit (`nvidia-docker2`)
 - 16 GB+ RAM recommended
+- GPU for training and Qwen3 services (CPU fallback available but slow):
+  - **NVIDIA**: CUDA drivers + NVIDIA Container Toolkit (`nvidia-docker2`)
+  - **AMD**: ROCm 6.2+ — use `docker-compose.rocm.yml` (see below)
 
-CPU-only mode works for PiperTTS and STT but training and Qwen3 services require a GPU.
+## AMD GPU (ROCm)
+
+All GPU services have a `Dockerfile.rocm` variant. Use the `docker-compose.rocm.yml` override alongside the main compose file:
+
+```bash
+# Full stack on AMD GPU
+docker-compose -f docker-compose.yml -f docker-compose.rocm.yml --profile all up -d
+
+# Single service
+docker-compose -f docker-compose.yml -f docker-compose.rocm.yml --profile qwen3-asr up -d
+```
+
+The overlay switches base images to `rocm/dev-ubuntu-22.04:6.2-complete`, installs ROCm PyTorch wheels, and replaces NVIDIA device reservations with `/dev/kfd` + `/dev/dri` mounts.
+
+**Strix Halo (gfx1201 / RDNA 4 iGPU):** ROCm 6.2 supports gfx1201 natively. If GPU detection fails, set `HSA_OVERRIDE_GFX_VERSION=11.0.0` in your `.env` file.
 
 ## Features
 

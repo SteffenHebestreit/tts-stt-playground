@@ -1,0 +1,35 @@
+FROM rocm/dev-ubuntu-22.04:6.2-complete
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    python3.10 \
+    python3-pip \
+    git \
+    wget \
+    curl \
+    build-essential \
+    libsndfile1 \
+    sox \
+    ffmpeg \
+    espeak-ng \
+    pciutils \
+    lshw \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+RUN pip3 install --upgrade pip setuptools wheel
+
+COPY requirements.txt .
+
+RUN pip3 install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/rocm6.2
+
+RUN pip3 install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+RUN chmod +x /app/start.sh
+
+EXPOSE 8080
+
+CMD ["/app/start.sh"]
