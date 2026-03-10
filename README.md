@@ -15,9 +15,19 @@ A self-hosted, Docker-based platform for text-to-speech synthesis, speech-to-tex
 
 ## Quick Start
 
+Each service has its own profile. Start only what you need:
+
 ```bash
-# Clone and start all services
-docker-compose up -d
+# Full stack
+docker-compose --profile all up -d
+
+# Single service — dependencies are pulled in automatically
+docker-compose --profile qwen3-asr up -d
+docker-compose --profile qwen3-tts up -d   # also starts qwen3-asr
+docker-compose --profile piper-tts up -d
+docker-compose --profile stt up -d
+docker-compose --profile training up -d    # also starts stt
+docker-compose --profile frontend up -d    # also starts piper-tts + stt
 
 # Check service health
 docker-compose ps
@@ -25,7 +35,7 @@ docker-compose ps
 # View logs
 docker-compose logs -f
 
-# Stop services
+# Stop everything
 docker-compose down
 ```
 

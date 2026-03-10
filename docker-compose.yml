@@ -3,6 +3,7 @@ name: ttstt
 services:
   # PiperTTS service with default and custom model support
   piper-tts-service:
+    profiles: [piper-tts, all]
     build:
       context: ./piper-tts-service
       dockerfile: Dockerfile
@@ -28,6 +29,7 @@ services:
 
   # PiperTTS Training service for custom voice models
   piper-training-service:
+    profiles: [training, all]
     build:
       context: ./piper-training-service
       dockerfile: Dockerfile
@@ -77,6 +79,7 @@ services:
 
   # Whisper STT service (used for training transcription)
   stt-service:
+    profiles: [stt, all]
     build:
       context: ./stt-service
     ports:
@@ -115,6 +118,7 @@ services:
 
   # Qwen3-ASR service (fast multilingual speech recognition)
   qwen3-asr-service:
+    profiles: [qwen3-asr, all]
     build:
       context: ./qwen3-asr-service
       dockerfile: Dockerfile
@@ -146,6 +150,7 @@ services:
 
   # Qwen3-TTS service (voice cloning + TTS, replaces XTTS)
   qwen3-tts-service:
+    profiles: [qwen3-tts, all]
     build:
       context: ./qwen3-tts-service
       dockerfile: Dockerfile
@@ -181,6 +186,7 @@ services:
 
   # Frontend Service - Modern web interface
   frontend-service:
+    profiles: [frontend, all]
     build:
       context: ./frontend-service
       dockerfile: Dockerfile
