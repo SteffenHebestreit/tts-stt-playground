@@ -64,6 +64,8 @@ The overlay replaces the CPU `Dockerfile` with `Dockerfile.vulkan` (built with `
 
 **Strix Halo (gfx1201 / Radeon 890M):** No GFX version override needed — the Radeon 890M is natively Vulkan 1.3 capable. On APU systems with a discrete GPU as device 1, set `GGML_VULKAN_DEVICE=0` to stay on the iGPU or `=1` for the dGPU.
 
+> **WSL2 + Docker Desktop note:** Docker Desktop's VM does not expose `/dev/dri` to containers, so the Vulkan overlay will fail to start on this setup. Vulkan GPU acceleration requires **native Linux** or **Docker Engine running directly inside WSL2** (not Docker Desktop). On Windows, the CPU build works fine.
+
 > **Why not use Vulkan for the Python services?** PyTorch and CTranslate2 (used by `stt-service`, `qwen3-asr-service`, etc.) do not have Vulkan backends. For those, use ROCm (AMD) or CUDA (NVIDIA).
 
 ## AMD GPU (ROCm)
