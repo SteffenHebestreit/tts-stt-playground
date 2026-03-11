@@ -1,6 +1,10 @@
 # whisper.cpp STT server — Vulkan build
 # Works on any Vulkan 1.2+ GPU: AMD (RDNA 2/3/4 incl. Strix Halo), Intel Arc, NVIDIA
-# Works in WSL2 Docker Desktop (uses /dev/dri, unlike ROCm which needs /dev/kfd)
+#
+# Requirements: /dev/dri device passthrough
+#   Native Linux:                 works out of the box
+#   WSL2 + Docker Engine (no Desktop): works — WSL2 exposes /dev/dri via GPU-PV
+#   WSL2 + Docker Desktop:        does NOT work — Docker Desktop VM has no /dev/dri
 #
 # Usage (via overlay):
 #   docker compose -f docker-compose.yml -f docker-compose.vulkan.yml --profile whisper-cpp up -d

@@ -48,7 +48,7 @@ Open **http://localhost:3000** for the web interface or **http://localhost:3000/
 - 16 GB+ RAM recommended
 - GPU for training and Qwen3 services (CPU fallback available but slow):
   - **NVIDIA**: CUDA drivers + NVIDIA Container Toolkit (`nvidia-docker2`)
-  - **AMD / any Vulkan GPU** (whisper-cpp only): use `docker-compose.vulkan.yml` (see below) — works in WSL2
+  - **AMD / any Vulkan GPU** (whisper-cpp only): use `docker-compose.vulkan.yml` (see below) — requires native Linux or Docker Engine in WSL2 (not Docker Desktop)
   - **AMD** (all Python services): ROCm 6.2+ — use `docker-compose.rocm.yml` (see below)
 
 ## Vulkan GPU (AMD / Intel / NVIDIA)
