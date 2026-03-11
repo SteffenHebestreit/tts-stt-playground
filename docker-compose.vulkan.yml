@@ -1,0 +1,42 @@
+# Vulkan overlay — GPU acceleration via Vulkan API (no ROCm or CUDA required)
+#
+# Supported hardware:
+#   AMD  — RDNA 2/3/4 including Strix Halo (gfx1201 / Radeon 890M)
+#   Intel — Arc (Xe HPG/LPG) and integrated Xe graphics
+#   NVIDIA — any GPU with Vulkan 1.2+ (driver ≥ 470)
+#
+# WSL2 compatibility: YES
+#   Vulkan uses /dev/dri which is exposed through WSL2's GPU virtualization layer.
+#   This is the key advantage over ROCm (which requires /dev/kfd, unavailable in WSL2).
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.vulkan.yml --profile whisper-cpp up -d
+#
+# Select GPU device (0-indexed):
+#   GGML_VULKAN_DEVICE=0  (default — first Vulkan-capable GPU)
+#
+# Strix Halo note:
+#   The integrated Radeon 890M (gfx1201) is fully Vulkan 1.3 capable via the
+#   AMD Adrenalin driver on Windows / AMDGPU on Linux. No GFX version override needed.
+
+# Vulkan device passthrough shared by all services in this overlay
+x-vulkan-devices: &vulkan-devices
+  devices:
+    - /dev/dri
+  group_add:
+    - video
+    - render
+  # Clear NVIDIA deploy reservations set in the base compose file
+  deploy:
+    resources:
+      reservations:
+        devices: []
+
+services:
+  whisper-cpp:
+    build:
+      dockerfile: Dockerfile.vulkan
+    environment:
+      # Select Vulkan device index (0 = first GPU; set to 1 for discrete GPU on APU systems)
+      GGML_VULKAN_DEVICE: ${GGML_VULKAN_DEVICE:-0}
+    <<: *vulkan-devices

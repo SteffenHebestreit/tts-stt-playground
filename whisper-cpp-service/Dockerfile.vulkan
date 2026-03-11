@@ -1,0 +1,49 @@
+# whisper.cpp STT server — Vulkan build
+# Works on any Vulkan 1.2+ GPU: AMD (RDNA 2/3/4 incl. Strix Halo), Intel Arc, NVIDIA
+# Works in WSL2 Docker Desktop (uses /dev/dri, unlike ROCm which needs /dev/kfd)
+#
+# Usage (via overlay):
+#   docker compose -f docker-compose.yml -f docker-compose.vulkan.yml --profile whisper-cpp up -d
+
+FROM ubuntu:22.04 AS builder
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git cmake build-essential pkg-config \
+    libvulkan-dev glslc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Clone and build whisper.cpp with Vulkan backend enabled
+RUN git clone https://github.com/ggerganov/whisper.cpp.git /src && \
+    cd /src && \
+    cmake -B build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DGGML_VULKAN=1 \
+        -DWHISPER_BUILD_SERVER=ON \
+        -DBUILD_SHARED_LIBS=OFF && \
+    cmake --build build -j$(nproc) --target whisper-server
+
+# ── Runtime ──────────────────────────────────────────────────────────────────
+FROM ubuntu:22.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# libvulkan1        — Vulkan loader (ICD dispatch)
+# mesa-vulkan-drivers — AMD/Intel open-source Vulkan ICDs (radv, anv)
+# vulkan-tools      — vulkaninfo for debugging
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libvulkan1 mesa-vulkan-drivers vulkan-tools \
+    curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /src/build/bin/whisper-server /usr/local/bin/whisper-server
+
+RUN mkdir -p /models
+
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+EXPOSE 8080
+
+ENTRYPOINT ["/entrypoint.sh"]

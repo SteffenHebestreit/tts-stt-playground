@@ -184,6 +184,34 @@ services:
     networks:
       - tts-stt-network
 
+  # whisper.cpp STT server — OpenAI-compatible /v1/audio/transcriptions endpoint
+  # CPU by default; use docker-compose.vulkan.yml overlay for Vulkan GPU acceleration
+  whisper-cpp:
+    profiles: [whisper-cpp]
+    build:
+      context: ./whisper-cpp-service
+      dockerfile: Dockerfile
+    ports:
+      - "${WHISPER_CPP_PORT:-5003}:8080"
+    environment:
+      # Model name maps to ggml-<name>.bin downloaded from HuggingFace on first start
+      # Available: tiny, base, small, medium, large-v1, large-v2, large-v3, large-v3-turbo
+      WHISPER_MODEL: ${WHISPER_MODEL:-large-v3}
+      # Optional extra whisper-server CLI flags (e.g. "--language de --threads 4")
+      EXTRA_ARGS: ${WHISPER_CPP_EXTRA_ARGS:-}
+    volumes:
+      - whisper-cpp-models:/models
+    restart: unless-stopped
+    healthcheck:
+      # whisper-server returns HTTP even on unrecognised paths; any response = healthy
+      test: ["CMD-SHELL", "curl -s http://localhost:8080/ > /dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 3
+    networks:
+      - tts-stt-network
+
   # Frontend Service - Modern web interface
   frontend-service:
     profiles: [frontend, all]
@@ -234,4 +262,6 @@ volumes:
   qwen3-tts-cache:
     driver: local
   qwen3-tts-voices:
+    driver: local
+  whisper-cpp-models:
     driver: local
