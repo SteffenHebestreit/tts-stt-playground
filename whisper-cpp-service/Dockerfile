@@ -6,7 +6,7 @@ FROM ubuntu:22.04 AS builder
 ARG DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git cmake build-essential \
+    git cmake build-essential ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # Clone and build whisper.cpp (server only, static binary)
@@ -24,7 +24,7 @@ FROM ubuntu:22.04
 ARG DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates \
+    curl ca-certificates libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /src/build/bin/whisper-server /usr/local/bin/whisper-server
