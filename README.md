@@ -8,83 +8,178 @@ A self-hosted, Docker-based platform for text-to-speech synthesis, speech-to-tex
 |---------|------|-------------|
 | **Frontend** | 3000 | Web UI and API documentation hub |
 | **PiperTTS** | 5000 | Text-to-speech with 40+ voices and custom model support |
-| **STT (Whisper)** | 5001 | Speech-to-text transcription and audio segmentation |
-| **whisper-cpp** | 5003 | OpenAI-compatible STT — CPU or Vulkan GPU via overlay |
+| **STT (faster-whisper)** | 5001 | Speech-to-text — Python, CUDA/ROCm/CPU |
+| **whisper-cpp** | 5003 | Speech-to-text — C++, Vulkan/CPU, OpenAI-compatible API |
 | **Piper Training** | 8080 | VITS neural network voice training pipeline |
-| **Qwen3-TTS** | 5004 | Voice cloning and multilingual TTS (replaces XTTS) |
+| **Qwen3-TTS** | 5004 | Voice cloning and multilingual TTS |
 | **Qwen3-ASR** | 5002 | Fast multilingual speech recognition |
 
 ## Quick Start
 
-Each service has its own profile. Start only what you need:
-
 ```bash
-# Full stack
-docker-compose --profile all up -d
+# CPU-only — works everywhere, no GPU setup required
+docker compose --profile stt up -d          # faster-whisper STT
+docker compose --profile whisper-cpp up -d  # whisper.cpp STT (OpenAI-compat)
+docker compose --profile piper-tts up -d    # TTS
+docker compose --profile all up -d          # everything
 
-# Single service — dependencies are pulled in automatically
-docker-compose --profile qwen3-asr up -d
-docker-compose --profile qwen3-tts up -d   # also starts qwen3-asr
-docker-compose --profile piper-tts up -d
-docker-compose --profile stt up -d
-docker-compose --profile training up -d    # also starts stt
-docker-compose --profile frontend up -d    # also starts piper-tts + stt
-
-# Check service health
-docker-compose ps
-
-# View logs
-docker-compose logs -f
+# Check status
+docker compose ps
+docker compose logs -f
 
 # Stop everything
-docker-compose down
+docker compose down
 ```
 
-Open **http://localhost:3000** for the web interface or **http://localhost:3000/api-docs** for API documentation.
+Open **http://localhost:3000** for the web interface.
 
-## Prerequisites
+---
 
-- Docker and Docker Compose
-- 16 GB+ RAM recommended
-- GPU for training and Qwen3 services (CPU fallback available but slow):
-  - **NVIDIA**: CUDA drivers + NVIDIA Container Toolkit (`nvidia-docker2`)
-  - **AMD / any Vulkan GPU** (whisper-cpp only): use `docker-compose.vulkan.yml` (see below) — requires native Linux or Docker Engine in WSL2 (not Docker Desktop)
-  - **AMD** (all Python services): ROCm 6.2+ — use `docker-compose.rocm.yml` (see below)
+## GPU Setup
 
-## Vulkan GPU (AMD / Intel / NVIDIA)
+Different services support different GPU backends. Choose based on your hardware and host OS.
 
-`whisper-cpp` uses the GGML Vulkan backend — no ROCm, no CUDA required. This is the recommended GPU path on **Strix Halo APUs** and any system running Docker Desktop on WSL2, because Vulkan uses `/dev/dri` which is exposed through WSL2's GPU virtualization layer.
+### Which backend does each service use?
 
+| Service | CPU | NVIDIA CUDA | AMD ROCm | Vulkan |
+|---------|:---:|:-----------:|:--------:|:------:|
+| STT (faster-whisper) | ✓ | ✓ | ✓ | — |
+| whisper-cpp | ✓ | — | — | ✓ |
+| Piper Training | ✓ (slow) | ✓ | ✓ | — |
+| Qwen3-ASR | ✓ (slow) | ✓ | ✓ | — |
+| Qwen3-TTS | ✓ (slow) | ✓ | ✓ | — |
+| PiperTTS | CPU only | — | — | — |
+
+### Which GPU works in which environment?
+
+| Environment | NVIDIA CUDA | AMD ROCm | Vulkan |
+|-------------|:-----------:|:--------:|:------:|
+| **Native Linux** | ✓ | ✓ | ✓ |
+| **WSL2 + Docker Engine** (no Desktop) | ✓ | — | ✓ |
+| **WSL2 + Docker Desktop** (Windows) | ✓ | — | — |
+| **Docker Desktop** (Windows, no WSL2) | ✓ | — | — |
+
+> ROCm requires `/dev/kfd` which is only available on native Linux (bare metal or passthrough VM).
+> Vulkan requires `/dev/dri` which Docker Desktop's internal VM does not expose. It works with Docker Engine running directly inside WSL2.
+
+---
+
+### NVIDIA CUDA
+
+**Works on:** native Linux · WSL2 + Docker Engine · WSL2 + Docker Desktop · Docker Desktop (Windows)
+
+**Prerequisites:**
+- NVIDIA drivers installed on the host
+- [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) (`nvidia-docker2` / `nvidia-container-toolkit`)
+
+**Verify:**
 ```bash
-# Start whisper-cpp with Vulkan acceleration
+nvidia-smi                             # host check
+docker run --rm --gpus all nvidia/cuda:12-base nvidia-smi  # container check
+```
+
+**Run (default — no overlay needed):**
+```bash
+docker compose --profile all up -d
+# or specific services:
+docker compose --profile stt up -d
+docker compose --profile qwen3-asr up -d
+docker compose --profile training up -d
+```
+
+The base `docker-compose.yml` already includes NVIDIA device reservations (`deploy.resources.reservations.devices`).
+
+**WSL2 + Docker Desktop:** Enable GPU support in Docker Desktop → Settings → Resources → GPU. NVIDIA's WSL2 driver handles CUDA passthrough automatically.
+
+---
+
+### AMD ROCm
+
+**Works on:** native Linux only
+
+**Prerequisites (native Linux):**
+- [ROCm 6.2+](https://rocm.docs.amd.com/en/latest/deploy/linux/index.html) installed
+- User added to `video` and `render` groups: `sudo usermod -aG video,render $USER`
+- Verify: `rocminfo | grep -i "gfx\|gpu"`
+
+**Run:**
+```bash
+docker compose -f docker-compose.yml -f docker-compose.rocm.yml --profile all up -d
+
+# Single service:
+docker compose -f docker-compose.yml -f docker-compose.rocm.yml --profile qwen3-asr up -d
+```
+
+The ROCm overlay (`docker-compose.rocm.yml`) replaces CUDA-based images with ROCm variants, removes NVIDIA device reservations, and mounts `/dev/kfd` + `/dev/dri`.
+
+**Strix Halo (gfx1201 / RDNA 4):** gfx1201 is not in ROCm 6.2's official support list. The overlay defaults `HSA_OVERRIDE_GFX_VERSION=11.0.0` to make ROCm treat it as gfx1100 (RDNA 3), which runs correctly on RDNA 4. `PYTORCH_HIP_ALLOC_CONF=expandable_segments:True` is also set automatically for the unified LPDDR5x memory pool.
+
+> **WSL2 limitation:** `/dev/kfd` is not exposed by Docker Desktop's VM, nor by the WSL2 GPU-PV driver. ROCm requires bare-metal Linux or a Linux VM with direct PCIe GPU passthrough.
+
+---
+
+### Vulkan (whisper-cpp only)
+
+**Works on:** native Linux · WSL2 + Docker Engine (not Docker Desktop)
+
+Vulkan is supported only by `whisper-cpp` (GGML Vulkan backend). It works on any Vulkan 1.2+ GPU — AMD RDNA, Intel Arc, NVIDIA — without needing CUDA or ROCm drivers.
+
+**Why not for Python services?** PyTorch and CTranslate2 (used by `stt-service`, `qwen3-asr`, etc.) have no Vulkan backend.
+
+**Prerequisites:**
+- GPU with Vulkan 1.2+ support
+- `/dev/dri` accessible from the container (see environment notes below)
+- Verify: `vulkaninfo --summary` (install `vulkan-tools` if needed)
+
+**Run:**
+```bash
 docker compose -f docker-compose.yml -f docker-compose.vulkan.yml --profile whisper-cpp up -d
 ```
 
-The overlay replaces the CPU `Dockerfile` with `Dockerfile.vulkan` (built with `-DGGML_VULKAN=1`) and mounts `/dev/dri`. Set `GGML_VULKAN_DEVICE=0` (default) to select the GPU by index.
+The Vulkan overlay (`docker-compose.vulkan.yml`) replaces the CPU `Dockerfile` with `Dockerfile.vulkan` (compiled with `-DGGML_VULKAN=1`), mounts `/dev/dri`, and sets `GGML_VULKAN_DEVICE=0`.
 
-**Strix Halo (gfx1201 / Radeon 890M):** No GFX version override needed — the Radeon 890M is natively Vulkan 1.3 capable. On APU systems with a discrete GPU as device 1, set `GGML_VULKAN_DEVICE=0` to stay on the iGPU or `=1` for the dGPU.
+**Strix Halo (gfx1201 / Radeon 890M):** No GFX version override needed — the Radeon 890M is natively Vulkan 1.3 capable. Set `GGML_VULKAN_DEVICE=1` if you have a discrete GPU and want to use device index 1 instead.
 
-> **WSL2 + Docker Desktop note:** Docker Desktop's VM does not expose `/dev/dri` to containers, so the Vulkan overlay will fail to start on this setup. Vulkan GPU acceleration requires **native Linux** or **Docker Engine running directly inside WSL2** (not Docker Desktop). On Windows, the CPU build works fine.
+#### Vulkan on WSL2 with Docker Engine (no Docker Desktop)
 
-> **Why not use Vulkan for the Python services?** PyTorch and CTranslate2 (used by `stt-service`, `qwen3-asr-service`, etc.) do not have Vulkan backends. For those, use ROCm (AMD) or CUDA (NVIDIA).
-
-## AMD GPU (ROCm)
-
-All GPU services have a `Dockerfile.rocm` variant. Use the `docker-compose.rocm.yml` override alongside the main compose file:
+WSL2's GPU-PV driver exposes the GPU as `/dev/dri/renderD128` inside the WSL2 instance. If Docker Engine is installed directly in WSL2 (not Docker Desktop), containers can access it:
 
 ```bash
-# Full stack on AMD GPU
-docker-compose -f docker-compose.yml -f docker-compose.rocm.yml --profile all up -d
+# Inside your WSL2 Ubuntu distro:
+sudo apt-get install docker.io
+sudo usermod -aG docker $USER
+newgrp docker
 
-# Single service
-docker-compose -f docker-compose.yml -f docker-compose.rocm.yml --profile qwen3-asr up -d
+# Verify GPU is visible:
+ls /dev/dri/          # should show card0 and renderD128
+vulkaninfo --summary  # should list your GPU
+
+# Then run the Vulkan compose from WSL2:
+docker compose -f docker-compose.yml -f docker-compose.vulkan.yml --profile whisper-cpp up -d
 ```
 
-The overlay switches base images to `rocm/dev-ubuntu-22.04:6.2-complete`, installs ROCm PyTorch wheels, and replaces NVIDIA device reservations with `/dev/kfd` + `/dev/dri` mounts.
+> **Docker Desktop on Windows:** Docker Desktop runs containers inside its own LinuxKit VM, which does **not** expose `/dev/dri`. The Vulkan overlay will fail with "no such file or directory" in this environment. Use the CPU build instead (default), or switch to Docker Engine in WSL2.
 
-**Strix Halo (gfx1201 / RDNA 4 iGPU):** gfx1201 is not in ROCm 6.2's official support list. The compose overlay defaults `HSA_OVERRIDE_GFX_VERSION=11.0.0` which makes ROCm treat it as gfx1100 (RDNA 3) — this works correctly on RDNA 4. The `PYTORCH_HIP_ALLOC_CONF=expandable_segments:True` setting is also applied automatically to prevent fragmentation of the unified LPDDR5x memory pool.
+---
 
-> **WSL2 note:** AMD ROCm GPU passthrough is not available in Docker Desktop's WSL2 backend (`/dev/kfd` is not exposed). The ROCm compose file requires native Linux or a Linux VM with direct PCIe GPU access.
+### CPU (no GPU)
+
+**Works on:** all environments — native Linux, WSL2, Docker Desktop, Windows
+
+No overlay needed. All services fall back to CPU automatically when no GPU is detected. Performance varies:
+
+| Service | CPU performance |
+|---------|----------------|
+| PiperTTS | Fast (real-time) |
+| STT (faster-whisper) | Acceptable for small/medium models |
+| whisper-cpp | Acceptable — optimized C++ inference |
+| Qwen3-ASR | Very slow — not recommended for production |
+| Qwen3-TTS | Very slow — not recommended for production |
+| Piper Training | Slow — hours per epoch |
+
+Use smaller models (`WHISPER_MODEL_SIZE=small`, `WHISPER_MODEL=small`) to improve CPU throughput.
+
+---
 
 ## Features
 
@@ -94,10 +189,21 @@ The overlay switches base images to `rocm/dev-ubuntu-22.04:6.2-complete`, instal
 - Custom trained model support (ONNX format)
 - Adjustable speech speed
 
-### Speech-to-Text (Whisper)
-- Multiple model sizes: tiny, base, small, medium, large-v3
-- Automatic language detection
-- Audio segmentation for training data preparation
+### Speech-to-Text — faster-whisper (`stt-service`)
+- Multiple model sizes: tiny, base, small, medium, large-v3 (all multilingual)
+- `distil-large-v3` available for English-only use cases (fastest) — **do not use for non-English**
+- Configurable VAD filter (`vad_filter`, `vad_threshold`) — disable if short clips are being rejected
+- Streaming transcription via SSE (`/transcribe-stream`)
+- Language detection (`/detect_language`)
+- `/health` returns `multilingual` flag to avoid accidentally using an English-only model
+- CUDA/ROCm/CPU; set `FORCE_ACCELERATION=cuda|rocm|cpu`
+
+### Speech-to-Text — whisper-cpp
+- C++ implementation — lower memory footprint than Python/PyTorch stack
+- GGUF quantized models (smaller downloads, faster inference)
+- OpenAI-compatible `/v1/audio/transcriptions` endpoint
+- CPU + Vulkan GPU backends; no CUDA or ROCm required
+- Model downloaded automatically from HuggingFace on first start
 
 ### Voice Training (Piper Training)
 - VITS neural network architecture
@@ -105,53 +211,50 @@ The overlay switches base images to `rocm/dev-ubuntu-22.04:6.2-complete`, instal
 - FP32 training with automatic batch size adjustment on OOM
 - Checkpoint saving and recovery after each epoch
 - ONNX model export for PiperTTS deployment
-- GPU acceleration with CPU fallback
 
 ### Voice Cloning (Qwen3-TTS)
-- Upload a short voice sample (3-10 seconds) and generate speech in that voice
+- Upload a short voice sample (3–10 seconds) and generate speech in that voice
 - Cross-lingual cloning across 13 languages
-- Replaces the previous XTTS service
-
-### Speech Recognition (Whisper STT)
-- Multiple model sizes: tiny, base, small, medium, large-v3 (all multilingual)
-- `distil-large-v3` available for English-only use cases (fastest)
-- Configurable VAD filter (`vad_filter`, `vad_threshold`) — disable if short clips are being filtered out
-- Streaming transcription via SSE (`/transcribe-stream`)
-- Language detection (`/detect_language`)
-- `/health` returns `multilingual` flag to avoid accidentally using an English-only model
 
 ### Speech Recognition (Qwen3-ASR)
 - Fast multilingual speech recognition via Qwen3-ASR-1.7B
-- Language detection
-- Requires GPU (CUDA/ROCm) for practical use; CPU inference is very slow
+- Requires GPU for practical use; CPU inference is very slow
+
+---
 
 ## API Endpoints
 
 ### PiperTTS (port 5000)
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/tts` | Generate speech (JSON body: text, language, quality, gender, speed) |
+| POST | `/tts` | Generate speech (JSON: `text`, `language`, `quality`, `gender`, `speed`) |
 | POST | `/synthesize` | Generate speech with a specific voice |
 | POST | `/upload_model` | Upload a custom ONNX model |
 | GET | `/voices` | List available voices |
 | GET | `/health` | Health check |
 
-### STT (port 5001 -> 8000 internal)
+### STT — faster-whisper (port 5001)
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/transcribe` | Transcribe audio (form: `audio`, `task`, `language`, `beam_size`, `vad_filter`, `vad_threshold`, `no_speech_threshold`) |
-| POST | `/transcribe-stream` | SSE streaming transcription (same params as `/transcribe`) |
+| POST | `/transcribe` | Transcribe audio (`audio`, `task`, `language`, `beam_size`, `vad_filter`, `vad_threshold`, `no_speech_threshold`) |
+| POST | `/transcribe-stream` | SSE streaming transcription (same params) |
 | POST | `/detect_language` | Detect spoken language |
-| GET | `/health` | Health check — includes `multilingual` and `model_size` fields |
-| GET | `/models` | List available models with size and multilingual flag |
-| GET | `/tasks` | Describe `transcribe` vs `translate` tasks |
+| GET | `/health` | Health — includes `multilingual` and `model_size` |
+| GET | `/models` | List models with size and multilingual flag |
+| GET | `/tasks` | Describe `transcribe` vs `translate` |
 
-**Model selection:** Use a multilingual model (`medium`, `large-v3`) for non-English languages. `distil-large-v3` is English-only and will silently output English regardless of the `language` parameter.
+> Use a multilingual model (`medium`, `large-v3`) for non-English languages. `distil-large-v3` is English-only and silently outputs English regardless of the `language` parameter.
+
+### STT — whisper-cpp (port 5003)
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/v1/audio/transcriptions` | Transcribe audio — OpenAI-compatible (`file`, `language`, `response_format`) |
+| POST | `/inference` | Native whisper.cpp inference endpoint |
 
 ### Piper Training (port 8080)
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/train` | Start training (multipart: model_name, language, audio_files) |
+| POST | `/train` | Start training (`model_name`, `language`, `audio_files`) |
 | GET | `/status/{job_id}` | Training progress |
 | GET | `/jobs` | List all training jobs |
 | POST | `/export/{job_id}` | Export model to ONNX |
@@ -167,15 +270,6 @@ The overlay switches base images to `rocm/dev-ubuntu-22.04:6.2-complete`, instal
 | GET | `/status` | Model and GPU status |
 | GET | `/health` | Health check |
 
-### whisper-cpp (port 5003)
-
-OpenAI-compatible endpoint — drop-in replacement for any client that targets `/v1/audio/transcriptions`.
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/v1/audio/transcriptions` | Transcribe audio (OpenAI-compatible; supports `language`, `response_format`) |
-| POST | `/inference` | Native whisper.cpp inference endpoint |
-
 ### Qwen3-ASR (port 5002)
 | Method | Endpoint | Description |
 |--------|----------|-------------|
@@ -183,91 +277,137 @@ OpenAI-compatible endpoint — drop-in replacement for any client that targets `
 | POST | `/detect_language` | Detect language |
 | GET | `/health` | Health check |
 
+---
+
 ## Configuration
 
-Copy `.env.example` to `.env` and adjust as needed. Key settings:
+Copy `.env.example` to `.env` and adjust as needed.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `WHISPER_MODEL_SIZE` | small | STT model (stt-service): tiny, base, small, medium, large-v3 |
-| `WHISPER_MODEL` | large-v3 | GGUF model for whisper-cpp: tiny, base, small, medium, large-v3, large-v3-turbo |
-| `WHISPER_CPP_PORT` | 5003 | Host port for whisper-cpp service |
-| `GGML_VULKAN_DEVICE` | 0 | Vulkan GPU device index (0 = first GPU) |
-| `CUDA_VISIBLE_DEVICES` | 0 | NVIDIA GPU device index |
-| `QWEN3_TTS_MODEL` | Qwen/Qwen3-TTS-12Hz-1.7B-Base | Qwen3 TTS model ID |
-| `QWEN3_ASR_MODEL` | Qwen/Qwen3-ASR-1.7B | Qwen3 ASR model ID |
-| `ALLOWED_ORIGINS` | * | CORS allowed origins |
+| `WHISPER_MODEL_SIZE` | `small` | faster-whisper model: `tiny` `base` `small` `medium` `large-v3` `distil-large-v3` |
+| `WHISPER_MODEL` | `large-v3` | whisper-cpp GGUF model: `tiny` `base` `small` `medium` `large-v3` `large-v3-turbo` |
+| `FORCE_ACCELERATION` | `cuda` | faster-whisper backend: `cuda` `rocm` `cpu` |
+| `WHISPER_CPP_PORT` | `5003` | Host port for whisper-cpp |
+| `GGML_VULKAN_DEVICE` | `0` | Vulkan GPU device index |
+| `HIP_VISIBLE_DEVICES` | `0` | ROCm GPU device index |
+| `HSA_OVERRIDE_GFX_VERSION` | `11.0.0` | ROCm GFX override (Strix Halo: keep at `11.0.0`) |
+| `CUDA_VISIBLE_DEVICES` | `0` | NVIDIA GPU device index |
+| `QWEN3_TTS_MODEL` | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | Qwen3 TTS model ID |
+| `QWEN3_ASR_MODEL` | `Qwen/Qwen3-ASR-1.7B` | Qwen3 ASR model ID |
+| `ALLOWED_ORIGINS` | `*` | CORS allowed origins |
+
+---
 
 ## Project Structure
 
 ```
-tts-stt/
-├── docker-compose.yml
-├── docker-compose.rocm.yml    # AMD ROCm overlay (all Python services)
-├── docker-compose.vulkan.yml  # Vulkan overlay (whisper-cpp only; works in WSL2)
+tts-stt-playground/
+├── docker-compose.yml           # Base stack — NVIDIA CUDA or CPU
+├── docker-compose.rocm.yml      # AMD ROCm overlay (native Linux only)
+├── docker-compose.vulkan.yml    # Vulkan overlay for whisper-cpp (Linux / WSL2+Docker Engine)
 ├── .env.example
-├── frontend-service/          # Web UI (FastAPI + Jinja2)
+├── frontend-service/            # Web UI (FastAPI + Jinja2)
+├── piper-tts-service/           # PiperTTS synthesis
+├── piper-training-service/      # VITS training pipeline
+├── stt-service/                 # faster-whisper STT (Python, CUDA/ROCm/CPU)
 │   ├── app.py
-│   ├── templates/index.html
-│   └── static/
-├── piper-tts-service/         # PiperTTS synthesis
-│   └── app.py
-├── piper-training-service/    # VITS training pipeline
+│   ├── Dockerfile               # CUDA / CPU
+│   └── Dockerfile.rocm          # AMD ROCm
+├── whisper-cpp-service/         # whisper.cpp STT (C++, Vulkan/CPU)
+│   ├── entrypoint.sh            # Downloads GGUF model from HuggingFace on first start
+│   ├── Dockerfile               # CPU build
+│   └── Dockerfile.vulkan        # Vulkan GPU build
+├── qwen3-tts-service/           # Qwen3 TTS + voice cloning
 │   ├── app.py
-│   ├── training_pipeline.py
-│   ├── vits_model.py
-│   ├── data_processor.py
-│   ├── model_exporter.py
-│   ├── dataset.py
-│   └── training_utils.py
-├── stt-service/               # faster-whisper STT (Python)
-│   └── app.py
-├── whisper-cpp-service/       # whisper.cpp STT (C++, OpenAI-compat API)
-│   ├── Dockerfile             # CPU build
-│   ├── Dockerfile.vulkan      # Vulkan GPU build
-│   └── entrypoint.sh          # Downloads GGUF model on first start
-├── qwen3-tts-service/         # Qwen3 TTS + voice cloning
-│   └── app.py
-├── qwen3-asr-service/         # Qwen3 ASR
-│   └── app.py
-└── models/                    # Shared model storage (gitignored)
+│   ├── Dockerfile               # CUDA / CPU
+│   └── Dockerfile.rocm          # AMD ROCm
+├── qwen3-asr-service/           # Qwen3 ASR
+│   ├── app.py
+│   ├── Dockerfile               # CUDA / CPU
+│   └── Dockerfile.rocm          # AMD ROCm
+└── models/                      # Shared model storage (gitignored)
 ```
+
+---
 
 ## Troubleshooting
 
+### Health checks
 ```bash
-# Check GPU availability inside a container
-docker exec tts-stt-piper-training-service-1 nvidia-smi
-
-# Monitor training progress
-curl http://localhost:8080/jobs
-
-# Check individual service health
 curl http://localhost:5000/health   # PiperTTS
-curl http://localhost:5001/health   # STT (faster-whisper, mapped from internal 8000)
-curl http://localhost:5003/         # whisper-cpp (any response = healthy)
-curl http://localhost:8080/health   # Training
+curl http://localhost:5001/health   # STT faster-whisper
+curl http://localhost:5003/         # whisper-cpp (any HTTP response = up)
+curl http://localhost:8080/health   # Piper Training
 curl http://localhost:5004/health   # Qwen3-TTS
 curl http://localhost:5002/health   # Qwen3-ASR
 curl http://localhost:3000/health   # Frontend
-
-# Rebuild a single service
-docker-compose build piper-tts-service
-docker-compose up -d piper-tts-service
 ```
 
-Common issues:
-- **CUDA not available**: Install NVIDIA Container Toolkit and restart Docker
-- **Out of memory**: Reduce `training-batch-size` or use a smaller Whisper model
-- **Slow first start**: Models are downloaded on first launch (several GB for Qwen3)
-- **Port conflicts**: Check that ports 3000, 5000-5004, 8080 are free
+### Common issues
+
+**CUDA not available in container**
+```bash
+# Verify NVIDIA Container Toolkit is installed
+docker run --rm --gpus all nvidia/cuda:12-base nvidia-smi
+# If this fails: install nvidia-container-toolkit and restart Docker
+```
+
+**ROCm: "No such file or directory: /dev/kfd"**
+ROCm requires native Linux. Docker Desktop (WSL2 or Windows) does not expose `/dev/kfd`. Run on bare-metal Linux.
+
+**Vulkan: "no such file or directory: /dev/dri"**
+Docker Desktop's VM does not expose `/dev/dri`. Options:
+- Use the CPU build (default, no overlay)
+- Install Docker Engine directly inside WSL2 (not Docker Desktop)
+- Run on native Linux
+
+**Vulkan: "no suitable Vulkan device found"**
+```bash
+# Check inside the container:
+docker exec <container> vulkaninfo --summary
+# If empty: the GPU driver is not visible. Verify /dev/dri is mounted and
+# the container user has access (render/video groups).
+```
+
+**STT translating instead of transcribing**
+The `distil-large-v3` model is English-only — it outputs English regardless of the `language` parameter. Switch to `large-v3` or `medium` for multilingual transcription:
+```bash
+WHISPER_MODEL_SIZE=large-v3   # for stt-service
+WHISPER_MODEL=large-v3        # for whisper-cpp
+```
+
+**No speech detected / audio rejected by VAD**
+The Silero VAD filter can be too aggressive on short clips or compressed audio (webm/opus). Disable or tune it:
+```
+POST /transcribe
+  vad_filter=false          # disable completely
+  vad_threshold=0.3         # lower threshold (default 0.5)
+  no_speech_threshold=0.95  # raise silence tolerance
+```
+
+**Slow first start**
+Models are downloaded on first launch. Sizes:
+- Whisper large-v3: ~3 GB
+- Qwen3-ASR-1.7B: ~3.5 GB
+- Qwen3-TTS-1.7B: ~4 GB
+
+**Out of memory**
+- Use a smaller model (`small`, `medium`)
+- For Qwen3 on ROCm/APU: `PYTORCH_HIP_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512` (set automatically in ROCm overlay)
+- For training: reduce batch size
+
+**Port conflicts**
+Default ports: 3000, 5000, 5001, 5002, 5003, 5004, 8080. Override with env vars: `FRONTEND_PORT`, `PIPER_TTS_PORT`, `STT_PORT`, `QWEN3_ASR_PORT`, `WHISPER_CPP_PORT`, `QWEN3_TTS_PORT`, `TRAINING_PORT`.
+
+---
 
 ## Local Development
 
-Service source files are bind-mounted in `docker-compose.yml`, so code changes are reflected on container restart without rebuilding:
+Service source files are bind-mounted, so code changes apply on container restart (no rebuild needed):
 
 ```bash
-docker-compose restart piper-tts-service
+docker compose restart stt-service
 ```
 
-All processing happens locally. No data is sent to external services.
+All processing is local. No data is sent to external services.
