@@ -17,8 +17,14 @@ fi
 
 echo "[whisper-cpp] Starting server — model: $MODEL, port: 8080"
 
+VULKAN_ARGS=""
+if [ -n "${GGML_VULKAN_DEVICE+x}" ]; then
+    VULKAN_ARGS="--device ${GGML_VULKAN_DEVICE}"
+fi
+
 exec whisper-server \
     --model "$MODEL_FILE" \
     --host 0.0.0.0 \
     --port 8080 \
+    ${VULKAN_ARGS} \
     ${EXTRA_ARGS:-}

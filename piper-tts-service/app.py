@@ -4,9 +4,12 @@ import subprocess
 import tempfile
 import json
 import asyncio
+import logging
 from pathlib import Path
 import shutil
 from typing import List, Dict, Optional
+
+logger = logging.getLogger(__name__)
 
 import numpy as np
 import soundfile as sf
@@ -662,10 +665,10 @@ async def load_custom_voices():
                         model_type="custom"
                     )
                     
-                    print(f"Loaded custom voice: {voice_name}")
-                    
+                    logger.info(f"Loaded custom voice: {voice_name}")
+
                 except Exception as e:
-                    print(f"Failed to load custom voice {voice_name}: {e}")
+                    logger.warning(f"Failed to load custom voice {voice_name}: {e}")
 
 @app.post("/refresh_voices")
 async def refresh_voices():

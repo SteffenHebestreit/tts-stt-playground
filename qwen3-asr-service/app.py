@@ -31,7 +31,14 @@ app.add_middleware(
 )
 
 # Global model state
-device = "cuda" if torch.cuda.is_available() else "cpu"
+# Check CUDA first, then ROCm/HIP (also reports as cuda in PyTorch), then CPU
+if torch.cuda.is_available():
+    # Both CUDA and ROCm expose through torch.cuda — check ROCM_VERSION for ROCm
+    device = "cuda"
+elif os.getenv("ROCR_VISIBLE_DEVICES") or os.getenv("HIP_VISIBLE_DEVICES"):
+    device = "cuda"  # ROCm uses the same CUDA API in PyTorch
+else:
+    device = "cpu"
 asr_model = None
 model_loaded = False
 
@@ -162,7 +169,7 @@ async def transcribe_audio(
                     "start": ts.start_time if hasattr(ts, 'start_time') else 0.0,
                     "end": ts.end_time if hasattr(ts, 'end_time') else 0.0,
                     "text": ts.text if hasattr(ts, 'text') else text,
-                    "confidence": 1.0,
+                    "confidence": ts.confidence if hasattr(ts, 'confidence') else None,
                 })
         else:
             # Single segment with full text
@@ -179,7 +186,7 @@ async def transcribe_audio(
             "text": text,
             "segments": segments,
             "language": detected_language,
-            "language_probability": 1.0,
+            "language_probability": result.language_probability if hasattr(result, 'language_probability') else None,
             "duration": duration,
             "processing_time": processing_time,
             "task": "transcribe",
@@ -221,7 +228,7 @@ async def detect_language(
 
         return {
             "detected_language": detected_language,
-            "language_probability": 1.0,
+            "language_probability": result.language_probability if hasattr(result, 'language_probability') else None,
             "sample_text": sample_text,
             "processing_time": processing_time,
             "audio_duration": duration,

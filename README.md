@@ -218,7 +218,7 @@ Use smaller models (`WHISPER_MODEL_SIZE=small`, `WHISPER_MODEL=small`) to improv
 
 ### Speech Recognition (Qwen3-ASR)
 - Fast multilingual speech recognition via Qwen3-ASR-1.7B
-- Requires GPU for practical use; CPU inference is very slow
+- Requires GPU for practical use; CPU inference is very slow (~60s per minute of audio vs ~2s on GPU)
 
 ---
 
@@ -295,7 +295,8 @@ Copy `.env.example` to `.env` and adjust as needed.
 | `CUDA_VISIBLE_DEVICES` | `0` | NVIDIA GPU device index |
 | `QWEN3_TTS_MODEL` | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | Qwen3 TTS model ID |
 | `QWEN3_ASR_MODEL` | `Qwen/Qwen3-ASR-1.7B` | Qwen3 ASR model ID |
-| `ALLOWED_ORIGINS` | `*` | CORS allowed origins |
+| `ALLOWED_ORIGINS` | `*` | CORS allowed origins (set explicitly in production) |
+| `STT_SERVICE_URL` | `http://stt-service:8000` | STT endpoint used by Piper Training for audio labelling |
 
 ---
 
@@ -382,9 +383,19 @@ The Silero VAD filter can be too aggressive on short clips or compressed audio (
 ```
 POST /transcribe
   vad_filter=false          # disable completely
-  vad_threshold=0.3         # lower threshold (default 0.5)
-  no_speech_threshold=0.95  # raise silence tolerance
+  vad_threshold=0.3         # lower threshold (default: 0.5)
+  no_speech_threshold=0.95  # raise silence tolerance (default: 0.6)
 ```
+
+VAD parameter defaults (applied to all `/transcribe` and `/transcribe-stream` requests):
+
+| Parameter | Default | Effect |
+|-----------|---------|--------|
+| `vad_filter` | `true` | Enable/disable VAD pre-filtering |
+| `vad_threshold` | `0.5` | Speech probability threshold; lower = more permissive |
+| `no_speech_threshold` | `0.6` | Segment-level silence threshold; raise to `0.95` for compressed/noisy audio |
+
+For browser recordings (webm/opus), use `no_speech_threshold=0.95` to avoid false silence detection.
 
 **Slow first start**
 Models are downloaded on first launch. Sizes:

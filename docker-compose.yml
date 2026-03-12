@@ -40,7 +40,7 @@ services:
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
       NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
       PYTHONUNBUFFERED: 1
-      STT_SERVICE_URL: http://stt-service:8000
+      STT_SERVICE_URL: ${STT_SERVICE_URL:-http://stt-service:8000}
     volumes:
       - "./piper-training-service/data:/app/data"
       - "./piper-training-service/models:/app/models"
@@ -223,7 +223,7 @@ services:
     environment:
       # Internal service URLs (container-to-container, don't change these)
       TTS_SERVICE_URL: http://piper-tts-service:5000
-      STT_SERVICE_URL: http://stt-service:8000
+      STT_SERVICE_URL: ${STT_SERVICE_URL:-http://stt-service:8000}
       VOICE_TRAINING_URL: http://piper-training-service:8080
       QWEN3_TTS_SERVICE_URL: http://qwen3-tts-service:5004
       QWEN3_ASR_SERVICE_URL: http://qwen3-asr-service:5002

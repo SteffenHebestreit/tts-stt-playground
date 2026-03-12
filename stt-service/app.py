@@ -421,7 +421,12 @@ async def transcribe_audio_stream(
                     language=language,
                     task=task,
                     vad_filter=vad_filter,
-                    vad_parameters=dict(min_silence_duration_ms=300, threshold=vad_threshold) if vad_filter else None,
+                    vad_parameters={
+                        "threshold": vad_threshold,
+                        "min_speech_duration_ms": 500,
+                        "min_silence_duration_ms": 1500,
+                        "speech_pad_ms": 300,
+                    } if vad_filter else None,
                 )
             
             loop = asyncio.get_running_loop()
@@ -617,9 +622,9 @@ async def detect_language(
             condition_on_previous_text=False,
             # Only process first part for speed
             vad_parameters={
-                "threshold": 0.6,
+                "threshold": 0.5,
                 "min_speech_duration_ms": 250,
-                "min_silence_duration_ms": 1000,
+                "min_silence_duration_ms": 500,
             }
         )
         
