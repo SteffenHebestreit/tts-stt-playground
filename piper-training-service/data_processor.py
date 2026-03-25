@@ -1,3 +1,9 @@
+"""Dataset preparation utilities for Piper VITS training.
+
+Handles audio loading, mel-spectrogram extraction, phonemisation, and
+train/validation splitting.
+"""
+
 import os
 import json
 import io
@@ -7,24 +13,26 @@ from pathlib import Path
 from typing import List, Dict
 import soundfile as sf
 from phonemizer import phonemize
-import pandas as pd
 import asyncio
 import aiofiles
-import requests
+import aiohttp
 import subprocess
 import logging
 
 logger = logging.getLogger(__name__)
 
 class DataProcessor:
+    """Prepare audio/text examples and mel features for VITS training."""
+
     def __init__(self):
+        """Initialise default audio and spectrogram parameters."""
         self.sample_rate = 22050
         self.hop_length = 256
         self.n_fft = 1024
         self.n_mels = 80
         
     async def prepare_dataset(self, segments: List, model_name: str, language: str = "en") -> Path:
-        """Prepare dataset from STT segments"""
+        """Build a training dataset from STT segments (audio + mel + phonemes)."""
         
         dataset_dir = Path(f"data/{model_name}")
         dataset_dir.mkdir(parents=True, exist_ok=True)
@@ -123,13 +131,14 @@ class DataProcessor:
         return dataset_dir
     
     async def _download_audio(self, url: str) -> bytes:
-        """Download audio file from URL"""
-        response = requests.get(url)
-        response.raise_for_status()
-        return response.content
+        """Download an audio file from *url* and return the raw bytes."""
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                resp.raise_for_status()
+                return await resp.read()
     
     def _compute_mel_spectrogram(self, audio):
-        """Compute mel spectrogram from audio"""
+        """Compute a normalised log-mel spectrogram from a waveform array."""
         stft = librosa.stft(
             audio,
             n_fft=self.n_fft,
@@ -156,7 +165,7 @@ class DataProcessor:
         return mel_spec
     
     async def _create_splits(self, metadata: List[Dict], dataset_dir: Path):
-        """Create train/validation splits"""
+        """Write train.json / val.json with a 90/10 random split."""
         n_samples = len(metadata)
         n_val = max(1, int(n_samples * 0.1))  # 10% validation
         
@@ -176,7 +185,7 @@ class DataProcessor:
         logger.info(f"Created splits: {len(train_metadata)} training, {len(val_metadata)} validation")
 
     def create_speaker_map(self, dataset_dir: Path) -> Dict:
-        """Create speaker ID mapping for multi-speaker models"""
+        """Create and persist a speaker-name → integer-ID mapping."""
         metadata_path = dataset_dir / "metadata.json"
         with open(metadata_path, 'r') as f:
             metadata = json.load(f)
@@ -196,7 +205,7 @@ class DataProcessor:
         return speaker_map
 
     def analyze_audio_with_ffmpeg(self, audio_path: str) -> dict:
-        """Analyze audio file using FFmpeg to get detailed information"""
+        """Use ffprobe to extract codec, duration, sample-rate, etc."""
         try:
             # Use ffprobe to get audio information
             cmd = [
@@ -235,7 +244,7 @@ class DataProcessor:
             return {}
 
     def preprocess_audio(self, audio_path: str, output_dir: str, target_sample_rate: int = 22050) -> str:
-        """Preprocess audio file for training with format analysis"""
+        """Resample and normalise an audio file, saving the result as 16-bit WAV."""
         try:
             # Analyze audio first
             analysis = self.analyze_audio_with_ffmpeg(audio_path)

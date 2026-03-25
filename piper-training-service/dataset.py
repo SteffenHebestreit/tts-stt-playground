@@ -1,3 +1,5 @@
+"""PyTorch Dataset for VITS training with phoneme vocabulary creation."""
+
 import torch
 from torch.utils.data import Dataset
 import json
@@ -10,7 +12,10 @@ import random
 logger = logging.getLogger(__name__)
 
 class TTSDataset(Dataset):
+    """Dataset wrapper that loads metadata, audio, mel features, and phoneme IDs."""
+
     def __init__(self, data_dir: Path, config: dict, split: str = "train"):
+        """Load the requested dataset split and build the phoneme vocabulary."""
         self.data_dir = data_dir
         self.config = config
         
@@ -32,9 +37,11 @@ class TTSDataset(Dataset):
         logger.info(f"Phoneme vocabulary size: {len(self.phoneme_to_id)}")
         
     def __len__(self):
+        """Return the number of examples in the current split."""
         return len(self.metadata)
     
     def __getitem__(self, idx):
+        """Load one training example, returning audio, mel, text, and duration targets."""
         item = self.metadata[idx]
         
         try:

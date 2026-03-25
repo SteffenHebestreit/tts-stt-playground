@@ -1,3 +1,9 @@
+"""VITS (Conditional Variational Autoencoder with Adversarial Learning) model.
+
+Implements TextEncoder, DurationPredictor, PosteriorEncoder, HiFiGAN decoder,
+ResidualCouplingBlock, and monotonic alignment for end-to-end TTS training.
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -51,6 +57,7 @@ class VITS(nn.Module):
     """VITS model for TTS training."""
 
     def __init__(self, config):
+        """Build the encoder, duration predictor, flow, and vocoder modules."""
         super().__init__()
         # Accept both dict and VITSConfig
         if isinstance(config, VITSConfig):
@@ -93,6 +100,7 @@ class VITS(nn.Module):
         )
 
     def forward(self, text, text_lengths, mel_spec=None, mel_lengths=None):
+        """Run training-mode or inference-mode synthesis depending on mel inputs."""
         text_encoded, text_mask = self.text_encoder(text, text_lengths)
         log_duration = self.duration_predictor(text_encoded, text_mask)
 
@@ -244,6 +252,7 @@ class TextEncoder(nn.Module):
     """Transformer-based text encoder."""
 
     def __init__(self, n_vocab, hidden_channels, filter_channels, n_heads, n_layers):
+        """Create token embeddings, positional encoding, and transformer layers."""
         super().__init__()
         self.embedding = nn.Embedding(n_vocab, hidden_channels)
         self.pos_encoding = PositionalEncoding(hidden_channels)
@@ -253,6 +262,7 @@ class TextEncoder(nn.Module):
         ])
 
     def forward(self, text, text_lengths):
+        """Encode token IDs into contextual hidden states and a padding mask."""
         x = self.embedding(text)
         x = self.pos_encoding(x)
         mask = torch.arange(text.shape[1], device=text.device)[None, :] < text_lengths[:, None]
@@ -265,6 +275,7 @@ class DurationPredictor(nn.Module):
     """Predicts log-scale phoneme durations from encoder output."""
 
     def __init__(self, hidden_channels, filter_channels):
+        """Construct the convolutional duration prediction stack."""
         super().__init__()
         self.conv1 = nn.Conv1d(hidden_channels, filter_channels, 3, padding=1)
         self.conv2 = nn.Conv1d(filter_channels, filter_channels, 3, padding=1)
@@ -272,6 +283,7 @@ class DurationPredictor(nn.Module):
         self.dropout = nn.Dropout(0.1)
 
     def forward(self, x, mask):
+        """Predict per-token log durations and apply the sequence mask."""
         x = x.transpose(1, 2)
         x = F.relu(self.conv1(x))
         x = self.dropout(x)
@@ -286,6 +298,7 @@ class ResidualCouplingBlock(nn.Module):
     """Stack of normalizing-flow coupling layers."""
 
     def __init__(self, channels, hidden_channels, kernel_size, n_layers):
+        """Create the sequence of affine coupling layers used by the flow."""
         super().__init__()
         self.channels = channels
         self.hidden_channels = hidden_channels
@@ -295,6 +308,7 @@ class ResidualCouplingBlock(nn.Module):
         ])
 
     def forward(self, x, mask=None):
+        """Apply each coupling layer in forward mode and sum log determinants."""
         log_det_total = 0
         for flow in self.flows:
             x, log_det = flow(x, mask)
@@ -302,6 +316,7 @@ class ResidualCouplingBlock(nn.Module):
         return x, log_det_total
 
     def inverse(self, z, mask=None):
+        """Run the flow in reverse to decode latent frames back to hidden states."""
         for flow in reversed(self.flows):
             z = flow.inverse(z, mask)
         return z
@@ -311,6 +326,7 @@ class CouplingLayer(nn.Module):
     """Affine coupling layer for normalizing flow."""
 
     def __init__(self, channels, hidden_channels, kernel_size):
+        """Initialise the transformation network for one coupling step."""
         super().__init__()
         self.half_channels = channels // 2
         self.transform_net = nn.Sequential(
@@ -322,6 +338,7 @@ class CouplingLayer(nn.Module):
         )
 
     def forward(self, x, mask=None):
+        """Transform half the channels conditioned on the other half."""
         x0, x1 = x[:, :self.half_channels], x[:, self.half_channels:]
         params = self.transform_net(x0)
         shift = params[:, :self.half_channels]
@@ -333,6 +350,7 @@ class CouplingLayer(nn.Module):
         return torch.cat([x0, x1], dim=1), log_det
 
     def inverse(self, z, mask=None):
+        """Undo the affine coupling transform during inference."""
         z0, z1 = z[:, :self.half_channels], z[:, self.half_channels:]
         params = self.transform_net(z0)
         shift = params[:, :self.half_channels]
@@ -348,6 +366,7 @@ class HiFiGANGenerator(nn.Module):
 
     def __init__(self, hidden_channels, resblock_kernel_sizes, resblock_dilation_sizes,
                  upsample_rates, upsample_kernel_sizes):
+        """Build the upsampling stack and residual blocks for waveform generation."""
         super().__init__()
         self.pre_conv = nn.Conv1d(hidden_channels, 512, 7, padding=3)
         self.upsample_layers = nn.ModuleList()
@@ -367,6 +386,7 @@ class HiFiGANGenerator(nn.Module):
         self.post_conv = nn.Conv1d(channel_size, 1, 7, padding=3)
 
     def forward(self, x):
+        """Convert latent acoustic features into a time-domain waveform."""
         x = self.pre_conv(x)
         for i, (upsample, resblocks) in enumerate(zip(self.upsample_layers, self.resblock_layers)):
             x = F.leaky_relu(x, 0.1)
@@ -384,6 +404,7 @@ class ResBlock(nn.Module):
     """Residual block for HiFi-GAN."""
 
     def __init__(self, channels, kernel_size, dilations):
+        """Create the dilated convolution pairs used in one residual block."""
         super().__init__()
         self.convs1 = nn.ModuleList()
         self.convs2 = nn.ModuleList()
@@ -398,6 +419,7 @@ class ResBlock(nn.Module):
             )
 
     def forward(self, x):
+        """Apply the residual convolution stack and return the updated activations."""
         for conv1, conv2 in zip(self.convs1, self.convs2):
             res = x
             x = F.leaky_relu(x, 0.1)
@@ -412,6 +434,7 @@ class TransformerEncoderLayer(nn.Module):
     """Transformer encoder layer with manual multi-head attention (ONNX-compatible)."""
 
     def __init__(self, hidden_channels, filter_channels, n_heads, dropout=0.1):
+        """Initialise ONNX-friendly attention projections and feed-forward layers."""
         super().__init__()
         self.n_heads = n_heads
         self.head_dim = hidden_channels // n_heads
@@ -437,6 +460,7 @@ class TransformerEncoderLayer(nn.Module):
         self.attn_scale = self.head_dim ** -0.5
 
     def forward(self, x, mask):
+        """Run self-attention and feed-forward sublayers with residual connections."""
         B, T, C = x.shape
 
         qkv = F.linear(x, self.self_attn.in_proj_weight, self.self_attn.in_proj_bias)
@@ -465,6 +489,7 @@ class PositionalEncoding(nn.Module):
     """Sinusoidal positional encoding for the transformer."""
 
     def __init__(self, d_model, max_len=5000):
+        """Precompute sinusoidal encodings up to ``max_len`` positions."""
         super().__init__()
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
@@ -475,6 +500,7 @@ class PositionalEncoding(nn.Module):
         self.register_buffer('pe', pe.unsqueeze(0))
 
     def forward(self, x):
+        """Add positional encodings to an embedded token sequence."""
         return x + self.pe[:, :x.size(1)]
 
 
@@ -482,6 +508,7 @@ class VITSConfig:
     """Configuration for the VITS model."""
 
     def __init__(self, **kwargs):
+        """Populate configuration fields with provided overrides or sane defaults."""
         self.sample_rate = kwargs.get('sample_rate', 22050)
         self.n_fft = kwargs.get('n_fft', 1024)
         self.hop_length = kwargs.get('hop_length', 256)
@@ -496,4 +523,5 @@ class VITSConfig:
         self.speaker_name = kwargs.get('speaker_name', 'default')
 
     def to_dict(self):
+        """Return the configuration as a plain serialisable dictionary."""
         return {k: v for k, v in self.__dict__.items()}

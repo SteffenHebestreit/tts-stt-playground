@@ -1,3 +1,5 @@
+"""Optimiser, scheduler, checkpoint, and early-stopping utilities."""
+
 import torch
 import torch.optim as optim
 import logging
@@ -99,12 +101,14 @@ class EarlyStopping:
     """Early stopping to prevent overfitting"""
     
     def __init__(self, patience=20, min_delta=0.001):
+        """Store the stopping patience and minimum improvement threshold."""
         self.patience = patience
         self.min_delta = min_delta
         self.counter = 0
         self.best_loss = float('inf')
         
     def __call__(self, val_loss):
+        """Return ``True`` when validation loss has plateaued for too long."""
         if val_loss < self.best_loss - self.min_delta:
             self.best_loss = val_loss
             self.counter = 0
@@ -117,10 +121,12 @@ class LossTracker:
     """Track training losses"""
     
     def __init__(self):
+        """Initialise rolling storage for per-loss and total-loss history."""
         self.losses = {}
         self.history = []
         
     def update(self, losses_dict):
+        """Append a new batch of named loss values to the history."""
         for key, value in losses_dict.items():
             if key not in self.losses:
                 self.losses[key] = []
@@ -130,11 +136,13 @@ class LossTracker:
         self.history.append(total_loss.item() if torch.is_tensor(total_loss) else total_loss)
     
     def get_average(self, window=100):
+        """Return the rolling average of the total loss over the last window."""
         if not self.history:
             return 0.0
         return sum(self.history[-window:]) / min(len(self.history), window)
     
     def get_loss_dict_average(self, window=100):
+        """Return rolling averages for each named loss component."""
         averages = {}
         for key, values in self.losses.items():
             if values:

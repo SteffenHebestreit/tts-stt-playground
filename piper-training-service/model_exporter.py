@@ -1,16 +1,18 @@
+"""Export a trained VITS checkpoint to ONNX with a Piper-compatible config."""
+
 import torch
-import onnx
 from pathlib import Path
 import json
 import logging
-import numpy as np
-import asyncio
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
 class ModelExporter:
+    """Export trained checkpoints to Piper-compatible ONNX bundles."""
+
     def __init__(self):
+        """Create the export directory used for generated model artifacts."""
         self.export_dir = Path("models")
         self.export_dir.mkdir(exist_ok=True)
     
@@ -214,27 +216,3 @@ class ModelExporter:
 
         return phoneme_map
     
-    def create_model_info(self, job_id: str, export_path: Path, config: dict):
-        """Create model information file"""
-        info = {
-            "model_id": job_id,
-            "created_at": str(datetime.now()),
-            "model_type": "VITS",
-            "framework": "PyTorch",
-            "exported_format": "ONNX",
-            "sample_rate": config['sample_rate'],
-            "language": config.get('language', 'en'),
-            "speaker": config.get('speaker_name', 'custom'),
-            "quality": config.get('quality', 'medium'),
-            "model_size": {
-                "hidden_channels": config['hidden_channels'],
-                "layers": config['n_layers'],
-                "vocab_size": config.get('n_vocab', 256)
-            }
-        }
-        
-        info_path = export_path / "model_info.json"
-        with open(info_path, 'w') as f:
-            json.dump(info, f, indent=2)
-        
-        return info_path

@@ -1,7 +1,12 @@
+// Frontend controller for the TTS/STT demo UI.
+// Manages tab navigation, service health polling, TTS/STT actions,
+// training workflows, and Qwen3 voice-cloning interactions.
+
 // Global variables
 let currentTTSEngine = 'piper'; // 'piper' or 'qwen3'
 
 // TTS Engine Switching
+/** Switch the visible UI panels to the selected TTS engine family. */
 function switchTTSEngine(engine) {
     currentTTSEngine = engine;
 
@@ -29,6 +34,7 @@ function switchTTSEngine(engine) {
 }
 
 // Notification system
+/** Render a temporary toast-style notification in the top-right corner. */
 function showNotification(message, type = 'info') {
     let notificationContainer = document.getElementById('notification-container');
     if (!notificationContainer) {
@@ -75,6 +81,7 @@ document.addEventListener('DOMContentLoaded', function() {
     checkServiceHealth();
 });
 
+/** Initialize UI widgets, voice lists, and background health polling. */
 function initializeApp() {
     setupFileDragDrop();
     setupRangeSliders();
@@ -96,6 +103,7 @@ function initializeApp() {
     }, 30000);
 }
 
+/** Bind tab buttons to the tab-switching helper. */
 function setupEventListeners() {
     document.querySelectorAll('.tab-button').forEach(button => {
         button.addEventListener('click', function() {
@@ -105,6 +113,7 @@ function setupEventListeners() {
     });
 }
 
+/** Activate a single tab and trigger tab-specific refresh actions. */
 function showTab(tabId) {
     document.querySelectorAll('.tab-content').forEach(tab => tab.classList.remove('active'));
     document.querySelectorAll('.tab-button').forEach(btn => btn.classList.remove('active'));
@@ -132,6 +141,7 @@ function showTab(tabId) {
 }
 
 // File drag and drop
+/** Attach drag-and-drop behavior to the file upload zones. */
 function setupFileDragDrop() {
     const dropZones = [
         { zone: 'stt-drop-zone', input: 'stt-file', callback: () => handleSTTFile(document.getElementById('stt-file')) },
@@ -183,6 +193,7 @@ function setupFileDragDrop() {
     });
 }
 
+/** Synchronize slider labels with their current numeric values. */
 function setupRangeSliders() {
     const speedSlider = document.getElementById('tts-speed');
     const speedValue = document.getElementById('tts-speed-value');
@@ -197,6 +208,7 @@ function setupRangeSliders() {
 // Service Health Checks
 // ============================================================
 
+/** Poll each backend health endpoint and update its status indicator. */
 async function checkServiceHealth() {
     const services = [
         { name: 'tts', url: window.TTS_SERVICE_URL, element: 'tts-status' },
@@ -227,16 +239,19 @@ async function checkServiceHealth() {
     }
 }
 
+/** Trigger a health refresh after UI state changes. */
 function updateServiceStatus() {
     checkServiceHealth();
 }
 
 // Helper functions
+/** Render a status message into the given result/status container. */
 function showStatus(elementId, type, message) {
     const element = document.getElementById(elementId);
     if (element) element.innerHTML = `<div class="${type}">${message}</div>`;
 }
 
+/** Convert a byte count into a human-readable size string. */
 function formatFileSize(bytes) {
     if (bytes === 0) return '0 Bytes';
     const k = 1024;
@@ -245,6 +260,7 @@ function formatFileSize(bytes) {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
+/** Show or hide the manual reference-text input for voice cloning. */
 function toggleRefText() {
     const checked = document.getElementById('enable-ref-text').checked;
     document.getElementById('ref-text-group').style.display = checked ? '' : 'none';
@@ -254,6 +270,7 @@ function toggleRefText() {
 // PiperTTS Functions
 // ============================================================
 
+/** Submit a PiperTTS generation request and render the returned audio. */
 async function generateTTS() {
     const text = document.getElementById('tts-text').value.trim();
     const language = document.getElementById('tts-language-select').value;
@@ -305,6 +322,7 @@ async function generateTTS() {
     }
 }
 
+/** Reload the list of Piper voices into the voice selector dropdown. */
 async function refreshTTSVoices() {
     try {
         const response = await fetch(`${window.TTS_SERVICE_URL}/voices`);
@@ -331,6 +349,7 @@ async function refreshTTSVoices() {
 }
 
 // Custom voice management for PiperTTS
+/** Refresh the card view of custom Piper voices exported from training jobs. */
 async function refreshCustomVoices() {
     const container = document.getElementById('custom-voices-list');
     if (!container) return;
@@ -391,6 +410,7 @@ async function refreshCustomVoices() {
     }
 }
 
+/** Generate a short preview clip for a specific custom Piper voice. */
 async function testVoice(voiceId, lang = 'en') {
     const playerDiv = document.getElementById(`voice-test-${voiceId}`);
     if (!playerDiv) return;
@@ -422,6 +442,7 @@ async function testVoice(voiceId, lang = 'en') {
     }
 }
 
+/** Delete a custom Piper voice and refresh the dependent UI state. */
 async function deleteCustomVoice(voiceId) {
     if (!confirm(`Delete custom voice "${voiceId}"? This cannot be undone.`)) return;
 
@@ -443,6 +464,7 @@ async function deleteCustomVoice(voiceId) {
 // ============================================================
 
 // Model management
+/** Load Qwen3-TTS model options into every visible model selector. */
 async function loadQwen3Models() {
     const selects = [
         { select: document.getElementById('qwen3-model-select'), desc: document.getElementById('qwen3-model-description') },
@@ -482,6 +504,7 @@ async function loadQwen3Models() {
     }
 }
 
+/** Switch the active Qwen3-TTS model and refresh related status displays. */
 async function switchQwen3Model(modelId) {
     if (!modelId) return;
 
@@ -533,6 +556,7 @@ async function switchQwen3Model(modelId) {
 let currentCloneMode = 'saved'; // 'saved', 'audio', 'design', or 'unsupported'
 let currentVoiceSource = 'saved'; // 'saved' or 'upload'
 
+/** Toggle the cloning UI between saved-voice and fresh-upload modes. */
 function switchVoiceSource(source) {
     currentVoiceSource = source;
     const savedMode = document.getElementById('clone-saved-mode');
@@ -549,6 +573,7 @@ function switchVoiceSource(source) {
     }
 }
 
+/** Reconfigure the cloning UI when the selected Qwen3 model changes. */
 function onCloneModelChange(modelId) {
     const isVoiceDesign = modelId.includes('VoiceDesign');
     const isCustomVoice = modelId.includes('CustomVoice');
@@ -597,6 +622,7 @@ function onCloneModelChange(modelId) {
 
 // --- Saved Voices ---
 
+/** Load saved Qwen3 voice profiles into the voice selector. */
 async function loadSavedVoices() {
     const select = document.getElementById('qwen3-saved-voice-select');
     const info = document.getElementById('saved-voice-info');
@@ -634,6 +660,7 @@ async function loadSavedVoices() {
     }
 }
 
+/** Display metadata for the currently selected saved Qwen3 voice. */
 function updateSavedVoiceInfo() {
     const select = document.getElementById('qwen3-saved-voice-select');
     const info = document.getElementById('saved-voice-info');
@@ -649,6 +676,7 @@ function updateSavedVoiceInfo() {
     }
 }
 
+/** Delete the selected saved Qwen3 voice profile. */
 async function deleteSavedVoice() {
     const select = document.getElementById('qwen3-saved-voice-select');
     if (!select || !select.value) {
@@ -669,6 +697,7 @@ async function deleteSavedVoice() {
     }
 }
 
+/** Save an uploaded reference recording as a reusable Qwen3 voice profile. */
 async function saveVoiceFromUpload(voiceFile, name) {
     const lang = document.getElementById('qwen3-tts-language-select')?.value || 'auto';
     const formData = new FormData();
@@ -696,6 +725,7 @@ async function saveVoiceFromUpload(voiceFile, name) {
 }
 
 // Built-in speaker TTS
+/** Generate audio with a built-in Qwen3 speaker voice. */
 async function generateQwen3BuiltinTTS() {
     const text = document.getElementById('qwen3-builtin-text').value.trim();
     const lang = document.getElementById('qwen3-builtin-language').value;
@@ -744,6 +774,7 @@ async function generateQwen3BuiltinTTS() {
 }
 
 // Voice cloning
+/** Show metadata for the currently selected Qwen3 reference voice file. */
 function handleQwen3VoiceFile(file) {
     if (!file) return;
     const infoDiv = document.getElementById('qwen3-voice-file-info');
@@ -755,6 +786,7 @@ function handleQwen3VoiceFile(file) {
     infoDiv.style.display = 'block';
 }
 
+/** Dispatch Qwen3 generation to saved-voice, clone, or voice-design mode. */
 async function generateQwen3TTS() {
     // Route to the correct handler based on current mode
     if (currentCloneMode === 'design') {
@@ -766,6 +798,7 @@ async function generateQwen3TTS() {
     return generateQwen3VoiceClone();
 }
 
+/** Generate audio using a previously saved Qwen3 voice profile. */
 async function generateWithSavedVoice() {
     const text = document.getElementById('qwen3-tts-text').value.trim();
     const lang = document.getElementById('qwen3-tts-language-select').value;
@@ -836,6 +869,7 @@ async function generateWithSavedVoice() {
     }
 }
 
+/** Clone a voice from an uploaded reference clip and optionally save it. */
 async function generateQwen3VoiceClone() {
     const text = document.getElementById('qwen3-tts-text').value.trim();
     const lang = document.getElementById('qwen3-tts-language-select').value;
@@ -929,6 +963,7 @@ async function generateQwen3VoiceClone() {
     }
 }
 
+/** Generate speech from a text-described target voice. */
 async function generateQwen3VoiceDesign() {
     const text = document.getElementById('qwen3-tts-text').value.trim();
     const lang = document.getElementById('qwen3-tts-language-select').value;
@@ -992,6 +1027,7 @@ async function generateQwen3VoiceDesign() {
     }
 }
 
+/** Fetch the current Qwen3-TTS status payload from the backend. */
 async function updateQwen3TTSStatus() {
     try {
         const response = await fetch(`${window.QWEN3_TTS_SERVICE_URL}/status`, {
@@ -1009,6 +1045,7 @@ async function updateQwen3TTSStatus() {
     }
 }
 
+/** Render the Qwen3-TTS status card from the latest backend status data. */
 function updateQwen3TTSStatusDisplay(status) {
     const statusElement = document.getElementById('qwen3-tts-system-status');
     if (!statusElement) return;
@@ -1052,6 +1089,7 @@ function updateQwen3TTSStatusDisplay(status) {
 // STT Functions
 // ============================================================
 
+/** Submit an audio transcription request to the selected STT backend. */
 async function processSTT() {
     const fileInput = document.getElementById('stt-file');
     const language = document.getElementById('stt-language').value;
@@ -1128,6 +1166,7 @@ async function processSTT() {
     }
 }
 
+/** Copy the current full transcription text to the clipboard. */
 function copyTranscription() {
     const el = document.getElementById('full-transcription');
     if (!el) return;
@@ -1147,6 +1186,7 @@ function copyTranscription() {
     });
 }
 
+/** Show selected STT file metadata in the UI. */
 function handleSTTFile(input) {
     const fileInfo = document.getElementById('stt-file-info');
     if (input.files.length > 0) {
@@ -1169,6 +1209,7 @@ function handleSTTFile(input) {
 // Training Functions
 // ============================================================
 
+/** Start a new Piper training job from uploaded audio files. */
 async function startTraining() {
     const voiceName = document.getElementById('training-voice-name').value.trim();
     const language = document.getElementById('training-language').value;
@@ -1231,6 +1272,7 @@ async function startTraining() {
     }
 }
 
+/** Display the selected training files and their total size. */
 function handleTrainingFiles(input) {
     const fileInfo = document.getElementById('training-files-info');
     if (input.files.length > 0) {
@@ -1249,6 +1291,7 @@ function handleTrainingFiles(input) {
     }
 }
 
+/** Poll the training service until a job completes, fails, or stops updating. */
 async function monitorTrainingProgress(sessionId) {
     const progressDiv = document.getElementById('training-progress');
 
@@ -1291,6 +1334,7 @@ async function monitorTrainingProgress(sessionId) {
 // Model Management Functions
 // ============================================================
 
+/** Refresh the table of completed/exportable trained voice models. */
 async function refreshModels() {
     const modelsList = document.getElementById('models-list');
     if (!modelsList) return;
@@ -1335,6 +1379,7 @@ async function refreshModels() {
     }
 }
 
+/** Refresh the training-jobs table with current job status information. */
 async function refreshTrainingJobs() {
     const jobsList = document.getElementById('training-jobs-list');
     if (!jobsList) return;
@@ -1388,6 +1433,7 @@ async function refreshTrainingJobs() {
     }
 }
 
+/** Export a completed training job into PiperTTS and refresh voice lists. */
 async function exportModelToTTS(jobId, modelName) {
     try {
         showNotification(`Exporting "${modelName}" to TTS service...`, 'info');
@@ -1416,6 +1462,7 @@ async function exportModelToTTS(jobId, modelName) {
     }
 }
 
+/** Download the exported ONNX artifact for a completed training job. */
 async function downloadModel(jobId) {
     try {
         const response = await fetch(`${window.VOICE_TRAINING_URL}/download/${jobId}`);
@@ -1438,6 +1485,7 @@ async function downloadModel(jobId) {
     }
 }
 
+/** Delete a trained model and its associated dataset/checkpoint artifacts. */
 async function deleteModel(jobId) {
     if (!confirm(`Delete model "${jobId}" and all training data? This cannot be undone.`)) return;
 
@@ -1454,6 +1502,7 @@ async function deleteModel(jobId) {
     }
 }
 
+/** Cancel an in-progress training job. */
 async function cancelJob(jobId) {
     if (!confirm('Cancel this training job?')) return;
 
@@ -1469,6 +1518,7 @@ async function cancelJob(jobId) {
     }
 }
 
+/** Resume training for the voice name entered in the manual resume form. */
 async function resumeTrainingManual() {
     const voiceName = document.getElementById('continue-voice-name').value.trim();
     if (!voiceName) {
@@ -1478,6 +1528,7 @@ async function resumeTrainingManual() {
     resumeTraining(voiceName, 'continue-status');
 }
 
+/** Start training from an already-prepared dataset on disk. */
 async function trainFromDataset() {
     const voiceName = document.getElementById('continue-voice-name').value.trim();
     const epochs = parseInt(document.getElementById('continue-epochs').value) || 10000;
@@ -1516,6 +1567,7 @@ async function trainFromDataset() {
     }
 }
 
+/** Ask the backend to resume a training job from its latest checkpoint. */
 async function resumeTraining(voiceName, statusElementId = 'training-progress-status') {
     if (!confirm(`Resume training for voice "${voiceName}" from the last checkpoint?`)) return;
 
@@ -1547,6 +1599,7 @@ async function resumeTraining(voiceName, statusElementId = 'training-progress-st
     }
 }
 
+/** Fetch and display detailed information for a specific training job. */
 async function viewJobDetails(jobId) {
     try {
         const response = await fetch(`${window.VOICE_TRAINING_URL}/status/${jobId}`);

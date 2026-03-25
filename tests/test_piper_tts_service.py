@@ -4,6 +4,7 @@ import pytest
 
 
 def test_health(piper_tts_client):
+    """Health endpoint returns a healthy status payload."""
     r = piper_tts_client.get("/health")
     assert r.status_code == 200
     data = r.json()
@@ -11,6 +12,7 @@ def test_health(piper_tts_client):
 
 
 def test_list_voices(piper_tts_client):
+    """Voices endpoint returns a dictionary of available voices."""
     r = piper_tts_client.get("/voices")
     assert r.status_code == 200
     data = r.json()
@@ -40,4 +42,4 @@ def test_tts_generates_audio(piper_tts_client):
 def test_tts_empty_text_rejected(piper_tts_client):
     """Empty text should return an error."""
     r = piper_tts_client.post("/tts", json={"text": ""})
-    assert r.status_code in (400, 422, 500)
+    assert r.status_code in (400, 422)

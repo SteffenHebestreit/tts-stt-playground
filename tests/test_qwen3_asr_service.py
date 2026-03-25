@@ -1,9 +1,8 @@
 """Tests for the Qwen3-ASR service."""
 
-import pytest
-
 
 def test_health(qwen3_asr_client):
+    """Health endpoint returns an OK status."""
     r = qwen3_asr_client.get("/health")
     assert r.status_code == 200
 

@@ -1,3 +1,5 @@
+"""Async STT service client with retry logic and chunked processing."""
+
 import asyncio
 import aiohttp
 import aiofiles
@@ -28,6 +30,7 @@ class STTProcessor:
     """Handles STT service integration for audio segmentation"""
     
     def __init__(self, stt_service_url: str = "http://stt-service:8000"):
+        """Store the STT base URL and defer session creation to async entry."""
         self.stt_service_url = stt_service_url.rstrip('/')
         self.session = None
     

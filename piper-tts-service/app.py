@@ -1,13 +1,20 @@
+"""PiperTTS service for text-to-speech synthesis.
+
+Supports 40+ pre-trained voices across multiple languages and custom
+ONNX models trained via the Piper Training service. Default voices use
+the Piper binary; custom VITS models use direct ONNX Runtime inference.
+"""
+
 import os
+import re
 import uuid
-import subprocess
 import tempfile
 import json
 import asyncio
 import logging
 from pathlib import Path
 import shutil
-from typing import List, Dict, Optional
+from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +22,7 @@ import numpy as np
 import soundfile as sf
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
@@ -25,16 +32,36 @@ import io
 
 app = FastAPI(title="PiperTTS Service", description="Text-to-Speech using Piper with custom and default models")
 
-# CORS configuration
+allowed_origins_str = os.getenv("ALLOWED_ORIGINS", "*")
+allowed_origins = [origin.strip() for origin in allowed_origins_str.split(",")] if allowed_origins_str else ["*"]
+allow_credentials = os.getenv("ALLOW_CREDENTIALS", "false").strip().lower() in {"1", "true", "yes", "on"}
+if "*" in allowed_origins and allow_credentials:
+    allow_credentials = False
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=allowed_origins,
+    allow_credentials=allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Regex for sanitising user-supplied voice/model names (prevents path traversal)
+_SAFE_NAME_RE = re.compile(r'^[a-zA-Z0-9_\-]+$')
+
+
+def _sanitize_voice_name(name: str) -> str:
+    """Return *name* if it contains only safe characters, otherwise raise."""
+    if not name or not _SAFE_NAME_RE.match(name):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid voice name '{name}': only alphanumeric, dash, and underscore allowed.",
+        )
+    return name
+
 class TTSRequest(BaseModel):
+    """Request body for standard Piper text-to-speech synthesis."""
+
     text: str
     voice: Optional[str] = None
     language: str = "en_US"
@@ -44,6 +71,8 @@ class TTSRequest(BaseModel):
     output_format: str = "wav"
 
 class VoiceInfo(BaseModel):
+    """Metadata describing a built-in or custom voice model."""
+
     name: str
     language: str
     speaker: str
@@ -53,6 +82,8 @@ class VoiceInfo(BaseModel):
     model_type: str = "default"  # "default" or "custom"
 
 class VoiceCloneRequest(BaseModel):
+    """Request body for synthesis with a named custom voice."""
+
     text: str
     voice_name: str
     reference_audio: Optional[str] = None
@@ -139,27 +170,31 @@ DEFAULT_VOICES = {
     )
 }
 
-# Custom voices (loaded from trained models)
-CUSTOM_VOICES = {}
+# Custom voices loaded at startup from /app/models/custom/
+CUSTOM_VOICES: Dict[str, VoiceInfo] = {}
+
 
 @app.on_event("startup")
 async def startup():
-    """Load custom voices on startup"""
+    """Scan the custom-models directory and register any valid voices."""
     await load_custom_voices()
+
 
 @app.get("/")
 async def root():
-    """Return service identity and status information."""
+    """Return service identity and readiness status."""
     return {"service": "PiperTTS Service", "status": "ready", "version": "1.0.0"}
+
 
 @app.get("/health")
 async def health():
-    """Return service health check status."""
+    """Health-check endpoint used by Docker and monitoring."""
     return {"status": "healthy"}
+
 
 @app.get("/voices")
 async def list_voices():
-    """List all available voices (default + custom)"""
+    """List all available voices grouped by language."""
     all_voices = {**DEFAULT_VOICES, **CUSTOM_VOICES}
     
     # Group by language
@@ -180,7 +215,11 @@ async def list_voices():
     }
 
 def select_best_voice(language: str, quality: str, gender: Optional[str] = None) -> str:
-    """Select the best matching voice based on criteria"""
+    """Pick the best voice matching *language*, *quality*, and optional *gender*.
+
+    Falls back to any matching-language voice, then English, then the hard-coded
+    default ``en_US-lessac-medium``.
+    """
     all_voices = {**DEFAULT_VOICES, **CUSTOM_VOICES}
     
     # Filter by language first
@@ -200,7 +239,6 @@ def select_best_voice(language: str, quality: str, gender: Optional[str] = None)
         return "en_US-lessac-medium"
     
     # Filter by quality
-    quality_order = ["x_low", "low", "medium", "high"]
     preferred_voices = []
     for voice_name, voice_info in matching_voices:
         if voice_info.quality == quality:
@@ -222,7 +260,7 @@ def select_best_voice(language: str, quality: str, gender: Optional[str] = None)
     return preferred_voices[0][0]
 
 async def analyze_audio_with_ffmpeg(file_path: str) -> Dict:
-    """Analyze audio file using ffmpeg to extract metadata"""
+    """Run ``ffprobe`` on *file_path* and return codec/duration/quality metadata."""
     try:
         # Get basic audio info
         cmd = [
@@ -278,7 +316,7 @@ async def analyze_audio_with_ffmpeg(file_path: str) -> Dict:
 
 @app.post("/analyze_audio")
 async def analyze_audio(audio_file: UploadFile = File(...)):
-    """Analyze uploaded audio file"""
+    """Upload an audio file and receive codec, duration, and quality metadata."""
     try:
         # Save temporary file
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_file:
@@ -395,8 +433,15 @@ def _custom_onnx_infer(model_path: str, text: str, voice_name: str) -> bytes:
 
 @app.post("/tts")
 async def text_to_speech(request: TTSRequest):
-    """Generate speech using Piper TTS"""
+    """Generate speech audio from text.
+
+    Selects the best matching voice if none is specified.  Custom VITS models
+    are served via ONNX Runtime; default Piper voices use the Piper CLI.
+    """
     try:
+        if not request.text.strip():
+            raise HTTPException(status_code=400, detail="Text must not be empty")
+
         # Select voice if not specified
         if not request.voice:
             request.voice = select_best_voice(request.language, request.quality, request.gender)
@@ -475,54 +520,37 @@ async def text_to_speech(request: TTSRequest):
             }
         )
         
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/synthesize")
 async def synthesize_with_custom_voice(request: VoiceCloneRequest):
-    """Synthesize speech using custom trained voice"""
+    """Synthesize speech with a named custom voice (uses ONNX Runtime)."""
+    voice_name = _sanitize_voice_name(request.voice_name)
+
+    if not request.text.strip():
+        raise HTTPException(status_code=400, detail="Text must not be empty")
+
+    if voice_name not in CUSTOM_VOICES:
+        raise HTTPException(status_code=404, detail=f"Custom voice '{voice_name}' not found")
+
+    model_path = f"/app/models/custom/{voice_name}/{voice_name}.onnx"
+    if not os.path.exists(model_path):
+        raise HTTPException(status_code=404, detail=f"Custom model file not found for '{voice_name}'")
+
     try:
-        # Check if custom voice exists
-        if request.voice_name not in CUSTOM_VOICES:
-            raise HTTPException(status_code=404, detail=f"Custom voice '{request.voice_name}' not found")
-        
-        voice_info = CUSTOM_VOICES[request.voice_name]
-        model_path = f"/app/models/custom/{request.voice_name}/{request.voice_name}.onnx"
-        
-        if not os.path.exists(model_path):
-            raise HTTPException(status_code=404, detail=f"Custom model file not found for '{request.voice_name}'")
-        
-        # Generate unique filename
-        output_filename = f"{uuid.uuid4()}.wav"
-        output_path = f"/app/output/{output_filename}"
-        
-        # Run Piper TTS with custom model
-        cmd = [
-            "piper",
-            "--model", model_path,
-            "--output_file", output_path
-        ]
-        
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+        wav_bytes = await asyncio.to_thread(
+            _custom_onnx_infer, model_path, request.text, voice_name
         )
-        
-        stdout, stderr = await process.communicate(input=request.text.encode())
-        
-        if process.returncode != 0:
-            error_msg = stderr.decode() if stderr else "Unknown error"
-            raise HTTPException(status_code=500, detail=f"Custom TTS generation failed: {error_msg}")
-        
-        return FileResponse(
-            path=output_path,
-            filename=output_filename,
+        return StreamingResponse(
+            io.BytesIO(wav_bytes),
             media_type="audio/wav",
-            headers={"X-Custom-Voice": request.voice_name}
+            headers={"X-Custom-Voice": voice_name},
         )
-        
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -531,14 +559,12 @@ async def upload_custom_model(
     model_file: UploadFile = File(...),
     config_file: Optional[UploadFile] = File(None),
     voice_name: str = Form(...),
-    model_name: str = Form(None)  # Allow model_name as alternative to voice_name
+    model_name: str = Form(None),
 ):
-    """Upload a custom trained model"""
+    """Upload a custom-trained ONNX model and optional JSON config."""
     try:
-        # Use model_name if provided, otherwise use voice_name
-        final_voice_name = model_name or voice_name
-        
-        # Create directory for custom voice
+        final_voice_name = _sanitize_voice_name(model_name or voice_name)
+
         voice_dir = Path(f"/app/models/custom/{final_voice_name}")
         voice_dir.mkdir(parents=True, exist_ok=True)
         
@@ -607,17 +633,20 @@ async def upload_custom_model(
             "voice_info": CUSTOM_VOICES[final_voice_name]
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Model upload failed: {str(e)}")
 
 @app.delete("/voice/{voice_name}")
 async def delete_custom_voice(voice_name: str):
-    """Delete a custom voice"""
+    """Delete a custom voice and its model files."""
     try:
+        voice_name = _sanitize_voice_name(voice_name)
+
         if voice_name not in CUSTOM_VOICES:
             raise HTTPException(status_code=404, detail=f"Custom voice '{voice_name}' not found")
-        
-        # Remove files
+
         voice_dir = Path(f"/app/models/custom/{voice_name}")
         if voice_dir.exists():
             shutil.rmtree(voice_dir)
@@ -627,12 +656,14 @@ async def delete_custom_voice(voice_name: str):
         
         return {"status": "success", "message": f"Custom voice '{voice_name}' deleted"}
         
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/voice/{voice_name}")
 async def get_voice_info(voice_name: str):
-    """Get information about a specific voice"""
+    """Return metadata for a single voice by name."""
     all_voices = {**DEFAULT_VOICES, **CUSTOM_VOICES}
     if voice_name not in all_voices:
         raise HTTPException(status_code=404, detail=f"Voice '{voice_name}' not found")
@@ -640,7 +671,7 @@ async def get_voice_info(voice_name: str):
     return all_voices[voice_name]
 
 async def load_custom_voices():
-    """Load custom voices from the models directory"""
+    """Scan ``/app/models/custom/`` and register each valid voice into ``CUSTOM_VOICES``."""
     custom_models_dir = Path("/app/models/custom")
     if not custom_models_dir.exists():
         return
@@ -672,7 +703,7 @@ async def load_custom_voices():
 
 @app.post("/refresh_voices")
 async def refresh_voices():
-    """Refresh the list of custom voices"""
+    """Re-scan the custom models directory and update the voice registry."""
     CUSTOM_VOICES.clear()
     await load_custom_voices()
     

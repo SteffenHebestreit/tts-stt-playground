@@ -1,6 +1,6 @@
 # Piper Voice Training Service
 
-VITS neural network training pipeline for creating custom Piper TTS voice models. Automatically transcribes uploaded audio via the STT service, prepares training datasets, trains a VITS model, and exports to ONNX format for use with PiperTTS.
+VITS training pipeline for creating custom Piper-compatible ONNX voices. The service can upload raw recordings, segment them via STT, prepare mel/phoneme datasets, train a model, resume interrupted jobs, and export directly into the shared Piper model volume.
 
 ## Endpoints
 
@@ -8,74 +8,58 @@ VITS neural network training pipeline for creating custom Piper TTS voice models
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/train` | Upload audio files and start a training job |
-| POST | `/train-from-dataset` | Start training from an already-prepared dataset |
-| POST | `/resume-training` | Resume a training job from a checkpoint |
-| POST | `/retrain-from-segments` | Retrain using existing segments |
-| GET | `/status/{job_id}` | Training progress and status |
-| GET | `/jobs` | List all training jobs |
-| DELETE | `/job/{job_id}` | Cancel a running training job |
+| POST | `/train` | Upload audio files and start a new training job |
+| POST | `/resume-training` | Resume an interrupted job from its latest checkpoint |
+| POST | `/train-from-dataset` | Train directly from an existing prepared dataset |
+| POST | `/retrain-from-segments` | Re-transcribe existing clips and retrain |
+| GET | `/status/{job_id}` | Retrieve progress and current status |
+| GET | `/jobs` | List known jobs |
+| DELETE | `/job/{job_id}` | Cancel a running job |
 
-### Data Processing
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/process-audio` | Transcribe and segment audio via STT service |
-| POST | `/prepare-dataset` | Build training dataset from segments |
-| POST | `/generate-missing-mels` | Generate mel spectrograms for dataset entries |
-| POST | `/restore-backup` | Restore a backed-up dataset |
-
-### Model Export
+### Data Preparation
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/export/{job_id}` | Export trained model to ONNX format |
-| GET | `/download/{job_id}` | Download the exported ONNX model |
-| DELETE | `/model/{job_id}` | Delete trained model files |
+| POST | `/process-audio` | Segment and transcribe a long recording via STT |
+| POST | `/prepare-dataset` | Build a dataset from STT-derived segments |
+| POST | `/generate-missing-mels` | Regenerate missing mel spectrograms |
+| POST | `/restore-backup` | Restore a local backup dataset |
 
-### Utility
+### Export and Cleanup
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
+| POST | `/export/{job_id}` | Export a completed checkpoint to ONNX |
+| GET | `/download/{job_id}` | Download the exported model |
+| DELETE | `/model/{job_id}` | Remove a trained model and its associated data |
 | GET | `/health` | Health check |
 
-## Training Workflow
+## Workflow
 
-```bash
-# 1. Upload audio and start training (multipart form)
-curl -X POST "http://localhost:8080/train" \
-  -F "model_name=my_voice" \
-  -F "language=de" \
-  -F "epochs=1000" \
-  -F "audio_files=@recording.wav"
-
-# 2. Poll for progress
-curl "http://localhost:8080/status/{job_id}"
-
-# 3. Export to ONNX when training completes
-curl -X POST "http://localhost:8080/export/{job_id}"
-
-# 4. Download the model
-curl "http://localhost:8080/download/{job_id}" --output model.zip
-```
+1. Upload recordings with `/train`, or prepare data first with `/process-audio` and `/prepare-dataset`.
+2. Poll `/status/{job_id}` or `/jobs` while training runs.
+3. Resume with `/resume-training` if a container restart interrupts work.
+4. Export with `/export/{job_id}` or let the automatic post-training export complete.
+5. Use the resulting model from the PiperTTS service once it is copied into the shared models volume.
 
 ## Configuration
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CUDA_VISIBLE_DEVICES` | `0` | GPU device index |
-| `STT_SERVICE_URL` | `http://stt-service:8000` | Internal STT service URL |
+| `STT_SERVICE_URL` | `http://stt-service:8000` | STT backend used for segmentation and transcription |
+| `ALLOWED_ORIGINS` | `*` | Comma-separated CORS origins |
+| `ALLOW_CREDENTIALS` | `false` | Enables CORS credentials when origins are explicit |
 
-## Architecture
+## Implementation Notes
 
-- **VITS model**: Variational Inference with adversarial learning for end-to-end TTS
-- **Training precision**: FP32 (FP16 disabled — VITS normalizing flow overflows FP16 max)
-- **Batch size**: Capped at 4 with automatic reduction on GPU OOM
-- **Checkpoint interval**: Every 5 epochs
-- **Dataset split**: 90% train / 10% validation
+- Uses FP32 training because VITS normalizing-flow layers are unstable in FP16
+- Automatically lowers the effective batch size when GPU memory is tight
+- Saves checkpoints every 5 epochs and restores job state on startup
+- Splits datasets into 90% training and 10% validation by default
 
 ## Requirements
 
-- NVIDIA GPU with CUDA support
-- STT service running for audio transcription
-- Sufficient audio data (10+ minutes of clean speech recommended)
+- CUDA or ROCm GPU recommended for practical training times
+- STT backend must be reachable for upload-driven training flows
+- Clean, single-speaker audio yields the best results; 10+ minutes is a practical minimum

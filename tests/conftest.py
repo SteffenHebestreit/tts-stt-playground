@@ -53,29 +53,41 @@ def test_audio_bytes() -> bytes:
 
 @pytest.fixture(scope="session")
 def piper_tts_client():
-    return httpx.Client(base_url=PIPER_TTS_URL, timeout=30.0)
+    """HTTP client for the Piper TTS service."""
+    with httpx.Client(base_url=PIPER_TTS_URL, timeout=30.0) as client:
+        yield client
 
 
 @pytest.fixture(scope="session")
 def stt_client():
-    return httpx.Client(base_url=STT_URL, timeout=60.0)
+    """HTTP client for the STT service."""
+    with httpx.Client(base_url=STT_URL, timeout=60.0) as client:
+        yield client
 
 
 @pytest.fixture(scope="session")
 def training_client():
-    return httpx.Client(base_url=TRAINING_URL, timeout=30.0)
+    """HTTP client for the training service."""
+    with httpx.Client(base_url=TRAINING_URL, timeout=30.0) as client:
+        yield client
 
 
 @pytest.fixture(scope="session")
 def qwen3_tts_client():
-    return httpx.Client(base_url=QWEN3_TTS_URL, timeout=120.0)
+    """HTTP client for the Qwen3 TTS service."""
+    with httpx.Client(base_url=QWEN3_TTS_URL, timeout=120.0) as client:
+        yield client
 
 
 @pytest.fixture(scope="session")
 def qwen3_asr_client():
-    return httpx.Client(base_url=QWEN3_ASR_URL, timeout=60.0)
+    """HTTP client for the Qwen3 ASR service."""
+    with httpx.Client(base_url=QWEN3_ASR_URL, timeout=60.0) as client:
+        yield client
 
 
 @pytest.fixture(scope="session")
 def frontend_client():
-    return httpx.Client(base_url=FRONTEND_URL, timeout=10.0)
+    """HTTP client for the frontend service."""
+    with httpx.Client(base_url=FRONTEND_URL, timeout=10.0) as client:
+        yield client

@@ -1,14 +1,17 @@
+"""Optimised VITS training loop with GPU memory management.
+
+Supports checkpoint resume, gradient accumulation, automatic batch-size
+reduction on OOM, and periodic memory cleanup.
+"""
+
 import os
 import json
 import logging
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from pathlib import Path
-import numpy as np
 from typing import Optional, Callable
-import asyncio
 import gc
 from datetime import datetime
 
@@ -20,7 +23,10 @@ from training_utils import get_optimizer, get_scheduler
 
 
 class OptimizedTrainingPipeline:
+    """Manage dataset loading, checkpointing, and stable VITS training execution."""
+
     def __init__(self):
+        """Initialise device selection and training-safety defaults."""
         self.device, self.device_info = self._detect_compute_device()
         self.memory_limit = self._get_memory_limit()
         logger.info(f"Training device: {self.device}")
@@ -352,36 +358,6 @@ class OptimizedTrainingPipeline:
             'use_pitch': False,
             'use_energy': False,
         }
-
-    async def start_training(self, request, job_id: str, jobs_dict: dict):
-        """Start a training job (async wrapper)."""
-        try:
-            await self.train(job_id, request,
-                             callback=lambda x: self._update_job_status(job_id, jobs_dict, x))
-        except Exception as e:
-            logger.error(f"Training failed: {e}")
-            if job_id in jobs_dict:
-                jobs_dict[job_id].status = "failed"
-                jobs_dict[job_id].message = str(e)
-
-    def _update_job_status(self, job_id: str, jobs_dict: dict, update_data: dict):
-        """Update job status from callback data."""
-        if job_id in jobs_dict:
-            job = jobs_dict[job_id]
-            if 'check_status' in update_data:
-                return job
-            for key, value in update_data.items():
-                if hasattr(job, key):
-                    setattr(job, key, value)
-
-    def cleanup_old_checkpoints(self, checkpoint_dir: Path, keep_latest: int = 5):
-        """Remove all but the latest N checkpoints to save disk space."""
-        checkpoints = list(checkpoint_dir.glob("checkpoint_*.pt"))
-        if len(checkpoints) > keep_latest:
-            checkpoints.sort(key=lambda x: int(x.stem.split('_')[-1]))
-            for old_checkpoint in checkpoints[:-keep_latest]:
-                old_checkpoint.unlink()
-                logger.info(f"Removed old checkpoint: {old_checkpoint.name}")
 
     async def generate_training_metadata(self, dataset_path: Path, audio_files_info: list, model_name: str):
         """Write a metadata.json summary file for a prepared dataset."""

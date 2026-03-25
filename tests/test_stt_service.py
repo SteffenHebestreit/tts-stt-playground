@@ -1,9 +1,8 @@
 """Tests for the STT (Whisper) service."""
 
-import pytest
-
 
 def test_health(stt_client):
+    """Health endpoint returns a successful response."""
     r = stt_client.get("/health")
     assert r.status_code == 200
 

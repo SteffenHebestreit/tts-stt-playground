@@ -1,8 +1,13 @@
+"""Piper Voice Training Service.
+
+Orchestrates VITS neural-network training for custom Piper TTS voices.
+Workflow: upload audio -> STT segmentation -> mel generation -> VITS training -> ONNX export.
+"""
+
 import os
 import json
 import asyncio
 import aiofiles
-import requests
 import math
 import tempfile
 import numpy as np
@@ -31,11 +36,16 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Piper Voice Training Service", description="VITS neural network training pipeline for custom Piper TTS voice models")
 
-# CORS configuration
+allowed_origins_str = os.getenv("ALLOWED_ORIGINS", "*")
+allowed_origins = [origin.strip() for origin in allowed_origins_str.split(",")] if allowed_origins_str else ["*"]
+allow_credentials = os.getenv("ALLOW_CREDENTIALS", "false").strip().lower() in {"1", "true", "yes", "on"}
+if "*" in allowed_origins and allow_credentials:
+    allow_credentials = False
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=allowed_origins,
+    allow_credentials=allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -45,6 +55,8 @@ data_processor = DataProcessor()
 model_exporter = ModelExporter()
 
 class TrainingRequest(BaseModel):
+    """Parameters for starting or resuming a VITS training job."""
+
     model_name: str
     language: str = "en"
     sample_rate: int = 22050
@@ -56,16 +68,22 @@ class TrainingRequest(BaseModel):
     batch_size: int = 32
     
 class SegmentData(BaseModel):
+    """Single STT-derived segment used for dataset preparation."""
+
     audio_path: str
     text: str
     start_time: float
     end_time: float
     
 class DatasetUpload(BaseModel):
+    """Payload for creating a dataset from pre-segmented clips."""
+
     segments: List[SegmentData]
     model_name: str
 
 class TrainingStatus(BaseModel):
+    """In-memory status record returned by the training job API."""
+
     job_id: str
     status: str
     progress: float
@@ -76,6 +94,8 @@ class TrainingStatus(BaseModel):
     model_name: Optional[str] = None
 
 class AudioProcessingRequest(BaseModel):
+    """Payload for STT segmentation of a long source recording."""
+
     audio_file_url: str
     model_name: str
     language: str = "en"
@@ -87,7 +107,7 @@ training_jobs = {}
 # Old chunking functions removed - now using AudioSegmenter for all STT processing
 
 async def copy_model_to_tts_service(job_id: str, model_name: str, onnx_path: Path):
-    """Copy trained model to TTS service custom models directory"""
+    """Copy a trained ONNX model to the shared volume so PiperTTS picks it up."""
     import shutil
 
     # PiperTTS scans /app/models/custom/{voice_name}/{voice_name}.onnx + .json
@@ -141,36 +161,29 @@ async def copy_model_to_tts_service(job_id: str, model_name: str, onnx_path: Pat
             raise e
 
 async def notify_tts_service_new_model(model_name: str, onnx_path: Path):
-    """Notify TTS service about new model via HTTP API"""
-    
-    # Read the model file
+    """Upload a model to the TTS service via its HTTP API (fallback path)."""
+
     async with aiofiles.open(onnx_path, 'rb') as f:
         model_data = await f.read()
-    
-    # Send to TTS service using requests in a thread
-    def upload_model():
-        tts_service_url = "http://piper-tts-service:5000"
-        
-        files = {
-            'model_file': (f"{model_name}.onnx", model_data, 'application/octet-stream')
-        }
-        data = {
-            'model_name': model_name
-        }
-        
-        response = requests.post(f"{tts_service_url}/upload_model", files=files, data=data, timeout=30)
-        if response.status_code == 200:
-            logger.info(f"Successfully uploaded model {model_name} to TTS service")
-        else:
-            raise Exception(f"Failed to upload model: {response.status_code} - {response.text}")
-    
-    # Run in thread pool to avoid blocking
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, upload_model)
+
+    tts_service_url = "http://piper-tts-service:5000"
+    async with aiohttp.ClientSession() as session:
+        form = aiohttp.FormData()
+        form.add_field('model_file', model_data,
+                        filename=f"{model_name}.onnx",
+                        content_type='application/octet-stream')
+        form.add_field('model_name', model_name)
+        async with session.post(f"{tts_service_url}/upload_model", data=form,
+                                timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            if resp.status == 200:
+                logger.info(f"Successfully uploaded model {model_name} to TTS service")
+            else:
+                body = await resp.text()
+                raise Exception(f"Failed to upload model: {resp.status} - {body}")
 
 @app.on_event("startup")
 async def restore_interrupted_jobs():
-    """On startup, scan checkpoints/ for jobs interrupted by a container restart."""
+    """Scan checkpoints/ for jobs interrupted by a container restart and restore them."""
     checkpoints_root = Path("checkpoints")
     if not checkpoints_root.exists():
         return
@@ -203,15 +216,17 @@ async def restore_interrupted_jobs():
 
 @app.get("/")
 async def root():
+    """Root endpoint — service identity."""
     return {"service": "PiperTTS Training Service", "status": "ready", "version": "1.0.0"}
 
 @app.get("/health")
 async def health():
+    """Liveness / readiness probe."""
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
 @app.post("/restore-backup")
 async def restore_backup():
-    """Restore backed up training data"""
+    """Restore training data from a local backup directory."""
     try:
         # Check if backup exists in current directory
         backup_dir = Path("./backup_stst_data")
@@ -230,7 +245,7 @@ async def restore_backup():
 
 @app.post("/generate-missing-mels")
 async def generate_missing_mels(model_name: str = "stst"):
-    """Generate missing mel spectrograms for existing audio files"""
+    """Generate mel spectrograms for audio files that are missing them."""
     try:
         dataset_dir = Path(f"data/{model_name}")
         audio_dir = dataset_dir / "audio"
@@ -280,23 +295,23 @@ async def generate_missing_mels(model_name: str = "stst"):
 
 @app.post("/process-audio")
 async def process_audio(request: AudioProcessingRequest):
-    """Process long audio file using STT service for segmentation and transcription"""
+    """Process a long audio file via the STT service for segmentation and transcription."""
     try:
-        # Call STT service to segment and transcribe audio
-        stt_response = requests.post(
-            f"{request.stt_service_url}/segment",
-            json={
-                "audio_url": request.audio_file_url,
-                "language": request.language,
-                "min_segment_length": 2.0,
-                "max_segment_length": 10.0
-            }
-        )
-        
-        if stt_response.status_code != 200:
-            raise HTTPException(status_code=500, detail=f"STT service error: {stt_response.text}")
-        
-        stt_data = stt_response.json()
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{request.stt_service_url}/segment",
+                json={
+                    "audio_url": request.audio_file_url,
+                    "language": request.language,
+                    "min_segment_length": 2.0,
+                    "max_segment_length": 10.0,
+                },
+                timeout=aiohttp.ClientTimeout(total=120),
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    raise HTTPException(status_code=500, detail=f"STT service error: {body}")
+                stt_data = await resp.json()
         
         # Convert STT segments to training segments
         segments = []
@@ -327,7 +342,7 @@ async def process_audio(request: AudioProcessingRequest):
 
 @app.post("/prepare-dataset")
 async def prepare_dataset(dataset: DatasetUpload):
-    """Prepare dataset from STT segments"""
+    """Create a training dataset from pre-segmented STT results."""
     try:
         dataset_path = await data_processor.prepare_dataset(
             segments=dataset.segments,
@@ -346,7 +361,7 @@ async def test_upload(
     model_name: str = Form(...),
     audio_files: List[UploadFile] = File(...)
 ):
-    """Test endpoint for file upload without processing"""
+    """Dry-run upload — returns filenames and content types without processing."""
     try:
         return {
             "model_name": model_name,
@@ -626,24 +641,9 @@ async def run_stt_based_training(job_id: str,
             if temp_audio_dir.exists():
                 import shutil
                 shutil.rmtree(temp_audio_dir)
-        except:
-            pass
+        except OSError as cleanup_err:
+            logger.warning(f"Cleanup failed after training error: {cleanup_err}")
 
-# This is the old endpoint, which we are replacing with the one above.
-# @app.post("/train", response_model=TrainingStatus)
-# async def train_model(request: TrainingRequest, background_tasks: BackgroundTasks):
-#     """Initiate a new training job"""
-#     job_id = str(uuid.uuid4())
-#     background_tasks.add_task(
-#         training_pipeline.start_training,
-#         request=request,
-#         job_id=job_id,
-#         jobs_dict=training_jobs
-#     )
-#     return JSONResponse(
-#         status_code=202,
-#         content={"message": "Training started successfully", "job_id": job_id},
-#     )
 
 @app.post("/resume-training")
 async def resume_training(
@@ -722,6 +722,7 @@ async def resume_training(
     )
 
     async def _resume():
+        """Resume training in a background thread, then export the updated model."""
         await asyncio.to_thread(
             training_pipeline.train_sync,
             job_id=resumed_job_id,
@@ -893,6 +894,7 @@ async def _run_retrain_from_segments(
         lock = asyncio.Lock()
 
         async def transcribe_one(audio_path: Path):
+            """Transcribe one pre-segmented WAV clip and append valid results."""
             nonlocal completed
             async with sem:
                 try:
@@ -1010,7 +1012,7 @@ async def _run_retrain_from_segments(
 
 @app.post("/export/{job_id}")
 async def manual_export_model(job_id: str, model_name: str = Form(...)):
-    """Manually export and upload a completed training model"""
+    """Manually export a completed training checkpoint to ONNX and upload to PiperTTS."""
     try:
         # Check if checkpoint exists
         checkpoint_path = Path(f"checkpoints/{job_id}/final_model.pt")
@@ -1035,7 +1037,7 @@ async def manual_export_model(job_id: str, model_name: str = Form(...)):
 
 @app.delete("/model/{job_id}")
 async def delete_trained_model(job_id: str):
-    """Delete a trained model and all its associated files"""
+    """Delete a trained model and all associated files (checkpoint, export, dataset)."""
     try:
         import shutil
         
@@ -1086,32 +1088,37 @@ async def delete_trained_model(job_id: str):
         raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)}")
 
 async def remove_model_from_tts_service(model_name: str):
-    """Remove model from TTS service"""
+    """Tell the TTS service to remove a model via its HTTP API."""
     try:
         tts_service_url = "http://piper-tts-service:5000"
-        response = requests.delete(f"{tts_service_url}/voice/{model_name}", timeout=10)
-        if response.status_code == 200:
-            logger.info(f"Successfully removed model {model_name} from TTS service")
-        else:
-            logger.warning(f"TTS service response: {response.status_code} - {response.text}")
+        async with aiohttp.ClientSession() as session:
+            async with session.delete(
+                f"{tts_service_url}/voice/{model_name}",
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status == 200:
+                    logger.info(f"Successfully removed model {model_name} from TTS service")
+                else:
+                    body = await resp.text()
+                    logger.warning(f"TTS service response: {resp.status} - {body}")
     except Exception as e:
         logger.error(f"Could not contact TTS service: {e}")
 
 @app.get("/status/{job_id}")
 async def get_training_status(job_id: str):
-    """Get status of a training job"""
+    """Return the current status of a training job."""
     if job_id not in training_jobs:
         raise HTTPException(status_code=404, detail="Job not found")
     return training_jobs[job_id]
 
 @app.get("/jobs")
 async def list_jobs():
-    """List all training jobs"""
+    """List all training jobs (active and historical)."""
     return list(training_jobs.values())
 
 @app.get("/download/{job_id}")
 async def download_model(job_id: str):
-    """Download trained model files"""
+    """Download the exported ONNX model for a training job."""
     if job_id not in training_jobs:
         raise HTTPException(status_code=404, detail="Job not found")
     
@@ -1127,7 +1134,7 @@ async def download_model(job_id: str):
 
 @app.delete("/job/{job_id}")
 async def cancel_training(job_id: str):
-    """Cancel a training job"""
+    """Request cancellation of a running training job."""
     if job_id not in training_jobs:
         raise HTTPException(status_code=404, detail="Job not found")
     
@@ -1140,7 +1147,7 @@ async def cancel_training(job_id: str):
     return {"message": "Training job cancelled"}
 
 async def run_training(job_id: str, request: TrainingRequest):
-    """Background task to run training"""
+    """Background task: run VITS training then export the model."""
     try:
         training_jobs[job_id].status = "training"
         training_jobs[job_id].message = "Training in progress..."
@@ -1179,8 +1186,7 @@ async def run_training(job_id: str, request: TrainingRequest):
         logger.error(f"Training error for {job_id}: {e}")
 
 def update_training_status(job_id: str, update: dict):
-    """Update training status. Returns the current job status for cancellation checks."""
-    import math
+    """Apply a training-loop status update to the in-memory job record."""
     if job_id in training_jobs:
         if 'check_status' in update:
             return training_jobs[job_id]

@@ -1,12 +1,18 @@
+"""Qwen3-TTS text-to-speech and voice-cloning service.
+
+Supports multiple Qwen3-TTS model variants (Base, CustomVoice, VoiceDesign)
+with a persistent voice library for saved speaker embeddings.
+"""
+
 import os
 import io
 import gc
 import json
 import re
 import time
-import uuid
 import subprocess
 import tempfile
+import logging
 from pathlib import Path
 
 import torch
@@ -20,15 +26,24 @@ from pydantic import BaseModel
 from typing import Optional
 import uvicorn
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 app = FastAPI(
     title="Qwen3-TTS Service",
     description="Text-to-Speech and Voice Cloning using Qwen3-TTS"
 )
 
+allowed_origins_str = os.getenv("ALLOWED_ORIGINS", "*")
+allowed_origins = [origin.strip() for origin in allowed_origins_str.split(",")] if allowed_origins_str else ["*"]
+allow_credentials = os.getenv("ALLOW_CREDENTIALS", "false").strip().lower() in {"1", "true", "yes", "on"}
+if "*" in allowed_origins and allow_credentials:
+    allow_credentials = False
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=allowed_origins,
+    allow_credentials=allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -84,7 +99,7 @@ BUILTIN_SPEAKERS = [
 
 
 def load_model(model_name=None):
-    """Load a Qwen3-TTS model by name. Unloads the current model first if switching."""
+    """Load a Qwen3-TTS model by name.  Unloads the previous model first if switching."""
     global tts_model, model_loaded, current_model_name
 
     if model_name is None:
@@ -96,7 +111,7 @@ def load_model(model_name=None):
 
     # Unload previous model
     if tts_model is not None:
-        print(f"Unloading current model: {current_model_name}")
+        logger.info(f"Unloading current model: {current_model_name}")
         del tts_model
         tts_model = None
         model_loaded = False
@@ -105,7 +120,7 @@ def load_model(model_name=None):
             torch.cuda.empty_cache()
         gc.collect()
 
-    print(f"Loading Qwen3-TTS model: {model_name}")
+    logger.info(f"Loading Qwen3-TTS model: {model_name}")
     try:
         from qwen_tts import Qwen3TTSModel
 
@@ -114,7 +129,7 @@ def load_model(model_name=None):
             import flash_attn  # noqa: F401
         except ImportError:
             attn_impl = "sdpa"
-            print("flash-attn not available, using SDPA attention")
+            logger.info("flash-attn not available, using SDPA attention")
 
         tts_model = Qwen3TTSModel.from_pretrained(
             model_name,
@@ -124,15 +139,15 @@ def load_model(model_name=None):
         )
         model_loaded = True
         current_model_name = model_name
-        print(f"Qwen3-TTS model '{model_name}' loaded on {device}")
+        logger.info(f"Qwen3-TTS model '{model_name}' loaded on {device}")
     except Exception as e:
-        print(f"Failed to load Qwen3-TTS model: {e}")
+        logger.error(f"Failed to load Qwen3-TTS model: {e}", exc_info=True)
         raise
     return tts_model
 
 
 def get_model():
-    """Load or return cached Qwen3-TTS model."""
+    """Return the currently-loaded model, loading the default if needed."""
     if tts_model is None:
         return load_model()
     return tts_model
@@ -144,11 +159,12 @@ async def startup():
     try:
         get_model()
     except Exception as e:
-        print(f"Warning: Could not preload model: {e}")
+        logger.warning(f"Could not preload model: {e}")
 
 
 @app.get("/health")
 async def health():
+    """Basic liveness / readiness probe."""
     return {
         "status": "ok",
         "model_loaded": model_loaded,
@@ -158,6 +174,7 @@ async def health():
 
 @app.get("/status")
 async def status():
+    """Return detailed service status including GPU memory and loaded model."""
     status_info = {
         "status": "ok",
         "device": device,
@@ -185,6 +202,8 @@ async def list_models():
 
 
 class LoadModelRequest(BaseModel):
+    """Request body for switching the active Qwen3-TTS model."""
+
     model: str
 
 
@@ -233,7 +252,7 @@ async def _auto_transcribe(audio_path: str, filename: str = "audio.wav") -> dict
     """Auto-transcribe an audio file using the Qwen3-ASR service.
     Returns full response dict with text, segments, duration."""
     try:
-        print(f"Auto-transcribing reference audio via Qwen3-ASR: {filename}")
+        logger.info(f"Auto-transcribing reference audio via Qwen3-ASR: {filename}")
         async with httpx.AsyncClient(timeout=60.0) as client:
             with open(audio_path, "rb") as f:
                 response = await client.post(
@@ -243,13 +262,13 @@ async def _auto_transcribe(audio_path: str, filename: str = "audio.wav") -> dict
             if response.status_code == 200:
                 data = response.json()
                 text = data.get("text", "").strip()
-                print(f"Auto-transcription result: '{text[:100]}...'")
+                logger.info(f"Auto-transcription result: '{text[:100]}...'")
                 return data
             else:
-                print(f"Auto-transcription failed: HTTP {response.status_code}")
+                logger.warning(f"Auto-transcription failed: HTTP {response.status_code}")
                 return {}
     except Exception as e:
-        print(f"Auto-transcription error: {e}")
+        logger.warning(f"Auto-transcription error: {e}")
         return {}
 
 
@@ -266,7 +285,7 @@ def _trim_audio_segment(input_path: str, start: float, end: float, output_path: 
         result = subprocess.run(cmd, capture_output=True, timeout=30)
         return result.returncode == 0 and os.path.exists(output_path)
     except Exception as e:
-        print(f"ffmpeg trim error: {e}")
+        logger.warning(f"ffmpeg trim error: {e}")
         return False
 
 
@@ -298,11 +317,18 @@ VOICES_DIR = Path(os.getenv("VOICES_DIR", "/app/voices"))
 VOICES_DIR.mkdir(parents=True, exist_ok=True)
 
 
+_SAFE_VOICE_RE = re.compile(r"^[a-zA-Z0-9_\-]+$")
+
+
 def _voice_dir(voice_id: str) -> Path:
+    """Return the directory for a voice, validating the id to prevent path traversal."""
+    if not _SAFE_VOICE_RE.match(voice_id):
+        raise HTTPException(status_code=400, detail="Invalid voice id")
     return VOICES_DIR / voice_id
 
 
 def _load_voice_metadata(voice_id: str) -> dict:
+    """Read the metadata.json for a saved voice, or return ``{}``."""
     meta_path = _voice_dir(voice_id) / "metadata.json"
     if meta_path.exists():
         return json.loads(meta_path.read_text())
@@ -344,7 +370,7 @@ def _load_voice_prompt(voice_id: str):
 
 
 def _list_voices() -> list:
-    """List all saved voices."""
+    """List all saved voice profiles with their metadata."""
     voices = []
     if not VOICES_DIR.exists():
         return voices
@@ -395,7 +421,7 @@ def _generate_chunks(model, sentences: list[str], language: str, voice_clone_pro
     prompts = [prompt_item] * len(sentences)
     langs = [language] * len(sentences)
 
-    print(f"  Generating {len(sentences)} sentences in batch mode...")
+    logger.info(f"  Generating {len(sentences)} sentences in batch mode...")
     start = time.time()
     wavs, sr = model.generate_voice_clone(
         text=sentences,
@@ -403,7 +429,7 @@ def _generate_chunks(model, sentences: list[str], language: str, voice_clone_pro
         voice_clone_prompt=prompts,
     )
     elapsed = time.time() - start
-    print(f"  Batch generation done in {elapsed:.2f}s")
+    logger.info(f"  Batch generation done in {elapsed:.2f}s")
 
     # Concatenate with gaps
     all_audio = []
@@ -465,7 +491,7 @@ async def save_voice(
                 audio_path = trimmed_path
                 segment_text = best.get("text", ref_text)
                 dur = best["end"] - best["start"]
-                print(f"Trimmed reference to {dur:.1f}s segment: '{segment_text[:60]}...'")
+                logger.info(f"Trimmed reference to {dur:.1f}s segment: '{segment_text[:60]}...'")
 
         # Extract speaker embedding (x_vector_only for fast TTS)
         prompt_items = model.create_voice_clone_prompt(
@@ -486,7 +512,7 @@ async def save_voice(
         })
 
         elapsed = time.time() - start_time
-        print(f"Voice '{name}' saved as '{voice_id}' in {elapsed:.1f}s")
+        logger.info(f"Voice '{name}' saved as '{voice_id}' in {elapsed:.1f}s")
 
         return {
             "status": "ok",
@@ -499,7 +525,7 @@ async def save_voice(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Save voice error: {e}")
+        logger.error(f"Save voice error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         _cleanup_temp(tmp_path)
@@ -540,7 +566,7 @@ async def tts_with_saved_voice(
         start_time = time.time()
 
         sentences = _split_sentences(text)
-        print(f"Saved-voice TTS: {len(sentences)} chunks for voice={voice_id}")
+        logger.info(f"Saved-voice TTS: {len(sentences)} chunks for voice={voice_id}")
 
         if len(sentences) > 1:
             audio, sr = _generate_chunks(model, sentences, lang, [prompt_item])
@@ -555,7 +581,7 @@ async def tts_with_saved_voice(
 
         generation_time = time.time() - start_time
         audio_duration = len(audio) / sr
-        print(f"Saved-voice TTS done in {generation_time:.2f}s ({audio_duration:.1f}s audio, voice={voice_id})")
+        logger.info(f"Saved-voice TTS done in {generation_time:.2f}s ({audio_duration:.1f}s audio, voice={voice_id})")
 
         buffer = io.BytesIO()
         sf.write(buffer, audio, sr, format="WAV")
@@ -578,11 +604,13 @@ async def tts_with_saved_voice(
         )
 
     except Exception as e:
-        print(f"Saved-voice TTS error: {e}")
+        logger.error(f"Saved-voice TTS error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
 class TTSRequest(BaseModel):
+    """Request body for built-in-speaker speech synthesis."""
+
     text: str
     lang: str = "English"
     speaker: str = "Vivian"
@@ -618,7 +646,7 @@ async def text_to_speech(request: TTSRequest):
             )
 
         generation_time = time.time() - start_time
-        print(f"TTS generated in {generation_time:.2f}s")
+        logger.info(f"TTS generated in {generation_time:.2f}s")
 
         # Convert to WAV bytes
         buffer = io.BytesIO()
@@ -641,8 +669,10 @@ async def text_to_speech(request: TTSRequest):
             },
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"TTS error: {e}")
+        logger.error(f"TTS error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -680,13 +710,13 @@ async def clone_voice(
             tmp.write(content)
             tmp_path = tmp.name
 
-        print(f"Voice clone request: text='{text[:50]}...', lang={lang}, ref={file.filename}")
+        logger.info(f"Voice clone request: text='{text[:50]}...', lang={lang}, ref={file.filename}")
 
         # Auto-transcribe the reference audio using Qwen3-ASR
         asr_result = await _auto_transcribe(tmp_path, file.filename or "reference.wav")
         ref_text = asr_result.get("text", "").strip() if asr_result else ""
         if not ref_text:
-            print("Auto-transcription returned empty, trying clone without ref_text")
+            logger.info("Auto-transcription returned empty, trying clone without ref_text")
 
         # Extract speaker embedding first (fast), then use it for chunked generation
         try:
@@ -707,7 +737,7 @@ async def clone_voice(
 
         # Chunked generation for long texts
         sentences = _split_sentences(text)
-        print(f"Voice clone: {len(sentences)} chunks, ref={file.filename}")
+        logger.info(f"Voice clone: {len(sentences)} chunks, ref={file.filename}")
 
         try:
             if len(sentences) > 1:
@@ -732,7 +762,7 @@ async def clone_voice(
 
         generation_time = time.time() - start_time
         audio_duration = len(audio) / sr
-        print(f"Voice clone done in {generation_time:.2f}s ({audio_duration:.1f}s audio)")
+        logger.info(f"Voice clone done in {generation_time:.2f}s ({audio_duration:.1f}s audio)")
 
         # Convert to WAV
         buffer = io.BytesIO()
@@ -756,8 +786,10 @@ async def clone_voice(
             },
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Voice clone error: {e}")
+        logger.error(f"Voice clone error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         _cleanup_temp(tmp_path)
@@ -798,7 +830,7 @@ async def clone_voice_with_ref_text(
         )
 
         generation_time = time.time() - start_time
-        print(f"High-quality voice clone generated in {generation_time:.2f}s")
+        logger.info(f"High-quality voice clone generated in {generation_time:.2f}s")
 
         buffer = io.BytesIO()
         sf.write(buffer, np.array(wavs[0]), sr, format="WAV")
@@ -818,14 +850,18 @@ async def clone_voice_with_ref_text(
             },
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"High-quality clone error: {e}")
+        logger.error(f"High-quality clone error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         _cleanup_temp(tmp_path)
 
 
 class VoiceDesignRequest(BaseModel):
+    """Request body for text-guided voice design synthesis."""
+
     text: str
     voice_description: str
     lang: str = "English"
@@ -860,7 +896,7 @@ async def voice_design(request: VoiceDesignRequest):
             )
 
         generation_time = time.time() - start_time
-        print(f"Voice design generated in {generation_time:.2f}s")
+        logger.info(f"Voice design generated in {generation_time:.2f}s")
 
         buffer = io.BytesIO()
         sf.write(buffer, np.array(wavs[0]), sr, format="WAV")
@@ -884,7 +920,7 @@ async def voice_design(request: VoiceDesignRequest):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Voice design error: {e}")
+        logger.error(f"Voice design error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 

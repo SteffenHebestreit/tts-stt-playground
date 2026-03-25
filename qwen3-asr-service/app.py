@@ -1,8 +1,12 @@
+"""Qwen3-ASR speech-to-text service.
+
+Uses the Qwen3-ASR-1.7B model for fast multilingual automatic speech
+recognition with segment-level timestamps.  Supports CUDA, ROCm, and CPU.
+"""
+
 import os
 import time
-import uuid
 import tempfile
-import json
 import logging
 from pathlib import Path
 
@@ -10,7 +14,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 import torch
-import numpy as np
 import librosa
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import JSONResponse
@@ -22,10 +25,16 @@ app = FastAPI(
     description="Speech-to-Text using Qwen3-ASR with multilingual support"
 )
 
+allowed_origins_str = os.getenv("ALLOWED_ORIGINS", "*")
+allowed_origins = [origin.strip() for origin in allowed_origins_str.split(",")] if allowed_origins_str else ["*"]
+allow_credentials = os.getenv("ALLOW_CREDENTIALS", "false").strip().lower() in {"1", "true", "yes", "on"}
+if "*" in allowed_origins and allow_credentials:
+    allow_credentials = False
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=allowed_origins,
+    allow_credentials=allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -44,7 +53,7 @@ model_loaded = False
 
 
 async def _save_upload(upload: UploadFile) -> tuple[str, bytes]:
-    """Save an uploaded file to a temp path. Returns (tmp_path, content_bytes)."""
+    """Save an uploaded file to a temp path and return ``(tmp_path, raw_bytes)``."""
     suffix = Path(upload.filename).suffix if upload.filename else ".wav"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         content = await upload.read()
@@ -53,7 +62,7 @@ async def _save_upload(upload: UploadFile) -> tuple[str, bytes]:
 
 
 def get_model():
-    """Load or return cached Qwen3-ASR model."""
+    """Load or return the cached Qwen3-ASR model (lazy singleton)."""
     global asr_model, model_loaded
     if asr_model is None:
         logger.info("Loading Qwen3-ASR model...")
@@ -99,6 +108,7 @@ async def startup():
 
 @app.get("/health")
 async def health():
+    """Basic liveness / readiness probe."""
     return {
         "status": "ok",
         "model_loaded": model_loaded,
@@ -108,6 +118,7 @@ async def health():
 
 @app.get("/status")
 async def status():
+    """Return detailed service status including GPU memory information."""
     status_info = {
         "status": "ok",
         "service": "Qwen3-ASR",
@@ -247,7 +258,7 @@ async def transcribe_batch(
     audios: list[UploadFile] = File(...),
     language: str = Form("auto"),
 ):
-    """Batch transcribe multiple audio files."""
+    """Batch-transcribe multiple audio files, returning per-file results."""
     model = get_model()
     results = []
 

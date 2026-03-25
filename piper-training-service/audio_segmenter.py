@@ -1,3 +1,5 @@
+"""FFmpeg-based audio segmentation driven by STT timestamps."""
+
 import asyncio
 import subprocess
 import json
@@ -31,6 +33,7 @@ class AudioSegmenter:
     """Segments audio files using ffmpeg based on STT timestamps."""
 
     def __init__(self):
+        """Initialise the segmenter and resolve the ffmpeg executable."""
         self.ffmpeg_path = self._find_ffmpeg()
 
     def _find_ffmpeg(self) -> str:

@@ -1,3 +1,9 @@
+"""Speech-to-Text service powered by faster-whisper.
+
+Supports CUDA, ROCm, and CPU backends with automatic hardware detection.
+Provides batch transcription, streaming SSE, and language detection endpoints.
+"""
+
 from fastapi import FastAPI, UploadFile, HTTPException, File, Form
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -41,7 +47,7 @@ app.add_middleware(
 executor = ThreadPoolExecutor(max_workers=os.cpu_count())
 
 def clean_json_inf_nan(data):
-    """Recursively clean a data structure, replacing float inf/NaN with None."""
+    """Recursively replace float inf/NaN with ``None`` so JSON serialisation succeeds."""
     if isinstance(data, dict):
         return {k: clean_json_inf_nan(v) for k, v in data.items()}
     elif isinstance(data, list):
@@ -53,8 +59,9 @@ def clean_json_inf_nan(data):
     return data
 
 class SafeJSONResponse(JSONResponse):
-    """JSONResponse subclass that handles NaN/Infinity values."""
+    """JSONResponse that sanitises NaN/Infinity before encoding."""
     def render(self, content: Any) -> bytes:
+        """Serialise JSON after normalising unsupported float values."""
         return json.dumps(
             clean_json_inf_nan(content),
             ensure_ascii=False,
@@ -65,7 +72,7 @@ class SafeJSONResponse(JSONResponse):
 
 # Hardware detection and optimization (re-check after startup)
 def detect_hardware():
-    """Detect and configure hardware acceleration"""
+    """Auto-detect the best compute device (CUDA > ROCm > CPU) and return ``(device, compute_type)``."""
     import torch
 
     force_accel = os.getenv("FORCE_ACCELERATION", "").lower()
@@ -119,13 +126,13 @@ model_loaded = False
 model_size_loaded = None
 
 def ensure_hardware_detected():
-    """Ensure hardware detection has been run"""
+    """Run hardware detection once (lazy initialisation)."""
     global device, compute_type
     if device is None:
         device, compute_type = detect_hardware()
 
 def load_model():
-    """Load Whisper model with fallback"""
+    """Load the Whisper model, falling back to CPU int8 on failure."""
     global whisper_model, model_loaded, model_size_loaded
     
     # Ensure hardware is detected first
@@ -168,10 +175,12 @@ def load_model():
 # Load model on startup
 @app.on_event("startup")
 async def startup_event():
+    """Load the Whisper model when the service starts."""
     load_model()
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    """Release executor resources during shutdown."""
     logger.info("Shutting down thread pool executor...")
     executor.shutdown(wait=False)
 
@@ -180,7 +189,7 @@ async def shutdown_event():
 async def transcribe_audio(
     # Accept either a single file (legacy) or multiple files (batch)
     audio: UploadFile = File(None),
-    audios: List[UploadFile] = File(None),  # client can send multiple 'audios' fields or 'audio'
+    audios: List[UploadFile] = File(None),
     task: str = Form("transcribe"),
     language: str = Form("auto"),
     beam_size: int = Form(5),
@@ -195,7 +204,11 @@ async def transcribe_audio(
     vad_filter: bool = Form(True),
     vad_threshold: float = Form(0.5),
 ):
-    """Transcribe audio file to text"""
+    """Transcribe one or more audio files to text.
+
+    Supports single-file (``audio``) and multi-file (``audios``) uploads.
+    Returns per-file results with segments, language, and timing information.
+    """
     logger.info(f"Transcription request - task: {task}, language: {language}")
     
     try:
@@ -358,11 +371,16 @@ async def transcribe_audio(
         }
         return JSONResponse(content=batch_response)
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Transcription error: {str(e)}", exc_info=True)
-        # Clean up temp file if it exists
-        if 'temp_audio_path' in locals() and os.path.exists(temp_audio_path):
-            os.unlink(temp_audio_path)
+        # Clean up any temp file left behind
+        try:
+            if 'temp_audio_path' in locals() and os.path.exists(temp_audio_path):
+                os.unlink(temp_audio_path)
+        except OSError:
+            pass
         raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
 
 @app.post("/transcribe-stream")
@@ -376,7 +394,7 @@ async def transcribe_audio_stream(
     vad_threshold: float = Form(0.5),
     no_speech_threshold: float = Form(0.6),
 ):
-    """Stream transcription results as they become available"""
+    """Stream transcription results via Server-Sent Events as segments are decoded."""
     if not model_loaded:
         raise HTTPException(status_code=503, detail="Whisper model not loaded")
     
@@ -395,15 +413,16 @@ async def transcribe_audio_stream(
         raise HTTPException(status_code=500, detail="Failed to process uploaded file.")
 
     async def generate_transcription():
-        """Generator function for streaming transcription"""
+        """SSE generator that yields transcription segments as JSON events."""
+        effective_target_lang = target_language  # capture outer scope value
         try:
             logger.info(f"[{req_id}] /transcribe-stream request received: filename={audio.filename}, content_type={audio.content_type}, language={language}, task={task}")
             logger.info(f"[{req_id}] Uploaded audio size: {len(audio_content)} bytes")
             
             # For translation task, ensure target language is supported
-            if task == "translate" and target_language.lower() not in ["english", "en"]:
-                yield f"data: {json.dumps({'warning': f'Translation to {target_language} not supported, using English'})}\n\n"
-                target_language = "english"
+            if task == "translate" and effective_target_lang.lower() not in ["english", "en"]:
+                yield f"data: {json.dumps({'warning': f'Translation to {effective_target_lang} not supported, using English'})}\n\n"
+                effective_target_lang = "english"
             
             # Start transcription
             yield f"data: {json.dumps({'status': 'processing', 'task': task})}\n\n"
@@ -411,6 +430,7 @@ async def transcribe_audio_stream(
             
             # Run transcription in executor to avoid blocking
             def run_transcription():
+                """Execute the blocking whisper transcription call inside a thread."""
                 return whisper_model.transcribe(
                     tmp_file_path,
                     beam_size=beam_size,
@@ -440,7 +460,7 @@ async def transcribe_audio_stream(
                 "task": task
             }
             if task == "translate":
-                metadata["target_language"] = target_language
+                metadata["target_language"] = effective_target_lang
             
             yield f"data: {json.dumps(clean_json_inf_nan({'metadata': metadata}))}\n\n"
             
@@ -495,7 +515,7 @@ ENGLISH_ONLY_MODELS = {"tiny.en", "base.en", "small.en", "medium.en", "distil-la
 
 @app.get("/health", response_class=SafeJSONResponse)
 async def health_check():
-    """Health check endpoint"""
+    """Return model, device, and readiness information for health monitoring."""
     current_model = model_size_loaded or os.getenv("WHISPER_MODEL_SIZE", "large-v3")
     return {
         "status": "ok",
@@ -510,7 +530,7 @@ async def health_check():
 
 @app.get("/info", response_class=SafeJSONResponse)
 async def service_info():
-    """Service information endpoint"""
+    """Return detailed service and GPU information."""
     return {
         "service": "STT Service",
         "device": device,
@@ -525,7 +545,7 @@ async def service_info():
 
 @app.get("/models")
 async def available_models():
-    """List available Whisper models"""
+    """List Whisper model variants with size and multilingual capability."""
     return {
         "available_models": [
             {"name": "tiny",            "multilingual": True,  "size_mb": 75},
@@ -556,7 +576,7 @@ async def available_models():
 
 @app.get("/tasks")
 async def available_tasks():
-    """Get information about available transcription tasks"""
+    """Describe the supported transcription tasks (transcribe / translate)."""
     return {
         "available_tasks": [
             {
@@ -591,9 +611,9 @@ async def available_tasks():
 @app.post("/detect_language")
 async def detect_language(
     file: UploadFile = File(...),
-    duration_limit: float = 30.0  # Only analyze first 30 seconds for speed
+    duration_limit: float = 30.0,
 ):
-    """Detect the language of an audio file quickly"""
+    """Quickly detect the spoken language and return a sample transcript."""
     if not model_loaded or whisper_model is None:
         logger.error("Model not loaded, attempting to load...")
         load_model()

@@ -255,18 +255,33 @@ Use smaller models (`WHISPER_MODEL_SIZE=small`, `WHISPER_MODEL=small`) to improv
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | POST | `/train` | Start training (`model_name`, `language`, `audio_files`) |
+| POST | `/resume-training` | Resume interrupted training from checkpoint |
+| POST | `/train-from-dataset` | Train from an already-prepared dataset |
+| POST | `/retrain-from-segments` | Re-transcribe existing clips and retrain |
+| POST | `/process-audio` | Segment/transcribe audio via STT |
+| POST | `/prepare-dataset` | Create dataset from STT segments |
+| POST | `/generate-missing-mels` | Regenerate missing mel spectrograms |
+| POST | `/export/{job_id}` | Export model to ONNX |
 | GET | `/status/{job_id}` | Training progress |
 | GET | `/jobs` | List all training jobs |
-| POST | `/export/{job_id}` | Export model to ONNX |
 | GET | `/download/{job_id}` | Download trained model |
 | DELETE | `/job/{job_id}` | Cancel training job |
-| DELETE | `/model/{job_id}` | Delete trained model |
+| DELETE | `/model/{job_id}` | Delete trained model and data |
 
 ### Qwen3-TTS (port 5004)
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | POST | `/tts` | Generate speech with built-in speaker |
 | POST | `/clone` | Clone voice from audio sample |
+| POST | `/clone-with-ref-text` | Clone voice with manual reference transcript |
+| POST | `/voice_design` | Design voice via text description |
+| POST | `/voices/save` | Save a voice profile from reference audio |
+| POST | `/voices/{voice_id}/tts` | Synthesise with a saved voice |
+| DELETE | `/voices/{voice_id}` | Delete a saved voice |
+| GET | `/voices` | List saved voice profiles |
+| GET | `/speakers` | List built-in speakers |
+| GET | `/models` | List available model variants |
+| POST | `/load_model` | Switch to a different model variant |
 | GET | `/status` | Model and GPU status |
 | GET | `/health` | Health check |
 
@@ -274,7 +289,9 @@ Use smaller models (`WHISPER_MODEL_SIZE=small`, `WHISPER_MODEL=small`) to improv
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | POST | `/transcribe` | Transcribe audio |
+| POST | `/transcribe-batch` | Batch-transcribe multiple files |
 | POST | `/detect_language` | Detect language |
+| GET | `/status` | Detailed GPU and model info |
 | GET | `/health` | Health check |
 
 ---
@@ -296,6 +313,7 @@ Copy `.env.example` to `.env` and adjust as needed.
 | `QWEN3_TTS_MODEL` | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | Qwen3 TTS model ID |
 | `QWEN3_ASR_MODEL` | `Qwen/Qwen3-ASR-1.7B` | Qwen3 ASR model ID |
 | `ALLOWED_ORIGINS` | `*` | CORS allowed origins (set explicitly in production) |
+| `ALLOW_CREDENTIALS` | `false` | Enables CORS credentials only when origins are explicit |
 | `STT_SERVICE_URL` | `http://stt-service:8000` | STT endpoint used by Piper Training for audio labelling |
 
 ---
@@ -422,3 +440,90 @@ docker compose restart stt-service
 ```
 
 All processing is local. No data is sent to external services.
+
+---
+
+## TrueNAS Deployment (RTX 5060 Ti 16 GB)
+
+This project supports deployment on a dedicated TrueNAS SCALE server with an
+NVIDIA RTX 5060 Ti (16 GB VRAM). Use the `docker-compose.truenas.yml` overlay
+for optimised GPU memory allocation.
+
+Use one of these env presets:
+
+- `.env.truenas.example`: balanced local-shell preset for a dedicated TrueNAS GPU host
+- `.env.truenas.production.example`: hostname-aware preset for browser access from another machine
+
+For a full deployment workflow, dataset layout, and profile strategy, see
+`docs/truenas-deployment.md`.
+For the first rollout, use `docs/truenas-custom-app-checklist.md`.
+For always-on versus training-window service recommendations, use
+`docs/truenas-service-profiles.md`.
+
+### Prerequisites
+
+1. **TrueNAS SCALE** with Docker/Compose support (Apps → Custom App or shell access)
+2. **NVIDIA drivers** installed (TrueNAS SCALE ships them for supported GPUs)
+3. **NVIDIA Container Toolkit** configured (`nvidia-ctk runtime configure`)
+4. Clone this repo to a dataset: `/mnt/pool/apps/tts-stt`
+
+### VRAM Budget (16 GB)
+
+| Service | Estimated VRAM | Notes |
+|---------|---------------:|-------|
+| STT (faster-whisper large-v3) | ~3 GB | Fits easily |
+| Qwen3-ASR-1.7B | ~4 GB | bfloat16 |
+| Qwen3-TTS-0.6B | ~3 GB | Default in `docker-compose.truenas.yml` |
+| Piper Training (VITS) | ~2–4 GB | Depends on batch size |
+
+> Running STT + Qwen3-ASR + Qwen3-TTS simultaneously uses roughly 10 to 11 GB,
+> leaving
+> headroom for training. Avoid running training concurrently with all three
+> inference services if you hit OOM.
+
+### Launch
+
+```bash
+cd /mnt/pool/apps/tts-stt
+
+# Balanced preset for local/direct host access
+cp .env.truenas.example .env
+
+# Or use the hostname-aware production preset
+# cp .env.truenas.production.example .env
+
+# Full stack with NVIDIA GPU
+docker compose --env-file .env -f docker-compose.yml -f docker-compose.truenas.yml --profile all up -d
+
+# Just STT + TTS (low VRAM)
+docker compose --env-file .env -f docker-compose.yml -f docker-compose.truenas.yml \
+  --profile stt --profile piper-tts up -d
+```
+
+### Persistent Storage
+
+Bind-mount a TrueNAS dataset so model caches survive container rebuilds:
+
+```
+/mnt/pool/apps/tts-stt/models  → /app/models          (PiperTTS, Training)
+/mnt/pool/apps/tts-stt/output  → /app/output           (PiperTTS)
+```
+
+Docker named volumes (`stt-cache`, `qwen3-tts-cache`, `qwen3-asr-cache`) are
+already defined in the base compose file — they persist automatically on TrueNAS.
+
+### Remote Browser Access
+
+If the frontend is opened from another machine on the network, do not leave the
+browser-facing URLs at `localhost`. Set `ALLOWED_ORIGINS` to the frontend origin
+and update the `BROWSER_TTS_URL`, `BROWSER_STT_URL`, `BROWSER_TRAINING_URL`,
+`BROWSER_QWEN3_ASR_URL`, and `BROWSER_QWEN3_TTS_URL` variables in `.env`.
+
+### Cleanup (optional)
+
+Remove leftover XTTS cache from an earlier version (requires root):
+
+```bash
+sudo rm -rf cache/tts cache/xtts-cache   # ~3.6 GB
+sudo rm -f models/luna.json models/luna.onnx  # old root-level export
+```

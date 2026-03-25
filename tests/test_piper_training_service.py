@@ -1,9 +1,8 @@
 """Tests for the Piper Training service."""
 
-import pytest
-
 
 def test_health(training_client):
+    """Health endpoint reports service readiness."""
     r = training_client.get("/health")
     assert r.status_code == 200
 
