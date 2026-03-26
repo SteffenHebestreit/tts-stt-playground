@@ -1,4 +1,4 @@
-"""Export a trained VITS checkpoint to ONNX with a Piper-compatible config."""
+"""Export a trained VITS checkpoint to ONNX with a runtime-compatible config bundle."""
 
 import torch
 from pathlib import Path
@@ -9,7 +9,7 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 class ModelExporter:
-    """Export trained checkpoints to Piper-compatible ONNX bundles."""
+    """Export trained checkpoints to ONNX bundles without deploying them."""
 
     def __init__(self):
         """Create the export directory used for generated model artifacts."""
@@ -17,7 +17,7 @@ class ModelExporter:
         self.export_dir.mkdir(exist_ok=True)
     
     async def export_to_onnx(self, job_id: str) -> Path:
-        """Export PyTorch model to ONNX format for Piper"""
+        """Export a training checkpoint to ONNX and write its companion config bundle."""
         
         checkpoint_path = Path(f"checkpoints/{job_id}/final_model.pt")
         if not checkpoint_path.exists():
@@ -126,30 +126,10 @@ class ModelExporter:
         del model
         gc.collect()
 
-        # Copy model to PiperTTS service if shared models directory exists
-        await self._copy_to_piper_service(job_id, onnx_path, config_path)
-
         logger.info(f"Model exported to: {onnx_path}")
         logger.info(f"Config saved to: {config_path}")
         
         return onnx_path
-    
-    async def _copy_to_piper_service(self, job_id: str, onnx_path: Path, config_path: Path):
-        """Copy exported model to PiperTTS service"""
-        try:
-            shared_models_dir = Path("/app/shared_models")
-            if shared_models_dir.exists():
-                piper_models_dir = shared_models_dir / "custom" / job_id
-                piper_models_dir.mkdir(parents=True, exist_ok=True)
-                
-                # Copy ONNX model
-                import shutil
-                shutil.copy2(onnx_path, piper_models_dir / f"{job_id}.onnx")
-                shutil.copy2(config_path, piper_models_dir / f"{job_id}.json")
-                
-                logger.info(f"Model copied to PiperTTS service: {piper_models_dir}")
-        except Exception as e:
-            logger.warning(f"Failed to copy model to PiperTTS service: {e}")
     
     def _load_config(self, job_id: str) -> dict:
         """Load training configuration"""

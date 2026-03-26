@@ -33,6 +33,11 @@ docker compose down
 
 Open **http://localhost:3000** for the web interface.
 
+## Developer Docs
+
+- [docs/developer-roadmap.md](docs/developer-roadmap.md) - planned architecture and migration steps for provider-generalization
+- [docs/provider-contracts.md](docs/provider-contracts.md) - provider registry schema and API contracts used by the frontend
+
 ---
 
 ## GPU Setup

@@ -44,6 +44,9 @@ services:
       PYTORCH_CUDA_ALLOC_CONF: ${TRAINING_PYTORCH_CUDA_ALLOC_CONF:-max_split_size_mb:1024}
       PYTHONUNBUFFERED: 1
       STT_SERVICE_URL: ${STT_SERVICE_URL:-http://stt-service:8000}
+      PIPER_TTS_SERVICE_URL: ${PIPER_TTS_SERVICE_URL:-http://piper-tts-service:5000}
+      SHARED_MODELS_DIR: ${SHARED_MODELS_DIR:-/app/shared_models}
+      DEFAULT_DEPLOYMENT_TARGET: ${DEFAULT_DEPLOYMENT_TARGET:-piper-volume}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
@@ -236,6 +239,7 @@ services:
       VOICE_TRAINING_URL: http://piper-training-service:8080
       QWEN3_TTS_SERVICE_URL: http://qwen3-tts-service:5004
       QWEN3_ASR_SERVICE_URL: http://qwen3-asr-service:5002
+      WHISPER_CPP_SERVICE_URL: ${WHISPER_CPP_SERVICE_URL:-http://whisper-cpp:8080}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
       # Browser-facing URLs (uses host ports for the browser to connect)
@@ -244,6 +248,7 @@ services:
       BROWSER_TRAINING_URL: ${BROWSER_TRAINING_URL:-http://localhost:${TRAINING_PORT:-8080}}
       BROWSER_QWEN3_TTS_URL: ${BROWSER_QWEN3_TTS_URL:-http://localhost:${QWEN3_TTS_PORT:-5004}}
       BROWSER_QWEN3_ASR_URL: ${BROWSER_QWEN3_ASR_URL:-http://localhost:${QWEN3_ASR_PORT:-5002}}
+      BROWSER_WHISPER_CPP_URL: ${BROWSER_WHISPER_CPP_URL:-http://localhost:${WHISPER_CPP_PORT:-5003}}
     volumes:
       - "./frontend-service/app.py:/app/app.py"
       - "./frontend-service/static:/app/static"

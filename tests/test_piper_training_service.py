@@ -15,6 +15,15 @@ def test_list_jobs(training_client):
     assert isinstance(data, list)
 
 
+def test_deployment_targets(training_client):
+    """Deployment target registry should be available."""
+    r = training_client.get("/deployment-targets")
+    assert r.status_code == 200
+    data = r.json()
+    assert "targets" in data
+    assert data["default_target"] in data["targets"]
+
+
 def test_train_requires_audio(training_client):
     """Starting training without audio files should fail."""
     r = training_client.post(

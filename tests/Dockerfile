@@ -1,10 +1,11 @@
 FROM python:3.11-slim
 
-WORKDIR /tests
+WORKDIR /workspace
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY tests/requirements.txt /tmp/test-requirements.txt
+RUN pip install --no-cache-dir -r /tmp/test-requirements.txt
 
-COPY . .
+COPY tests/ /workspace/tests/
+COPY frontend-service/ /workspace/frontend-service/
 
-ENTRYPOINT ["pytest", "-v", "--tb=short"]
+ENTRYPOINT ["pytest", "-v", "--tb=short", "/workspace/tests"]
