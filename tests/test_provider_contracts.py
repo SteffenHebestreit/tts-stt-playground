@@ -33,13 +33,11 @@ def test_frontend_provider_registry(frontend_client):
     assert "piper" in providers
     assert "whisper" in providers
     assert "qwen3-asr" in providers
-    assert "whisper-cpp" in providers
     assert ui.get("default_tts_provider") in providers
     assert ui.get("default_stt_provider") in providers
 
     assert providers["whisper"]["contracts"]["transcribe"] == "stt-form-v1"
     assert providers["qwen3-asr"]["contracts"]["transcribe"] == "stt-form-v1"
-    assert providers["whisper-cpp"]["contracts"]["transcribe"] == "openai-audio-transcriptions-v1"
     assert providers["piper"]["contracts"]["tts"] == "simple-json-tts-v1"
     assert providers["qwen3"]["contracts"]["tts"] == "simple-json-tts-v1"
     assert providers["qwen3"]["contracts"]["model_catalog"] == "model-catalog-v1"
@@ -56,10 +54,13 @@ def test_frontend_provider_registry(frontend_client):
     assert providers["piper"]["ui"]["messages"]["custom_voice_library"]["action_delete"] == "Delete"
     assert providers["piper"]["ui"]["messages"]["tts_generation"]["voice_auto_option"] == "Auto-Select Best Voice"
     assert providers["whisper"]["ui"]["messages"]["transcription"]["copy_success"] == "Transcription copied to clipboard"
-    assert providers["whisper-cpp"]["ui"]["messages"]["transcription"]["result_heading"] == "Transcription Result"
     assert providers["piper-training"]["ui"]["forms"]["start_training"]["fields"]["files"]["hint"] == "Recommended: 10+ minutes of high-quality speech data"
     assert providers["piper-training"]["ui"]["messages"]["start_training"]["progress"] == "Progress: {progress}% (Epoch {current_epoch}/{total_epochs})"
     assert providers["piper-training"]["ui"]["messages"]["model_list"]["empty"] == "No trained models found. Start training to create your first model!"
+
+    if "whisper-cpp" in providers:
+        assert providers["whisper-cpp"]["contracts"]["transcribe"] == "openai-audio-transcriptions-v1"
+        assert providers["whisper-cpp"]["ui"]["messages"]["transcription"]["result_heading"] == "Transcription Result"
 
 
 def test_frontend_normalizes_piper_voice_catalog(frontend_client):

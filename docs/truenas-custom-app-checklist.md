@@ -32,6 +32,8 @@ Recommended persistent paths:
 docker compose --env-file .env -f docker-compose.yml -f docker-compose.truenas.yml --profile all up -d
 ```
 
+If you want `whisper-cpp` visible in the frontend as an alternative STT backend, set `ENABLE_WHISPER_CPP=true` and add `--profile whisper-cpp` to that command.
+
 ## First Startup Validation
 
 Run these checks after the first deployment:

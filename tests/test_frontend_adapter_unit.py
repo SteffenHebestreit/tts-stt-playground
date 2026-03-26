@@ -19,11 +19,17 @@ def frontend_module():
     module = module_from_spec(spec)
 
     previous_cwd = os.getcwd()
+    previous_enable_whisper_cpp = os.environ.get("ENABLE_WHISPER_CPP")
     try:
+        os.environ["ENABLE_WHISPER_CPP"] = "true"
         os.chdir(app_path.parent)
         assert spec.loader is not None
         spec.loader.exec_module(module)
     finally:
+        if previous_enable_whisper_cpp is None:
+            os.environ.pop("ENABLE_WHISPER_CPP", None)
+        else:
+            os.environ["ENABLE_WHISPER_CPP"] = previous_enable_whisper_cpp
         os.chdir(previous_cwd)
 
     return module
@@ -48,6 +54,7 @@ def test_provider_registry_endpoint(frontend_test_client):
     assert data["providers"]["qwen3"]["contracts"]["model_selection"] == "model-selection-v1"
     assert data["providers"]["qwen3"]["contracts"]["runtime_status"] == "runtime-status-v1"
     assert data["providers"]["qwen3"]["contracts"]["voice_design"] == "voice-design-tts-v1"
+    assert data["providers"]["whisper-cpp"]["contracts"]["transcribe"] == "openai-audio-transcriptions-v1"
     assert data["providers"]["piper-training"]["contracts"]["training"] == "voice-training-job-v1"
     assert data["providers"]["piper-training"]["settings"]["defaults"]["batch_size"] == "32"
     assert data["ui"]["copy"]["stt_title"] == "Speech-to-Text"

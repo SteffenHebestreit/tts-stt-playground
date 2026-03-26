@@ -8,6 +8,34 @@ let currentTTSEngine = providerRegistry.ui?.default_tts_provider || 'piper';
 let trainingDeploymentRegistry = null;
 const qwen3ProviderId = 'qwen3';
 
+function removeOptionalProvider(providerId) {
+    if (providerRegistry.providers?.[providerId]) {
+        delete providerRegistry.providers[providerId];
+    }
+
+    const statusElement = document.getElementById(`service-status-${providerId}`);
+    if (statusElement) {
+        statusElement.remove();
+    }
+
+    const sttSelect = document.getElementById('stt-engine-select');
+    if (sttSelect) {
+        const option = sttSelect.querySelector(`option[value="${providerId}"]`);
+        if (option) {
+            option.remove();
+        }
+    }
+}
+
+function pruneOptionalProviders() {
+    if (!providerRegistry.ui?.enable_whisper_cpp) {
+        removeOptionalProvider('whisper-cpp');
+        if (providerRegistry.ui?.default_stt_provider === 'whisper-cpp') {
+            providerRegistry.ui.default_stt_provider = 'whisper';
+        }
+    }
+}
+
 function getProvider(providerId) {
     return providerRegistry.providers?.[providerId] || null;
 }
@@ -510,6 +538,7 @@ document.addEventListener('DOMContentLoaded', function() {
 
 /** Initialize UI widgets, voice lists, and background health polling. */
 function initializeApp() {
+    pruneOptionalProviders();
     applyGlobalCopy();
     applyTrainingProviderCopy();
     applyQwen3ProviderCopy();
@@ -2052,13 +2081,13 @@ async function deployExportedModel(jobId, modelName) {
 
         const result = await response.json();
         const deploymentResult = result.deployment || {};
-        const deploymentLabel = deploymentResult.target_label || getTrainingDeploymentLabel(deploymentResult.target || deploymentTarget);
+        const resolvedDeploymentLabel = deploymentResult.target_label || getTrainingDeploymentLabel(deploymentResult.target || deploymentTarget);
         showNotification(
             formatMessage(messages.deploy_success, {
                 model_name: modelName,
                 status: deploymentResult.status || 'ok',
-                deployment_target: deploymentLabel,
-            }) || `Model "${modelName}" deployment status: ${deploymentResult.status || 'ok'} on ${deploymentLabel}.`,
+                deployment_target: resolvedDeploymentLabel,
+            }) || `Model "${modelName}" deployment status: ${deploymentResult.status || 'ok'} on ${resolvedDeploymentLabel}.`,
             'success'
         );
 

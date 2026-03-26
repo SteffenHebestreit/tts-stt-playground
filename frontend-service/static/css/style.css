@@ -174,6 +174,27 @@ body {
     background: var(--accent);
     border: 1px solid var(--border);
     position: relative;
+    color: var(--text);
+    transition: background-color 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+}
+
+.service-indicator.healthy {
+    background: rgba(73, 199, 122, 0.12);
+    border-color: rgba(73, 199, 122, 0.4);
+    color: var(--success);
+}
+
+.service-indicator.error {
+    background: rgba(255, 106, 106, 0.12);
+    border-color: rgba(255, 106, 106, 0.4);
+    color: var(--error);
+}
+
+.service-indicator.loading {
+    background: rgba(245, 179, 1, 0.12);
+    border-color: rgba(245, 179, 1, 0.45);
+    color: var(--warning);
+    animation: status-blink 1s ease-in-out infinite;
 }
 
 .service-indicator.healthy::before {
@@ -563,7 +584,12 @@ input[type="range"]::-moz-range-thumb {
 }
 
 .loading {
-    animation: spin 1s linear infinite;
+    animation: none;
+}
+
+@keyframes status-blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.65; }
 }
 
 /* Responsive */

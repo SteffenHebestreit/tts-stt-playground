@@ -42,10 +42,13 @@ This repository now exposes a frontend provider registry that describes which se
     "default_tts_provider": "piper",
     "default_stt_provider": "whisper",
     "training_provider": "piper-training",
+    "enable_whisper_cpp": false,
     "copy": {}
   }
 }
 ```
+
+Optional providers may be omitted from the registry entirely. In the current frontend implementation, `whisper-cpp` is only registered when `ENABLE_WHISPER_CPP=true` is set for `frontend-service`.
 
 The `settings` object is intentionally provider-specific metadata for configurable UI defaults and allowed values. The frontend now uses it to drive service configuration controls such as language lists, quality levels, training defaults, and built-in speaker defaults.
 
@@ -349,6 +352,8 @@ Response:
 Used by:
 
 - `whisper-cpp`
+
+This contract family is optional in the default stack because the frontend only exposes `whisper-cpp` when `ENABLE_WHISPER_CPP=true`.
 
 Request:
 

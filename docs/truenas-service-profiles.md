@@ -25,6 +25,7 @@ Reasons:
 
 - `piper-training-service` competes for VRAM with the Qwen services
 - `whisper-cpp` is useful as an alternative STT backend, but not required if `stt-service` is already running
+- if you do enable `whisper-cpp`, set `ENABLE_WHISPER_CPP=true` in the frontend environment so it appears in the browser UI
 
 ## Recommended Modes
 

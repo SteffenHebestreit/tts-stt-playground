@@ -240,6 +240,7 @@ services:
       QWEN3_TTS_SERVICE_URL: http://qwen3-tts-service:5004
       QWEN3_ASR_SERVICE_URL: http://qwen3-asr-service:5002
       WHISPER_CPP_SERVICE_URL: ${WHISPER_CPP_SERVICE_URL:-http://whisper-cpp:8080}
+      ENABLE_WHISPER_CPP: ${ENABLE_WHISPER_CPP:-false}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
       # Browser-facing URLs (uses host ports for the browser to connect)

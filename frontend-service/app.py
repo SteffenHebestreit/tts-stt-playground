@@ -57,6 +57,7 @@ BROWSER_VOICE_TRAINING_URL = os.getenv("BROWSER_TRAINING_URL", "http://localhost
 BROWSER_QWEN3_TTS_SERVICE_URL = os.getenv("BROWSER_QWEN3_TTS_URL", "http://localhost:5004")
 BROWSER_QWEN3_ASR_SERVICE_URL = os.getenv("BROWSER_QWEN3_ASR_URL", "http://localhost:5002")
 BROWSER_WHISPER_CPP_SERVICE_URL = os.getenv("BROWSER_WHISPER_CPP_URL", "http://localhost:5003")
+ENABLE_WHISPER_CPP = os.getenv("ENABLE_WHISPER_CPP", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _build_basic_tts_messages() -> dict:
@@ -465,40 +466,6 @@ def _build_provider_registry() -> dict:
                 },
             },
         },
-        "whisper-cpp": {
-            "kind": "stt",
-            "display_name": "whisper.cpp (OpenAI-compatible)",
-            "short_name": "whisper.cpp",
-            "internal_url": WHISPER_CPP_SERVICE_URL,
-            "browser_url": BROWSER_WHISPER_CPP_SERVICE_URL,
-            "health_endpoint": "/",
-            "capabilities": ["transcribe", "openai_compatible"],
-            "contracts": {
-                "transcribe": "openai-audio-transcriptions-v1",
-            },
-            "settings": {
-                "defaults": {
-                    "language": "auto",
-                    "enable_segmentation": False,
-                },
-                "languages": [
-                    {"value": "auto", "label": "Auto-Detect"},
-                    {"value": "en", "label": "English"},
-                    {"value": "de", "label": "German"},
-                    {"value": "fr", "label": "French"},
-                    {"value": "es", "label": "Spanish"},
-                    {"value": "it", "label": "Italian"},
-                    {"value": "nl", "label": "Dutch"},
-                ],
-            },
-            "ui": {
-                "selectable_as_stt": True,
-                "show_status": True,
-                "messages": {
-                    "transcription": _build_stt_messages(),
-                },
-            },
-        },
         "piper-training": {
             "kind": "training",
             "display_name": "Piper Training",
@@ -675,12 +642,49 @@ def _build_provider_registry() -> dict:
         },
     }
 
+    if ENABLE_WHISPER_CPP:
+        providers["whisper-cpp"] = {
+            "kind": "stt",
+            "display_name": "whisper.cpp (OpenAI-compatible)",
+            "short_name": "whisper.cpp",
+            "internal_url": WHISPER_CPP_SERVICE_URL,
+            "browser_url": BROWSER_WHISPER_CPP_SERVICE_URL,
+            "health_endpoint": "/",
+            "capabilities": ["transcribe", "openai_compatible"],
+            "contracts": {
+                "transcribe": "openai-audio-transcriptions-v1",
+            },
+            "settings": {
+                "defaults": {
+                    "language": "auto",
+                    "enable_segmentation": False,
+                },
+                "languages": [
+                    {"value": "auto", "label": "Auto-Detect"},
+                    {"value": "en", "label": "English"},
+                    {"value": "de", "label": "German"},
+                    {"value": "fr", "label": "French"},
+                    {"value": "es", "label": "Spanish"},
+                    {"value": "it", "label": "Italian"},
+                    {"value": "nl", "label": "Dutch"},
+                ],
+            },
+            "ui": {
+                "selectable_as_stt": True,
+                "show_status": True,
+                "messages": {
+                    "transcription": _build_stt_messages(),
+                },
+            },
+        }
+
     registry = {
         "providers": providers,
         "ui": {
             "default_tts_provider": os.getenv("DEFAULT_TTS_PROVIDER", "piper"),
             "default_stt_provider": os.getenv("DEFAULT_STT_PROVIDER", "whisper"),
             "training_provider": os.getenv("TRAINING_PROVIDER", "piper-training"),
+            "enable_whisper_cpp": ENABLE_WHISPER_CPP,
             "copy": {
                 "app_subtitle": "Neural Text-to-Speech with Voice Training & Cloning + Speech-to-Text",
                 "stt_tab_label": "Speech-to-Text",

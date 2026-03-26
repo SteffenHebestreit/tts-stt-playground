@@ -9,7 +9,7 @@ A self-hosted, Docker-based platform for text-to-speech synthesis, speech-to-tex
 | **Frontend** | 3000 | Web UI and API documentation hub |
 | **PiperTTS** | 5000 | Text-to-speech with 40+ voices and custom model support |
 | **STT (faster-whisper)** | 5001 | Speech-to-text — Python, CUDA/ROCm/CPU |
-| **whisper-cpp** | 5003 | Speech-to-text — C++, Vulkan/CPU, OpenAI-compatible API |
+| **whisper-cpp** | 5003 | Optional speech-to-text — C++, Vulkan/CPU, OpenAI-compatible API |
 | **Piper Training** | 8080 | VITS neural network voice training pipeline |
 | **Qwen3-TTS** | 5004 | Voice cloning and multilingual TTS |
 | **Qwen3-ASR** | 5002 | Fast multilingual speech recognition |
@@ -19,9 +19,10 @@ A self-hosted, Docker-based platform for text-to-speech synthesis, speech-to-tex
 ```bash
 # CPU-only — works everywhere, no GPU setup required
 docker compose --profile stt up -d          # faster-whisper STT
-docker compose --profile whisper-cpp up -d  # whisper.cpp STT (OpenAI-compat)
+ENABLE_WHISPER_CPP=true docker compose --profile whisper-cpp --profile frontend up -d  # whisper.cpp surfaced in UI
 docker compose --profile piper-tts up -d    # TTS
-docker compose --profile all up -d          # everything
+docker compose --profile all up -d          # default full stack (without optional whisper-cpp)
+ENABLE_WHISPER_CPP=true docker compose --profile all --profile whisper-cpp up -d  # full stack plus whisper.cpp
 
 # Check status
 docker compose ps
@@ -32,6 +33,8 @@ docker compose down
 ```
 
 Open **http://localhost:3000** for the web interface.
+
+`whisper-cpp` is opt-in. Starting the `whisper-cpp` profile alone is not enough for it to appear in the frontend; set `ENABLE_WHISPER_CPP=true` for the frontend service as well.
 
 ## Developer Docs
 
@@ -90,6 +93,7 @@ docker compose --profile all up -d
 docker compose --profile stt up -d
 docker compose --profile qwen3-asr up -d
 docker compose --profile training up -d
+ENABLE_WHISPER_CPP=true docker compose --profile all --profile whisper-cpp up -d
 ```
 
 The base `docker-compose.yml` already includes NVIDIA device reservations (`deploy.resources.reservations.devices`).
@@ -256,6 +260,8 @@ Use smaller models (`WHISPER_MODEL_SIZE=small`, `WHISPER_MODEL=small`) to improv
 | POST | `/v1/audio/transcriptions` | Transcribe audio — OpenAI-compatible (`file`, `language`, `response_format`) |
 | POST | `/inference` | Native whisper.cpp inference endpoint |
 
+This backend is optional and is only shown in the frontend when `ENABLE_WHISPER_CPP=true` is set for `frontend-service`.
+
 ### Piper Training (port 8080)
 | Method | Endpoint | Description |
 |--------|----------|-------------|
@@ -311,6 +317,7 @@ Copy `.env.example` to `.env` and adjust as needed.
 | `WHISPER_MODEL` | `large-v3` | whisper-cpp GGUF model: `tiny` `base` `small` `medium` `large-v3` `large-v3-turbo` |
 | `FORCE_ACCELERATION` | `cuda` | faster-whisper backend: `cuda` `rocm` `cpu` |
 | `WHISPER_CPP_PORT` | `5003` | Host port for whisper-cpp |
+| `ENABLE_WHISPER_CPP` | `false` | Exposes whisper-cpp in the frontend provider registry and status checks |
 | `GGML_VULKAN_DEVICE` | `0` | Vulkan GPU device index |
 | `HIP_VISIBLE_DEVICES` | `0` | ROCm GPU device index |
 | `HSA_OVERRIDE_GFX_VERSION` | `11.0.0` | ROCm GFX override (Strix Halo: keep at `11.0.0`) |

@@ -26,6 +26,16 @@ docker compose \
   --profile all up -d
 ```
 
+To include the optional `whisper-cpp` backend in the browser UI as well, set `ENABLE_WHISPER_CPP=true` in the frontend environment and start it explicitly:
+
+```bash
+ENABLE_WHISPER_CPP=true docker compose \
+  --env-file .env.truenas.example \
+  -f docker-compose.yml \
+  -f docker-compose.truenas.yml \
+  --profile all --profile whisper-cpp up -d
+```
+
 If you rename `.env.truenas.example` to `.env`, you can omit `--env-file`.
 
 Use `.env.truenas.production.example` instead when the frontend is opened from a

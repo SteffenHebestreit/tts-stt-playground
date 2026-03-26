@@ -41,6 +41,7 @@ Browser-facing UI and API hub for the TTS-STT platform. Built with FastAPI, Jinj
 - Injects a provider registry plus browser-facing service URLs into the HTML template
 - Serves static assets with restart-based cache busting
 - Exposes health data for all backend services used by the UI
+- Exposes optional providers such as `whisper-cpp` only when explicitly enabled in the frontend environment
 - Supports multiple STT request contracts, including OpenAI-compatible `/v1/audio/transcriptions`
 - Exposes a normalized basic TTS adapter so multiple providers can share one browser-facing synthesis contract
 - Exposes a normalized basic STT adapter so multiple providers can share one browser-facing transcription contract
@@ -65,6 +66,7 @@ Browser-facing UI and API hub for the TTS-STT platform. Built with FastAPI, Jinj
 | `QWEN3_TTS_SERVICE_URL` | `http://qwen3-tts-service:5004` | Internal Qwen3-TTS URL |
 | `QWEN3_ASR_SERVICE_URL` | `http://qwen3-asr-service:5002` | Internal Qwen3-ASR URL |
 | `WHISPER_CPP_SERVICE_URL` | `http://whisper-cpp:8080` | Internal whisper.cpp URL |
+| `ENABLE_WHISPER_CPP` | `false` | Include whisper.cpp in the provider registry, STT selector, and health polling |
 | `BROWSER_TTS_URL` | `http://localhost:5000` | Browser-visible PiperTTS URL |
 | `BROWSER_STT_URL` | `http://localhost:5001` | Browser-visible STT URL |
 | `BROWSER_TRAINING_URL` | `http://localhost:8080` | Browser-visible training URL |
@@ -77,5 +79,7 @@ Browser-facing UI and API hub for the TTS-STT platform. Built with FastAPI, Jinj
 | `PROVIDER_REGISTRY_JSON` | unset | Optional JSON override for provider metadata, per-service settings, and defaults |
 | `ALLOWED_ORIGINS` | `*` | Comma-separated CORS origins |
 | `ALLOW_CREDENTIALS` | `false` | Enables CORS credentials when origins are explicit |
+
+`whisper-cpp` remains optional even when its backend container is running. To surface it in the browser UI, set `ENABLE_WHISPER_CPP=true` for `frontend-service` and start the `whisper-cpp` compose profile.
 
 Access the UI at `http://localhost:3000`.
