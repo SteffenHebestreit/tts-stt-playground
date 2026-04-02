@@ -63,6 +63,21 @@ Recommended dataset layout on TrueNAS:
 - `piper-training-service/data/`: prepared datasets
 - `piper-training-service/checkpoints/`: resumable training state
 
+## CUDA / Driver Requirements
+
+The Dockerfiles use `nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04` and PyTorch cu128 wheels.
+
+| Requirement | Minimum |
+|---|---|
+| NVIDIA driver | 550 (570+ recommended) |
+| CUDA base image | 12.8.1 |
+| PyTorch wheel | cu128 |
+| GPU architecture | Ampere (sm_80) through Blackwell (sm_120) |
+
+This was validated on an **RTX 5060 Ti (Blackwell, sm_120)** on TrueNAS SCALE.
+Earlier CUDA 12.1 images produced `cudaErrorNoKernelImageForDevice` on Blackwell GPUs because the cu121 PyTorch wheels only include kernels up to sm_90.
+The cu128 wheels are backward-compatible with Ampere and Ada Lovelace cards.
+
 ## VRAM Planning
 
 Approximate GPU memory usage on this hardware class:

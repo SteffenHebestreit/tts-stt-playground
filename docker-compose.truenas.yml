@@ -1,5 +1,8 @@
 # TrueNAS SCALE overlay for a single NVIDIA RTX 5060 Ti (16 GB).
 #
+# Requires NVIDIA driver >= 550 and CUDA 12.8 base images.
+# Dockerfiles use cuda:12.8.1 + PyTorch cu128 for Blackwell (sm_120) support.
+#
 # Usage:
 #   docker compose -f docker-compose.yml -f docker-compose.truenas.yml --profile all up -d
 #
