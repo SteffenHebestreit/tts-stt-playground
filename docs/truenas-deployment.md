@@ -20,23 +20,23 @@ Use these files together:
 
 ```bash
 docker compose \
-  --env-file .env.truenas.example \
+  --env-file .env.example \
   -f docker-compose.yml \
   -f docker-compose.truenas.yml \
   --profile all up -d
 ```
 
-If you rename `.env.truenas.example` to `.env`, you can omit `--env-file`.
+If you rename `.env.example` to `.env`, you can omit `--env-file`.
 
-Use `.env.truenas.production.example` instead when the frontend is opened from a
-different machine and must call the backend services through a hostname rather
-than `localhost`.
+When the frontend is opened from another machine, edit `ALLOWED_ORIGINS` and the
+`BROWSER_*_URL` values in `.env` so the browser calls the TrueNAS host instead
+of `localhost`.
 
 Additional deployment aids:
 
 - `docs/truenas-custom-app-checklist.md`
 - `docs/truenas-service-profiles.md`
-- `.env.truenas.production.example`
+- `.env.example`
 
 ## Storage Layout
 
@@ -120,6 +120,31 @@ docker compose -f docker-compose.yml -f docker-compose.truenas.yml \
 docker compose stop qwen3-tts-service
 docker compose -f docker-compose.yml -f docker-compose.truenas.yml --profile training up -d
 ```
+
+## Custom App YAML GPU Pinning
+
+If you deploy through TrueNAS Apps -> Discover -> Install via YAML instead of a
+shell `docker compose` command, pin both Qwen services to the same GPU
+explicitly. For a single NVIDIA card shared by `qwen3-asr-service` and
+`qwen3-tts-service`, use the same `device_ids` entry on both services:
+
+```yaml
+deploy:
+  resources:
+    reservations:
+      devices:
+        - driver: nvidia
+          device_ids: ["0"]
+          capabilities: [gpu]
+environment:
+  NVIDIA_VISIBLE_DEVICES: "0"
+  CUDA_VISIBLE_DEVICES: "0"
+```
+
+Apply that block to both Qwen services if they should share GPU `0`.
+Use either `device_ids` or `count`, never both in the same device reservation.
+If you keep using `docker-compose.truenas.yml`, the overlay already pins the
+GPU-facing environment variables to `0` for the single-GPU host profile.
 
 ## Reverse Proxy / Hostname
 

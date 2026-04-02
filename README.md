@@ -447,12 +447,10 @@ All processing is local. No data is sent to external services.
 
 This project supports deployment on a dedicated TrueNAS SCALE server with an
 NVIDIA RTX 5060 Ti (16 GB VRAM). Use the `docker-compose.truenas.yml` overlay
-for optimised GPU memory allocation.
+for optimised GPU memory allocation and single-GPU pinning.
 
-Use one of these env presets:
-
-- `.env.truenas.example`: balanced local-shell preset for a dedicated TrueNAS GPU host
-- `.env.truenas.production.example`: hostname-aware preset for browser access from another machine
+Start from `.env.example`. If the frontend is opened from another machine,
+change `ALLOWED_ORIGINS` and the `BROWSER_*_URL` values before deployment.
 
 For a full deployment workflow, dataset layout, and profile strategy, see
 `docs/truenas-deployment.md`.
@@ -486,11 +484,8 @@ For always-on versus training-window service recommendations, use
 ```bash
 cd /mnt/pool/apps/tts-stt
 
-# Balanced preset for local/direct host access
-cp .env.truenas.example .env
-
-# Or use the hostname-aware production preset
-# cp .env.truenas.production.example .env
+# Start from the checked-in defaults and then edit for your host/network
+cp .env.example .env
 
 # Full stack with NVIDIA GPU
 docker compose --env-file .env -f docker-compose.yml -f docker-compose.truenas.yml --profile all up -d
@@ -499,6 +494,14 @@ docker compose --env-file .env -f docker-compose.yml -f docker-compose.truenas.y
 docker compose --env-file .env -f docker-compose.yml -f docker-compose.truenas.yml \
   --profile stt --profile piper-tts up -d
 ```
+
+### TrueNAS Custom App YAML
+
+If you paste a merged Compose file into Apps -> Discover -> Install via YAML and
+want `qwen3-asr-service` plus `qwen3-tts-service` to share the same NVIDIA GPU,
+pin both services to GPU `0` with `device_ids: ["0"]` and set
+`NVIDIA_VISIBLE_DEVICES=0` plus `CUDA_VISIBLE_DEVICES=0` in each service.
+Do not use `count` and `device_ids` together.
 
 ### Persistent Storage
 
