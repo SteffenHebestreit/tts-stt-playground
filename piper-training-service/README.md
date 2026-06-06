@@ -1,6 +1,6 @@
 # Piper Voice Training Service
 
-VITS training pipeline for creating custom Piper-compatible ONNX voices. The service can upload raw recordings, segment them via STT, prepare mel/phoneme datasets, train a model, resume interrupted jobs, and export directly into the shared Piper model volume.
+VITS training pipeline for creating ONNX voice bundles. The service can upload raw recordings, segment them via STT, prepare mel/phoneme datasets, train a model, resume interrupted jobs, export a runtime bundle, and deploy that bundle to a configured target.
 
 ## Endpoints
 
@@ -30,6 +30,7 @@ VITS training pipeline for creating custom Piper-compatible ONNX voices. The ser
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | POST | `/export/{job_id}` | Export a completed checkpoint to ONNX |
+| GET | `/deployment-targets` | List configured deployment targets and the default target |
 | GET | `/download/{job_id}` | Download the exported model |
 | DELETE | `/model/{job_id}` | Remove a trained model and its associated data |
 | GET | `/health` | Health check |
@@ -40,7 +41,7 @@ VITS training pipeline for creating custom Piper-compatible ONNX voices. The ser
 2. Poll `/status/{job_id}` or `/jobs` while training runs.
 3. Resume with `/resume-training` if a container restart interrupts work.
 4. Export with `/export/{job_id}` or let the automatic post-training export complete.
-5. Use the resulting model from the PiperTTS service once it is copied into the shared models volume.
+5. Deploy automatically to the configured target, or choose manual download only.
 
 ## Configuration
 
@@ -48,8 +49,22 @@ VITS training pipeline for creating custom Piper-compatible ONNX voices. The ser
 |----------|---------|-------------|
 | `CUDA_VISIBLE_DEVICES` | `0` | GPU device index |
 | `STT_SERVICE_URL` | `http://stt-service:8000` | STT backend used for segmentation and transcription |
+| `PIPER_TTS_SERVICE_URL` | `http://piper-tts-service:5000` | Piper runtime URL used by Piper deployment targets |
+| `SHARED_MODELS_DIR` | `/app/shared_models` | Shared model directory used by the `piper-volume` target |
+| `DEFAULT_DEPLOYMENT_TARGET` | `piper-volume` | Default deployment target used after export |
+| `DEPLOYMENT_TARGETS_JSON` | unset | Optional JSON override for deployment targets and default target |
 | `ALLOWED_ORIGINS` | `*` | Comma-separated CORS origins |
 | `ALLOW_CREDENTIALS` | `false` | Enables CORS credentials when origins are explicit |
+
+## Deployment Targets
+
+The service now treats deployment as a target contract rather than assuming Piper is the only destination.
+
+- `none`: export the ONNX bundle only and leave it available for download
+- `piper-volume`: copy the bundle into the shared Piper models volume and refresh voices
+- `piper-http`: upload the bundle through Piper's HTTP API and refresh voices
+
+Training endpoints that eventually export a model accept an optional `deployment_target` form field. If omitted, the service uses `DEFAULT_DEPLOYMENT_TARGET`.
 
 ## Implementation Notes
 

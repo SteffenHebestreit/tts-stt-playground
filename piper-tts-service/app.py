@@ -6,7 +6,7 @@ the Piper binary; custom VITS models use direct ONNX Runtime inference.
 """
 
 import os
-import re
+import time
 import uuid
 import tempfile
 import json
@@ -30,6 +30,8 @@ import aiofiles
 import librosa
 import io
 
+from naming import sanitize_voice_name, select_best_voice as _select_best_voice, prune_old_outputs
+
 app = FastAPI(title="PiperTTS Service", description="Text-to-Speech using Piper with custom and default models")
 
 allowed_origins_str = os.getenv("ALLOWED_ORIGINS", "*")
@@ -46,18 +48,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Regex for sanitising user-supplied voice/model names (prevents path traversal)
-_SAFE_NAME_RE = re.compile(r'^[a-zA-Z0-9_\-]+$')
+# Generated default-voice WAVs land in OUTPUT_DIR and would otherwise accumulate
+# indefinitely. Files older than the retention window are pruned best-effort.
+OUTPUT_DIR = os.getenv("PIPER_OUTPUT_DIR", "/app/output")
+OUTPUT_RETENTION_HOURS = float(os.getenv("OUTPUT_RETENTION_HOURS", "24"))
+
+
+def _prune_old_outputs() -> None:
+    """Best-effort removal of generated WAVs older than the retention window."""
+    prune_old_outputs(OUTPUT_DIR, OUTPUT_RETENTION_HOURS)
 
 
 def _sanitize_voice_name(name: str) -> str:
     """Return *name* if it contains only safe characters, otherwise raise."""
-    if not name or not _SAFE_NAME_RE.match(name):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid voice name '{name}': only alphanumeric, dash, and underscore allowed.",
-        )
-    return name
+    return sanitize_voice_name(name)
 
 class TTSRequest(BaseModel):
     """Request body for standard Piper text-to-speech synthesis."""
@@ -173,6 +177,27 @@ DEFAULT_VOICES = {
 # Custom voices loaded at startup from /app/models/custom/
 CUSTOM_VOICES: Dict[str, VoiceInfo] = {}
 
+# Cache of loaded ONNX inference sessions keyed by model path. Each entry stores
+# the file mtime so a re-trained/re-uploaded model is reloaded automatically.
+_ONNX_SESSION_CACHE: Dict[str, tuple] = {}
+
+
+def _get_onnx_session(model_path: str):
+    """Return a cached ONNX Runtime session for *model_path*, loading it if needed."""
+    import onnxruntime as ort
+
+    mtime = os.path.getmtime(model_path)
+    cached = _ONNX_SESSION_CACHE.get(model_path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+
+    sess_options = ort.SessionOptions()
+    sess_options.inter_op_num_threads = 2
+    sess_options.intra_op_num_threads = 2
+    session = ort.InferenceSession(model_path, sess_options=sess_options)
+    _ONNX_SESSION_CACHE[model_path] = (mtime, session)
+    return session
+
 
 @app.on_event("startup")
 async def startup():
@@ -203,7 +228,7 @@ async def list_voices():
         lang = voice_info.language
         if lang not in voices_by_language:
             voices_by_language[lang] = []
-        voices_by_language[lang].append(voice_info.dict())
+        voices_by_language[lang].append(voice_info.model_dump())
     
     return {
         "voices": all_voices,
@@ -215,49 +240,8 @@ async def list_voices():
     }
 
 def select_best_voice(language: str, quality: str, gender: Optional[str] = None) -> str:
-    """Pick the best voice matching *language*, *quality*, and optional *gender*.
-
-    Falls back to any matching-language voice, then English, then the hard-coded
-    default ``en_US-lessac-medium``.
-    """
-    all_voices = {**DEFAULT_VOICES, **CUSTOM_VOICES}
-    
-    # Filter by language first
-    matching_voices = []
-    for voice_name, voice_info in all_voices.items():
-        if voice_info.language.startswith(language.split('_')[0]):  # Match base language
-            matching_voices.append((voice_name, voice_info))
-    
-    if not matching_voices:
-        # Fallback to English if no matching language
-        for voice_name, voice_info in all_voices.items():
-            if voice_info.language.startswith('en'):
-                matching_voices.append((voice_name, voice_info))
-    
-    if not matching_voices:
-        # Ultimate fallback
-        return "en_US-lessac-medium"
-    
-    # Filter by quality
-    preferred_voices = []
-    for voice_name, voice_info in matching_voices:
-        if voice_info.quality == quality:
-            preferred_voices.append((voice_name, voice_info))
-    
-    if not preferred_voices:
-        preferred_voices = matching_voices
-    
-    # Filter by gender if specified
-    if gender:
-        gender_voices = []
-        for voice_name, voice_info in preferred_voices:
-            if hasattr(voice_info, 'gender') and voice_info.gender == gender:
-                gender_voices.append((voice_name, voice_info))
-        if gender_voices:
-            preferred_voices = gender_voices
-    
-    # Return the first match
-    return preferred_voices[0][0]
+    """Pick the best voice across all registered voices (see naming.select_best_voice)."""
+    return _select_best_voice({**DEFAULT_VOICES, **CUSTOM_VOICES}, language, quality, gender)
 
 async def analyze_audio_with_ffmpeg(file_path: str) -> Dict:
     """Run ``ffprobe`` on *file_path* and return codec/duration/quality metadata."""
@@ -317,16 +301,17 @@ async def analyze_audio_with_ffmpeg(file_path: str) -> Dict:
 @app.post("/analyze_audio")
 async def analyze_audio(audio_file: UploadFile = File(...)):
     """Upload an audio file and receive codec, duration, and quality metadata."""
+    temp_path = None
     try:
         # Save temporary file
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_file:
             content = await audio_file.read()
             temp_file.write(content)
             temp_path = temp_file.name
-        
+
         # Analyze with ffmpeg
         analysis = await analyze_audio_with_ffmpeg(temp_path)
-        
+
         # Add librosa analysis for more details
         try:
             audio_data, sr = librosa.load(temp_path, sr=None)
@@ -339,14 +324,18 @@ async def analyze_audio(audio_file: UploadFile = File(...)):
             }
         except Exception as e:
             analysis["librosa_error"] = str(e)
-        
-        # Clean up
-        os.unlink(temp_path)
-        
+
         return analysis
-        
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Audio analysis failed: {str(e)}")
+    finally:
+        # Always clean up the temp file, even on failure
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
 
 def _custom_onnx_infer(model_path: str, text: str, voice_name: str) -> bytes:
     """Run direct ONNX inference for custom-trained VITS models.
@@ -356,7 +345,6 @@ def _custom_onnx_infer(model_path: str, text: str, voice_name: str) -> bytes:
     binary can't be used. We phonemize here using the same settings as
     training (phonemizer + espeak backend), then look up IDs.
     """
-    import onnxruntime as ort
     from phonemizer import phonemize
 
     # Load config (piper-tts scans for {voice}.json, not .onnx.json)
@@ -409,11 +397,8 @@ def _custom_onnx_infer(model_path: str, text: str, voice_name: str) -> bytes:
     text_tensor   = np.array([ids], dtype=np.int64)
     length_tensor = np.array([len(ids)], dtype=np.int64)
 
-    # Run ONNX inference
-    sess_options = ort.SessionOptions()
-    sess_options.inter_op_num_threads = 2
-    sess_options.intra_op_num_threads = 2
-    session = ort.InferenceSession(model_path, sess_options=sess_options)
+    # Run ONNX inference (session is cached across requests)
+    session = _get_onnx_session(model_path)
 
     outputs = session.run(
         None,
@@ -481,8 +466,9 @@ async def text_to_speech(request: TTSRequest):
             )
 
         # Standard Piper binary for default models
+        _prune_old_outputs()  # keep the output dir from growing unbounded
         output_filename = f"{uuid.uuid4()}.{request.output_format}"
-        output_path = f"/app/output/{output_filename}"
+        output_path = os.path.join(OUTPUT_DIR, output_filename)
 
         cmd = [
             "piper",
@@ -650,7 +636,10 @@ async def delete_custom_voice(voice_name: str):
         voice_dir = Path(f"/app/models/custom/{voice_name}")
         if voice_dir.exists():
             shutil.rmtree(voice_dir)
-        
+
+        # Drop any cached ONNX session for this voice's model
+        _ONNX_SESSION_CACHE.pop(str(voice_dir / f"{voice_name}.onnx"), None)
+
         # Remove from custom voices
         del CUSTOM_VOICES[voice_name]
         

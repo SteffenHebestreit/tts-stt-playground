@@ -6,6 +6,7 @@ recognition with segment-level timestamps.  Supports CUDA, ROCm, and CPU.
 
 import os
 import time
+import asyncio
 import tempfile
 import logging
 from pathlib import Path
@@ -157,9 +158,10 @@ async def transcribe_audio(
         # Get audio duration
         duration = librosa.get_duration(path=tmp_path)
 
-        # Transcribe with Qwen3-ASR
+        # Transcribe with Qwen3-ASR (off the event loop — model.transcribe is blocking)
         lang_param = None if language == "auto" else language
-        results = model.transcribe(
+        results = await asyncio.to_thread(
+            model.transcribe,
             audio=tmp_path,
             language=lang_param,
         )
@@ -224,8 +226,9 @@ async def detect_language(
 
         tmp_path, _ = await _save_upload(file)
 
-        # Transcribe to detect language
-        results = model.transcribe(
+        # Transcribe to detect language (off the event loop)
+        results = await asyncio.to_thread(
+            model.transcribe,
             audio=tmp_path,
             language=None,  # Auto-detect
         )
@@ -269,7 +272,8 @@ async def transcribe_batch(
 
             start_time = time.time()
             lang_param = None if language == "auto" else language
-            asr_results = model.transcribe(
+            asr_results = await asyncio.to_thread(
+                model.transcribe,
                 audio=tmp_path,
                 language=lang_param,
             )

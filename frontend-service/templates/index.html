@@ -11,22 +11,19 @@
         <!-- Header -->
         <div class="header">
             <h1>TTS-STT Platform</h1>
-            <p>Neural Text-to-Speech with Voice Training & Cloning + Speech-to-Text</p>
+            <p id="app-subtitle">Neural Text-to-Speech with Voice Training & Cloning + Speech-to-Text</p>
 
             <!-- TTS Service Selector -->
             <div class="tts-service-selector">
                 <h3>TTS Engine:</h3>
                 <div class="radio-group">
+                    {% for provider_id, provider in tts_provider_options %}
                     <label class="radio-label">
-                        <input type="radio" name="tts-engine" value="piper" checked onchange="switchTTSEngine(this.value)">
+                        <input type="radio" name="tts-engine" value="{{ provider_id }}" {% if provider_id == default_tts_provider %}checked{% endif %} onchange="switchTTSEngine(this.value)">
                         <span class="radio-custom"></span>
-                        PiperTTS (Local Training)
+                        {{ provider.display_name }}
                     </label>
-                    <label class="radio-label">
-                        <input type="radio" name="tts-engine" value="qwen3" onchange="switchTTSEngine(this.value)">
-                        <span class="radio-custom"></span>
-                        Qwen3-TTS (Voice Cloning)
-                    </label>
+                    {% endfor %}
                 </div>
             </div>
 
@@ -34,34 +31,33 @@
                 <a href="/api-docs" target="_blank" class="api-docs-link">API Documentation</a>
             </div>
             <div class="service-status">
-                <div class="service-indicator" id="tts-status">PiperTTS</div>
-                <div class="service-indicator" id="stt-status-indicator">Whisper STT</div>
-                <div class="service-indicator" id="training-status">Voice Training</div>
-                <div class="service-indicator" id="qwen3-tts-status">Qwen3-TTS</div>
-                <div class="service-indicator" id="qwen3-asr-status">Qwen3-ASR</div>
+                {% for provider_id, provider in status_provider_options %}
+                <div class="service-indicator" id="service-status-{{ provider_id }}">{{ provider.short_name or provider.display_name }}</div>
+                {% endfor %}
             </div>
         </div>
 
         <!-- Navigation Tabs -->
         <div class="tabs">
-            <button class="tab-button active" onclick="showTab('stt-tab')">Speech-to-Text</button>
-            <button class="tab-button piper-only" onclick="showTab('training-tab')">Voice Training</button>
-            <button class="tab-button piper-only" onclick="showTab('tts-tab')">Text-to-Speech</button>
-            <button class="tab-button qwen3-only" onclick="showTab('qwen3-tts-tab')" style="display: none;">Qwen3 TTS</button>
-            <button class="tab-button qwen3-only" onclick="showTab('qwen3-cloning-tab')" style="display: none;">Voice Cloning</button>
+            <button class="tab-button active" id="stt-tab-button" onclick="showTab('stt-tab')">Speech-to-Text</button>
+            <button class="tab-button piper-only" id="training-tab-button" onclick="showTab('training-tab')">Voice Training</button>
+            <button class="tab-button piper-only" id="tts-tab-button" onclick="showTab('tts-tab')">Text-to-Speech</button>
+            <button class="tab-button qwen3-only" id="qwen3-tts-tab-button" onclick="showTab('qwen3-tts-tab')" style="display: none;">Qwen3 TTS</button>
+            <button class="tab-button qwen3-only" id="qwen3-cloning-tab-button" onclick="showTab('qwen3-cloning-tab')" style="display: none;">Voice Cloning</button>
         </div>
 
         <!-- STT Tab -->
         <div id="stt-tab" class="tab-content active">
             <div class="panel">
-                <h2>Speech-to-Text</h2>
-                <p class="description">Convert speech to text. Supports transcription with optional audio segmentation for training data preparation.</p>
+                <h2 id="stt-title">Speech-to-Text</h2>
+                <p class="description" id="stt-description">Convert speech to text. Supports transcription with optional audio segmentation for training data preparation.</p>
 
                 <div class="form-group">
                     <label for="stt-engine-select">STT Engine:</label>
                     <select id="stt-engine-select">
-                        <option value="whisper">Whisper (faster-whisper)</option>
-                        <option value="qwen3-asr">Qwen3-ASR (multilingual)</option>
+                        {% for provider_id, provider in stt_provider_options %}
+                        <option value="{{ provider_id }}" {% if provider_id == default_stt_provider %}selected{% endif %}>{{ provider.display_name }}</option>
+                        {% endfor %}
                     </select>
                 </div>
 
@@ -81,13 +77,7 @@
                     <div class="form-group">
                         <label for="stt-language">Language:</label>
                         <select id="stt-language">
-                            <option value="auto">Auto-Detect</option>
-                            <option value="en">English</option>
-                            <option value="de">German</option>
-                            <option value="fr">French</option>
-                            <option value="es">Spanish</option>
-                            <option value="it">Italian</option>
-                            <option value="nl">Dutch</option>
+                            <option value="">Loading languages...</option>
                         </select>
                     </div>
 
@@ -109,44 +99,37 @@
         <!-- Voice Training Tab -->
         <div id="training-tab" class="tab-content">
             <div class="panel">
-                <h2>Voice Training</h2>
-                <p class="description">Train custom voice models using VITS neural networks. Upload multiple audio files with transcripts for high-quality voice cloning.</p>
+                <h2 id="training-title">Voice Training</h2>
+                <p class="description" id="training-description">Train custom voice models using VITS neural networks. Upload multiple audio files with transcripts for high-quality voice cloning.</p>
 
                 <div class="form-group">
-                    <label for="training-voice-name">Voice Model Name:</label>
+                    <label id="training-voice-name-label" for="training-voice-name">Voice Model Name:</label>
                     <input type="text" id="training-voice-name" placeholder="Enter a unique name for this voice model">
                 </div>
 
                 <div class="form-row">
                     <div class="form-group">
-                        <label for="training-language">Target Language:</label>
+                        <label id="training-language-label" for="training-language">Target Language:</label>
                         <select id="training-language">
-                            <option value="en">English</option>
-                            <option value="de">German</option>
-                            <option value="fr">French</option>
-                            <option value="es">Spanish</option>
-                            <option value="it">Italian</option>
-                            <option value="nl">Dutch</option>
+                            <option value="">Loading languages...</option>
                         </select>
                     </div>
 
                     <div class="form-group">
-                        <label for="training-gender">Voice Gender:</label>
+                        <label id="training-gender-label" for="training-gender">Voice Gender:</label>
                         <select id="training-gender">
-                            <option value="female">Female</option>
-                            <option value="male">Male</option>
-                            <option value="neutral">Neutral</option>
+                            <option value="">Loading genders...</option>
                         </select>
                     </div>
                 </div>
 
                 <div class="form-group">
-                    <label for="training-files">Training Audio Files:</label>
+                    <label id="training-files-label" for="training-files">Training Audio Files:</label>
                     <div class="file-upload">
                         <input type="file" id="training-files" accept="audio/*" multiple onchange="handleTrainingFiles(this)">
                         <div class="file-drop-zone" id="training-drop-zone">
-                            <p>Drop multiple audio files here or click to browse</p>
-                            <small>Recommended: 10+ minutes of high-quality speech data</small>
+                            <p id="training-files-drop-text">Drop multiple audio files here or click to browse</p>
+                            <small id="training-files-hint">Upload guidance will load here.</small>
                         </div>
                     </div>
                     <div id="training-files-info" class="file-info"></div>
@@ -154,21 +137,27 @@
 
                 <div class="form-row">
                     <div class="form-group">
-                        <label for="training-epochs">Training Epochs:</label>
+                        <label id="training-epochs-label" for="training-epochs">Training Epochs:</label>
                         <input type="number" id="training-epochs" value="1000" min="100" max="5000">
                     </div>
 
                     <div class="form-group">
-                        <label for="training-batch-size">Batch Size:</label>
+                        <label id="training-batch-size-label" for="training-batch-size">Batch Size:</label>
                         <select id="training-batch-size">
-                            <option value="16">16 (Lower memory)</option>
-                            <option value="32" selected>32 (Recommended)</option>
-                            <option value="64">64 (Higher memory)</option>
+                            <option value="">Loading batch sizes...</option>
                         </select>
                     </div>
                 </div>
 
-                <button class="btn-primary" onclick="startTraining()">Start Training</button>
+                <div class="form-group">
+                    <label id="training-deployment-target-label" for="training-deployment-target">Post-Export Deployment Target:</label>
+                    <select id="training-deployment-target">
+                        <option value="">Loading deployment targets...</option>
+                    </select>
+                    <small class="form-hint" id="training-deployment-target-description"></small>
+                </div>
+
+                <button class="btn-primary" id="start-training-button" onclick="startTraining()">Start Training</button>
 
                 <div id="training-progress-status" class="status-display"></div>
                 <div id="training-progress" class="progress-display"></div>
@@ -176,27 +165,31 @@
 
             <!-- Continue / Restart Training Section -->
             <div class="panel" style="margin-top: 20px;">
-                <h3>Continue Existing Training</h3>
-                <p class="description">
-                    If a training job was interrupted (e.g. after a restart) and a checkpoint exists, use
-                    <strong>Resume from Checkpoint</strong>. If no checkpoint was saved yet but the dataset
-                    (train.json / val.json) is already prepared, use <strong>Train from Dataset</strong>.
-                </p>
+                <h3 id="continue-training-title">Continue Existing Training</h3>
+                <p class="description" id="continue-training-description">Continue an existing training job or start from a prepared dataset.</p>
 
                 <div class="form-row">
                     <div class="form-group">
-                        <label for="continue-voice-name">Voice Model Name:</label>
+                        <label id="continue-voice-name-label" for="continue-voice-name">Voice Model Name:</label>
                         <input type="text" id="continue-voice-name" placeholder="e.g. luna">
                     </div>
                     <div class="form-group">
-                        <label for="continue-epochs">Epochs:</label>
+                        <label id="continue-epochs-label" for="continue-epochs">Epochs:</label>
                         <input type="number" id="continue-epochs" value="10000" min="100" max="50000">
                     </div>
                 </div>
 
+                <div class="form-group">
+                    <label id="continue-deployment-target-label" for="continue-deployment-target">Deployment Target:</label>
+                    <select id="continue-deployment-target">
+                        <option value="">Loading deployment targets...</option>
+                    </select>
+                    <small class="form-hint" id="continue-deployment-target-description"></small>
+                </div>
+
                 <div style="display: flex; gap: 10px; flex-wrap: wrap;">
-                    <button class="btn-secondary" onclick="resumeTrainingManual()">Resume from Checkpoint</button>
-                    <button class="btn-secondary" onclick="trainFromDataset()">Train from Dataset</button>
+                    <button class="btn-secondary" id="resume-training-button" onclick="resumeTrainingManual()">Resume</button>
+                    <button class="btn-secondary" id="train-from-dataset-button" onclick="trainFromDataset()">Train from Dataset</button>
                 </div>
 
                 <div id="continue-status" class="status-display" style="margin-top: 10px;"></div>
@@ -205,7 +198,15 @@
             <!-- Model Management Section -->
             <div class="panel" style="margin-top: 20px;">
                 <h3>Trained Models</h3>
-                <p class="description">Manage your trained voice models. Export to TTS to use them, download, or delete.</p>
+                <p class="description" id="training-models-description">Manage your trained voice models. Export to TTS to use them, download, or delete.</p>
+
+                <div class="form-group" style="max-width: 420px;">
+                    <label id="model-deployment-target-label" for="model-deployment-target">Manual Deployment Target:</label>
+                    <select id="model-deployment-target">
+                        <option value="">Loading deployment targets...</option>
+                    </select>
+                    <small class="form-hint" id="model-deployment-target-description"></small>
+                </div>
 
                 <div id="models-list" style="margin-bottom: 20px;">
                     <p>Loading trained models...</p>
@@ -221,8 +222,8 @@
         <!-- PiperTTS Tab -->
         <div id="tts-tab" class="tab-content">
             <div class="panel">
-                <h2>Text-to-Speech (PiperTTS)</h2>
-                <p class="description">Generate high-quality speech using PiperTTS with intelligent voice selection based on language, quality, and gender preferences.</p>
+                <h2 id="tts-title">Text-to-Speech (PiperTTS)</h2>
+                <p class="description" id="tts-description">Generate high-quality speech using PiperTTS with intelligent voice selection based on language, quality, and gender preferences.</p>
 
                 <div class="form-group">
                     <label for="tts-text">Text to synthesize:</label>
@@ -233,23 +234,14 @@
                     <div class="form-group">
                         <label for="tts-language-select">Language:</label>
                         <select id="tts-language-select">
-                            <option value="auto">Auto-Detect</option>
-                            <option value="en">English</option>
-                            <option value="de">German</option>
-                            <option value="fr">French</option>
-                            <option value="es">Spanish</option>
-                            <option value="it">Italian</option>
-                            <option value="nl">Dutch</option>
+                            <option value="">Loading languages...</option>
                         </select>
                     </div>
 
                     <div class="form-group">
                         <label for="tts-quality-select">Voice Quality:</label>
                         <select id="tts-quality-select">
-                            <option value="medium">Medium Quality</option>
-                            <option value="high">High Quality</option>
-                            <option value="low">Low Quality (Faster)</option>
-                            <option value="x_low">Ultra Low (Fastest)</option>
+                            <option value="">Loading quality options...</option>
                         </select>
                     </div>
                 </div>
@@ -258,9 +250,7 @@
                     <div class="form-group">
                         <label for="tts-gender-select">Voice Gender:</label>
                         <select id="tts-gender-select">
-                            <option value="any">Any Gender</option>
-                            <option value="male">Male Voice</option>
-                            <option value="female">Female Voice</option>
+                            <option value="">Loading gender options...</option>
                         </select>
                     </div>
 
@@ -290,10 +280,10 @@
             <!-- Custom Voice Management -->
             <div class="panel" style="margin-top: 20px;">
                 <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;">
-                    <h3 style="margin: 0;">Custom Voices</h3>
+                    <h3 id="custom-voices-title" style="margin: 0;">Custom Voices</h3>
                     <button class="btn-secondary" onclick="refreshCustomVoices()">Refresh</button>
                 </div>
-                <p class="description">Manage custom trained voices loaded in PiperTTS. Delete voices you no longer need.</p>
+                <p class="description" id="custom-voices-description">Manage custom trained voices loaded in PiperTTS. Delete voices you no longer need.</p>
                 <div id="custom-voices-list">
                     <p>Loading custom voices...</p>
                 </div>
@@ -303,8 +293,8 @@
         <!-- Qwen3-TTS Tab (Built-in Speakers) -->
         <div id="qwen3-tts-tab" class="tab-content qwen3-only" style="display: none;">
             <div class="panel">
-                <h2>Text-to-Speech (Qwen3-TTS)</h2>
-                <p class="description">Generate speech using Qwen3-TTS with built-in neural voices. Supports multiple languages with high-quality synthesis.</p>
+                <h2 id="qwen3-builtin-title">Text-to-Speech (Qwen3-TTS)</h2>
+                <p class="description" id="qwen3-builtin-description">Generate speech using Qwen3-TTS with built-in neural voices. Supports multiple languages with high-quality synthesis.</p>
 
                 <!-- Model Selector -->
                 <div class="form-group">
@@ -326,51 +316,33 @@
                 </div>
 
                 <div class="form-group">
-                    <label for="qwen3-builtin-text">Text to synthesize:</label>
+                    <label id="qwen3-builtin-text-label" for="qwen3-builtin-text">Text to synthesize:</label>
                     <textarea id="qwen3-builtin-text" placeholder="Enter the text you want to convert to speech..." rows="4">Hello! This is a demonstration of Qwen3-TTS neural text-to-speech.</textarea>
                 </div>
 
                 <div class="form-row">
                     <div class="form-group">
-                        <label for="qwen3-builtin-language">Language:</label>
+                        <label id="qwen3-builtin-language-label" for="qwen3-builtin-language">Language:</label>
                         <select id="qwen3-builtin-language">
-                            <option value="English">English</option>
-                            <option value="German">German</option>
-                            <option value="French">French</option>
-                            <option value="Spanish">Spanish</option>
-                            <option value="Italian">Italian</option>
-                            <option value="Portuguese">Portuguese</option>
-                            <option value="Russian">Russian</option>
-                            <option value="Japanese">Japanese</option>
-                            <option value="Korean">Korean</option>
-                            <option value="Chinese">Chinese</option>
+                            <option value="">Loading languages...</option>
                         </select>
                     </div>
 
                     <div class="form-group">
-                        <label for="qwen3-builtin-speaker">Speaker Voice:</label>
+                        <label id="qwen3-builtin-speaker-label" for="qwen3-builtin-speaker">Speaker Voice:</label>
                         <select id="qwen3-builtin-speaker">
-                            <option value="Vivian">Vivian</option>
-                            <option value="Ryan">Ryan</option>
-                            <option value="Ethan">Ethan</option>
-                            <option value="Olivia">Olivia</option>
-                            <option value="Aria">Aria</option>
-                            <option value="Liam">Liam</option>
-                            <option value="Nova">Nova</option>
-                            <option value="Atlas">Atlas</option>
-                            <option value="Aurora">Aurora</option>
-                            <option value="Kai">Kai</option>
+                            <option value="">Loading speakers...</option>
                         </select>
                     </div>
                 </div>
 
                 <div class="form-group">
-                    <label for="qwen3-builtin-instruct">Voice Instruction (Optional):</label>
+                    <label id="qwen3-builtin-instruct-label" for="qwen3-builtin-instruct">Voice Instruction (Optional):</label>
                     <input type="text" id="qwen3-builtin-instruct" placeholder="e.g., Speak slowly and calmly, with a warm tone">
-                    <small class="form-hint">Describe how the voice should sound. Leave empty for default style.</small>
+                    <small class="form-hint" id="qwen3-builtin-instruct-hint">Describe how the voice should sound. Leave empty for default style.</small>
                 </div>
 
-                <button class="btn-primary" onclick="generateQwen3BuiltinTTS()">Generate Speech</button>
+                <button class="btn-primary" id="qwen3-builtin-generate-button" onclick="generateQwen3BuiltinTTS()">Generate Speech</button>
 
                 <div id="qwen3-builtin-status" class="status-display"></div>
                 <div id="qwen3-builtin-audio-player" class="audio-player"></div>
@@ -385,7 +357,7 @@
 
                 <!-- Model Selector -->
                 <div class="form-group">
-                    <label for="qwen3-clone-model-select">Model:</label>
+                    <label id="qwen3-clone-model-label" for="qwen3-clone-model-select">Model:</label>
                     <div class="voice-select-row">
                         <select id="qwen3-clone-model-select" onchange="onCloneModelChange(this.value)">
                             <option value="">Loading models...</option>
@@ -396,41 +368,32 @@
                 </div>
 
                 <div class="form-group">
-                    <label for="qwen3-tts-text">Text to synthesize:</label>
+                    <label id="qwen3-tts-text-label" for="qwen3-tts-text">Text to synthesize:</label>
                     <textarea id="qwen3-tts-text" placeholder="Enter the text you want to synthesize..." rows="4">Hello! This is a demonstration of Qwen3-TTS voice cloning.</textarea>
                 </div>
 
                 <div class="form-row">
                     <div class="form-group">
-                        <label for="qwen3-tts-language-select">Output Language:</label>
+                        <label id="qwen3-tts-language-label" for="qwen3-tts-language-select">Output Language:</label>
                         <select id="qwen3-tts-language-select">
-                            <option value="English">English</option>
-                            <option value="German">German</option>
-                            <option value="Spanish">Spanish</option>
-                            <option value="French">French</option>
-                            <option value="Portuguese">Portuguese</option>
-                            <option value="Italian">Italian</option>
-                            <option value="Russian">Russian</option>
-                            <option value="Japanese">Japanese</option>
-                            <option value="Korean">Korean</option>
-                            <option value="Chinese">Chinese</option>
+                            <option value="">Loading languages...</option>
                         </select>
                     </div>
                 </div>
 
                 <!-- Voice Source Toggle -->
                 <div id="clone-voice-source" class="form-group">
-                    <label>Voice Source:</label>
+                    <label id="clone-voice-source-label">Voice Source:</label>
                     <div class="radio-group">
                         <label class="radio-label">
                             <input type="radio" name="voice-source" value="saved" checked onchange="switchVoiceSource(this.value)">
                             <span class="radio-custom"></span>
-                            Saved Voices (fast)
+                            <span id="clone-saved-source-label">Saved Voices (fast)</span>
                         </label>
                         <label class="radio-label">
                             <input type="radio" name="voice-source" value="upload" onchange="switchVoiceSource(this.value)">
                             <span class="radio-custom"></span>
-                            Upload New Sample
+                            <span id="clone-upload-source-label">Upload New Sample</span>
                         </label>
                     </div>
                 </div>
@@ -438,13 +401,13 @@
                 <!-- Saved Voice Mode -->
                 <div id="clone-saved-mode">
                     <div class="form-group">
-                        <label for="qwen3-saved-voice-select">Select Saved Voice:</label>
+                        <label id="qwen3-saved-voice-select-label" for="qwen3-saved-voice-select">Select Saved Voice:</label>
                         <div class="voice-select-row">
                             <select id="qwen3-saved-voice-select">
                                 <option value="">Loading saved voices...</option>
                             </select>
-                            <button class="btn-secondary" onclick="loadSavedVoices()">Refresh</button>
-                            <button class="btn-secondary" onclick="deleteSavedVoice()" title="Delete selected voice" style="background: var(--error); color: white; padding: 8px 12px;">Delete</button>
+                            <button class="btn-secondary" id="saved-voices-refresh-button" onclick="loadSavedVoices()">Refresh</button>
+                            <button class="btn-secondary" id="saved-voices-delete-button" onclick="deleteSavedVoice()" title="Delete selected voice" style="background: var(--error); color: white; padding: 8px 12px;">Delete</button>
                         </div>
                         <small class="form-hint" id="saved-voice-info"></small>
                     </div>
@@ -453,43 +416,43 @@
                 <!-- Voice Clone Mode: Audio upload -->
                 <div id="clone-audio-mode" style="display: none;">
                     <div class="form-group">
-                        <label for="qwen3-voice-file">Voice Sample Audio:</label>
+                        <label id="qwen3-voice-file-label" for="qwen3-voice-file">Reference Audio:</label>
                         <div class="file-upload" id="qwen3-voice-drop-zone">
                             <input type="file" id="qwen3-voice-file" accept="audio/*">
                             <div class="file-upload-text">
-                                <span>Drop audio file here or click to browse</span>
-                                <small>Supports: MP3, WAV, M4A, FLAC (recommended: 3-10 seconds, clear speech)</small>
+                                <span id="qwen3-voice-file-drop-text">Drop audio file here or click to browse</span>
+                                <small id="qwen3-voice-file-hint">Supports: MP3, WAV, M4A, FLAC (recommended: 3-10 seconds, clear speech)</small>
                             </div>
                         </div>
                         <div id="qwen3-voice-file-info" class="file-info"></div>
                     </div>
 
                     <div class="form-group">
-                        <label for="save-voice-name">Save this voice as (optional):</label>
+                        <label id="save-voice-name-label" for="save-voice-name">Save this voice as (optional):</label>
                         <input type="text" id="save-voice-name" placeholder="e.g., My Voice, John, Customer Support">
-                        <small class="form-hint">Name this voice to save it for fast reuse. Leave empty to clone without saving.</small>
+                        <small class="form-hint" id="save-voice-name-hint">Name this voice to save it for fast reuse. Leave empty to clone without saving.</small>
                     </div>
 
                     <div class="form-group">
                         <label>
                             <input type="checkbox" id="enable-ref-text" onchange="toggleRefText()">
-                            Provide reference text manually (auto-transcribed via Qwen3-ASR if unchecked)
+                            <span id="enable-ref-text-label">Provide reference text manually</span>
                         </label>
                     </div>
 
                     <div class="form-group" id="ref-text-group" style="display: none;">
-                        <label for="qwen3-ref-text">Reference Audio Transcript:</label>
-                        <textarea id="qwen3-ref-text" placeholder="Type the exact words spoken in the voice sample audio..." rows="2"></textarea>
-                        <small class="form-hint">Providing the transcript of the reference audio improves voice cloning quality.</small>
+                        <label id="qwen3-ref-text-label" for="qwen3-ref-text">Reference Audio Transcript:</label>
+                        <textarea id="qwen3-ref-text" placeholder="Enter the transcript for the reference audio..." rows="2"></textarea>
+                        <small class="form-hint" id="qwen3-ref-text-hint">Providing the transcript of the reference audio improves voice cloning quality.</small>
                     </div>
                 </div>
 
                 <!-- Voice Design Mode: Text description -->
                 <div id="clone-design-mode" style="display: none;">
                     <div class="form-group">
-                        <label for="qwen3-voice-description">Voice Description:</label>
-                        <textarea id="qwen3-voice-description" placeholder="Describe the voice you want, e.g.: A deep male voice with a warm, calm British accent and slow speaking pace" rows="3"></textarea>
-                        <small class="form-hint">Describe the characteristics of the voice: gender, pitch, accent, tempo, tone, emotion, etc.</small>
+                        <label id="qwen3-voice-description-label" for="qwen3-voice-description">Voice Description:</label>
+                        <textarea id="qwen3-voice-description" placeholder="Describe the target voice..." rows="3"></textarea>
+                        <small class="form-hint" id="qwen3-voice-description-hint">Describe the characteristics of the voice: gender, pitch, accent, tempo, tone, emotion, etc.</small>
                     </div>
                 </div>
 
@@ -503,11 +466,13 @@
 
     <!-- Service Configuration -->
     <script>
-        window.TTS_SERVICE_URL = "{{ tts_service_url }}";
-        window.STT_SERVICE_URL = "{{ stt_service_url }}";
-        window.VOICE_TRAINING_URL = "{{ voice_training_url }}";
-        window.QWEN3_TTS_SERVICE_URL = "{{ qwen3_tts_service_url }}";
-        window.QWEN3_ASR_SERVICE_URL = "{{ qwen3_asr_service_url }}";
+        window.PROVIDER_REGISTRY = {{ provider_registry_json | safe }};
+        window.TTS_SERVICE_URL = window.PROVIDER_REGISTRY.providers.piper?.browser_url || "{{ tts_service_url }}";
+        window.STT_SERVICE_URL = window.PROVIDER_REGISTRY.providers.whisper?.browser_url || "{{ stt_service_url }}";
+        window.VOICE_TRAINING_URL = window.PROVIDER_REGISTRY.providers['piper-training']?.browser_url || "{{ voice_training_url }}";
+        window.QWEN3_TTS_SERVICE_URL = window.PROVIDER_REGISTRY.providers.qwen3?.browser_url || "{{ qwen3_tts_service_url }}";
+        window.QWEN3_ASR_SERVICE_URL = window.PROVIDER_REGISTRY.providers['qwen3-asr']?.browser_url || "{{ qwen3_asr_service_url }}";
+        window.WHISPER_CPP_SERVICE_URL = window.PROVIDER_REGISTRY.providers['whisper-cpp']?.browser_url || "{{ whisper_cpp_service_url }}";
     </script>
 
     <script src="{{ url_for('static', path='/js/app.js') }}?v={{ app_version }}"></script>

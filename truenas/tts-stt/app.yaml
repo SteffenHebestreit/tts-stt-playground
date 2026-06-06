@@ -1,0 +1,29 @@
+name: tts-stt
+title: TTS-STT Studio
+train: community
+version: 0.1.0
+app_version: "0.1.0"
+categories:
+  - media
+  - ai
+maintainers:
+  - name: Steffen Hebestreit
+    email: info@steffen-hebestreit.com
+    url: https://github.com/SteffenHebestreit/tts-stt-playground
+home: https://github.com/SteffenHebestreit/tts-stt-playground
+sources:
+  - https://github.com/SteffenHebestreit/tts-stt-playground
+description: >-
+  Self-hosted neural Text-to-Speech and Speech-to-Text platform: PiperTTS,
+  Qwen3-TTS voice cloning, Whisper / Qwen3-ASR / Parakeet STT, and a custom
+  VITS voice-training pipeline, behind one web UI. GPU-accelerated (NVIDIA).
+keywords:
+  - tts
+  - stt
+  - whisper
+  - piper
+  - qwen3
+  - parakeet
+  - voice-cloning
+  - german
+icon: https://raw.githubusercontent.com/SteffenHebestreit/tts-stt-playground/master/frontend-service/static/favicon.ico

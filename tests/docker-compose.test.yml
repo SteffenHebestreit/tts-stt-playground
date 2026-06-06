@@ -7,8 +7,8 @@
 services:
   test-runner:
     build:
-      context: ./tests
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: tests/Dockerfile
     environment:
       PIPER_TTS_URL: http://piper-tts-service:5000
       STT_URL: http://stt-service:8000

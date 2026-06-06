@@ -1,0 +1,19 @@
+# Coverage config for the TTS-STT test suites.
+#
+# The in-process unit suites (frontend adapter + the extracted *-service helper
+# modules) run anywhere. The live-integration suites only run inside the Docker
+# test stack, where the full deps are present and more source is importable.
+[run]
+branch = True
+omit =
+    tests/*
+    */__pycache__/*
+
+[report]
+show_missing = True
+skip_covered = False
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.:
+    raise NotImplementedError
+    \.\.\.

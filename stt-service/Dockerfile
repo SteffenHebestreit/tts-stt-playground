@@ -38,6 +38,7 @@ RUN pip3 install -r requirements.txt
 COPY start.sh /app/start.sh
 RUN chmod +x /app/start.sh && sed -i 's/\r$//' /app/start.sh
 COPY app.py .
+COPY json_utils.py .
 
 # Create models directory
 RUN mkdir -p /app/models && chmod 755 /app/models

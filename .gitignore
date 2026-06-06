@@ -55,6 +55,8 @@ piper-training-service/configs/
 .env.local
 .env.*
 !.env.example
+!.env.truenas.example
+!.env.truenas.production.example
 
 # IDE
 .vscode/

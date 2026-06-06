@@ -48,6 +48,15 @@ class OptimizedTrainingPipeline:
         self.gradient_accumulation_steps = 2
         self.memory_cleanup_interval = 5
 
+        # Hard cap on batch size for training stability. The from-scratch VITS
+        # loss is sensitive to large batches; override via MAX_TRAIN_BATCH_SIZE
+        # if you have GPU headroom. OOM still triggers automatic reduction.
+        try:
+            self.max_batch_size = max(1, int(os.getenv("MAX_TRAIN_BATCH_SIZE", "4")))
+        except ValueError:
+            self.max_batch_size = 4
+        logger.info(f"Max training batch size: {self.max_batch_size}")
+
         if self.enable_mixed_precision:
             self.scaler = torch.cuda.amp.GradScaler()
             logger.info("Mixed precision training enabled (FP16)")
@@ -118,8 +127,14 @@ class OptimizedTrainingPipeline:
         if override_config:
             config.update(override_config)
 
-        # Cap batch size for stability
-        optimized_batch_size = min(config.get('batch_size', 8), 4)
+        # Cap batch size for stability (configurable via MAX_TRAIN_BATCH_SIZE)
+        requested_batch_size = config.get('batch_size', 8)
+        optimized_batch_size = min(requested_batch_size, self.max_batch_size)
+        if optimized_batch_size < requested_batch_size:
+            logger.warning(
+                f"Requested batch size {requested_batch_size} capped to "
+                f"{optimized_batch_size} (MAX_TRAIN_BATCH_SIZE={self.max_batch_size})"
+            )
         config['batch_size'] = optimized_batch_size
         logger.info(f"Batch size: {optimized_batch_size}")
 

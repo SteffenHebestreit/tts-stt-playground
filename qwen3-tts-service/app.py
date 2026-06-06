@@ -10,6 +10,7 @@ import gc
 import json
 import re
 import time
+import asyncio
 import subprocess
 import tempfile
 import logging
@@ -493,8 +494,9 @@ async def save_voice(
                 dur = best["end"] - best["start"]
                 logger.info(f"Trimmed reference to {dur:.1f}s segment: '{segment_text[:60]}...'")
 
-        # Extract speaker embedding (x_vector_only for fast TTS)
-        prompt_items = model.create_voice_clone_prompt(
+        # Extract speaker embedding (x_vector_only for fast TTS); off the event loop
+        prompt_items = await asyncio.to_thread(
+            model.create_voice_clone_prompt,
             ref_audio=audio_path,
             x_vector_only_mode=True,
         )
@@ -569,9 +571,10 @@ async def tts_with_saved_voice(
         logger.info(f"Saved-voice TTS: {len(sentences)} chunks for voice={voice_id}")
 
         if len(sentences) > 1:
-            audio, sr = _generate_chunks(model, sentences, lang, [prompt_item])
+            audio, sr = await asyncio.to_thread(_generate_chunks, model, sentences, lang, [prompt_item])
         else:
-            wavs, sr = model.generate_voice_clone(
+            wavs, sr = await asyncio.to_thread(
+                model.generate_voice_clone,
                 text=text,
                 language=lang,
                 voice_clone_prompt=[prompt_item],
@@ -629,7 +632,8 @@ async def text_to_speech(request: TTSRequest):
 
         # Check if model has custom voice generation (CustomVoice model)
         if hasattr(model, 'generate_custom_voice'):
-            wavs, sr = model.generate_custom_voice(
+            wavs, sr = await asyncio.to_thread(
+                model.generate_custom_voice,
                 text=request.text,
                 language=request.lang,
                 speaker=request.speaker,
@@ -638,7 +642,8 @@ async def text_to_speech(request: TTSRequest):
         else:
             # Base model fallback — use voice cloning with empty ref
             # For base model, we need a reference audio; generate simple output
-            wavs, sr = model.generate_voice_clone(
+            wavs, sr = await asyncio.to_thread(
+                model.generate_voice_clone,
                 text=request.text,
                 language=request.lang,
                 ref_audio=None,
@@ -720,7 +725,8 @@ async def clone_voice(
 
         # Extract speaker embedding first (fast), then use it for chunked generation
         try:
-            prompt_items = model.create_voice_clone_prompt(
+            prompt_items = await asyncio.to_thread(
+                model.create_voice_clone_prompt,
                 ref_audio=tmp_path,
                 x_vector_only_mode=True,
             )
@@ -741,9 +747,10 @@ async def clone_voice(
 
         try:
             if len(sentences) > 1:
-                audio, sr = _generate_chunks(model, sentences, lang, [prompt_item])
+                audio, sr = await asyncio.to_thread(_generate_chunks, model, sentences, lang, [prompt_item])
             else:
-                wavs, sr = model.generate_voice_clone(
+                wavs, sr = await asyncio.to_thread(
+                    model.generate_voice_clone,
                     text=text,
                     language=lang,
                     voice_clone_prompt=[prompt_item],
@@ -822,7 +829,8 @@ async def clone_voice_with_ref_text(
             tmp.write(content)
             tmp_path = tmp.name
 
-        wavs, sr = model.generate_voice_clone(
+        wavs, sr = await asyncio.to_thread(
+            model.generate_voice_clone,
             text=text,
             language=lang,
             ref_audio=tmp_path,
@@ -884,7 +892,8 @@ async def voice_design(request: VoiceDesignRequest):
         start_time = time.time()
 
         if hasattr(model, 'generate_voice_design'):
-            wavs, sr = model.generate_voice_design(
+            wavs, sr = await asyncio.to_thread(
+                model.generate_voice_design,
                 text=request.text,
                 language=request.lang,
                 instruct=request.voice_description,
@@ -913,7 +922,8 @@ async def voice_design(request: VoiceDesignRequest):
             headers={
                 "X-Generation-Time": f"{generation_time:.3f}",
                 "X-Language": request.lang,
-                "X-Voice-Description": request.voice_description[:100],
+                # HTTP header values must be latin-1 encodable; drop other chars
+                "X-Voice-Description": request.voice_description[:100].encode("ascii", "replace").decode("ascii"),
             },
         )
 

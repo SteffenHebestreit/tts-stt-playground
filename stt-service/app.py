@@ -18,8 +18,9 @@ import json
 import asyncio
 import time
 import uuid
-import math
 from concurrent.futures import ThreadPoolExecutor
+
+from json_utils import clean_json_inf_nan, ENGLISH_ONLY_MODELS
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -45,18 +46,6 @@ app.add_middleware(
 
 # Create a thread pool for running blocking IO
 executor = ThreadPoolExecutor(max_workers=os.cpu_count())
-
-def clean_json_inf_nan(data):
-    """Recursively replace float inf/NaN with ``None`` so JSON serialisation succeeds."""
-    if isinstance(data, dict):
-        return {k: clean_json_inf_nan(v) for k, v in data.items()}
-    elif isinstance(data, list):
-        return [clean_json_inf_nan(i) for i in data]
-    elif isinstance(data, float):
-        if math.isinf(data) or math.isnan(data):
-            return None  # Replace with null in JSON
-        return data
-    return data
 
 class SafeJSONResponse(JSONResponse):
     """JSONResponse that sanitises NaN/Infinity before encoding."""
@@ -264,63 +253,71 @@ async def transcribe_audio(
 
             logger.info(f"Starting transcription for file {afile.filename} (vad_filter={vad_filter}, vad_threshold={vad_threshold})...")
             start_time = time.time()
-            segments, info = whisper_model.transcribe(
-                temp_audio_path,
-                task=task,
-                language=None if language == "auto" else language,
-                beam_size=beam_size,
-                best_of=best_of,
-                patience=patience,
-                temperature=temperature,
-                suppress_tokens=parsed_suppress_tokens,
-                initial_prompt=initial_prompt,
-                condition_on_previous_text=condition_on_previous_text,
-                compression_ratio_threshold=compression_ratio_threshold,
-                no_speech_threshold=no_speech_threshold,
-                vad_filter=vad_filter,
-                vad_parameters={
-                    "threshold": vad_threshold,
-                    "min_speech_duration_ms": 500,
-                    "min_silence_duration_ms": 1500,
-                    "speech_pad_ms": 300,
-                } if vad_filter else None,
-            )
 
-            segments_list = []
-            full_text = ""
-            last_text = ""
-            processed_segments = 0
+            def _do_transcribe(path=temp_audio_path):
+                """Run faster-whisper + segment filtering in a worker thread.
+
+                faster-whisper is blocking and the segment generator is consumed
+                here, so this whole step runs off the event loop to keep /health
+                and concurrent requests responsive during transcription.
+                """
+                segments, info = whisper_model.transcribe(
+                    path,
+                    task=task,
+                    language=None if language == "auto" else language,
+                    beam_size=beam_size,
+                    best_of=best_of,
+                    patience=patience,
+                    temperature=temperature,
+                    suppress_tokens=parsed_suppress_tokens,
+                    initial_prompt=initial_prompt,
+                    condition_on_previous_text=condition_on_previous_text,
+                    compression_ratio_threshold=compression_ratio_threshold,
+                    no_speech_threshold=no_speech_threshold,
+                    vad_filter=vad_filter,
+                    vad_parameters={
+                        "threshold": vad_threshold,
+                        "min_speech_duration_ms": 500,
+                        "min_silence_duration_ms": 1500,
+                        "speech_pad_ms": 300,
+                    } if vad_filter else None,
+                )
+
+                segs = []
+                full = ""
+                last = ""
+                processed = 0
+                duration = info.duration or 0
+                for segment in segments:
+                    processed += 1
+                    text = segment.text.strip()
+                    seg_duration = segment.end - segment.start
+
+                    if processed % 50 == 0:
+                        if duration > 0:
+                            progress_pct = min((segment.end / duration) * 100, 100)
+                            logger.info(f"Progress: {processed} segments, {segment.end:.1f}s/{duration:.1f}s ({progress_pct:.1f}%)")
+                        else:
+                            logger.info(f"Progress: {processed} segments, current time: {segment.end:.1f}s")
+
+                    if seg_duration < 0.2 or segment.no_speech_prob > 0.8:
+                        continue
+                    if text == last or not text:
+                        continue
+                    segs.append({
+                        "start": segment.start,
+                        "end": segment.end,
+                        "text": text,
+                        "avg_logprob": segment.avg_logprob,
+                        "no_speech_prob": segment.no_speech_prob,
+                    })
+                    full += text + " "
+                    last = text
+                return segs, full, processed, info
+
+            loop = asyncio.get_running_loop()
+            segments_list, full_text, processed_segments, info = await loop.run_in_executor(executor, _do_transcribe)
             total_duration = info.duration or 0
-            
-            logger.info(f"Processing segments for {afile.filename} (duration: {total_duration:.1f}s)")
-            
-            for segment in segments:
-                processed_segments += 1
-                text = segment.text.strip()
-                seg_duration = segment.end - segment.start
-                
-                # Log progress every 50 segments or at significant timestamps
-                if processed_segments % 50 == 0 or segment.end > 0:
-                    if total_duration > 0:
-                        progress_pct = min((segment.end / total_duration) * 100, 100)
-                        logger.info(f"Progress: {processed_segments} segments processed, {segment.end:.1f}s/{total_duration:.1f}s ({progress_pct:.1f}%)")
-                    else:
-                        logger.info(f"Progress: {processed_segments} segments processed, current time: {segment.end:.1f}s")
-                
-                if seg_duration < 0.2 or segment.no_speech_prob > 0.8:
-                    continue
-                if text == last_text or not text:
-                    continue
-                segment_dict = {
-                    "start": segment.start,
-                    "end": segment.end,
-                    "text": text,
-                    "avg_logprob": segment.avg_logprob,
-                    "no_speech_prob": segment.no_speech_prob
-                }
-                segments_list.append(segment_dict)
-                full_text += text + " "
-                last_text = text
 
             processing_time = time.time() - start_time
             total_processing_time += processing_time
@@ -329,7 +326,8 @@ async def transcribe_audio(
             logger.info(f"Transcription completed for {afile.filename}")
             logger.info(f"Final stats: {len(segments_list)} valid segments created from {processed_segments} total segments")
             logger.info(f"Processing time: {processing_time:.2f}s for {total_duration:.1f}s audio")
-            logger.info(f"Speed: {total_duration/processing_time:.1f}x realtime")
+            if processing_time > 0:
+                logger.info(f"Speed: {total_duration/processing_time:.1f}x realtime")
 
             try:
                 os.unlink(temp_audio_path)
@@ -511,8 +509,6 @@ async def transcribe_audio_stream(
         }
     )
 
-ENGLISH_ONLY_MODELS = {"tiny.en", "base.en", "small.en", "medium.en", "distil-large-v2", "distil-large-v3", "distil-medium.en", "distil-small.en"}
-
 @app.get("/health", response_class=SafeJSONResponse)
 async def health_check():
     """Return model, device, and readiness information for health monitoring."""
@@ -631,34 +627,39 @@ async def detect_language(
         logger.info(f"Detecting language for: {file.filename}")
         start_time = time.time()
         
-        # Use transcribe with short duration for quick language detection
-        segments, info = whisper_model.transcribe(
-            temp_audio_path,
-            task="transcribe",
-            language=None,  # Auto-detect
-            beam_size=1,    # Fastest setting
-            best_of=1,      # Fastest setting
-            vad_filter=True,
-            condition_on_previous_text=False,
-            # Only process first part for speed
-            vad_parameters={
-                "threshold": 0.5,
-                "min_speech_duration_ms": 250,
-                "min_silence_duration_ms": 500,
-            }
-        )
-        
+        # Use transcribe with short duration for quick language detection.
+        # Runs in a worker thread so the event loop stays responsive.
+        def _detect():
+            """Blocking language-detection transcription, run off the event loop."""
+            segments, info = whisper_model.transcribe(
+                temp_audio_path,
+                task="transcribe",
+                language=None,  # Auto-detect
+                beam_size=1,    # Fastest setting
+                best_of=1,      # Fastest setting
+                vad_filter=True,
+                condition_on_previous_text=False,
+                # Only process first part for speed
+                vad_parameters={
+                    "threshold": 0.5,
+                    "min_speech_duration_ms": 250,
+                    "min_silence_duration_ms": 500,
+                }
+            )
+            sample = ""
+            count = 0
+            for segment in segments:
+                if count >= 3:  # Only need a few segments for detection
+                    break
+                if segment.no_speech_prob < 0.8:
+                    sample += segment.text.strip() + " "
+                    count += 1
+            return sample, info
+
+        loop = asyncio.get_running_loop()
+        sample_text, info = await loop.run_in_executor(executor, _detect)
+
         processing_time = time.time() - start_time
-        
-        # Get a sample of text for confidence
-        sample_text = ""
-        segment_count = 0
-        for segment in segments:
-            if segment_count >= 3:  # Only need a few segments for detection
-                break
-            if segment.no_speech_prob < 0.8:
-                sample_text += segment.text.strip() + " "
-                segment_count += 1
         
         logger.info(f"Language detection completed in {processing_time:.2f}s: {info.language} ({info.language_probability:.2f})")
         

@@ -1,4 +1,4 @@
-FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
 
 WORKDIR /app
 
@@ -20,8 +20,8 @@ RUN ln -sf /usr/bin/python3.11 /usr/bin/python3 && \
 # Upgrade pip
 RUN pip3 install --upgrade pip setuptools wheel
 
-# Install PyTorch with CUDA 12.1 support
-RUN pip3 install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+# Install PyTorch with CUDA 12.8 support (required for Blackwell / RTX 50 series, sm_120+)
+RUN pip3 install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cu128
 
 # Install flash-attn for better performance (optional)
 RUN pip3 install --no-cache-dir flash-attn --no-build-isolation || echo "flash-attn not available, continuing without it"

@@ -9,7 +9,7 @@ A self-hosted, Docker-based platform for text-to-speech synthesis, speech-to-tex
 | **Frontend** | 3000 | Web UI and API documentation hub |
 | **PiperTTS** | 5000 | Text-to-speech with 40+ voices and custom model support |
 | **STT (faster-whisper)** | 5001 | Speech-to-text — Python, CUDA/ROCm/CPU |
-| **whisper-cpp** | 5003 | Speech-to-text — C++, Vulkan/CPU, OpenAI-compatible API |
+| **whisper-cpp** | 5003 | Optional speech-to-text — C++, Vulkan/CPU, OpenAI-compatible API |
 | **Piper Training** | 8080 | VITS neural network voice training pipeline |
 | **Qwen3-TTS** | 5004 | Voice cloning and multilingual TTS |
 | **Qwen3-ASR** | 5002 | Fast multilingual speech recognition |
@@ -19,9 +19,10 @@ A self-hosted, Docker-based platform for text-to-speech synthesis, speech-to-tex
 ```bash
 # CPU-only — works everywhere, no GPU setup required
 docker compose --profile stt up -d          # faster-whisper STT
-docker compose --profile whisper-cpp up -d  # whisper.cpp STT (OpenAI-compat)
+ENABLE_WHISPER_CPP=true docker compose --profile whisper-cpp --profile frontend up -d  # whisper.cpp surfaced in UI
 docker compose --profile piper-tts up -d    # TTS
-docker compose --profile all up -d          # everything
+docker compose --profile all up -d          # default full stack (without optional whisper-cpp)
+ENABLE_WHISPER_CPP=true docker compose --profile all --profile whisper-cpp up -d  # full stack plus whisper.cpp
 
 # Check status
 docker compose ps
@@ -32,6 +33,13 @@ docker compose down
 ```
 
 Open **http://localhost:3000** for the web interface.
+
+`whisper-cpp` is opt-in. Starting the `whisper-cpp` profile alone is not enough for it to appear in the frontend; set `ENABLE_WHISPER_CPP=true` for the frontend service as well.
+
+## Developer Docs
+
+- [docs/developer-roadmap.md](docs/developer-roadmap.md) - planned architecture and migration steps for provider-generalization
+- [docs/provider-contracts.md](docs/provider-contracts.md) - provider registry schema and API contracts used by the frontend
 
 ---
 
@@ -85,6 +93,7 @@ docker compose --profile all up -d
 docker compose --profile stt up -d
 docker compose --profile qwen3-asr up -d
 docker compose --profile training up -d
+ENABLE_WHISPER_CPP=true docker compose --profile all --profile whisper-cpp up -d
 ```
 
 The base `docker-compose.yml` already includes NVIDIA device reservations (`deploy.resources.reservations.devices`).
@@ -251,6 +260,8 @@ Use smaller models (`WHISPER_MODEL_SIZE=small`, `WHISPER_MODEL=small`) to improv
 | POST | `/v1/audio/transcriptions` | Transcribe audio — OpenAI-compatible (`file`, `language`, `response_format`) |
 | POST | `/inference` | Native whisper.cpp inference endpoint |
 
+This backend is optional and is only shown in the frontend when `ENABLE_WHISPER_CPP=true` is set for `frontend-service`.
+
 ### Piper Training (port 8080)
 | Method | Endpoint | Description |
 |--------|----------|-------------|
@@ -306,6 +317,7 @@ Copy `.env.example` to `.env` and adjust as needed.
 | `WHISPER_MODEL` | `large-v3` | whisper-cpp GGUF model: `tiny` `base` `small` `medium` `large-v3` `large-v3-turbo` |
 | `FORCE_ACCELERATION` | `cuda` | faster-whisper backend: `cuda` `rocm` `cpu` |
 | `WHISPER_CPP_PORT` | `5003` | Host port for whisper-cpp |
+| `ENABLE_WHISPER_CPP` | `false` | Exposes whisper-cpp in the frontend provider registry and status checks |
 | `GGML_VULKAN_DEVICE` | `0` | Vulkan GPU device index |
 | `HIP_VISIBLE_DEVICES` | `0` | ROCm GPU device index |
 | `HSA_OVERRIDE_GFX_VERSION` | `11.0.0` | ROCm GFX override (Strix Halo: keep at `11.0.0`) |
@@ -433,13 +445,22 @@ Default ports: 3000, 5000, 5001, 5002, 5003, 5004, 8080. Override with env vars:
 
 ## Local Development
 
-Service source files are bind-mounted, so code changes apply on container restart (no rebuild needed):
+The base `docker-compose.yml` runs from the built images (deployment-ready). For
+development, add the `docker-compose.dev.yml` overlay, which bind-mounts service
+source files so code changes apply on container restart — no rebuild needed:
 
 ```bash
-docker compose restart stt-service
+docker compose -f docker-compose.yml -f docker-compose.dev.yml --profile all up -d
+docker compose restart stt-service   # pick up an edited file
 ```
 
 All processing is local. No data is sent to external services.
+
+### Storage location
+
+Persistent data (models, output, caches, training data) defaults to `./` under
+the repo. Set `APP_DATA_DIR=/path/to/data` (e.g. a TrueNAS dataset) to relocate
+everything with one variable; see `docs/truenas-deployment.md`.
 
 ---
 
@@ -447,14 +468,26 @@ All processing is local. No data is sent to external services.
 
 This project supports deployment on a dedicated TrueNAS SCALE server with an
 NVIDIA RTX 5060 Ti (16 GB VRAM). Use the `docker-compose.truenas.yml` overlay
-for optimised GPU memory allocation.
+for optimised GPU memory allocation and single-GPU pinning.
 
-Use one of these env presets:
+Start from `.env.truenas.example` (copy it to `.env`) and set `APP_DATA_DIR` to a
+dataset path. If the frontend is opened from another machine, change
+`ALLOWED_ORIGINS` and the `BROWSER_*_URL` values before deployment.
 
-- `.env.truenas.example`: balanced local-shell preset for a dedicated TrueNAS GPU host
-- `.env.truenas.production.example`: hostname-aware preset for browser access from another machine
+### Install without building (prebuilt images)
 
-For a full deployment workflow, dataset layout, and profile strategy, see
+CI publishes every service image to GHCR (`ghcr.io/steffenhebestreit/tts-stt-*`),
+so you can deploy on TrueNAS **without cloning or building**:
+
+- **Install via YAML** — paste [`docker-compose.truenas-app.yml`](docker-compose.truenas-app.yml)
+  into Apps → Custom App, set the data dataset, allocate the GPU, deploy.
+- **Custom catalog (point-and-click form)** — add this repo as a community
+  catalog; see [`truenas/README.md`](truenas/README.md) and the
+  [`truenas/tts-stt/`](truenas/tts-stt/) scaffold (`questions.yaml`).
+
+See [`truenas/README.md`](truenas/README.md) for both paths and their caveats.
+
+For the build-from-source workflow, dataset layout, and profile strategy, see
 `docs/truenas-deployment.md`.
 For the first rollout, use `docs/truenas-custom-app-checklist.md`.
 For always-on versus training-window service recommendations, use
@@ -486,11 +519,8 @@ For always-on versus training-window service recommendations, use
 ```bash
 cd /mnt/pool/apps/tts-stt
 
-# Balanced preset for local/direct host access
-cp .env.truenas.example .env
-
-# Or use the hostname-aware production preset
-# cp .env.truenas.production.example .env
+# Start from the checked-in defaults and then edit for your host/network
+cp .env.example .env
 
 # Full stack with NVIDIA GPU
 docker compose --env-file .env -f docker-compose.yml -f docker-compose.truenas.yml --profile all up -d
@@ -499,6 +529,14 @@ docker compose --env-file .env -f docker-compose.yml -f docker-compose.truenas.y
 docker compose --env-file .env -f docker-compose.yml -f docker-compose.truenas.yml \
   --profile stt --profile piper-tts up -d
 ```
+
+### TrueNAS Custom App YAML
+
+If you paste a merged Compose file into Apps -> Discover -> Install via YAML and
+want `qwen3-asr-service` plus `qwen3-tts-service` to share the same NVIDIA GPU,
+pin both services to GPU `0` with `device_ids: ["0"]` and set
+`NVIDIA_VISIBLE_DEVICES=0` plus `CUDA_VISIBLE_DEVICES=0` in each service.
+Do not use `count` and `device_ids` together.
 
 ### Persistent Storage
 

@@ -1,4 +1,4 @@
-"""Export a trained VITS checkpoint to ONNX with a Piper-compatible config."""
+"""Export a trained VITS checkpoint to ONNX with a runtime-compatible config bundle."""
 
 import torch
 from pathlib import Path
@@ -6,10 +6,12 @@ import json
 import logging
 from datetime import datetime
 
+from validation import phoneme_id_map_from_entries
+
 logger = logging.getLogger(__name__)
 
 class ModelExporter:
-    """Export trained checkpoints to Piper-compatible ONNX bundles."""
+    """Export trained checkpoints to ONNX bundles without deploying them."""
 
     def __init__(self):
         """Create the export directory used for generated model artifacts."""
@@ -17,7 +19,7 @@ class ModelExporter:
         self.export_dir.mkdir(exist_ok=True)
     
     async def export_to_onnx(self, job_id: str) -> Path:
-        """Export PyTorch model to ONNX format for Piper"""
+        """Export a training checkpoint to ONNX and write its companion config bundle."""
         
         checkpoint_path = Path(f"checkpoints/{job_id}/final_model.pt")
         if not checkpoint_path.exists():
@@ -90,7 +92,7 @@ class ModelExporter:
             'it': 'it', 'nl': 'nl', 'pt': 'pt', 'ru': 'ru',
         }
         phonemizer_lang = lang_map.get(lang, 'en-us')
-        phoneme_id_map = await self._create_phoneme_map(job_id, export_path)
+        phoneme_id_map = await self._create_phoneme_map(job_id, export_path, config)
 
         # Create Piper config file (includes phoneme vocab for custom inference)
         piper_config = {
@@ -126,30 +128,10 @@ class ModelExporter:
         del model
         gc.collect()
 
-        # Copy model to PiperTTS service if shared models directory exists
-        await self._copy_to_piper_service(job_id, onnx_path, config_path)
-
         logger.info(f"Model exported to: {onnx_path}")
         logger.info(f"Config saved to: {config_path}")
         
         return onnx_path
-    
-    async def _copy_to_piper_service(self, job_id: str, onnx_path: Path, config_path: Path):
-        """Copy exported model to PiperTTS service"""
-        try:
-            shared_models_dir = Path("/app/shared_models")
-            if shared_models_dir.exists():
-                piper_models_dir = shared_models_dir / "custom" / job_id
-                piper_models_dir.mkdir(parents=True, exist_ok=True)
-                
-                # Copy ONNX model
-                import shutil
-                shutil.copy2(onnx_path, piper_models_dir / f"{job_id}.onnx")
-                shutil.copy2(config_path, piper_models_dir / f"{job_id}.json")
-                
-                logger.info(f"Model copied to PiperTTS service: {piper_models_dir}")
-        except Exception as e:
-            logger.warning(f"Failed to copy model to PiperTTS service: {e}")
     
     def _load_config(self, job_id: str) -> dict:
         """Load training configuration"""
@@ -173,45 +155,58 @@ class ModelExporter:
             'speaker_name': 'stst'
         }
     
-    async def _create_phoneme_map(self, job_id: str, export_path: Path) -> dict:
-        """Build phoneme->id mapping from dataset metadata and save it.
+    async def _create_phoneme_map(self, job_id: str, export_path: Path, config: dict) -> dict:
+        """Build phoneme->id mapping that matches the training vocabulary, and save it.
+
+        Training builds its vocabulary from the ``train.json`` split via
+        ``TTSDataset._create_phoneme_vocab()`` — ``sorted(phonemes ∪ special_tokens)``.
+        To produce an identical id mapping for inference we must read the SAME
+        split of the SAME dataset, located by the model name stored in the
+        training config (the dataset dir is named after the model, not the uuid
+        job id). Falls back to the job id, then a scan, then ``metadata.json``.
 
         Returns the mapping dict so callers can embed it in the model config.
-        The ordering matches TTSDataset._create_phoneme_vocab() exactly:
-        sorted(phonemes ∪ special_tokens).
         """
-        # Try to find dataset directory - check by job_id first, then scan data/
-        dataset_path = Path(f"data/{job_id}")
-        if not dataset_path.exists():
+        model_name = (config or {}).get('speaker_name')
+
+        # Prefer the dataset whose directory matches the trained model name.
+        candidates = []
+        if model_name:
+            candidates.append(Path("data") / model_name)
+        candidates.append(Path(f"data/{job_id}"))
+
+        dataset_path = next((c for c in candidates if c.exists()), None)
+        if dataset_path is None:
             data_root = Path("data")
             if data_root.exists():
-                for candidate in data_root.iterdir():
-                    if candidate.is_dir() and (candidate / "metadata.json").exists():
+                for candidate in sorted(data_root.iterdir()):
+                    if candidate.is_dir() and (candidate / "train.json").exists():
                         dataset_path = candidate
                         break
 
         phoneme_map = {}
-        if dataset_path.exists():
-            metadata_path = dataset_path / "metadata.json"
-            if metadata_path.exists():
-                with open(metadata_path, 'r') as f:
-                    metadata = json.load(f)
+        if dataset_path is not None and dataset_path.exists():
+            # train.json matches the split used to build the training vocab;
+            # metadata.json (train+val superset) is only a fallback.
+            source_path = dataset_path / "train.json"
+            if not source_path.exists():
+                source_path = dataset_path / "metadata.json"
 
-                # Collect every character seen in phonemized text
-                phonemes = set()
-                for item in metadata:
-                    phoneme_text = item.get('phonemes', item.get('text', ''))
-                    if phoneme_text:
-                        phonemes.update(list(phoneme_text))
+            if source_path.exists():
+                with open(source_path, 'r', encoding='utf-8') as f:
+                    entries = json.load(f)
 
-                # Replicate TTSDataset._create_phoneme_vocab() ordering
-                special_tokens = ['<pad>', '<unk>', '<start>', '<end>', ' ']
-                all_phonemes = sorted(phonemes.union(special_tokens))
-                phoneme_map = {p: i for i, p in enumerate(all_phonemes)}
+                # Build the vocab exactly as TTSDataset._create_phoneme_vocab() does
+                phoneme_map = phoneme_id_map_from_entries(entries)
+                logger.info(f"Phoneme map built from {source_path} ({len(phoneme_map)} symbols)")
+            else:
+                logger.warning(f"No train.json/metadata.json under {dataset_path}; phoneme map will be empty")
+        else:
+            logger.warning("Dataset directory not found for export; phoneme map will be empty")
 
         # Save as standalone file for debugging / manual inspection
         phoneme_map_path = export_path / "phonemes.json"
-        with open(phoneme_map_path, 'w') as f:
+        with open(phoneme_map_path, 'w', encoding='utf-8') as f:
             json.dump(phoneme_map, f, indent=2, ensure_ascii=False)
 
         return phoneme_map

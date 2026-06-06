@@ -1,9 +1,20 @@
 name: ttstt
 
+# This base file runs the stack from the built images and persists data through
+# configurable host paths. Override data locations with a single APP_DATA_DIR
+# (e.g. a TrueNAS dataset) or per-path vars (MODELS_DIR, OUTPUT_DIR, CACHE_DIR,
+# TRAINING_*_DIR, *_CACHE_DIR); all default to ./ so local use is unchanged.
+#
+#   Local dev (live-reload source):  -f docker-compose.yml -f docker-compose.dev.yml
+#   TrueNAS / single-GPU host:       -f docker-compose.yml -f docker-compose.truenas.yml
+#
+# See docs/truenas-deployment.md for the full guide.
+
 services:
   # PiperTTS service with default and custom model support
   piper-tts-service:
     profiles: [piper-tts, all]
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-piper-tts:${IMAGE_TAG:-latest}
     build:
       context: ./piper-tts-service
       dockerfile: Dockerfile
@@ -12,13 +23,12 @@ services:
     environment:
       PIPER_DATA_DIR: /app/models
       PIPER_OUTPUT_DIR: /app/output
+      OUTPUT_RETENTION_HOURS: ${OUTPUT_RETENTION_HOURS:-24}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
-      - "./models:/app/models"
-      - "./output:/app/output"
-      - "./piper-tts-service/app.py:/app/app.py"
-      - "./piper-tts-service/requirements.txt:/app/requirements.txt"
+      - "${MODELS_DIR:-${APP_DATA_DIR:-.}/models}:/app/models"
+      - "${OUTPUT_DIR:-${APP_DATA_DIR:-.}/output}:/app/output"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
@@ -32,6 +42,7 @@ services:
   # PiperTTS Training service for custom voice models
   piper-training-service:
     profiles: [training, all]
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-piper-training:${IMAGE_TAG:-latest}
     build:
       context: ./piper-training-service
       dockerfile: Dockerfile
@@ -44,24 +55,18 @@ services:
       PYTORCH_CUDA_ALLOC_CONF: ${TRAINING_PYTORCH_CUDA_ALLOC_CONF:-max_split_size_mb:1024}
       PYTHONUNBUFFERED: 1
       STT_SERVICE_URL: ${STT_SERVICE_URL:-http://stt-service:8000}
+      PIPER_TTS_SERVICE_URL: ${PIPER_TTS_SERVICE_URL:-http://piper-tts-service:5000}
+      SHARED_MODELS_DIR: ${SHARED_MODELS_DIR:-/app/shared_models}
+      DEFAULT_DEPLOYMENT_TARGET: ${DEFAULT_DEPLOYMENT_TARGET:-piper-volume}
+      MAX_TRAIN_BATCH_SIZE: ${MAX_TRAIN_BATCH_SIZE:-4}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
-      - "./piper-training-service/data:/app/data"
-      - "./piper-training-service/models:/app/models"
-      - "./piper-training-service/checkpoints:/app/checkpoints"
-      - "./piper-training-service/configs:/app/configs"
-      - "./models:/app/shared_models"
-      - "./piper-training-service/app.py:/app/app.py"
-      - "./piper-training-service/training_pipeline.py:/app/training_pipeline.py"
-      - "./piper-training-service/dataset.py:/app/dataset.py"
-      - "./piper-training-service/vits_model.py:/app/vits_model.py"
-      - "./piper-training-service/training_utils.py:/app/training_utils.py"
-      - "./piper-training-service/data_processor.py:/app/data_processor.py"
-      - "./piper-training-service/model_exporter.py:/app/model_exporter.py"
-      - "./piper-training-service/stt_processor.py:/app/stt_processor.py"
-      - "./piper-training-service/audio_segmenter.py:/app/audio_segmenter.py"
-      - "./piper-training-service/requirements.txt:/app/requirements.txt"
+      - "${TRAINING_DATA_DIR:-${APP_DATA_DIR:-.}/piper-training-service/data}:/app/data"
+      - "${TRAINING_MODELS_DIR:-${APP_DATA_DIR:-.}/piper-training-service/models}:/app/models"
+      - "${TRAINING_CHECKPOINTS_DIR:-${APP_DATA_DIR:-.}/piper-training-service/checkpoints}:/app/checkpoints"
+      - "${TRAINING_CONFIGS_DIR:-${APP_DATA_DIR:-.}/piper-training-service/configs}:/app/configs"
+      - "${MODELS_DIR:-${APP_DATA_DIR:-.}/models}:/app/shared_models"
     shm_size: 2gb
     restart: unless-stopped
     healthcheck:
@@ -85,6 +90,7 @@ services:
   # Whisper STT service (used for training transcription)
   stt-service:
     profiles: [stt, all]
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-stt:${IMAGE_TAG:-latest}
     build:
       context: ./stt-service
     ports:
@@ -99,11 +105,9 @@ services:
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
-      - "./models:/app/models"
-      - "./.cache:/root/.cache"
+      - "${MODELS_DIR:-${APP_DATA_DIR:-.}/models}:/app/models"
+      - "${CACHE_DIR:-${APP_DATA_DIR:-.}/.cache}:/root/.cache"
       - pip-cache:/root/.cache/pip
-      - "./stt-service/app.py:/app/app.py"
-      - "./stt-service/requirements.txt:/app/requirements.txt"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -124,6 +128,7 @@ services:
   # Qwen3-ASR service (fast multilingual speech recognition)
   qwen3-asr-service:
     profiles: [qwen3-asr, all]
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-qwen3-asr:${IMAGE_TAG:-latest}
     build:
       context: ./qwen3-asr-service
       dockerfile: Dockerfile
@@ -136,8 +141,7 @@ services:
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
-      - qwen3-asr-cache:/root/.cache
-      - "./qwen3-asr-service/app.py:/app/app.py"
+      - "${QWEN3_ASR_CACHE_DIR:-qwen3-asr-cache}:/root/.cache"
     deploy:
       resources:
         reservations:
@@ -155,9 +159,46 @@ services:
     networks:
       - tts-stt-network
 
+  # Parakeet-ASR service (fast multilingual realtime STT — 25 EU langs incl. German)
+  # Opt-in: heavy NeMo image, so it is not part of the `all` profile. Enable it in
+  # the browser UI with ENABLE_PARAKEET_ASR=true on the frontend.
+  parakeet-asr-service:
+    profiles: [parakeet-asr]
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-parakeet-asr:${IMAGE_TAG:-latest}
+    build:
+      context: ./parakeet-asr-service
+      dockerfile: Dockerfile
+    ports:
+      - "${PARAKEET_ASR_PORT:-5005}:5005"
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+      PARAKEET_ASR_MODEL: ${PARAKEET_ASR_MODEL:-nvidia/parakeet-tdt-0.6b-v3}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
+      ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
+    volumes:
+      - "${PARAKEET_ASR_CACHE_DIR:-parakeet-asr-cache}:/root/.cache"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              count: 1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5005/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 180s
+      retries: 3
+    networks:
+      - tts-stt-network
+
   # Qwen3-TTS service (voice cloning + TTS, replaces XTTS)
   qwen3-tts-service:
     profiles: [qwen3-tts, all]
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-qwen3-tts:${IMAGE_TAG:-latest}
     build:
       context: ./qwen3-tts-service
       dockerfile: Dockerfile
@@ -171,9 +212,8 @@ services:
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
-      - qwen3-tts-cache:/root/.cache
-      - qwen3-tts-voices:/app/voices
-      - "./qwen3-tts-service/app.py:/app/app.py"
+      - "${QWEN3_TTS_CACHE_DIR:-qwen3-tts-cache}:/root/.cache"
+      - "${QWEN3_TTS_VOICES_DIR:-qwen3-tts-voices}:/app/voices"
     deploy:
       resources:
         reservations:
@@ -197,6 +237,7 @@ services:
   # CPU by default; use docker-compose.vulkan.yml overlay for Vulkan GPU acceleration
   whisper-cpp:
     profiles: [whisper-cpp]
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-whisper-cpp:${IMAGE_TAG:-latest}
     build:
       context: ./whisper-cpp-service
       dockerfile: Dockerfile
@@ -209,7 +250,7 @@ services:
       # Optional extra whisper-server CLI flags (e.g. "--language de --threads 4")
       EXTRA_ARGS: ${WHISPER_CPP_EXTRA_ARGS:-}
     volumes:
-      - whisper-cpp-models:/models
+      - "${WHISPER_CPP_MODELS_DIR:-whisper-cpp-models}:/models"
     restart: unless-stopped
     healthcheck:
       # whisper-server returns HTTP even on unrecognised paths; any response = healthy
@@ -224,6 +265,7 @@ services:
   # Frontend Service - Modern web interface
   frontend-service:
     profiles: [frontend, all]
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-frontend:${IMAGE_TAG:-latest}
     build:
       context: ./frontend-service
       dockerfile: Dockerfile
@@ -236,6 +278,10 @@ services:
       VOICE_TRAINING_URL: http://piper-training-service:8080
       QWEN3_TTS_SERVICE_URL: http://qwen3-tts-service:5004
       QWEN3_ASR_SERVICE_URL: http://qwen3-asr-service:5002
+      PARAKEET_ASR_SERVICE_URL: ${PARAKEET_ASR_SERVICE_URL:-http://parakeet-asr-service:5005}
+      ENABLE_PARAKEET_ASR: ${ENABLE_PARAKEET_ASR:-false}
+      WHISPER_CPP_SERVICE_URL: ${WHISPER_CPP_SERVICE_URL:-http://whisper-cpp:8080}
+      ENABLE_WHISPER_CPP: ${ENABLE_WHISPER_CPP:-false}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
       # Browser-facing URLs (uses host ports for the browser to connect)
@@ -244,10 +290,8 @@ services:
       BROWSER_TRAINING_URL: ${BROWSER_TRAINING_URL:-http://localhost:${TRAINING_PORT:-8080}}
       BROWSER_QWEN3_TTS_URL: ${BROWSER_QWEN3_TTS_URL:-http://localhost:${QWEN3_TTS_PORT:-5004}}
       BROWSER_QWEN3_ASR_URL: ${BROWSER_QWEN3_ASR_URL:-http://localhost:${QWEN3_ASR_PORT:-5002}}
-    volumes:
-      - "./frontend-service/app.py:/app/app.py"
-      - "./frontend-service/static:/app/static"
-      - "./frontend-service/templates:/app/templates"
+      BROWSER_PARAKEET_ASR_URL: ${BROWSER_PARAKEET_ASR_URL:-http://localhost:${PARAKEET_ASR_PORT:-5005}}
+      BROWSER_WHISPER_CPP_URL: ${BROWSER_WHISPER_CPP_URL:-http://localhost:${WHISPER_CPP_PORT:-5003}}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
@@ -269,6 +313,8 @@ volumes:
   pip-cache:
     driver: local
   qwen3-asr-cache:
+    driver: local
+  parakeet-asr-cache:
     driver: local
   qwen3-tts-cache:
     driver: local

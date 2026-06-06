@@ -10,6 +10,7 @@ import asyncio
 import aiofiles
 import math
 import tempfile
+import shutil
 import numpy as np
 import uuid
 import logging
@@ -29,6 +30,11 @@ import uvicorn
 from training_pipeline import OptimizedTrainingPipeline
 from data_processor import DataProcessor
 from model_exporter import ModelExporter
+from validation import (
+    safe_name as _safe_name,
+    coerce_resume_int as _coerce_resume_int,
+    coerce_resume_path as _coerce_resume_path,
+)
 
 # Configure logging so all logger.info() calls actually output to stdout
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
@@ -54,6 +60,58 @@ training_pipeline = OptimizedTrainingPipeline()
 data_processor = DataProcessor()
 model_exporter = ModelExporter()
 
+PIPER_TTS_SERVICE_URL = os.getenv("PIPER_TTS_SERVICE_URL", "http://piper-tts-service:5000")
+SHARED_MODELS_DIR = os.getenv("SHARED_MODELS_DIR", "/app/shared_models")
+
+
+def _build_deployment_target_registry() -> dict:
+    """Describe where trained model bundles can be deployed after export."""
+    targets = {
+        "none": {
+            "display_name": "Manual download only",
+            "deployment_contract": "manual-artifact-v1",
+            "kind": "manual",
+            "capabilities": ["download_only"],
+        },
+        "piper-volume": {
+            "display_name": "Piper shared volume",
+            "deployment_contract": "piper-shared-volume-v1",
+            "kind": "tts-runtime",
+            "capabilities": ["copy_bundle", "refresh_runtime"],
+            "shared_models_dir": SHARED_MODELS_DIR,
+            "runtime_url": PIPER_TTS_SERVICE_URL,
+            "refresh_path": "/refresh_voices",
+        },
+        "piper-http": {
+            "display_name": "Piper upload API",
+            "deployment_contract": "piper-upload-api-v1",
+            "kind": "tts-runtime",
+            "capabilities": ["upload_bundle", "delete_model", "refresh_runtime"],
+            "runtime_url": PIPER_TTS_SERVICE_URL,
+            "upload_path": "/upload_model",
+            "delete_path": "/voice/{model_name}",
+            "refresh_path": "/refresh_voices",
+        },
+    }
+
+    registry = {
+        "default_target": os.getenv("DEFAULT_DEPLOYMENT_TARGET", "piper-volume"),
+        "targets": targets,
+    }
+
+    override = os.getenv("DEPLOYMENT_TARGETS_JSON", "").strip()
+    if override:
+        parsed = json.loads(override)
+        registry["targets"].update(parsed.get("targets", {}))
+        if parsed.get("default_target"):
+            registry["default_target"] = parsed["default_target"]
+
+    return registry
+
+
+DEPLOYMENT_TARGET_REGISTRY = _build_deployment_target_registry()
+
+
 class TrainingRequest(BaseModel):
     """Parameters for starting or resuming a VITS training job."""
 
@@ -66,6 +124,7 @@ class TrainingRequest(BaseModel):
     audio_files: Optional[List[str]] = None # To pass file info internally
     epochs: int = 1000
     batch_size: int = 32
+    deployment_target: Optional[str] = None
     
 class SegmentData(BaseModel):
     """Single STT-derived segment used for dataset preparation."""
@@ -92,6 +151,7 @@ class TrainingStatus(BaseModel):
     loss: Optional[float]
     message: str
     model_name: Optional[str] = None
+    deployment_target: Optional[str] = None
 
 class AudioProcessingRequest(BaseModel):
     """Payload for STT segmentation of a long source recording."""
@@ -106,80 +166,136 @@ training_jobs = {}
 
 # Old chunking functions removed - now using AudioSegmenter for all STT processing
 
-async def copy_model_to_tts_service(job_id: str, model_name: str, onnx_path: Path):
-    """Copy a trained ONNX model to the shared volume so PiperTTS picks it up."""
-    import shutil
+def resolve_deployment_target(target_id: Optional[str] = None) -> tuple[str, dict]:
+    """Resolve a deployment target id to a registry entry."""
+    resolved_id = (target_id or DEPLOYMENT_TARGET_REGISTRY["default_target"]).strip()
+    target = DEPLOYMENT_TARGET_REGISTRY["targets"].get(resolved_id)
+    if not target:
+        raise HTTPException(status_code=400, detail=f"Unknown deployment target: {resolved_id}")
+    return resolved_id, target
 
-    # PiperTTS scans /app/models/custom/{voice_name}/{voice_name}.onnx + .json
-    custom_dir = Path("/app/shared_models/custom") / model_name
-    custom_dir.mkdir(parents=True, exist_ok=True)
 
-    try:
-        # Load the Piper-format config from the export directory
-        export_config_path = onnx_path.parent / f"{onnx_path.stem}.json"
+async def refresh_deployment_target(target: dict):
+    """Refresh a runtime after deployment when the target supports it."""
+    runtime_url = target.get("runtime_url")
+    refresh_path = target.get("refresh_path")
+    if not runtime_url or not refresh_path:
+        return
 
-        # Copy ONNX model
-        onnx_dest = custom_dir / f"{model_name}.onnx"
-        shutil.copy2(onnx_path, onnx_dest)
-
-        # Copy or create Piper-compatible JSON config
-        if export_config_path.exists():
-            shutil.copy2(export_config_path, custom_dir / f"{model_name}.json")
-        else:
-            # Load training config for metadata
-            checkpoint_path = Path(f"checkpoints/{job_id}/final_model.pt")
-            config = {}
-            if checkpoint_path.exists():
-                import torch
-                ckpt = torch.load(checkpoint_path, map_location='cpu')
-                config = ckpt.get('config', {})
-
-            piper_config = {
-                "audio": {"sample_rate": config.get("sample_rate", 22050), "quality": "medium"},
-                "espeak": {"voice": config.get("language", "en")},
-                "inference": {"noise_scale": 0.667, "length_scale": 1.0, "noise_w": 0.8},
-                "model_card": {
-                    "name": model_name,
-                    "language": config.get("language", "en"),
-                    "dataset": "custom",
-                    "version": "1.0.0",
-                    "speaker": config.get("speaker_name", model_name),
-                },
-            }
-            with open(custom_dir / f"{model_name}.json", 'w') as f:
-                json.dump(piper_config, f, indent=2)
-
-        logger.info(f"Model {model_name} copied to PiperTTS at {onnx_dest}")
-        
-    except Exception as e:
-        logger.error(f"Failed to copy model to TTS service: {e}")
-        # Try alternative approach - use HTTP API to notify TTS service
-        try:
-            await notify_tts_service_new_model(model_name, onnx_path)
-        except Exception as api_error:
-            logger.error(f"Failed to notify TTS service via API: {api_error}")
-            raise e
-
-async def notify_tts_service_new_model(model_name: str, onnx_path: Path):
-    """Upload a model to the TTS service via its HTTP API (fallback path)."""
-
-    async with aiofiles.open(onnx_path, 'rb') as f:
-        model_data = await f.read()
-
-    tts_service_url = "http://piper-tts-service:5000"
     async with aiohttp.ClientSession() as session:
-        form = aiohttp.FormData()
-        form.add_field('model_file', model_data,
-                        filename=f"{model_name}.onnx",
-                        content_type='application/octet-stream')
-        form.add_field('model_name', model_name)
-        async with session.post(f"{tts_service_url}/upload_model", data=form,
-                                timeout=aiohttp.ClientTimeout(total=30)) as resp:
-            if resp.status == 200:
-                logger.info(f"Successfully uploaded model {model_name} to TTS service")
-            else:
+        async with session.post(
+            f"{runtime_url}{refresh_path}",
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            if resp.status != 200:
                 body = await resp.text()
-                raise Exception(f"Failed to upload model: {resp.status} - {body}")
+                raise RuntimeError(f"Refresh failed: {resp.status} - {body}")
+
+
+async def deploy_model_bundle(job_id: str, model_name: str, onnx_path: Path, target_id: Optional[str] = None) -> dict:
+    """Deploy an exported model bundle to the selected target."""
+    resolved_target_id, target = resolve_deployment_target(target_id)
+    config_path = onnx_path.parent / f"{onnx_path.stem}.json"
+
+    if resolved_target_id == "none":
+        return {
+            "target": resolved_target_id,
+            "status": "skipped",
+            "message": "Export completed; model bundle retained for manual download.",
+        }
+
+    if target.get("deployment_contract") == "piper-shared-volume-v1":
+        shared_models_dir = Path(target["shared_models_dir"])
+        custom_dir = shared_models_dir / "custom" / model_name
+        custom_dir.mkdir(parents=True, exist_ok=True)
+
+        shutil.copy2(onnx_path, custom_dir / f"{model_name}.onnx")
+        if config_path.exists():
+            shutil.copy2(config_path, custom_dir / f"{model_name}.json")
+
+        try:
+            await refresh_deployment_target(target)
+        except Exception as refresh_error:
+            logger.warning(f"Deployment refresh failed for {resolved_target_id}: {refresh_error}")
+
+        return {
+            "target": resolved_target_id,
+            "status": "deployed",
+            "message": f"Model deployed to {target['display_name']}",
+            "location": str(custom_dir),
+        }
+
+    if target.get("deployment_contract") == "piper-upload-api-v1":
+        async with aiofiles.open(onnx_path, 'rb') as f:
+            model_data = await f.read()
+
+        config_data = None
+        if config_path.exists():
+            async with aiofiles.open(config_path, 'rb') as f:
+                config_data = await f.read()
+
+        async with aiohttp.ClientSession() as session:
+            form = aiohttp.FormData()
+            form.add_field('model_file', model_data, filename=f"{model_name}.onnx", content_type='application/octet-stream')
+            if config_data is not None:
+                form.add_field('config_file', config_data, filename=f"{model_name}.json", content_type='application/json')
+            form.add_field('voice_name', model_name)
+            form.add_field('model_name', model_name)
+
+            async with session.post(
+                f"{target['runtime_url']}{target['upload_path']}",
+                data=form,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    raise RuntimeError(f"Upload failed: {resp.status} - {body}")
+
+        try:
+            await refresh_deployment_target(target)
+        except Exception as refresh_error:
+            logger.warning(f"Deployment refresh failed for {resolved_target_id}: {refresh_error}")
+
+        return {
+            "target": resolved_target_id,
+            "status": "deployed",
+            "message": f"Model deployed to {target['display_name']}",
+            "location": target['runtime_url'],
+        }
+
+    raise HTTPException(status_code=400, detail=f"Unsupported deployment contract: {target.get('deployment_contract')}")
+
+
+async def remove_model_from_deployment_target(model_name: str, target_id: Optional[str] = None):
+    """Remove a deployed model from the selected target when supported."""
+    resolved_target_id, target = resolve_deployment_target(target_id)
+
+    if resolved_target_id == "none":
+        return
+
+    if target.get("deployment_contract") == "piper-shared-volume-v1":
+        model_dir = Path(target["shared_models_dir"]) / "custom" / model_name
+        if model_dir.exists():
+            shutil.rmtree(model_dir)
+        try:
+            await refresh_deployment_target(target)
+        except Exception as refresh_error:
+            logger.warning(f"Deployment refresh failed for {resolved_target_id}: {refresh_error}")
+        return
+
+    if target.get("deployment_contract") == "piper-upload-api-v1":
+        delete_path = target["delete_path"].format(model_name=model_name)
+        async with aiohttp.ClientSession() as session:
+            async with session.delete(
+                f"{target['runtime_url']}{delete_path}",
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status not in {200, 404}:
+                    body = await resp.text()
+                    logger.warning(f"Deployment delete failed: {resp.status} - {body}")
+        return
+
+    logger.info(f"No removal implementation for deployment target {resolved_target_id}")
 
 @app.on_event("startup")
 async def restore_interrupted_jobs():
@@ -224,6 +340,12 @@ async def health():
     """Liveness / readiness probe."""
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
+
+@app.get("/deployment-targets")
+async def deployment_targets():
+    """Return the configured deployment targets for exported model bundles."""
+    return DEPLOYMENT_TARGET_REGISTRY
+
 @app.post("/restore-backup")
 async def restore_backup():
     """Restore training data from a local backup directory."""
@@ -246,6 +368,7 @@ async def restore_backup():
 @app.post("/generate-missing-mels")
 async def generate_missing_mels(model_name: str = "stst"):
     """Generate mel spectrograms for audio files that are missing them."""
+    model_name = _safe_name(model_name, "model_name")
     try:
         dataset_dir = Path(f"data/{model_name}")
         audio_dir = dataset_dir / "audio"
@@ -334,7 +457,7 @@ async def process_audio(request: AudioProcessingRequest):
             "message": f"Processed {len(segments)} segments from audio",
             "segments_count": len(segments),
             "dataset_path": dataset_result["dataset_path"],
-            "segments": [segment.dict() for segment in segments[:5]]  # Return first 5 for preview
+            "segments": [segment.model_dump() for segment in segments[:5]]  # Return first 5 for preview
         }
         
     except Exception as e:
@@ -343,10 +466,11 @@ async def process_audio(request: AudioProcessingRequest):
 @app.post("/prepare-dataset")
 async def prepare_dataset(dataset: DatasetUpload):
     """Create a training dataset from pre-segmented STT results."""
+    model_name = _safe_name(dataset.model_name, "model_name")
     try:
         dataset_path = await data_processor.prepare_dataset(
             segments=dataset.segments,
-            model_name=dataset.model_name
+            model_name=model_name
         )
         return {
             "status": "success",
@@ -383,6 +507,7 @@ async def train_model(
     stt_service_url: str = Form("http://stt-service:8000"),
     epochs: int = Form(1000),
     batch_size: int = Form(32),
+    deployment_target: str = Form(""),
 ):
     """
     New STT-based training endpoint that processes audio files through STT service
@@ -396,7 +521,10 @@ async def train_model(
     5. Start training with optimized pipeline
     """
     job_id = str(uuid.uuid4())
-    
+
+    model_name = _safe_name(model_name, "model_name")
+    resolved_target_id, _ = resolve_deployment_target(deployment_target or None)
+
     try:
         logger.info(f"Starting STT-based training for model: {model_name}")
         logger.info(f"Received {len(audio_files)} audio files")
@@ -411,6 +539,7 @@ async def train_model(
             loss=None,
             message="Initializing STT-based training pipeline...",
             model_name=model_name,
+            deployment_target=resolved_target_id,
         )
         
         # Create dataset directory
@@ -465,6 +594,7 @@ async def train_model(
             quality,
             epochs,
             batch_size,
+            resolved_target_id,
         )
         
         return JSONResponse(
@@ -493,7 +623,8 @@ async def run_stt_based_training(job_id: str,
                                stt_service_url: str,
                                quality: str = "medium",
                                epochs: int = 1000,
-                               batch_size: int = 32):
+                               batch_size: int = 32,
+                               deployment_target: Optional[str] = None):
     """Background task for STT-based training workflow"""
     try:
         from audio_segmenter import AudioSegmenter
@@ -582,6 +713,7 @@ async def run_stt_based_training(job_id: str,
             quality=quality,
             epochs=epochs,
             batch_size=batch_size,
+            deployment_target=deployment_target,
         )
         
         # Start actual training with optimized pipeline
@@ -596,10 +728,10 @@ async def run_stt_based_training(job_id: str,
             callback=lambda update: update_training_status(job_id, update),
         )
         
-        # Export model to ONNX format for PiperTTS
+        # Export model to ONNX format and deploy to the selected target
         training_jobs[job_id].status = "exporting"
         training_jobs[job_id].progress = 90
-        training_jobs[job_id].message = "Exporting model to ONNX format for PiperTTS..."
+        training_jobs[job_id].message = "Exporting model to ONNX format..."
         logger.info(f"Exporting model to ONNX for job {job_id}")
 
         try:
@@ -614,19 +746,31 @@ async def run_stt_based_training(job_id: str,
             logger.info(f"STT-based training completed (export failed) for job {job_id}")
             return
 
-        # Notify PiperTTS service to reload voices
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post("http://piper-tts-service:5000/reload_voices", timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status == 200:
-                        logger.info("PiperTTS service notified to reload voices")
-        except Exception:
-            logger.warning("Could not notify PiperTTS service (it will pick up the model on restart)")
+            deployment_result = await deploy_model_bundle(job_id, model_name, onnx_path, deployment_target)
+            logger.info(f"Deployment result for {job_id}: {deployment_result}")
+        except Exception as deploy_error:
+            logger.warning(f"Model export succeeded but deployment failed for {job_id}: {deploy_error}")
+            deployment_result = {"status": "failed", "message": str(deploy_error)}
 
         # Final status update
         training_jobs[job_id].status = "completed"
         training_jobs[job_id].progress = 100
-        training_jobs[job_id].message = f"Training completed! Model exported and available in PiperTTS. Created from {len(training_segments)} segments ({stats['training_audio_duration']:.1f}s of audio)"
+        if deployment_result.get("status") == "deployed":
+            training_jobs[job_id].message = (
+                f"Training completed and model deployed to {deployment_result['target']}. "
+                f"Created from {len(training_segments)} segments ({stats['training_audio_duration']:.1f}s of audio)"
+            )
+        elif deployment_result.get("status") == "skipped":
+            training_jobs[job_id].message = (
+                f"Training completed. Exported model retained for manual download. "
+                f"Created from {len(training_segments)} segments ({stats['training_audio_duration']:.1f}s of audio)"
+            )
+        else:
+            training_jobs[job_id].message = (
+                f"Training completed but deployment failed: {deployment_result.get('message')}. "
+                f"Exported model is still available for download."
+            )
 
         logger.info(f"STT-based training completed for job {job_id}")
         
@@ -651,11 +795,17 @@ async def resume_training(
     model_name: str = Form(...),
     job_id: str = Form(""),          # optional — auto-detect latest if blank
     extra_epochs: int = Form(0),     # 0 = continue to original total_epochs
+    deployment_target: str = Form(""),
 ):
     """
     Resume an interrupted training job from its latest checkpoint.
     Finds the newest checkpoint_epoch_N.pt for the job and continues from there.
     """
+    model_name = _safe_name(model_name, "model_name")
+    if job_id.strip():
+        job_id = _safe_name(job_id, "job_id")
+    resolved_target_id, _ = resolve_deployment_target(deployment_target or None)
+
     checkpoints_root = Path("checkpoints")
 
     # Find the job_id from disk if not provided
@@ -672,7 +822,9 @@ async def resume_training(
             id_match   = target_job_id and state.get("job_id") == target_job_id
             if id_match or (not target_job_id and name_match):
                 # Pick the most-recently-written one if multiple
-                if target_state is None or state.get("epoch", 0) > target_state.get("epoch", 0):
+                state_epoch = _coerce_resume_int(state.get("epoch", 0), 0)
+                current_best_epoch = _coerce_resume_int(target_state.get("epoch", 0), 0) if target_state else 0
+                if target_state is None or state_epoch > current_best_epoch:
                     target_state = state
         except Exception:
             continue
@@ -684,20 +836,28 @@ async def resume_training(
                    "Train a new model first."
         )
 
-    resumed_job_id   = target_state["job_id"]
-    latest_ckpt      = target_state.get("latest_checkpoint")
-    saved_epoch      = target_state.get("epoch", 0)
-    total_epochs     = target_state.get("total_epochs", 10000)
+    resumed_job_id   = str(target_state.get("job_id") or "").strip()
+    latest_ckpt_path = _coerce_resume_path(target_state.get("latest_checkpoint"))
+    saved_epoch      = _coerce_resume_int(target_state.get("epoch", 0), 0)
+    total_epochs     = _coerce_resume_int(target_state.get("total_epochs", 10000), 10000)
     language         = target_state.get("language", "de")
-    config           = target_state.get("config", {})
+    config           = target_state.get("config") if isinstance(target_state.get("config"), dict) else {}
+
+    if not resumed_job_id:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Interrupted job state for model '{model_name}' is missing a valid job id."
+        )
 
     if extra_epochs > 0:
         total_epochs = saved_epoch + extra_epochs
 
-    if not latest_ckpt or not Path(latest_ckpt).exists():
+    total_epochs = max(total_epochs, saved_epoch or 1)
+
+    if latest_ckpt_path is None or not latest_ckpt_path.exists():
         raise HTTPException(
             status_code=404,
-            detail=f"Checkpoint file not found: {latest_ckpt}"
+            detail=f"Checkpoint file not found: {target_state.get('latest_checkpoint')}"
         )
 
     # Update/create the in-memory job record
@@ -710,6 +870,7 @@ async def resume_training(
         loss=target_state.get("loss"),
         message=f"Resuming from epoch {saved_epoch}/{total_epochs}...",
         model_name=model_name,
+        deployment_target=resolved_target_id,
     )
 
     training_request = TrainingRequest(
@@ -719,6 +880,7 @@ async def resume_training(
         quality=config.get("quality", "medium"),
         epochs=total_epochs,
         batch_size=config.get("batch_size", 16),
+        deployment_target=resolved_target_id,
     )
 
     async def _resume():
@@ -728,16 +890,18 @@ async def resume_training(
             job_id=resumed_job_id,
             request=training_request,
             callback=lambda update: update_training_status(resumed_job_id, update),
-            resume_from=latest_ckpt,
+            resume_from=str(latest_ckpt_path),
         )
         # Export after training completes
         try:
             training_jobs[resumed_job_id].status = "exporting"
             onnx_path = await model_exporter.export_to_onnx(resumed_job_id)
-            await copy_model_to_tts_service(resumed_job_id, model_name, onnx_path)
+            deployment_result = await deploy_model_bundle(resumed_job_id, model_name, onnx_path, resolved_target_id)
             training_jobs[resumed_job_id].status = "completed"
             training_jobs[resumed_job_id].progress = 100
-            training_jobs[resumed_job_id].message = f"Resumed training complete. Model '{model_name}' updated in PiperTTS."
+            training_jobs[resumed_job_id].message = (
+                f"Resumed training complete. Deployment target: {deployment_result['target']} ({deployment_result['status']})."
+            )
         except Exception as e:
             logger.error(f"Export after resume failed: {e}")
             training_jobs[resumed_job_id].message = f"Training complete but export failed: {e}"
@@ -749,7 +913,7 @@ async def resume_training(
         "job_id": resumed_job_id,
         "resume_from_epoch": saved_epoch,
         "total_epochs": total_epochs,
-        "checkpoint": latest_ckpt,
+        "checkpoint": str(latest_ckpt_path),
     })
 
 
@@ -760,12 +924,14 @@ async def train_from_dataset(
     language: str = Form("de"),
     epochs: int = Form(10000),
     batch_size: int = Form(32),
+    deployment_target: str = Form(""),
 ):
     """
     Start training directly from an already-prepared dataset.
     Requires data/{model_name}/train.json and val.json to exist.
     Skips upload and STT — goes straight to VITS training.
     """
+    model_name = _safe_name(model_name, "model_name")
     train_json = Path(f"data/{model_name}/train.json")
     val_json = Path(f"data/{model_name}/val.json")
 
@@ -779,6 +945,8 @@ async def train_from_dataset(
     n_train = len(_json.loads(train_json.read_text()))
     n_val   = len(_json.loads(val_json.read_text()))
 
+    resolved_target_id, _ = resolve_deployment_target(deployment_target or None)
+
     job_id = str(uuid.uuid4())
     training_jobs[job_id] = TrainingStatus(
         job_id=job_id,
@@ -789,6 +957,7 @@ async def train_from_dataset(
         loss=None,
         message=f"Starting training with {n_train} train / {n_val} val samples...",
         model_name=model_name,
+        deployment_target=resolved_target_id,
     )
 
     background_tasks.add_task(run_training, job_id, TrainingRequest(
@@ -798,6 +967,7 @@ async def train_from_dataset(
         quality="medium",
         epochs=epochs,
         batch_size=batch_size,
+        deployment_target=resolved_target_id,
     ))
 
     return JSONResponse(status_code=202, content={
@@ -818,6 +988,7 @@ async def retrain_from_segments(
     batch_size: int = Form(32),
     prefix_filter: str = Form(""),
     stt_service_url: str = Form("http://stt-service:8000"),
+    deployment_target: str = Form(""),
 ):
     """
     Rebuild metadata from existing pre-segmented audio files and retrain.
@@ -826,6 +997,7 @@ async def retrain_from_segments(
     in data/{model_name}/audio/.  Runs STT on each clip to get transcriptions,
     then calls generate_training_metadata() and train_sync().
     """
+    model_name = _safe_name(model_name, "model_name")
     dataset_path = Path(f"data/{model_name}")
     audio_dir = dataset_path / "audio"
 
@@ -839,6 +1011,8 @@ async def retrain_from_segments(
     if not wav_files:
         raise HTTPException(status_code=404, detail=f"No WAV files found (prefix_filter='{prefix_filter}')")
 
+    resolved_target_id, _ = resolve_deployment_target(deployment_target or None)
+
     job_id = str(uuid.uuid4())
     training_jobs[job_id] = TrainingStatus(
         job_id=job_id,
@@ -849,12 +1023,13 @@ async def retrain_from_segments(
         loss=None,
         message=f"Found {len(wav_files)} audio segments — starting STT transcription...",
         model_name=model_name,
+        deployment_target=resolved_target_id,
     )
 
     background_tasks.add_task(
         _run_retrain_from_segments,
         job_id, model_name, wav_files, dataset_path,
-        language, epochs, batch_size, stt_service_url,
+        language, epochs, batch_size, stt_service_url, resolved_target_id,
     )
 
     return JSONResponse(status_code=202, content={
@@ -873,6 +1048,7 @@ async def _run_retrain_from_segments(
     epochs: int,
     batch_size: int,
     stt_service_url: str,
+    deployment_target: Optional[str],
 ):
     """Background task: STT-transcribe existing clips, rebuild metadata, train."""
     from audio_segmenter import AudioSegmenter, TrainingSegment
@@ -967,6 +1143,7 @@ async def _run_retrain_from_segments(
             quality="medium",
             epochs=epochs,
             batch_size=batch_size,
+            deployment_target=deployment_target,
         )
 
         await asyncio.to_thread(
@@ -982,25 +1159,13 @@ async def _run_retrain_from_segments(
         training_jobs[job_id].message = "Exporting model to ONNX..."
 
         onnx_path = await model_exporter.export_to_onnx(job_id)
-        await copy_model_to_tts_service(job_id, model_name, onnx_path)
-
-        # Notify piper-tts to reload
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    "http://piper-tts-service:5000/refresh_voices",
-                    timeout=aiohttp.ClientTimeout(total=10)
-                ) as resp:
-                    if resp.status == 200:
-                        logger.info(f"[{job_id}] PiperTTS voices refreshed")
-        except Exception:
-            pass
+        deployment_result = await deploy_model_bundle(job_id, model_name, onnx_path, deployment_target)
 
         training_jobs[job_id].status = "completed"
         training_jobs[job_id].progress = 100
         training_jobs[job_id].message = (
             f"Training complete! {len(training_segments)} segments, "
-            f"model '{model_name}' available in PiperTTS."
+            f"model '{model_name}' deployment status: {deployment_result['status']} on {deployment_result['target']}."
         )
         logger.info(f"[{job_id}] Retrain from segments completed for '{model_name}'")
 
@@ -1011,9 +1176,12 @@ async def _run_retrain_from_segments(
 
 
 @app.post("/export/{job_id}")
-async def manual_export_model(job_id: str, model_name: str = Form(...)):
-    """Manually export a completed training checkpoint to ONNX and upload to PiperTTS."""
+async def manual_export_model(job_id: str, model_name: str = Form(...), deployment_target: str = Form("")):
+    """Manually export a completed training checkpoint and deploy it to a configured target."""
+    job_id = _safe_name(job_id, "job_id")
+    model_name = _safe_name(model_name, "model_name")
     try:
+        resolved_target_id, _ = resolve_deployment_target(deployment_target or None)
         # Check if checkpoint exists
         checkpoint_path = Path(f"checkpoints/{job_id}/final_model.pt")
         if not checkpoint_path.exists():
@@ -1022,14 +1190,15 @@ async def manual_export_model(job_id: str, model_name: str = Form(...)):
         # Export model to ONNX format
         onnx_path = await model_exporter.export_to_onnx(job_id)
         
-        # Upload to TTS service
-        await copy_model_to_tts_service(job_id, model_name, onnx_path)
+        # Deploy model bundle to selected target
+        deployment_result = await deploy_model_bundle(job_id, model_name, onnx_path, resolved_target_id)
         
         return {
-            "message": f"Model '{model_name}' exported and uploaded successfully!",
+            "message": f"Model '{model_name}' exported successfully.",
             "job_id": job_id,
             "model_name": model_name,
-            "onnx_path": str(onnx_path)
+            "onnx_path": str(onnx_path),
+            "deployment": deployment_result,
         }
         
     except Exception as e:
@@ -1038,9 +1207,10 @@ async def manual_export_model(job_id: str, model_name: str = Form(...)):
 @app.delete("/model/{job_id}")
 async def delete_trained_model(job_id: str):
     """Delete a trained model and all associated files (checkpoint, export, dataset)."""
+    job_id = _safe_name(job_id, "job_id")
     try:
         import shutil
-        
+
         # Remove checkpoint directory
         checkpoint_dir = Path(f"checkpoints/{job_id}")
         if checkpoint_dir.exists():
@@ -1055,8 +1225,10 @@ async def delete_trained_model(job_id: str):
         
         # Look up model name from training job record
         model_name = None
+        deployment_target = None
         if job_id in training_jobs:
             model_name = training_jobs[job_id].model_name
+            deployment_target = training_jobs[job_id].deployment_target
             del training_jobs[job_id]
             logger.info(f"Removed job {job_id} from active jobs")
 
@@ -1067,12 +1239,11 @@ async def delete_trained_model(job_id: str):
                 shutil.rmtree(dataset_dir)
                 logger.info(f"Deleted dataset directory: {dataset_dir}")
 
-        # Try to remove from TTS service if it was uploaded
         if model_name:
             try:
-                await remove_model_from_tts_service(model_name)
+                await remove_model_from_deployment_target(model_name, deployment_target)
             except Exception as tts_error:
-                logger.warning(f"Could not remove from TTS service: {tts_error}")
+                logger.warning(f"Could not remove from deployment target: {tts_error}")
         
         return {
             "message": f"Model {job_id} deleted successfully",
@@ -1086,23 +1257,6 @@ async def delete_trained_model(job_id: str):
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)}")
-
-async def remove_model_from_tts_service(model_name: str):
-    """Tell the TTS service to remove a model via its HTTP API."""
-    try:
-        tts_service_url = "http://piper-tts-service:5000"
-        async with aiohttp.ClientSession() as session:
-            async with session.delete(
-                f"{tts_service_url}/voice/{model_name}",
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                if resp.status == 200:
-                    logger.info(f"Successfully removed model {model_name} from TTS service")
-                else:
-                    body = await resp.text()
-                    logger.warning(f"TTS service response: {resp.status} - {body}")
-    except Exception as e:
-        logger.error(f"Could not contact TTS service: {e}")
 
 @app.get("/status/{job_id}")
 async def get_training_status(job_id: str):
@@ -1119,9 +1273,10 @@ async def list_jobs():
 @app.get("/download/{job_id}")
 async def download_model(job_id: str):
     """Download the exported ONNX model for a training job."""
+    job_id = _safe_name(job_id, "job_id")
     if job_id not in training_jobs:
         raise HTTPException(status_code=404, detail="Job not found")
-    
+
     model_path = Path(f"models/{job_id}/{job_id}.onnx")
     if not model_path.exists():
         raise HTTPException(status_code=404, detail="Model file not found")
@@ -1167,12 +1322,18 @@ async def run_training(job_id: str, request: TrainingRequest):
         try:
             onnx_path = await model_exporter.export_to_onnx(job_id)
             
-            # Copy model to TTS service models directory
-            await copy_model_to_tts_service(job_id, request.model_name, onnx_path)
+            deployment_result = await deploy_model_bundle(
+                job_id,
+                request.model_name,
+                onnx_path,
+                request.deployment_target,
+            )
             
             training_jobs[job_id].status = "completed"
             training_jobs[job_id].progress = 100.0
-            training_jobs[job_id].message = f"Training completed! Model '{request.model_name}' is now available for TTS."
+            training_jobs[job_id].message = (
+                f"Training completed. Deployment target: {deployment_result['target']} ({deployment_result['status']})."
+            )
             
         except Exception as export_error:
             logger.error(f"Model export failed for {job_id}: {export_error}")
