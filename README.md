@@ -445,13 +445,22 @@ Default ports: 3000, 5000, 5001, 5002, 5003, 5004, 8080. Override with env vars:
 
 ## Local Development
 
-Service source files are bind-mounted, so code changes apply on container restart (no rebuild needed):
+The base `docker-compose.yml` runs from the built images (deployment-ready). For
+development, add the `docker-compose.dev.yml` overlay, which bind-mounts service
+source files so code changes apply on container restart — no rebuild needed:
 
 ```bash
-docker compose restart stt-service
+docker compose -f docker-compose.yml -f docker-compose.dev.yml --profile all up -d
+docker compose restart stt-service   # pick up an edited file
 ```
 
 All processing is local. No data is sent to external services.
+
+### Storage location
+
+Persistent data (models, output, caches, training data) defaults to `./` under
+the repo. Set `APP_DATA_DIR=/path/to/data` (e.g. a TrueNAS dataset) to relocate
+everything with one variable; see `docs/truenas-deployment.md`.
 
 ---
 
@@ -461,10 +470,24 @@ This project supports deployment on a dedicated TrueNAS SCALE server with an
 NVIDIA RTX 5060 Ti (16 GB VRAM). Use the `docker-compose.truenas.yml` overlay
 for optimised GPU memory allocation and single-GPU pinning.
 
-Start from `.env.example`. If the frontend is opened from another machine,
-change `ALLOWED_ORIGINS` and the `BROWSER_*_URL` values before deployment.
+Start from `.env.truenas.example` (copy it to `.env`) and set `APP_DATA_DIR` to a
+dataset path. If the frontend is opened from another machine, change
+`ALLOWED_ORIGINS` and the `BROWSER_*_URL` values before deployment.
 
-For a full deployment workflow, dataset layout, and profile strategy, see
+### Install without building (prebuilt images)
+
+CI publishes every service image to GHCR (`ghcr.io/steffenhebestreit/tts-stt-*`),
+so you can deploy on TrueNAS **without cloning or building**:
+
+- **Install via YAML** — paste [`docker-compose.truenas-app.yml`](docker-compose.truenas-app.yml)
+  into Apps → Custom App, set the data dataset, allocate the GPU, deploy.
+- **Custom catalog (point-and-click form)** — add this repo as a community
+  catalog; see [`truenas/README.md`](truenas/README.md) and the
+  [`truenas/tts-stt/`](truenas/tts-stt/) scaffold (`questions.yaml`).
+
+See [`truenas/README.md`](truenas/README.md) for both paths and their caveats.
+
+For the build-from-source workflow, dataset layout, and profile strategy, see
 `docs/truenas-deployment.md`.
 For the first rollout, use `docs/truenas-custom-app-checklist.md`.
 For always-on versus training-window service recommendations, use

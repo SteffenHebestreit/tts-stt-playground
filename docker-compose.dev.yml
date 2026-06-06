@@ -1,0 +1,54 @@
+# Development overlay — live-mounts source files over the built images so code
+# edits take effect on container restart without rebuilding. The base
+# docker-compose.yml runs purely from images (suitable for TrueNAS/prod); this
+# overlay is for local development only.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml --profile all up
+#
+# Data volumes live in the base file; only source/static is added here.
+
+services:
+  piper-tts-service:
+    volumes:
+      - "./piper-tts-service/app.py:/app/app.py"
+      - "./piper-tts-service/naming.py:/app/naming.py"
+      - "./piper-tts-service/requirements.txt:/app/requirements.txt"
+
+  piper-training-service:
+    volumes:
+      - "./piper-training-service/app.py:/app/app.py"
+      - "./piper-training-service/training_pipeline.py:/app/training_pipeline.py"
+      - "./piper-training-service/dataset.py:/app/dataset.py"
+      - "./piper-training-service/vits_model.py:/app/vits_model.py"
+      - "./piper-training-service/training_utils.py:/app/training_utils.py"
+      - "./piper-training-service/data_processor.py:/app/data_processor.py"
+      - "./piper-training-service/model_exporter.py:/app/model_exporter.py"
+      - "./piper-training-service/validation.py:/app/validation.py"
+      - "./piper-training-service/stt_processor.py:/app/stt_processor.py"
+      - "./piper-training-service/audio_segmenter.py:/app/audio_segmenter.py"
+      - "./piper-training-service/requirements.txt:/app/requirements.txt"
+
+  stt-service:
+    volumes:
+      - "./stt-service/app.py:/app/app.py"
+      - "./stt-service/json_utils.py:/app/json_utils.py"
+      - "./stt-service/requirements.txt:/app/requirements.txt"
+
+  qwen3-asr-service:
+    volumes:
+      - "./qwen3-asr-service/app.py:/app/app.py"
+
+  parakeet-asr-service:
+    volumes:
+      - "./parakeet-asr-service/app.py:/app/app.py"
+      - "./parakeet-asr-service/transcription.py:/app/transcription.py"
+
+  qwen3-tts-service:
+    volumes:
+      - "./qwen3-tts-service/app.py:/app/app.py"
+
+  frontend-service:
+    volumes:
+      - "./frontend-service/app.py:/app/app.py"
+      - "./frontend-service/static:/app/static"
+      - "./frontend-service/templates:/app/templates"

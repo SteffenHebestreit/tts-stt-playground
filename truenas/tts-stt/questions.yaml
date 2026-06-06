@@ -1,0 +1,157 @@
+# TrueNAS SCALE configuration form for TTS-STT Studio.
+#
+# This describes the point-and-click options shown when installing the app from
+# a custom catalog. The values are consumed by templates/docker-compose.yaml.
+#
+# NOTE: TrueNAS's app engine renders templates with its internal ix-lib Jinja2
+# helpers, which evolve per release. Treat this as a starting scaffold and
+# validate on your target TrueNAS version. The fully supported path is
+# "Install via YAML" with docker-compose.truenas-app.yml (see truenas/README.md).
+
+groups:
+  - name: Network
+    description: Host ports exposed by the stack
+  - name: Storage
+    description: Where persistent data lives on the pool
+  - name: GPU
+    description: NVIDIA GPU acceleration
+  - name: Models
+    description: Which models each engine loads
+  - name: Backends
+    description: Optional, heavier backends (opt-in)
+  - name: Access
+    description: CORS and browser-facing URLs
+  - name: Images
+    description: Container image source
+
+questions:
+  # --- Network ---
+  - variable: frontend_port
+    label: Web UI port
+    group: Network
+    schema:
+      type: int
+      default: 3000
+      required: true
+
+  - variable: expose_backend_ports
+    label: Also expose backend service ports (5000-5005, 8080)
+    description: Needed because the browser calls TTS/STT backends directly.
+    group: Network
+    schema:
+      type: boolean
+      default: true
+
+  # --- Storage ---
+  - variable: host_path
+    label: Data dataset (host path)
+    description: All models, output, caches and training data are stored here.
+    group: Storage
+    schema:
+      type: hostpath
+      required: true
+
+  # --- GPU ---
+  - variable: use_gpu
+    label: Use NVIDIA GPU
+    group: GPU
+    schema:
+      type: boolean
+      default: true
+
+  - variable: gpu_device_id
+    label: GPU device id
+    description: Index of the NVIDIA card to use (single-GPU hosts use 0).
+    group: GPU
+    schema:
+      type: string
+      default: "0"
+      show_if: [["use_gpu", "=", true]]
+
+  # --- Models ---
+  - variable: whisper_model_size
+    label: Whisper STT model
+    group: Models
+    schema:
+      type: string
+      default: medium
+      enum:
+        - {value: tiny, description: tiny (fastest)}
+        - {value: base, description: base}
+        - {value: small, description: small}
+        - {value: medium, description: medium (balanced)}
+        - {value: large-v3, description: large-v3 (best, most VRAM)}
+
+  - variable: qwen3_tts_model
+    label: Qwen3-TTS model
+    group: Models
+    schema:
+      type: string
+      default: Qwen/Qwen3-TTS-12Hz-0.6B-Base
+      enum:
+        - {value: Qwen/Qwen3-TTS-12Hz-0.6B-Base, description: 0.6B Base (16 GB friendly)}
+        - {value: Qwen/Qwen3-TTS-12Hz-1.7B-Base, description: 1.7B Base (higher quality)}
+
+  - variable: qwen3_asr_model
+    label: Qwen3-ASR model
+    group: Models
+    schema:
+      type: string
+      default: Qwen/Qwen3-ASR-1.7B
+
+  # --- Backends ---
+  - variable: enable_parakeet
+    label: Enable Parakeet-ASR (realtime, 25 EU langs incl. German)
+    description: Fast multilingual STT. Heavy NeMo image; uses extra VRAM.
+    group: Backends
+    schema:
+      type: boolean
+      default: false
+
+  - variable: enable_whisper_cpp
+    label: Enable whisper.cpp (CPU, OpenAI-compatible STT)
+    group: Backends
+    schema:
+      type: boolean
+      default: false
+
+  - variable: enable_training
+    label: Enable voice-training service
+    group: Backends
+    schema:
+      type: boolean
+      default: false
+
+  # --- Access ---
+  - variable: allowed_origins
+    label: Allowed CORS origins
+    description: Use "*" for LAN use, or the exact frontend origin in production.
+    group: Access
+    schema:
+      type: string
+      default: "*"
+
+  - variable: browser_host
+    label: Browser-facing host
+    description: >-
+      Hostname/IP the browser uses to reach the backends (not "localhost" when
+      accessed from another machine). Example: 192.168.1.50 or truenas.local.
+    group: Access
+    schema:
+      type: string
+      default: localhost
+
+  # --- Images ---
+  - variable: image_registry
+    label: Image registry / owner
+    group: Images
+    schema:
+      type: string
+      default: ghcr.io/steffenhebestreit
+
+  - variable: image_tag
+    label: Image tag
+    group: Images
+    schema:
+      type: string
+      default: latest

@@ -1,0 +1,166 @@
+# Jinja2 template rendered from questions.yaml values into a docker-compose.
+#
+# SCAFFOLD: plain Jinja2 (no ix-lib) so it is readable and adaptable. TrueNAS's
+# own app engine uses additional ix-lib helpers; validate/adjust for your
+# release. The fully supported, no-template path is docker-compose.truenas-app.yml.
+{%- set reg = values.image_registry %}
+{%- set tag = values.image_tag %}
+{%- set data = values.host_path %}
+{%- set origins = values.allowed_origins %}
+{%- set bhost = values.browser_host %}
+{%- macro gpu() %}
+    {%- if values.use_gpu %}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["{{ values.gpu_device_id }}"]
+              capabilities: [gpu]
+    {%- endif %}
+{%- endmacro %}
+name: tts-stt
+services:
+  frontend-service:
+    image: {{ reg }}/tts-stt-frontend:{{ tag }}
+    ports:
+      - "{{ values.frontend_port }}:3000"
+    environment:
+      TTS_SERVICE_URL: http://piper-tts-service:5000
+      STT_SERVICE_URL: http://stt-service:8000
+      VOICE_TRAINING_URL: http://piper-training-service:8080
+      QWEN3_TTS_SERVICE_URL: http://qwen3-tts-service:5004
+      QWEN3_ASR_SERVICE_URL: http://qwen3-asr-service:5002
+      PARAKEET_ASR_SERVICE_URL: http://parakeet-asr-service:5005
+      WHISPER_CPP_SERVICE_URL: http://whisper-cpp:8080
+      ENABLE_PARAKEET_ASR: "{{ values.enable_parakeet | lower }}"
+      ENABLE_WHISPER_CPP: "{{ values.enable_whisper_cpp | lower }}"
+      ALLOWED_ORIGINS: "{{ origins }}"
+      BROWSER_TTS_URL: "http://{{ bhost }}:5000"
+      BROWSER_STT_URL: "http://{{ bhost }}:5001"
+      BROWSER_TRAINING_URL: "http://{{ bhost }}:8080"
+      BROWSER_QWEN3_TTS_URL: "http://{{ bhost }}:5004"
+      BROWSER_QWEN3_ASR_URL: "http://{{ bhost }}:5002"
+      BROWSER_PARAKEET_ASR_URL: "http://{{ bhost }}:5005"
+      BROWSER_WHISPER_CPP_URL: "http://{{ bhost }}:5003"
+    restart: unless-stopped
+    networks: [tts-stt-network]
+
+  piper-tts-service:
+    image: {{ reg }}/tts-stt-piper-tts:{{ tag }}
+    {%- if values.expose_backend_ports %}
+    ports: ["5000:5000"]
+    {%- endif %}
+    environment:
+      ALLOWED_ORIGINS: "{{ origins }}"
+    volumes:
+      - "{{ data }}/models:/app/models"
+      - "{{ data }}/output:/app/output"
+    restart: unless-stopped
+    networks: [tts-stt-network]
+
+  stt-service:
+    image: {{ reg }}/tts-stt-stt:{{ tag }}
+    {%- if values.expose_backend_ports %}
+    ports: ["5001:8000"]
+    {%- endif %}
+    environment:
+      USE_CUDA: "{{ values.use_gpu | lower }}"
+      FORCE_ACCELERATION: "{{ 'cuda' if values.use_gpu else 'cpu' }}"
+      NVIDIA_VISIBLE_DEVICES: "{{ values.gpu_device_id if values.use_gpu else '' }}"
+      WHISPER_MODEL_SIZE: "{{ values.whisper_model_size }}"
+      ALLOWED_ORIGINS: "{{ origins }}"
+    volumes:
+      - "{{ data }}/models:/app/models"
+      - "{{ data }}/.cache:/root/.cache"
+    restart: unless-stopped
+    {{- gpu() }}
+    networks: [tts-stt-network]
+
+  qwen3-asr-service:
+    image: {{ reg }}/tts-stt-qwen3-asr:{{ tag }}
+    {%- if values.expose_backend_ports %}
+    ports: ["5002:5002"]
+    {%- endif %}
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "{{ values.gpu_device_id if values.use_gpu else '' }}"
+      QWEN3_ASR_MODEL: "{{ values.qwen3_asr_model }}"
+      ALLOWED_ORIGINS: "{{ origins }}"
+    volumes:
+      - "{{ data }}/hf-cache/qwen3-asr:/root/.cache"
+    restart: unless-stopped
+    {{- gpu() }}
+    networks: [tts-stt-network]
+
+  qwen3-tts-service:
+    image: {{ reg }}/tts-stt-qwen3-tts:{{ tag }}
+    {%- if values.expose_backend_ports %}
+    ports: ["5004:5004"]
+    {%- endif %}
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "{{ values.gpu_device_id if values.use_gpu else '' }}"
+      QWEN3_TTS_MODEL: "{{ values.qwen3_tts_model }}"
+      QWEN3_ASR_SERVICE_URL: http://qwen3-asr-service:5002
+      ALLOWED_ORIGINS: "{{ origins }}"
+    volumes:
+      - "{{ data }}/hf-cache/qwen3-tts:/root/.cache"
+      - "{{ data }}/qwen3-voices:/app/voices"
+    restart: unless-stopped
+    {{- gpu() }}
+    networks: [tts-stt-network]
+
+  {%- if values.enable_parakeet %}
+  parakeet-asr-service:
+    image: {{ reg }}/tts-stt-parakeet-asr:{{ tag }}
+    {%- if values.expose_backend_ports %}
+    ports: ["5005:5005"]
+    {%- endif %}
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "{{ values.gpu_device_id if values.use_gpu else '' }}"
+      PARAKEET_ASR_MODEL: "nvidia/parakeet-tdt-0.6b-v3"
+      ALLOWED_ORIGINS: "{{ origins }}"
+    volumes:
+      - "{{ data }}/hf-cache/parakeet:/root/.cache"
+    restart: unless-stopped
+    {{- gpu() }}
+    networks: [tts-stt-network]
+  {%- endif %}
+
+  {%- if values.enable_whisper_cpp %}
+  whisper-cpp:
+    image: {{ reg }}/tts-stt-whisper-cpp:{{ tag }}
+    {%- if values.expose_backend_ports %}
+    ports: ["5003:8080"]
+    {%- endif %}
+    environment:
+      WHISPER_MODEL: "large-v3"
+    volumes:
+      - "{{ data }}/whisper-cpp-models:/models"
+    restart: unless-stopped
+    networks: [tts-stt-network]
+  {%- endif %}
+
+  {%- if values.enable_training %}
+  piper-training-service:
+    image: {{ reg }}/tts-stt-piper-training:{{ tag }}
+    {%- if values.expose_backend_ports %}
+    ports: ["8080:8080"]
+    {%- endif %}
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "{{ values.gpu_device_id if values.use_gpu else '' }}"
+      MAX_TRAIN_BATCH_SIZE: "4"
+      ALLOWED_ORIGINS: "{{ origins }}"
+    shm_size: 1gb
+    volumes:
+      - "{{ data }}/piper-training-service/data:/app/data"
+      - "{{ data }}/piper-training-service/checkpoints:/app/checkpoints"
+      - "{{ data }}/piper-training-service/models:/app/models"
+      - "{{ data }}/models:/app/shared_models"
+    restart: unless-stopped
+    {{- gpu() }}
+    networks: [tts-stt-network]
+  {%- endif %}
+
+networks:
+  tts-stt-network:
+    driver: bridge

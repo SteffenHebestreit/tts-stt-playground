@@ -5,34 +5,38 @@ Use this checklist when turning the repository into a TrueNAS SCALE Custom App d
 ## Before You Start
 
 - Confirm the NVIDIA GPU is visible in TrueNAS SCALE
-- Confirm the repo is stored on a persistent dataset, for example `/mnt/pool/apps/tts-stt`
-- Copy `.env.example` to `.env`
+- Confirm the repo is stored on a persistent dataset, for example `/mnt/pool/apps/tts-stt` (needed to build the images)
+- Copy `.env.truenas.example` to `.env` and set `APP_DATA_DIR`
 - Decide whether the frontend will access services via `localhost` ports or a TrueNAS hostname
 
 ## Dataset Layout
 
-Recommended persistent paths:
+Set **one** variable and every data directory is created under it:
 
-- `/mnt/pool/apps/tts-stt/models`
-- `/mnt/pool/apps/tts-stt/output`
-- `/mnt/pool/apps/tts-stt/.cache`
-- `/mnt/pool/apps/tts-stt/piper-training-service/data`
-- `/mnt/pool/apps/tts-stt/piper-training-service/checkpoints`
-- `/mnt/pool/apps/tts-stt/piper-training-service/models`
+```env
+APP_DATA_DIR=/mnt/pool/apps/tts-stt
+```
+
+That produces `models/`, `output/`, `.cache/`, and `piper-training-service/{data,checkpoints,models}/` under the dataset. Optionally relocate the big Hugging Face caches with `QWEN3_TTS_CACHE_DIR`, `QWEN3_ASR_CACHE_DIR`, `PARAKEET_ASR_CACHE_DIR`, `WHISPER_CPP_MODELS_DIR`.
 
 ## TrueNAS App Setup Steps
 
 1. Create or select a dataset, for example `/mnt/pool/apps/tts-stt`.
-2. Clone or copy the repository into that dataset.
-3. Copy `.env.example` to `.env`.
+2. Clone or copy the repository into that dataset (required to build images).
+3. Copy `.env.truenas.example` to `.env`; set `APP_DATA_DIR` (and hostnames if remote).
 4. If using a hostname, edit `ALLOWED_ORIGINS` and the `BROWSER_*_URL` variables in `.env`.
 5. Launch the stack with:
 
 ```bash
-docker compose --env-file .env -f docker-compose.yml -f docker-compose.truenas.yml --profile all up -d
+docker compose -f docker-compose.yml -f docker-compose.truenas.yml --profile all up -d
 ```
 
-If you want `whisper-cpp` visible in the frontend as an alternative STT backend, set `ENABLE_WHISPER_CPP=true` and add `--profile whisper-cpp` to that command.
+(The base + `truenas` overlay run from the built images — do **not** add `docker-compose.dev.yml`, which is for local source editing only.)
+
+Optional STT backends, each opt-in via its own profile + frontend flag:
+
+- `whisper-cpp`: `ENABLE_WHISPER_CPP=true` + `--profile whisper-cpp`
+- `parakeet-asr` (realtime, 25 EU langs incl. German): `ENABLE_PARAKEET_ASR=true` + `--profile parakeet-asr`
 
 ## First Startup Validation
 
