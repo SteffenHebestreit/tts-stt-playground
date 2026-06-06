@@ -30,6 +30,11 @@ import uvicorn
 from training_pipeline import OptimizedTrainingPipeline
 from data_processor import DataProcessor
 from model_exporter import ModelExporter
+from validation import (
+    safe_name as _safe_name,
+    coerce_resume_int as _coerce_resume_int,
+    coerce_resume_path as _coerce_resume_path,
+)
 
 # Configure logging so all logger.info() calls actually output to stdout
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
@@ -105,6 +110,7 @@ def _build_deployment_target_registry() -> dict:
 
 
 DEPLOYMENT_TARGET_REGISTRY = _build_deployment_target_registry()
+
 
 class TrainingRequest(BaseModel):
     """Parameters for starting or resuming a VITS training job."""
@@ -362,6 +368,7 @@ async def restore_backup():
 @app.post("/generate-missing-mels")
 async def generate_missing_mels(model_name: str = "stst"):
     """Generate mel spectrograms for audio files that are missing them."""
+    model_name = _safe_name(model_name, "model_name")
     try:
         dataset_dir = Path(f"data/{model_name}")
         audio_dir = dataset_dir / "audio"
@@ -450,7 +457,7 @@ async def process_audio(request: AudioProcessingRequest):
             "message": f"Processed {len(segments)} segments from audio",
             "segments_count": len(segments),
             "dataset_path": dataset_result["dataset_path"],
-            "segments": [segment.dict() for segment in segments[:5]]  # Return first 5 for preview
+            "segments": [segment.model_dump() for segment in segments[:5]]  # Return first 5 for preview
         }
         
     except Exception as e:
@@ -459,10 +466,11 @@ async def process_audio(request: AudioProcessingRequest):
 @app.post("/prepare-dataset")
 async def prepare_dataset(dataset: DatasetUpload):
     """Create a training dataset from pre-segmented STT results."""
+    model_name = _safe_name(dataset.model_name, "model_name")
     try:
         dataset_path = await data_processor.prepare_dataset(
             segments=dataset.segments,
-            model_name=dataset.model_name
+            model_name=model_name
         )
         return {
             "status": "success",
@@ -513,7 +521,8 @@ async def train_model(
     5. Start training with optimized pipeline
     """
     job_id = str(uuid.uuid4())
-    
+
+    model_name = _safe_name(model_name, "model_name")
     resolved_target_id, _ = resolve_deployment_target(deployment_target or None)
 
     try:
@@ -792,6 +801,9 @@ async def resume_training(
     Resume an interrupted training job from its latest checkpoint.
     Finds the newest checkpoint_epoch_N.pt for the job and continues from there.
     """
+    model_name = _safe_name(model_name, "model_name")
+    if job_id.strip():
+        job_id = _safe_name(job_id, "job_id")
     resolved_target_id, _ = resolve_deployment_target(deployment_target or None)
 
     checkpoints_root = Path("checkpoints")
@@ -810,7 +822,9 @@ async def resume_training(
             id_match   = target_job_id and state.get("job_id") == target_job_id
             if id_match or (not target_job_id and name_match):
                 # Pick the most-recently-written one if multiple
-                if target_state is None or state.get("epoch", 0) > target_state.get("epoch", 0):
+                state_epoch = _coerce_resume_int(state.get("epoch", 0), 0)
+                current_best_epoch = _coerce_resume_int(target_state.get("epoch", 0), 0) if target_state else 0
+                if target_state is None or state_epoch > current_best_epoch:
                     target_state = state
         except Exception:
             continue
@@ -822,20 +836,28 @@ async def resume_training(
                    "Train a new model first."
         )
 
-    resumed_job_id   = target_state["job_id"]
-    latest_ckpt      = target_state.get("latest_checkpoint")
-    saved_epoch      = target_state.get("epoch", 0)
-    total_epochs     = target_state.get("total_epochs", 10000)
+    resumed_job_id   = str(target_state.get("job_id") or "").strip()
+    latest_ckpt_path = _coerce_resume_path(target_state.get("latest_checkpoint"))
+    saved_epoch      = _coerce_resume_int(target_state.get("epoch", 0), 0)
+    total_epochs     = _coerce_resume_int(target_state.get("total_epochs", 10000), 10000)
     language         = target_state.get("language", "de")
-    config           = target_state.get("config", {})
+    config           = target_state.get("config") if isinstance(target_state.get("config"), dict) else {}
+
+    if not resumed_job_id:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Interrupted job state for model '{model_name}' is missing a valid job id."
+        )
 
     if extra_epochs > 0:
         total_epochs = saved_epoch + extra_epochs
 
-    if not latest_ckpt or not Path(latest_ckpt).exists():
+    total_epochs = max(total_epochs, saved_epoch or 1)
+
+    if latest_ckpt_path is None or not latest_ckpt_path.exists():
         raise HTTPException(
             status_code=404,
-            detail=f"Checkpoint file not found: {latest_ckpt}"
+            detail=f"Checkpoint file not found: {target_state.get('latest_checkpoint')}"
         )
 
     # Update/create the in-memory job record
@@ -868,7 +890,7 @@ async def resume_training(
             job_id=resumed_job_id,
             request=training_request,
             callback=lambda update: update_training_status(resumed_job_id, update),
-            resume_from=latest_ckpt,
+            resume_from=str(latest_ckpt_path),
         )
         # Export after training completes
         try:
@@ -891,7 +913,7 @@ async def resume_training(
         "job_id": resumed_job_id,
         "resume_from_epoch": saved_epoch,
         "total_epochs": total_epochs,
-        "checkpoint": latest_ckpt,
+        "checkpoint": str(latest_ckpt_path),
     })
 
 
@@ -909,6 +931,7 @@ async def train_from_dataset(
     Requires data/{model_name}/train.json and val.json to exist.
     Skips upload and STT — goes straight to VITS training.
     """
+    model_name = _safe_name(model_name, "model_name")
     train_json = Path(f"data/{model_name}/train.json")
     val_json = Path(f"data/{model_name}/val.json")
 
@@ -974,6 +997,7 @@ async def retrain_from_segments(
     in data/{model_name}/audio/.  Runs STT on each clip to get transcriptions,
     then calls generate_training_metadata() and train_sync().
     """
+    model_name = _safe_name(model_name, "model_name")
     dataset_path = Path(f"data/{model_name}")
     audio_dir = dataset_path / "audio"
 
@@ -1154,6 +1178,8 @@ async def _run_retrain_from_segments(
 @app.post("/export/{job_id}")
 async def manual_export_model(job_id: str, model_name: str = Form(...), deployment_target: str = Form("")):
     """Manually export a completed training checkpoint and deploy it to a configured target."""
+    job_id = _safe_name(job_id, "job_id")
+    model_name = _safe_name(model_name, "model_name")
     try:
         resolved_target_id, _ = resolve_deployment_target(deployment_target or None)
         # Check if checkpoint exists
@@ -1181,9 +1207,10 @@ async def manual_export_model(job_id: str, model_name: str = Form(...), deployme
 @app.delete("/model/{job_id}")
 async def delete_trained_model(job_id: str):
     """Delete a trained model and all associated files (checkpoint, export, dataset)."""
+    job_id = _safe_name(job_id, "job_id")
     try:
         import shutil
-        
+
         # Remove checkpoint directory
         checkpoint_dir = Path(f"checkpoints/{job_id}")
         if checkpoint_dir.exists():
@@ -1246,9 +1273,10 @@ async def list_jobs():
 @app.get("/download/{job_id}")
 async def download_model(job_id: str):
     """Download the exported ONNX model for a training job."""
+    job_id = _safe_name(job_id, "job_id")
     if job_id not in training_jobs:
         raise HTTPException(status_code=404, detail="Job not found")
-    
+
     model_path = Path(f"models/{job_id}/{job_id}.onnx")
     if not model_path.exists():
         raise HTTPException(status_code=404, detail="Model file not found")

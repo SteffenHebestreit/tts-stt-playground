@@ -6,6 +6,8 @@ import json
 import logging
 from datetime import datetime
 
+from validation import phoneme_id_map_from_entries
+
 logger = logging.getLogger(__name__)
 
 class ModelExporter:
@@ -90,7 +92,7 @@ class ModelExporter:
             'it': 'it', 'nl': 'nl', 'pt': 'pt', 'ru': 'ru',
         }
         phonemizer_lang = lang_map.get(lang, 'en-us')
-        phoneme_id_map = await self._create_phoneme_map(job_id, export_path)
+        phoneme_id_map = await self._create_phoneme_map(job_id, export_path, config)
 
         # Create Piper config file (includes phoneme vocab for custom inference)
         piper_config = {
@@ -153,45 +155,58 @@ class ModelExporter:
             'speaker_name': 'stst'
         }
     
-    async def _create_phoneme_map(self, job_id: str, export_path: Path) -> dict:
-        """Build phoneme->id mapping from dataset metadata and save it.
+    async def _create_phoneme_map(self, job_id: str, export_path: Path, config: dict) -> dict:
+        """Build phoneme->id mapping that matches the training vocabulary, and save it.
+
+        Training builds its vocabulary from the ``train.json`` split via
+        ``TTSDataset._create_phoneme_vocab()`` — ``sorted(phonemes ∪ special_tokens)``.
+        To produce an identical id mapping for inference we must read the SAME
+        split of the SAME dataset, located by the model name stored in the
+        training config (the dataset dir is named after the model, not the uuid
+        job id). Falls back to the job id, then a scan, then ``metadata.json``.
 
         Returns the mapping dict so callers can embed it in the model config.
-        The ordering matches TTSDataset._create_phoneme_vocab() exactly:
-        sorted(phonemes ∪ special_tokens).
         """
-        # Try to find dataset directory - check by job_id first, then scan data/
-        dataset_path = Path(f"data/{job_id}")
-        if not dataset_path.exists():
+        model_name = (config or {}).get('speaker_name')
+
+        # Prefer the dataset whose directory matches the trained model name.
+        candidates = []
+        if model_name:
+            candidates.append(Path("data") / model_name)
+        candidates.append(Path(f"data/{job_id}"))
+
+        dataset_path = next((c for c in candidates if c.exists()), None)
+        if dataset_path is None:
             data_root = Path("data")
             if data_root.exists():
-                for candidate in data_root.iterdir():
-                    if candidate.is_dir() and (candidate / "metadata.json").exists():
+                for candidate in sorted(data_root.iterdir()):
+                    if candidate.is_dir() and (candidate / "train.json").exists():
                         dataset_path = candidate
                         break
 
         phoneme_map = {}
-        if dataset_path.exists():
-            metadata_path = dataset_path / "metadata.json"
-            if metadata_path.exists():
-                with open(metadata_path, 'r') as f:
-                    metadata = json.load(f)
+        if dataset_path is not None and dataset_path.exists():
+            # train.json matches the split used to build the training vocab;
+            # metadata.json (train+val superset) is only a fallback.
+            source_path = dataset_path / "train.json"
+            if not source_path.exists():
+                source_path = dataset_path / "metadata.json"
 
-                # Collect every character seen in phonemized text
-                phonemes = set()
-                for item in metadata:
-                    phoneme_text = item.get('phonemes', item.get('text', ''))
-                    if phoneme_text:
-                        phonemes.update(list(phoneme_text))
+            if source_path.exists():
+                with open(source_path, 'r', encoding='utf-8') as f:
+                    entries = json.load(f)
 
-                # Replicate TTSDataset._create_phoneme_vocab() ordering
-                special_tokens = ['<pad>', '<unk>', '<start>', '<end>', ' ']
-                all_phonemes = sorted(phonemes.union(special_tokens))
-                phoneme_map = {p: i for i, p in enumerate(all_phonemes)}
+                # Build the vocab exactly as TTSDataset._create_phoneme_vocab() does
+                phoneme_map = phoneme_id_map_from_entries(entries)
+                logger.info(f"Phoneme map built from {source_path} ({len(phoneme_map)} symbols)")
+            else:
+                logger.warning(f"No train.json/metadata.json under {dataset_path}; phoneme map will be empty")
+        else:
+            logger.warning("Dataset directory not found for export; phoneme map will be empty")
 
         # Save as standalone file for debugging / manual inspection
         phoneme_map_path = export_path / "phonemes.json"
-        with open(phoneme_map_path, 'w') as f:
+        with open(phoneme_map_path, 'w', encoding='utf-8') as f:
             json.dump(phoneme_map, f, indent=2, ensure_ascii=False)
 
         return phoneme_map
