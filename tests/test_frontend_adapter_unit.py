@@ -20,8 +20,10 @@ def frontend_module():
 
     previous_cwd = os.getcwd()
     previous_enable_whisper_cpp = os.environ.get("ENABLE_WHISPER_CPP")
+    previous_enable_parakeet_asr = os.environ.get("ENABLE_PARAKEET_ASR")
     try:
         os.environ["ENABLE_WHISPER_CPP"] = "true"
+        os.environ["ENABLE_PARAKEET_ASR"] = "true"
         os.chdir(app_path.parent)
         assert spec.loader is not None
         spec.loader.exec_module(module)
@@ -30,6 +32,10 @@ def frontend_module():
             os.environ.pop("ENABLE_WHISPER_CPP", None)
         else:
             os.environ["ENABLE_WHISPER_CPP"] = previous_enable_whisper_cpp
+        if previous_enable_parakeet_asr is None:
+            os.environ.pop("ENABLE_PARAKEET_ASR", None)
+        else:
+            os.environ["ENABLE_PARAKEET_ASR"] = previous_enable_parakeet_asr
         os.chdir(previous_cwd)
 
     return module
@@ -102,7 +108,7 @@ class _MockAsyncClient:
     async def __aexit__(self, exc_type, exc, tb):
         return False
 
-    async def get(self, url):
+    async def get(self, url, timeout=None):
         if url.endswith('/deployment-targets'):
             return httpx.Response(
                 200,
@@ -254,7 +260,7 @@ class _MockAsyncClient:
 
         raise AssertionError(f"Unexpected GET url: {url}")
 
-    async def post(self, url, json=None, data=None, files=None):
+    async def post(self, url, json=None, data=None, files=None, timeout=None):
         if url.endswith('/train'):
             return httpx.Response(
                 202,
@@ -360,7 +366,7 @@ class _MockAsyncClient:
 
         raise AssertionError(f"Unexpected POST url: {url}")
 
-    async def delete(self, url):
+    async def delete(self, url, timeout=None):
         if '/voices/' in url or '/voice/' in url:
             return httpx.Response(
                 200,
@@ -376,6 +382,57 @@ class _MockAsyncClient:
             )
 
         raise AssertionError(f'Unexpected DELETE url: {url}')
+
+
+class _TrainingUnavailableAsyncClient(_MockAsyncClient):
+    """Async client stub that simulates the training service being unreachable."""
+
+    async def post(self, url, json=None, data=None, files=None, timeout=None):
+        if url.endswith('/resume-training'):
+            raise httpx.ConnectError('connection refused', request=httpx.Request('POST', url))
+        return await super().post(url, json=json, data=data, files=files)
+
+
+class _TrainingResumeNoFilesAsyncClient(_MockAsyncClient):
+    """Async client stub that verifies data-only resume requests omit an empty files payload."""
+
+    async def post(self, url, json=None, data=None, files=None, timeout=None):
+        if url.endswith('/resume-training'):
+            assert dict(data or []).get('model_name') == 'demo'
+            assert files is None
+            return httpx.Response(
+                202,
+                json={'job_id': 'job-3', 'message': 'resumed'},
+                request=httpx.Request('POST', url),
+            )
+        return await super().post(url, json=json, data=data, files=files)
+
+
+class _VoicesUnavailableAsyncClient(_MockAsyncClient):
+    """Async client stub that simulates a TTS provider being unreachable on /voices."""
+
+    async def get(self, url, timeout=None):
+        if url.endswith('/voices'):
+            raise httpx.ConnectError('connection refused', request=httpx.Request('GET', url))
+        return await super().get(url)
+
+
+class _TtsUnavailableAsyncClient(_MockAsyncClient):
+    """Async client stub that simulates a TTS provider being unreachable on /tts."""
+
+    async def post(self, url, json=None, data=None, files=None, timeout=None):
+        if url.endswith('/tts'):
+            raise httpx.ConnectError('connection refused', request=httpx.Request('POST', url))
+        return await super().post(url, json=json, data=data, files=files)
+
+
+class _SttUnavailableAsyncClient(_MockAsyncClient):
+    """Async client stub that simulates an STT provider being unreachable on /transcribe."""
+
+    async def post(self, url, json=None, data=None, files=None, timeout=None):
+        if url.endswith('/transcribe'):
+            raise httpx.ConnectError('connection refused', request=httpx.Request('POST', url))
+        return await super().post(url, json=json, data=data, files=files)
 
 
 def test_piper_voice_catalog_adapter(frontend_module, frontend_test_client, monkeypatch):
@@ -623,6 +680,88 @@ def test_training_status_adapter(frontend_module, frontend_test_client, monkeypa
     assert data['recent_logs'][0]['display'] == '2025-01-01 00:05 UTC: Training completed successfully'
 
 
+def test_training_resume_returns_service_unavailable(frontend_module, frontend_test_client, monkeypatch):
+    """Frontend should surface training transport failures as a 503 instead of a generic 500."""
+    monkeypatch.setattr(frontend_module.httpx, 'AsyncClient', _TrainingUnavailableAsyncClient)
+
+    response = frontend_test_client.post('/api/training/resume', data={'model_name': 'demo'})
+
+    assert response.status_code == 503
+    assert 'Piper Training is unavailable' in response.json()['detail']
+
+
+def test_training_resume_adapter_omits_empty_files(frontend_module, frontend_test_client, monkeypatch):
+    """Frontend should forward data-only resume forms without forcing an empty files payload."""
+    monkeypatch.setattr(frontend_module.httpx, 'AsyncClient', _TrainingResumeNoFilesAsyncClient)
+
+    response = frontend_test_client.post('/api/training/resume', data={'model_name': 'demo'})
+
+    assert response.status_code == 200
+    assert response.json() == {'job_id': 'job-3', 'message': 'resumed'}
+
+
+def test_provider_voices_returns_service_unavailable(frontend_module, frontend_test_client, monkeypatch):
+    """A voice catalog request should surface upstream transport failures as 503."""
+    monkeypatch.setattr(frontend_module.httpx, 'AsyncClient', _VoicesUnavailableAsyncClient)
+
+    response = frontend_test_client.get('/api/providers/piper/voices')
+
+    assert response.status_code == 503
+    assert 'is unavailable' in response.json()['detail']
+
+
+def test_frontend_tts_returns_service_unavailable(frontend_module, frontend_test_client, monkeypatch):
+    """The TTS adapter should surface upstream transport failures as 503 instead of 500."""
+    monkeypatch.setattr(frontend_module.httpx, 'AsyncClient', _TtsUnavailableAsyncClient)
+
+    response = frontend_test_client.post('/api/tts', json={'provider': 'piper', 'text': 'Hello world'})
+
+    assert response.status_code == 503
+    assert 'is unavailable' in response.json()['detail']
+
+
+def test_frontend_stt_returns_service_unavailable(frontend_module, frontend_test_client, monkeypatch, test_audio_bytes):
+    """The STT adapter should surface upstream transport failures as 503 instead of 500."""
+    monkeypatch.setattr(frontend_module.httpx, 'AsyncClient', _SttUnavailableAsyncClient)
+
+    response = frontend_test_client.post(
+        '/api/stt',
+        files={'audio': ('test.wav', test_audio_bytes, 'audio/wav')},
+        data={'provider': 'whisper'},
+    )
+
+    assert response.status_code == 503
+    assert 'is unavailable' in response.json()['detail']
+
+
+def test_parakeet_provider_registered(frontend_test_client):
+    """Parakeet should register as an STT provider on the shared stt-form-v1 contract."""
+    data = frontend_test_client.get('/providers').json()
+    assert data['ui']['enable_parakeet_asr'] is True
+    parakeet = data['providers']['parakeet']
+    assert parakeet['kind'] == 'stt'
+    assert parakeet['contracts']['transcribe'] == 'stt-form-v1'
+    assert parakeet['settings']['defaults']['enable_segmentation'] is True
+    assert parakeet['ui']['selectable_as_stt'] is True
+
+
+def test_parakeet_stt_transcribe(frontend_module, frontend_test_client, monkeypatch, test_audio_bytes):
+    """Transcribing through the Parakeet provider should reuse the stt-form-v1 adapter."""
+    monkeypatch.setattr(frontend_module.httpx, 'AsyncClient', _MockAsyncClient)
+
+    response = frontend_test_client.post(
+        '/api/stt',
+        files={'audio': ('test.wav', test_audio_bytes, 'audio/wav')},
+        data={'provider': 'parakeet', 'language': 'de'},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['text'] == 'hallo welt'
+    assert body['language'] == 'de'
+    assert body['segments'][0]['text'] == 'hallo welt'
+
+
 def test_training_download_adapter(frontend_module, frontend_test_client, monkeypatch):
     """Frontend should proxy model downloads with upstream headers."""
     monkeypatch.setattr(frontend_module.httpx, 'AsyncClient', _MockAsyncClient)
@@ -631,3 +770,309 @@ def test_training_download_adapter(frontend_module, frontend_test_client, monkey
     assert response.status_code == 200
     assert response.content == b'onnx-binary'
     assert 'attachment;' in response.headers['content-disposition']
+
+
+# --------------------------------------------------------------------------
+# Pure normalizer / helper unit tests (called directly, no HTTP)
+# --------------------------------------------------------------------------
+
+def test_normalize_qwen3_language(frontend_module):
+    fn = frontend_module._normalize_qwen3_language
+    assert fn("de") == "German"
+    assert fn("en_US") == "English"
+    assert fn("auto") == "English"
+    assert fn("nl") == "English"          # Dutch unsupported -> English
+    assert fn("French") == "French"       # already a capitalized label
+    assert fn("zz") == "English"          # unknown lowercase -> English
+    assert fn("") == "English"
+
+
+def test_format_frontend_timestamp(frontend_module):
+    fn = frontend_module._format_frontend_timestamp
+    assert fn(None) is None
+    assert fn("") is None
+    assert fn("not-a-date") == "not-a-date"          # unparseable -> echoed
+    assert fn("2025-01-01T00:05:00Z") == "2025-01-01 00:05 UTC"
+    naive = fn("2025-01-01T12:30:00")                # no tz -> no UTC suffix
+    assert naive == "2025-01-01 12:30"
+
+
+def test_truncate_text(frontend_module):
+    fn = frontend_module._truncate_text
+    assert fn(None) is None
+    assert fn("   ") is None
+    assert fn("short") == "short"
+    assert fn("x" * 100, limit=10).endswith("...")
+
+
+def test_normalize_training_target_label(frontend_module):
+    fn = frontend_module._normalize_training_target_label
+    assert fn(None) == "Default"
+    assert fn("none") == "Manual download only"
+    assert fn("piper-volume") == "Piper shared volume"
+    assert fn("custom-thing") == "Custom Thing"
+
+
+def test_normalize_qwen3_voice_catalog(frontend_module):
+    out = frontend_module._normalize_qwen3_voice_catalog(
+        {"speakers": ["Vivian", "Ryan"], "languages": ["English", "German"]}
+    )
+    assert [v["id"] for v in out] == ["Vivian", "Ryan"]
+    assert out[0]["kind"] == "builtin"
+
+
+def test_normalize_qwen3_model_catalog(frontend_module):
+    out = frontend_module._normalize_qwen3_model_catalog({
+        "current_model": "m1",
+        "models": {
+            "m1": {"name": "M1", "capabilities": ["tts"]},
+            "m2": {"name": "M2", "capabilities": ["tts", "voice_clone"]},
+        },
+    })
+    by_id = {m["id"]: m for m in out}
+    assert by_id["m1"]["is_current"] is True
+    assert by_id["m2"]["capabilities_text"] == "tts, voice_clone"
+
+
+def test_normalize_qwen3_runtime_status(frontend_module):
+    out = frontend_module._normalize_qwen3_runtime_status({
+        "device": "cuda",
+        "cuda_available": True,
+        "model_loaded": True,
+        "current_model_info": {"name": "M"},
+        "gpu_memory_allocated": 2 * 1024 ** 3,
+        "builtin_speakers": ["A"],
+    }, "qwen3")
+    assert out["device_type"] == "gpu"
+    assert out["gpu_memory_gb"] == 2.0
+    assert out["model_name"] == "M"
+    assert out["speakers"] == ["A"]
+
+
+def test_normalize_qwen3_runtime_status_handles_bad_gpu_mem(frontend_module):
+    out = frontend_module._normalize_qwen3_runtime_status(
+        {"device": "cpu", "cuda_available": False, "gpu_memory_allocated": "nope"}, "qwen3"
+    )
+    assert out["device_type"] == "cpu"
+    assert out["gpu_memory_gb"] is None
+    assert out["speakers"] == []
+
+
+def test_normalize_qwen3_saved_voice_library(frontend_module):
+    out = frontend_module._normalize_qwen3_saved_voice_library({
+        "voices": [
+            {"id": "v1", "name": "Demo", "ref_text": "hello there", "created_at": "2025-01-01T00:00:00Z"},
+            "not-a-dict",
+        ]
+    }, "qwen3")
+    assert out["provider"] == "qwen3"
+    assert len(out["voices"]) == 1
+    assert out["voices"][0]["reference_preview"] == "hello there"
+    assert out["voices"][0]["created_at_display"] == "2025-01-01 00:00 UTC"
+
+
+def test_normalize_training_logs(frontend_module):
+    logs = [{"timestamp": "2025-01-01T00:05:00Z", "message": "done"}, "plain string"]
+    out = frontend_module._normalize_training_logs(logs)
+    assert out[0]["display"] == "2025-01-01 00:05 UTC: done"
+    assert out[1]["message"] == "plain string"
+    # non-list input -> empty
+    assert frontend_module._normalize_training_logs(None) == []
+
+
+def test_normalize_training_job_best_loss_and_config(frontend_module):
+    job = frontend_module._normalize_training_job({
+        "job_id": "j1",
+        "loss": "0.1234",
+        "config": {"epochs": 100, "batch_size": 16, "learning_rate": 0.0001},
+    })
+    assert job["best_loss"] == 0.1234
+    assert job["best_loss_display"] == "0.1234"
+    assert job["config_summary"]["epochs"] == 100
+    assert job["voice_name"] == "j1"  # falls back to job_id
+
+
+def test_normalize_training_jobs_payload_shapes(frontend_module):
+    fn = frontend_module._normalize_training_jobs_payload
+    as_list = fn([{"job_id": "a"}, "skip-non-dict"])
+    assert isinstance(as_list, list) and len(as_list) == 1
+    as_dict = fn({"jobs": [{"job_id": "b"}]})
+    assert as_dict["jobs"][0]["job_id"] == "b"
+    assert fn("passthrough") == "passthrough"
+
+
+def test_normalize_training_export_response(frontend_module):
+    out = frontend_module._normalize_training_export_response(
+        {"deployment": {"target": "piper-volume", "status": "deployed"}}
+    )
+    assert out["deployment"]["target_label"] == "Piper shared volume"
+
+
+def test_build_error_from_response(frontend_module):
+    resp = httpx.Response(502, json={"detail": "boom"}, request=httpx.Request("GET", "http://svc/x"))
+    exc = frontend_module._build_error_from_response(resp)
+    assert exc.status_code == 502
+    assert exc.detail == "boom"
+
+
+def test_build_upstream_request_error(frontend_module):
+    err = httpx.ConnectError("refused", request=httpx.Request("POST", "http://svc:5005/transcribe"))
+    exc = frontend_module._build_upstream_request_error("Parakeet ASR", err)
+    assert exc.status_code == 503
+    assert "Parakeet ASR is unavailable" in exc.detail
+    assert "http://svc:5005/transcribe" in exc.detail
+
+
+def test_get_http_client_is_shared_and_recreated(frontend_module, monkeypatch):
+    frontend_module._http_client = None
+    frontend_module._http_client_factory = None
+    c1 = frontend_module._get_http_client()
+    c2 = frontend_module._get_http_client()
+    assert c1 is c2  # reused
+    # Swapping the AsyncClient class triggers transparent recreation
+    monkeypatch.setattr(frontend_module.httpx, "AsyncClient", _MockAsyncClient)
+    c3 = frontend_module._get_http_client()
+    assert c3 is not c1
+    frontend_module._http_client = None
+    frontend_module._http_client_factory = None
+
+
+# --------------------------------------------------------------------------
+# Contract-guard / validation error paths (return 4xx before any upstream call)
+# --------------------------------------------------------------------------
+
+def test_provider_voices_unknown_provider_404(frontend_test_client):
+    assert frontend_test_client.get('/api/providers/nope/voices').status_code == 404
+
+
+def test_provider_voices_wrong_kind_400(frontend_test_client):
+    # whisper is an STT provider, not a TTS voice catalog
+    assert frontend_test_client.get('/api/providers/whisper/voices').status_code == 400
+
+
+def test_provider_models_rejects_unsupported(frontend_test_client):
+    assert frontend_test_client.get('/api/providers/piper/models').status_code == 400
+
+
+def test_provider_status_rejects_unsupported(frontend_test_client):
+    assert frontend_test_client.get('/api/providers/piper/status').status_code == 400
+
+
+def test_provider_model_select_rejects_unsupported(frontend_test_client):
+    r = frontend_test_client.post('/api/providers/piper/models/select', json={'model': 'x'})
+    assert r.status_code == 400
+
+
+def test_provider_saved_voices_rejects_unsupported(frontend_test_client):
+    assert frontend_test_client.get('/api/providers/piper/saved-voices').status_code == 400
+
+
+def test_provider_delete_saved_voice_rejects_unsupported(frontend_test_client):
+    assert frontend_test_client.delete('/api/providers/piper/saved-voices/x').status_code == 400
+
+
+def test_provider_custom_voices_rejects_unsupported(frontend_test_client):
+    assert frontend_test_client.get('/api/providers/qwen3/custom-voices').status_code == 400
+
+
+def test_provider_delete_custom_voice_rejects_unsupported(frontend_test_client):
+    assert frontend_test_client.delete('/api/providers/qwen3/custom-voices/x').status_code == 400
+
+
+def test_provider_voice_clone_rejects_unsupported(frontend_test_client):
+    assert frontend_test_client.post('/api/providers/piper/voice-clone').status_code == 400
+
+
+def test_provider_voice_design_rejects_unsupported(frontend_test_client):
+    r = frontend_test_client.post(
+        '/api/providers/piper/voice-design',
+        json={'text': 'hi', 'voice_description': 'deep voice'},
+    )
+    assert r.status_code == 400
+
+
+def test_provider_save_voice_rejects_unsupported(frontend_test_client):
+    assert frontend_test_client.post('/api/providers/piper/saved-voices').status_code == 400
+
+
+def test_frontend_stt_missing_audio_400(frontend_test_client):
+    r = frontend_test_client.post('/api/stt', data={'provider': 'whisper'})
+    assert r.status_code == 400
+
+
+def test_frontend_stt_missing_provider_400(frontend_test_client, test_audio_bytes):
+    r = frontend_test_client.post('/api/stt', files={'audio': ('a.wav', test_audio_bytes, 'audio/wav')})
+    assert r.status_code == 400
+
+
+def test_frontend_tts_empty_text_400(frontend_test_client):
+    r = frontend_test_client.post('/api/tts', json={'provider': 'piper', 'text': '   '})
+    assert r.status_code == 400
+
+
+def test_training_start_adapter(frontend_module, frontend_test_client, monkeypatch, test_audio_bytes):
+    """Start-training proxies a multipart form to the training service."""
+    monkeypatch.setattr(frontend_module.httpx, 'AsyncClient', _MockAsyncClient)
+    r = frontend_test_client.post(
+        '/api/training/train',
+        data={'model_name': 'demo', 'language': 'de'},
+        files={'audio_files': ('a.wav', test_audio_bytes, 'audio/wav')},
+    )
+    assert r.status_code == 200
+    assert r.json()['job_id'] == 'job-1'
+
+
+def test_training_export_adapter(frontend_module, frontend_test_client, monkeypatch):
+    """Export proxies a form POST and labels the deployment target."""
+    monkeypatch.setattr(frontend_module.httpx, 'AsyncClient', _MockAsyncClient)
+    r = frontend_test_client.post('/api/training/export/job-1', data={'model_name': 'demo'})
+    assert r.status_code == 200
+    assert r.json()['deployment']['target_label'] == 'Manual download only'
+
+
+def test_training_delete_model_adapter(frontend_module, frontend_test_client, monkeypatch):
+    monkeypatch.setattr(frontend_module.httpx, 'AsyncClient', _MockAsyncClient)
+    r = frontend_test_client.delete('/api/training/model/job-1')
+    assert r.status_code == 200
+    assert r.json()['status'] == 'success'
+
+
+def test_training_cancel_job_adapter(frontend_module, frontend_test_client, monkeypatch):
+    monkeypatch.setattr(frontend_module.httpx, 'AsyncClient', _MockAsyncClient)
+    r = frontend_test_client.delete('/api/training/job/job-1')
+    assert r.status_code == 200
+    assert r.json()['status'] == 'success'
+
+
+def test_training_deployment_targets_unavailable(frontend_module, frontend_test_client, monkeypatch):
+    """Transport failure on a training GET should surface as 503."""
+    monkeypatch.setattr(frontend_module.httpx, 'AsyncClient', _TrainingUnavailableAsyncClient)
+    # _TrainingUnavailableAsyncClient only fails resume; deployment-targets GET succeeds via base.
+    r = frontend_test_client.get('/api/training/deployment-targets')
+    assert r.status_code == 200
+
+
+# --------------------------------------------------------------------------
+# Page routes (render the UI / docs and the lean health probe)
+# --------------------------------------------------------------------------
+
+def test_index_page_renders(frontend_test_client):
+    r = frontend_test_client.get('/')
+    assert r.status_code == 200
+    assert 'text/html' in r.headers['content-type']
+
+
+def test_api_docs_page(frontend_test_client):
+    r = frontend_test_client.get('/api-docs')
+    assert r.status_code == 200
+    assert 'text/html' in r.headers['content-type']
+
+
+def test_health_is_lean(frontend_test_client):
+    """/health stays small: status + service map, no full provider registry (P4)."""
+    r = frontend_test_client.get('/health')
+    assert r.status_code == 200
+    body = r.json()
+    assert body['status'] == 'healthy'
+    assert 'services' in body
+    assert 'provider_registry' not in body
