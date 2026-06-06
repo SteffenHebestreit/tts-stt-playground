@@ -48,6 +48,7 @@ STT_SERVICE_URL = os.getenv("STT_SERVICE_URL", "http://stt-service:8000")
 VOICE_TRAINING_URL = os.getenv("VOICE_TRAINING_URL", "http://piper-training-service:8080")
 QWEN3_TTS_SERVICE_URL = os.getenv("QWEN3_TTS_SERVICE_URL", "http://qwen3-tts-service:5004")
 QWEN3_ASR_SERVICE_URL = os.getenv("QWEN3_ASR_SERVICE_URL", "http://qwen3-asr-service:5002")
+PARAKEET_ASR_SERVICE_URL = os.getenv("PARAKEET_ASR_SERVICE_URL", "http://parakeet-asr-service:5005")
 WHISPER_CPP_SERVICE_URL = os.getenv("WHISPER_CPP_SERVICE_URL", "http://whisper-cpp:8080")
 
 # Browser-facing URLs (host ports, used by client-side JavaScript)
@@ -56,8 +57,10 @@ BROWSER_STT_SERVICE_URL = os.getenv("BROWSER_STT_URL", "http://localhost:5001")
 BROWSER_VOICE_TRAINING_URL = os.getenv("BROWSER_TRAINING_URL", "http://localhost:8080")
 BROWSER_QWEN3_TTS_SERVICE_URL = os.getenv("BROWSER_QWEN3_TTS_URL", "http://localhost:5004")
 BROWSER_QWEN3_ASR_SERVICE_URL = os.getenv("BROWSER_QWEN3_ASR_URL", "http://localhost:5002")
+BROWSER_PARAKEET_ASR_SERVICE_URL = os.getenv("BROWSER_PARAKEET_ASR_URL", "http://localhost:5005")
 BROWSER_WHISPER_CPP_SERVICE_URL = os.getenv("BROWSER_WHISPER_CPP_URL", "http://localhost:5003")
 ENABLE_WHISPER_CPP = os.getenv("ENABLE_WHISPER_CPP", "false").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_PARAKEET_ASR = os.getenv("ENABLE_PARAKEET_ASR", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _build_basic_tts_messages() -> dict:
@@ -642,6 +645,43 @@ def _build_provider_registry() -> dict:
         },
     }
 
+    if ENABLE_PARAKEET_ASR:
+        providers["parakeet"] = {
+            "kind": "stt",
+            "display_name": "Parakeet-TDT (realtime, 25 EU langs)",
+            "short_name": "Parakeet ASR",
+            "internal_url": PARAKEET_ASR_SERVICE_URL,
+            "browser_url": BROWSER_PARAKEET_ASR_SERVICE_URL,
+            "health_endpoint": "/health",
+            "capabilities": ["transcribe", "segments", "detect_language"],
+            "contracts": {
+                "transcribe": "stt-form-v1",
+                "detect_language": "stt-detect-language-v1",
+            },
+            "settings": {
+                "defaults": {
+                    "language": "auto",
+                    "enable_segmentation": True,
+                },
+                "languages": [
+                    {"value": "auto", "label": "Auto-Detect"},
+                    {"value": "en", "label": "English"},
+                    {"value": "de", "label": "German"},
+                    {"value": "fr", "label": "French"},
+                    {"value": "es", "label": "Spanish"},
+                    {"value": "it", "label": "Italian"},
+                    {"value": "nl", "label": "Dutch"},
+                ],
+            },
+            "ui": {
+                "selectable_as_stt": True,
+                "show_status": True,
+                "messages": {
+                    "transcription": _build_stt_messages(),
+                },
+            },
+        }
+
     if ENABLE_WHISPER_CPP:
         providers["whisper-cpp"] = {
             "kind": "stt",
@@ -685,6 +725,7 @@ def _build_provider_registry() -> dict:
             "default_stt_provider": os.getenv("DEFAULT_STT_PROVIDER", "whisper"),
             "training_provider": os.getenv("TRAINING_PROVIDER", "piper-training"),
             "enable_whisper_cpp": ENABLE_WHISPER_CPP,
+            "enable_parakeet_asr": ENABLE_PARAKEET_ASR,
             "copy": {
                 "app_subtitle": "Neural Text-to-Speech with Voice Training & Cloning + Speech-to-Text",
                 "stt_tab_label": "Speech-to-Text",
@@ -1031,6 +1072,15 @@ def _build_error_from_response(response: httpx.Response) -> HTTPException:
     return HTTPException(status_code=response.status_code, detail=detail)
 
 
+def _build_upstream_request_error(service_name: str, exc: httpx.RequestError) -> HTTPException:
+    """Convert an upstream transport failure into a 503 frontend HTTPException."""
+    request_url = getattr(getattr(exc, "request", None), "url", None)
+    detail = f"{service_name} is unavailable"
+    if request_url:
+        detail = f"{service_name} is unavailable: {request_url}"
+    return HTTPException(status_code=503, detail=detail)
+
+
 def _passthrough_headers(response: httpx.Response) -> dict:
     """Return a filtered set of upstream headers safe to forward."""
     keep = {"content-type", "content-disposition", "content-length"}
@@ -1041,11 +1091,62 @@ def _passthrough_headers(response: httpx.Response) -> dict:
     }
 
 
+async def _extract_form_payload(request: Request) -> tuple[list[tuple[str, str]], Optional[list[tuple[str, tuple[str, bytes, str]]]]]:
+    """Normalize a Starlette form request into httpx-compatible data/files payloads."""
+    form = await request.form()
+
+    data: list[tuple[str, str]] = []
+    files: list[tuple[str, tuple[str, bytes, str]]] = []
+    for key, value in form.multi_items():
+        if hasattr(value, "filename"):
+            content = await value.read()
+            files.append((
+                key,
+                (value.filename or "upload.bin", content, value.content_type or "application/octet-stream"),
+            ))
+        else:
+            data.append((key, str(value)))
+
+    return data, files or None
+
+
+# Shared, connection-pooled HTTP client. Reused across requests so we don't pay
+# pool/connection setup on every proxied call. Recreated transparently if
+# httpx.AsyncClient is swapped out (e.g. patched in unit tests).
+_http_client: Optional[httpx.AsyncClient] = None
+_http_client_factory = None
+
+
+def _get_http_client() -> httpx.AsyncClient:
+    """Return the process-wide pooled AsyncClient (per-call timeouts are passed explicitly)."""
+    global _http_client, _http_client_factory
+    if _http_client is None or _http_client_factory is not httpx.AsyncClient:
+        _http_client = httpx.AsyncClient()
+        _http_client_factory = httpx.AsyncClient
+    return _http_client
+
+
+@app.on_event("shutdown")
+async def _shutdown_http_client():
+    """Close the shared HTTP client when the service stops."""
+    global _http_client
+    client, _http_client = _http_client, None
+    aclose = getattr(client, "aclose", None) if client is not None else None
+    if aclose is not None:
+        try:
+            await aclose()
+        except Exception:
+            pass
+
+
 async def _provider_get(provider_id: str, path: str, timeout: float = 30.0) -> httpx.Response:
     """Run a GET against a registered provider's internal URL."""
     provider = _get_provider(provider_id)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.get(f"{provider['internal_url']}{path}")
+    client = _get_http_client()
+    try:
+        response = await client.get(f"{provider['internal_url']}{path}", timeout=timeout)
+    except httpx.RequestError as exc:
+        raise _build_upstream_request_error(provider.get("display_name", provider_id), exc) from exc
     if response.status_code >= 400:
         raise _build_error_from_response(response)
     return response
@@ -1054,8 +1155,11 @@ async def _provider_get(provider_id: str, path: str, timeout: float = 30.0) -> h
 async def _provider_delete(provider_id: str, path: str, timeout: float = 30.0) -> httpx.Response:
     """Run a DELETE against a registered provider's internal URL."""
     provider = _get_provider(provider_id)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.delete(f"{provider['internal_url']}{path}")
+    client = _get_http_client()
+    try:
+        response = await client.delete(f"{provider['internal_url']}{path}", timeout=timeout)
+    except httpx.RequestError as exc:
+        raise _build_upstream_request_error(provider.get("display_name", provider_id), exc) from exc
     if response.status_code >= 400:
         raise _build_error_from_response(response)
     return response
@@ -1064,8 +1168,11 @@ async def _provider_delete(provider_id: str, path: str, timeout: float = 30.0) -
 async def _provider_json_post(provider_id: str, path: str, payload: dict, timeout: float = 120.0) -> httpx.Response:
     """Run a JSON POST against a registered provider's internal URL."""
     provider = _get_provider(provider_id)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(f"{provider['internal_url']}{path}", json=payload)
+    client = _get_http_client()
+    try:
+        response = await client.post(f"{provider['internal_url']}{path}", json=payload, timeout=timeout)
+    except httpx.RequestError as exc:
+        raise _build_upstream_request_error(provider.get("display_name", provider_id), exc) from exc
     if response.status_code >= 400:
         raise _build_error_from_response(response)
     return response
@@ -1074,22 +1181,16 @@ async def _provider_json_post(provider_id: str, path: str, payload: dict, timeou
 async def _provider_form_post(provider_id: str, path: str, request: Request, timeout: float = 300.0) -> httpx.Response:
     """Run a multipart form POST against a registered provider's internal URL."""
     provider = _get_provider(provider_id)
-    form = await request.form()
+    data, files = await _extract_form_payload(request)
+    client = _get_http_client()
 
-    data = []
-    files = []
-    for key, value in form.multi_items():
-        if hasattr(value, "filename"):
-            content = await value.read()
-            files.append((
-                key,
-                (value.filename or "upload.bin", content, value.content_type or "application/octet-stream"),
-            ))
-        else:
-            data.append((key, str(value)))
-
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(f"{provider['internal_url']}{path}", data=data, files=files)
+    try:
+        request_kwargs = {"data": data, "timeout": timeout}
+        if files:
+            request_kwargs["files"] = files
+        response = await client.post(f"{provider['internal_url']}{path}", **request_kwargs)
+    except httpx.RequestError as exc:
+        raise _build_upstream_request_error(provider.get("display_name", provider_id), exc) from exc
     if response.status_code >= 400:
         raise _build_error_from_response(response)
     return response
@@ -1098,8 +1199,11 @@ async def _provider_form_post(provider_id: str, path: str, request: Request, tim
 async def _proxy_training_get(path: str, timeout: float = 30.0):
     """Proxy a GET request to the training service."""
     provider = _get_provider("piper-training", kind="training")
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.get(f"{provider['internal_url']}{path}")
+    client = _get_http_client()
+    try:
+        response = await client.get(f"{provider['internal_url']}{path}", timeout=timeout)
+    except httpx.RequestError as exc:
+        raise _build_upstream_request_error(provider.get("display_name", "training service"), exc) from exc
     if response.status_code >= 400:
         raise _build_error_from_response(response)
     return response
@@ -1108,8 +1212,11 @@ async def _proxy_training_get(path: str, timeout: float = 30.0):
 async def _proxy_training_delete(path: str, timeout: float = 30.0):
     """Proxy a DELETE request to the training service."""
     provider = _get_provider("piper-training", kind="training")
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.delete(f"{provider['internal_url']}{path}")
+    client = _get_http_client()
+    try:
+        response = await client.delete(f"{provider['internal_url']}{path}", timeout=timeout)
+    except httpx.RequestError as exc:
+        raise _build_upstream_request_error(provider.get("display_name", "training service"), exc) from exc
     if response.status_code >= 400:
         raise _build_error_from_response(response)
     return response
@@ -1118,22 +1225,16 @@ async def _proxy_training_delete(path: str, timeout: float = 30.0):
 async def _proxy_training_form_post(path: str, request: Request, timeout: float = 300.0):
     """Proxy a multipart form POST request to the training service."""
     provider = _get_provider("piper-training", kind="training")
-    form = await request.form()
+    data, files = await _extract_form_payload(request)
+    client = _get_http_client()
 
-    data = []
-    files = []
-    for key, value in form.multi_items():
-        if hasattr(value, "filename"):
-            content = await value.read()
-            files.append((
-                key,
-                (value.filename or "upload.bin", content, value.content_type or "application/octet-stream"),
-            ))
-        else:
-            data.append((key, str(value)))
-
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(f"{provider['internal_url']}{path}", data=data, files=files)
+    try:
+        request_kwargs = {"data": data, "timeout": timeout}
+        if files:
+            request_kwargs["files"] = files
+        response = await client.post(f"{provider['internal_url']}{path}", **request_kwargs)
+    except httpx.RequestError as exc:
+        raise _build_upstream_request_error(provider.get("display_name", "training service"), exc) from exc
     if response.status_code >= 400:
         raise _build_error_from_response(response)
     return response
@@ -1240,6 +1341,7 @@ async def read_root(request: Request):
         "voice_training_url": BROWSER_VOICE_TRAINING_URL,
         "qwen3_tts_service_url": BROWSER_QWEN3_TTS_SERVICE_URL,
         "qwen3_asr_service_url": BROWSER_QWEN3_ASR_SERVICE_URL,
+        "parakeet_asr_service_url": BROWSER_PARAKEET_ASR_SERVICE_URL,
         "whisper_cpp_service_url": BROWSER_WHISPER_CPP_SERVICE_URL,
         "provider_registry_json": json.dumps(PROVIDER_REGISTRY),
         "tts_provider_options": tts_providers,
@@ -1261,14 +1363,17 @@ async def api_docs():
 
 @app.get("/health")
 async def health():
-    """Return service health status and configured backend URLs."""
+    """Return service health status and configured backend URLs.
+
+    Kept lightweight: Docker probes this every 30s, so it returns only the
+    small service map. The full provider registry is available at /providers.
+    """
     return {
         "status": "healthy",
         "services": {
             provider_id: provider["internal_url"]
             for provider_id, provider in PROVIDER_REGISTRY["providers"].items()
         },
-        "provider_registry": PROVIDER_REGISTRY,
     }
 
 
@@ -1284,24 +1389,21 @@ async def provider_voices(provider_id: str):
     provider = _get_provider(provider_id, kind="tts")
     contract = provider.get("contracts", {}).get("voice_catalog")
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        if contract == "voice-catalog-v1":
-            response = await client.get(f"{provider['internal_url']}/voices")
-            response.raise_for_status()
-            return {
-                "provider": provider_id,
-                "contract": contract,
-                "voices": _normalize_piper_voice_catalog(response.json()),
-            }
+    if contract == "voice-catalog-v1":
+        response = await _provider_get(provider_id, "/voices", timeout=15.0)
+        return {
+            "provider": provider_id,
+            "contract": contract,
+            "voices": _normalize_piper_voice_catalog(response.json()),
+        }
 
-        if contract == "speaker-catalog-v1":
-            response = await client.get(f"{provider['internal_url']}/speakers")
-            response.raise_for_status()
-            return {
-                "provider": provider_id,
-                "contract": contract,
-                "voices": _normalize_qwen3_voice_catalog(response.json()),
-            }
+    if contract == "speaker-catalog-v1":
+        response = await _provider_get(provider_id, "/speakers", timeout=15.0)
+        return {
+            "provider": provider_id,
+            "contract": contract,
+            "voices": _normalize_qwen3_voice_catalog(response.json()),
+        }
 
     raise HTTPException(status_code=400, detail=f"Provider {provider_id} does not expose a normalized voice catalog")
 
@@ -1479,8 +1581,11 @@ async def frontend_stt(request: Request):
     contract = provider.get("contracts", {}).get("transcribe") or "stt-form-v1"
     backend_path, data, files = await _build_frontend_stt_payload(provider_id, form, contract)
 
-    async with httpx.AsyncClient(timeout=300.0) as client:
-        response = await client.post(f"{provider['internal_url']}{backend_path}", data=data, files=files)
+    client = _get_http_client()
+    try:
+        response = await client.post(f"{provider['internal_url']}{backend_path}", data=data, files=files, timeout=300.0)
+    except httpx.RequestError as exc:
+        raise _build_upstream_request_error(provider.get("display_name", provider_id), exc) from exc
 
     if response.status_code >= 400:
         raise _build_error_from_response(response)
@@ -1502,7 +1607,8 @@ async def frontend_tts(request: FrontendTTSRequest):
     if not request.text.strip():
         raise HTTPException(status_code=400, detail="Text not provided")
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    client = _get_http_client()
+    try:
         if contract == "simple-json-tts-v1" and request.provider == "piper":
             payload = {
                 "text": request.text,
@@ -1518,7 +1624,7 @@ async def frontend_tts(request: FrontendTTSRequest):
             if request.gender:
                 payload["gender"] = request.gender
 
-            response = await client.post(f"{provider['internal_url']}/tts", json=payload)
+            response = await client.post(f"{provider['internal_url']}/tts", json=payload, timeout=120.0)
         elif contract == "simple-json-tts-v1" and request.provider == "qwen3":
             payload = {
                 "text": request.text,
@@ -1526,9 +1632,11 @@ async def frontend_tts(request: FrontendTTSRequest):
                 "speaker": request.voice or "Vivian",
                 "instruct": request.instructions or "",
             }
-            response = await client.post(f"{provider['internal_url']}/tts", json=payload)
+            response = await client.post(f"{provider['internal_url']}/tts", json=payload, timeout=120.0)
         else:
             raise HTTPException(status_code=400, detail=f"Unsupported TTS contract for provider {request.provider}")
+    except httpx.RequestError as exc:
+        raise _build_upstream_request_error(provider.get("display_name", request.provider), exc) from exc
 
     if response.status_code >= 400:
         detail = response.text

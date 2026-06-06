@@ -76,6 +76,36 @@ function getTrainingProviderId() {
     return providerRegistry.ui?.training_provider || 'piper-training';
 }
 
+function getTrainingBrowserUrl() {
+    return getProviderUrl(getTrainingProviderId());
+}
+
+async function fetchTrainingRequest(primaryPath, fallbackPath, options = {}) {
+    const fallbackUrl = getTrainingBrowserUrl();
+    let primaryError = null;
+
+    try {
+        const response = await fetch(primaryPath, options);
+        if (response.ok || response.status < 500 || !fallbackUrl) {
+            return response;
+        }
+    } catch (error) {
+        primaryError = error;
+        if (!fallbackUrl) {
+            throw error;
+        }
+    }
+
+    try {
+        return await fetch(`${fallbackUrl}${fallbackPath}`, options);
+    } catch (fallbackError) {
+        if (primaryError) {
+            throw primaryError;
+        }
+        throw fallbackError;
+    }
+}
+
 function getProviderMessages(providerId) {
     return getProviderUI(providerId)?.messages || {};
 }
@@ -1899,7 +1929,7 @@ async function monitorTrainingProgress(sessionId) {
 
     const checkProgress = async () => {
         try {
-            const response = await fetch(`/api/training/status/${sessionId}`);
+            const response = await fetchTrainingRequest(`/api/training/status/${sessionId}`, `/status/${sessionId}`);
             const status = await response.json();
 
             if (status.status === 'completed') {
@@ -2005,7 +2035,7 @@ async function refreshTrainingJobs() {
     try {
         jobsList.innerHTML = `<p>${messages.loading || 'Loading training jobs...'}</p>`;
 
-        const response = await fetch('/api/training/jobs');
+        const response = await fetchTrainingRequest('/api/training/jobs', '/jobs');
         if (!response.ok) throw new Error('Failed to fetch training jobs');
 
         const data = await response.json();
@@ -2199,7 +2229,7 @@ async function trainFromDataset() {
         formData.append('epochs', epochs);
         if (deploymentTarget) formData.append('deployment_target', deploymentTarget);
 
-        const response = await fetch('/api/training/train-from-dataset', {
+        const response = await fetchTrainingRequest('/api/training/train-from-dataset', '/train-from-dataset', {
             method: 'POST',
             body: formData
         });
@@ -2247,7 +2277,7 @@ async function resumeTraining(voiceName, statusElementId = 'training-progress-st
         formData.append('model_name', voiceName);
         if (deploymentTarget) formData.append('deployment_target', deploymentTarget);
 
-        const response = await fetch('/api/training/resume', {
+        const response = await fetchTrainingRequest('/api/training/resume', '/resume-training', {
             method: 'POST',
             body: formData
         });
@@ -2287,7 +2317,7 @@ async function resumeTraining(voiceName, statusElementId = 'training-progress-st
 async function viewJobDetails(jobId) {
     const messages = getProviderMessages(getTrainingProviderId())?.job_details || {};
     try {
-        const response = await fetch(`/api/training/status/${jobId}`);
+        const response = await fetchTrainingRequest(`/api/training/status/${jobId}`, `/status/${jobId}`);
         if (!response.ok) throw new Error('Failed to fetch job details');
 
         const job = await response.json();
