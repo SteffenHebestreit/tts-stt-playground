@@ -1,10 +1,14 @@
 # TrueNAS SCALE overlay for a single NVIDIA RTX 5060 Ti (16 GB).
 #
+# Requires NVIDIA driver >= 550 and CUDA 12.8 base images.
+# Dockerfiles use cuda:12.8.1 + PyTorch cu128 for Blackwell (sm_120) support.
+#
 # Usage:
 #   docker compose -f docker-compose.yml -f docker-compose.truenas.yml --profile all up -d
 #
 # This overlay:
-#   - Pins CUDA_VISIBLE_DEVICES=0 for all GPU services
+#   - Pins CUDA_VISIBLE_DEVICES=0 and NVIDIA_VISIBLE_DEVICES=0 for all GPU services
+#   - Keeps the Qwen services on the same physical GPU on single-GPU hosts
 #   - Applies memory-friendly settings for 16 GB VRAM
 #   - Keeps restart policy for unattended operation
 
@@ -15,19 +19,23 @@ services:
       WHISPER_MODEL_SIZE: ${WHISPER_MODEL_SIZE:-medium}
       FORCE_ACCELERATION: cuda
       CUDA_VISIBLE_DEVICES: "0"
+      NVIDIA_VISIBLE_DEVICES: "0"
 
   piper-training-service:
     environment:
       CUDA_VISIBLE_DEVICES: "0"
+      NVIDIA_VISIBLE_DEVICES: "0"
     # Smaller shared-memory buffer — training uses gradient accumulation instead
     shm_size: 1gb
 
   qwen3-asr-service:
     environment:
       CUDA_VISIBLE_DEVICES: "0"
+      NVIDIA_VISIBLE_DEVICES: "0"
 
   qwen3-tts-service:
     environment:
       CUDA_VISIBLE_DEVICES: "0"
+      NVIDIA_VISIBLE_DEVICES: "0"
       # Use the smaller 0.6B model to save ~2 GB VRAM
       QWEN3_TTS_MODEL: ${QWEN3_TTS_MODEL:-Qwen/Qwen3-TTS-12Hz-0.6B-Base}

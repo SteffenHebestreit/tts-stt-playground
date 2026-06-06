@@ -13,6 +13,8 @@ Recommended for day-to-day operation:
 - `qwen3-tts-service` using `Qwen/Qwen3-TTS-12Hz-0.6B-Base`
 
 This mode gives the broadest feature coverage while keeping GPU pressure reasonable.
+On the single-GPU TrueNAS profile, `qwen3-asr-service` and `qwen3-tts-service`
+both target GPU `0`.
 
 ## On-Demand Services
 
