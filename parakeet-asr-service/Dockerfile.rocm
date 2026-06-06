@@ -1,0 +1,36 @@
+FROM rocm/dev-ubuntu-22.04:6.2-complete
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    python3.11 \
+    python3.11-dev \
+    python3-pip \
+    curl \
+    git \
+    ffmpeg \
+    libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN ln -sf /usr/bin/python3.11 /usr/bin/python3 && \
+    ln -sf /usr/bin/python3.11 /usr/bin/python
+
+RUN pip3 install --upgrade pip setuptools wheel
+
+# Install non-torch deps first (requirements.txt has no torch line)
+COPY requirements.txt .
+RUN pip3 install --no-cache-dir -r requirements.txt
+
+# Install ROCm-enabled PyTorch LAST so it is not overwritten by any dep
+RUN pip3 install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/rocm6.2
+
+COPY app.py .
+COPY transcription.py .
+
+EXPOSE 5005
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=3 \
+    CMD curl -f http://localhost:5005/health || exit 1
+
+CMD ["python3", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "5005"]
