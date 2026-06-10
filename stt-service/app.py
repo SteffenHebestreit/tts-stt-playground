@@ -4,8 +4,9 @@ Supports CUDA, ROCm, and CPU backends with automatic hardware detection.
 Provides batch transcription, streaming SSE, and language detection endpoints.
 """
 
-from fastapi import FastAPI, UploadFile, HTTPException, File, Form
+from fastapi import FastAPI, UploadFile, HTTPException, File, Form, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse, JSONResponse
+import numpy as np
 from fastapi.middleware.cors import CORSMiddleware
 from faster_whisper import WhisperModel
 from typing import Any, Union, List
@@ -524,6 +525,135 @@ async def transcribe_audio_stream(
             "Connection": "keep-alive",
         }
     )
+
+# --- WebSocket live transcription ---
+
+WS_SAMPLE_RATE = 16000          # required input rate (PCM16 little-endian mono)
+WS_MIN_NEW_AUDIO_S = 1.0        # decode again once this much new audio arrived
+WS_WINDOW_S = 25.0              # interim decodes look at the most recent window
+WS_MAX_BUFFER_S = 600.0         # hard cap on buffered audio per connection
+
+
+def _ws_decode(audio: np.ndarray, language):
+    """Greedy low-latency decode of a float32 16 kHz buffer (runs in the executor)."""
+    segments, info = whisper_model.transcribe(
+        audio,
+        language=language,
+        beam_size=1,
+        best_of=1,
+        temperature=0.0,
+        condition_on_previous_text=False,
+        without_timestamps=True,
+        vad_filter=True,
+    )
+    text = " ".join(s.text.strip() for s in segments).strip()
+    return text, info
+
+
+@app.websocket("/ws/transcribe")
+async def websocket_transcribe(websocket: WebSocket):
+    """Live transcription over WebSocket.
+
+    Protocol:
+    - Optional first text frame: JSON config, e.g. {"language": "de"}
+      ("auto" or omitted = auto-detect).
+    - Binary frames: raw PCM16 little-endian mono audio at 16 kHz.
+    - Text frame {"event": "stop"}: finish — the full buffer is decoded once
+      more and a {"type": "final", ...} message is sent before closing.
+
+    Server messages: {"type": "partial", "confirmed": str, "pending": str}
+    after each interim decode (confirmed = word-level prefix stable across the
+    last two decodes), then {"type": "final", "text", "language", "duration"}.
+
+    Interim decodes only look at the most recent 25 s window; the final decode
+    covers the whole session buffer (capped at 10 minutes).
+    """
+    await websocket.accept()
+
+    if whisper_model is None:
+        load_model()
+    if whisper_model is None:
+        await websocket.send_json({"type": "error", "error": "Model not available"})
+        await websocket.close(code=1011)
+        return
+
+    language = None
+    chunks: list[np.ndarray] = []
+    total_samples = 0
+    decoded_at_samples = 0
+    prev_words: list[str] = []
+    max_samples = int(WS_MAX_BUFFER_S * WS_SAMPLE_RATE)
+    loop = asyncio.get_running_loop()
+
+    try:
+        while True:
+            message = await websocket.receive()
+            if message.get("type") == "websocket.disconnect":
+                return
+
+            if message.get("bytes") is not None:
+                samples = np.frombuffer(message["bytes"], dtype=np.int16).astype(np.float32) / 32768.0
+                if total_samples + len(samples) > max_samples:
+                    samples = samples[: max(0, max_samples - total_samples)]
+                if len(samples):
+                    chunks.append(samples)
+                    total_samples += len(samples)
+            elif message.get("text") is not None:
+                try:
+                    control = json.loads(message["text"])
+                except json.JSONDecodeError:
+                    continue
+                if control.get("event") == "stop":
+                    break
+                lang = str(control.get("language", "") or "").strip().lower()
+                language = None if lang in ("", "auto") else lang
+
+            # Interim decode once enough new audio has arrived
+            if total_samples - decoded_at_samples >= int(WS_MIN_NEW_AUDIO_S * WS_SAMPLE_RATE):
+                buffer = np.concatenate(chunks)
+                window = buffer[-int(WS_WINDOW_S * WS_SAMPLE_RATE):]
+                decoded_at_samples = total_samples
+                try:
+                    text, _info = await loop.run_in_executor(executor, _ws_decode, window, language)
+                except Exception as decode_err:
+                    logger.warning(f"WS interim decode failed: {decode_err}")
+                    continue
+                words = text.split()
+                agree = 0
+                while agree < len(words) and agree < len(prev_words) and words[agree] == prev_words[agree]:
+                    agree += 1
+                prev_words = words
+                await websocket.send_json(clean_json_inf_nan({
+                    "type": "partial",
+                    "confirmed": " ".join(words[:agree]),
+                    "pending": " ".join(words[agree:]),
+                    "buffered_seconds": round(total_samples / WS_SAMPLE_RATE, 2),
+                }))
+
+        # Final decode over the whole session buffer
+        if total_samples:
+            buffer = np.concatenate(chunks)
+            text, info = await loop.run_in_executor(executor, _ws_decode, buffer, language)
+            await websocket.send_json(clean_json_inf_nan({
+                "type": "final",
+                "text": text,
+                "language": info.language,
+                "language_probability": info.language_probability,
+                "duration": round(total_samples / WS_SAMPLE_RATE, 2),
+            }))
+        else:
+            await websocket.send_json({"type": "final", "text": "", "language": None, "duration": 0.0})
+        await websocket.close()
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.error(f"WebSocket transcription error: {e}", exc_info=True)
+        try:
+            await websocket.send_json({"type": "error", "error": str(e)})
+            await websocket.close(code=1011)
+        except Exception:
+            pass
+
 
 @app.get("/health", response_class=SafeJSONResponse)
 async def health_check():
