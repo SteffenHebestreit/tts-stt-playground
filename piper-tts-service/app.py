@@ -108,6 +108,7 @@ class VoiceCloneRequest(BaseModel):
     text: str
     voice_name: str
     reference_audio: Optional[str] = None
+    speed: float = 1.0
 
 # Available default voices by language
 DEFAULT_VOICES = {
@@ -348,13 +349,16 @@ async def analyze_audio(audio_file: UploadFile = File(...)):
             except OSError:
                 pass
 
-def _custom_onnx_infer(model_path: str, text: str, voice_name: str) -> bytes:
+def _custom_onnx_infer(model_path: str, text: str, voice_name: str, speed: float = 1.0) -> bytes:
     """Run direct ONNX inference for custom-trained VITS models.
 
     Custom models were trained with a character-level IPA phoneme vocab
     via espeak, not Piper's espeak phoneme_id_map format — so the Piper
     binary can't be used. We phonemize here using the same settings as
     training (phonemizer + espeak backend), then look up IDs.
+
+    The exported graph has no duration/length-scale input, so *speed* is
+    applied as a pitch-preserving time-stretch on the generated audio.
     """
     from phonemizer import phonemize
 
@@ -429,6 +433,15 @@ def _custom_onnx_infer(model_path: str, text: str, voice_name: str) -> bytes:
         audio = audio[0]
     audio = audio.astype(np.float32)
 
+    # Apply playback speed (clamped to the UI slider range). Best-effort:
+    # fall back to the unstretched audio if the clip is too short to stretch.
+    if speed and abs(speed - 1.0) > 1e-3 and audio.size > 0:
+        try:
+            rate = float(np.clip(speed, 0.5, 2.0))
+            audio = librosa.effects.time_stretch(audio, rate=rate).astype(np.float32)
+        except Exception as stretch_err:
+            logger.warning(f"Speed adjustment failed for voice '{voice_name}': {stretch_err}")
+
     # Write to WAV buffer
     buf = io.BytesIO()
     sf.write(buf, audio, sample_rate, format="WAV")
@@ -481,7 +494,7 @@ async def text_to_speech(request: TTSRequest):
         # Custom VITS models use a character-level IPA vocab — route to direct ONNX inference
         if voice_info.model_type == "custom":
             wav_bytes = await asyncio.to_thread(
-                _custom_onnx_infer, model_path, request.text, request.voice
+                _custom_onnx_infer, model_path, request.text, request.voice, request.speed
             )
             return StreamingResponse(
                 io.BytesIO(wav_bytes),
@@ -556,7 +569,7 @@ async def synthesize_with_custom_voice(request: VoiceCloneRequest):
 
     try:
         wav_bytes = await asyncio.to_thread(
-            _custom_onnx_infer, model_path, request.text, voice_name
+            _custom_onnx_infer, model_path, request.text, voice_name, request.speed
         )
         return StreamingResponse(
             io.BytesIO(wav_bytes),

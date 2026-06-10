@@ -599,15 +599,8 @@ function initializeApp() {
     }, 30000);
 }
 
-/** Bind tab buttons to the tab-switching helper. */
+/** Bind dynamic control listeners (tab buttons use their inline onclick handlers). */
 function setupEventListeners() {
-    document.querySelectorAll('.tab-button').forEach(button => {
-        button.addEventListener('click', function() {
-            const match = this.getAttribute('onclick').match(/'([^']+)'/);
-            if (match) showTab(match[1]);
-        });
-    });
-
     const sttEngineSelect = document.getElementById('stt-engine-select');
     if (sttEngineSelect) {
         sttEngineSelect.addEventListener('change', applySTTProviderSettings);
@@ -751,6 +744,16 @@ function updateServiceStatus() {
 function showStatus(elementId, type, message) {
     const element = document.getElementById(elementId);
     if (element) element.innerHTML = `<div class="${type}">${message}</div>`;
+}
+
+/** Escape a value for safe interpolation into innerHTML. */
+function escapeHtml(value) {
+    return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
 }
 
 /** Convert a byte count into a human-readable size string. */
@@ -1356,9 +1359,9 @@ function handleQwen3VoiceFile(file) {
     if (!file) return;
     const infoDiv = document.getElementById('qwen3-voice-file-info');
     infoDiv.innerHTML = `
-        <strong>Selected:</strong> ${file.name}<br>
+        <strong>Selected:</strong> ${escapeHtml(file.name)}<br>
         <strong>Size:</strong> ${(file.size / 1024 / 1024).toFixed(2)} MB<br>
-        <strong>Type:</strong> ${file.type}
+        <strong>Type:</strong> ${escapeHtml(file.type)}
     `;
     infoDiv.style.display = 'block';
 }
@@ -1747,7 +1750,7 @@ async function processSTT() {
                     <button class="btn-secondary btn-sm" onclick="copyTranscription()">${messages.copy_action || 'Copy Text'}</button>
                 </div>
                 <div class="segment-stats">
-                    <strong>${messages.language_label || 'Language'}:</strong> ${result.language || messages.unknown || 'Unknown'} |
+                    <strong>${messages.language_label || 'Language'}:</strong> ${escapeHtml(result.language || messages.unknown || 'Unknown')} |
                     <strong>${messages.duration_label || 'Duration'}:</strong> ${result.duration ? result.duration.toFixed(2) + 's' : (messages.not_available || 'N/A')} |
                     <strong>${messages.segments_label || 'Segments'}:</strong> ${result.segments.length}
                 </div>
@@ -1755,11 +1758,11 @@ async function processSTT() {
                     ${result.segments.map(seg => `
                         <div class="segment-item">
                             <div class="segment-time">${seg.start.toFixed(2)}s - ${seg.end.toFixed(2)}s</div>
-                            <div class="segment-text">${seg.text}</div>
+                            <div class="segment-text">${escapeHtml(seg.text)}</div>
                         </div>
                     `).join('')}
                 </div>
-                <div id="full-transcription" style="display:none;">${result.text || result.segments.map(s => s.text).join(' ')}</div>
+                <div id="full-transcription" style="display:none;">${escapeHtml(result.text || result.segments.map(s => s.text).join(' '))}</div>
             `;
         } else {
             resultsDiv.innerHTML = `
@@ -1767,8 +1770,8 @@ async function processSTT() {
                     <h3>${messages.result_heading || 'Transcription Result'}</h3>
                     <button class="btn-secondary btn-sm" onclick="copyTranscription()">${messages.copy_action || 'Copy Text'}</button>
                 </div>
-                <div class="transcription-text" id="full-transcription">${result.text}</div>
-                ${result.language ? `<div class="result-meta"><strong>${messages.language_label || 'Language'}:</strong> ${result.language}</div>` : ''}
+                <div class="transcription-text" id="full-transcription">${escapeHtml(result.text)}</div>
+                ${result.language ? `<div class="result-meta"><strong>${messages.language_label || 'Language'}:</strong> ${escapeHtml(result.language)}</div>` : ''}
             `;
         }
 
@@ -1812,9 +1815,9 @@ function handleSTTFile(input) {
         const file = input.files[0];
         fileInfo.innerHTML = `
             <div class="file-details">
-                <strong>${file.name}</strong><br>
+                <strong>${escapeHtml(file.name)}</strong><br>
                 <span>Size: ${(file.size / 1024 / 1024).toFixed(2)} MB</span> |
-                <span>Type: ${file.type}</span>
+                <span>Type: ${escapeHtml(file.type)}</span>
             </div>
         `;
         fileInfo.style.display = 'block';
@@ -1912,7 +1915,7 @@ function handleTrainingFiles(input) {
             <div class="file-details">
                 <strong>${input.files.length} file(s) selected</strong><br>
                 <span>Total Size: ${(totalSize / 1024 / 1024).toFixed(2)} MB</span><br>
-                ${Array.from(input.files).map(f => `<span>- ${f.name}</span>`).join('<br>')}
+                ${Array.from(input.files).map(f => `<span>- ${escapeHtml(f.name)}</span>`).join('<br>')}
             </div>
         `;
         fileInfo.style.display = 'block';
@@ -1926,11 +1929,16 @@ function handleTrainingFiles(input) {
 async function monitorTrainingProgress(sessionId) {
     const progressDiv = document.getElementById('training-progress');
     const messages = getProviderMessages(getTrainingProviderId())?.start_training || {};
+    let consecutiveFailures = 0;
 
     const checkProgress = async () => {
         try {
             const response = await fetchTrainingRequest(`/api/training/status/${sessionId}`, `/status/${sessionId}`);
+            if (!response.ok) {
+                throw new Error(`Status request failed: HTTP ${response.status}`);
+            }
             const status = await response.json();
+            consecutiveFailures = 0;
 
             if (status.status === 'completed') {
                 const deploymentLabel = status.deployment_target_label || getTrainingDeploymentLabel(status.deployment_target);
@@ -1965,7 +1973,19 @@ async function monitorTrainingProgress(sessionId) {
                 setTimeout(checkProgress, 5000);
             }
         } catch (error) {
-            console.error('Progress monitoring error:', error);
+            // Transient errors (service restart, network blip) shouldn't kill
+            // monitoring permanently — retry a few times before giving up.
+            consecutiveFailures += 1;
+            console.error(`Progress monitoring error (attempt ${consecutiveFailures}):`, error);
+            if (consecutiveFailures < 5) {
+                setTimeout(checkProgress, 10000);
+            } else {
+                showStatus(
+                    'training-progress-status',
+                    'error',
+                    formatMessage(messages.error, { error: error.message }) || `Lost contact with the training job: ${error.message}`
+                );
+            }
         }
     };
 
