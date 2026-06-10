@@ -94,6 +94,17 @@
                 <div id="stt-result-status" class="status-display"></div>
                 <div id="stt-results" class="results-display"></div>
             </div>
+
+            <div class="panel" id="live-stt-panel">
+                <h2>Live Transcription (Microphone)</h2>
+                <p class="description">Stream your microphone to the Whisper backend over WebSocket and watch the transcript build in real time. Uses the language selected above ("Auto-Detect" works).</p>
+                <button class="btn-primary" id="live-stt-button" onclick="toggleLiveTranscription()">Start Live Transcription</button>
+                <div id="live-stt-status" class="status-display"></div>
+                <div id="live-stt-transcript" class="results-display" style="display:none; padding: 12px; line-height: 1.6;">
+                    <span id="live-stt-confirmed"></span>
+                    <span id="live-stt-pending" style="opacity: 0.55; font-style: italic;"></span>
+                </div>
+            </div>
         </div>
 
         <!-- Voice Training Tab -->

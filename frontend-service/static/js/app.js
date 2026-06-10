@@ -1786,6 +1786,160 @@ async function processSTT() {
     }
 }
 
+// ============================================================
+// Live microphone transcription (WebSocket to the Whisper service)
+// ============================================================
+
+const liveSTT = {
+    socket: null,
+    audioContext: null,
+    processor: null,
+    source: null,
+    mediaStream: null,
+    active: false,
+};
+
+/** Resample a Float32 buffer to 16 kHz and encode as PCM16 little-endian. */
+function encodePCM16At16k(float32, inputRate) {
+    const targetRate = 16000;
+    let samples = float32;
+    if (inputRate !== targetRate) {
+        const ratio = inputRate / targetRate;
+        const outLength = Math.floor(float32.length / ratio);
+        samples = new Float32Array(outLength);
+        for (let i = 0; i < outLength; i++) {
+            samples[i] = float32[Math.floor(i * ratio)];
+        }
+    }
+    const pcm = new Int16Array(samples.length);
+    for (let i = 0; i < samples.length; i++) {
+        const s = Math.max(-1, Math.min(1, samples[i]));
+        pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    }
+    return pcm.buffer;
+}
+
+/** Start or stop the live microphone transcription session. */
+async function toggleLiveTranscription() {
+    if (liveSTT.active) {
+        stopLiveTranscription();
+        return;
+    }
+
+    const button = document.getElementById('live-stt-button');
+    const transcript = document.getElementById('live-stt-transcript');
+    const confirmedEl = document.getElementById('live-stt-confirmed');
+    const pendingEl = document.getElementById('live-stt-pending');
+
+    // The streaming endpoint lives on the Whisper service
+    const whisperUrl = getProviderUrl('whisper');
+    if (!whisperUrl) {
+        showStatus('live-stt-status', 'error', 'Whisper service URL not configured.');
+        return;
+    }
+    const wsUrl = whisperUrl.replace(/^http/, 'ws') + '/ws/transcribe';
+
+    try {
+        liveSTT.mediaStream = await navigator.mediaDevices.getUserMedia({
+            audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+        });
+    } catch (err) {
+        showStatus('live-stt-status', 'error', `Microphone access denied: ${err.message}`);
+        return;
+    }
+
+    confirmedEl.textContent = '';
+    pendingEl.textContent = '';
+    transcript.style.display = '';
+    showStatus('live-stt-status', 'info', 'Connecting...');
+
+    const socket = new WebSocket(wsUrl);
+    liveSTT.socket = socket;
+
+    socket.onopen = () => {
+        const language = document.getElementById('stt-language')?.value || 'auto';
+        socket.send(JSON.stringify({ language: language || 'auto' }));
+
+        liveSTT.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        liveSTT.source = liveSTT.audioContext.createMediaStreamSource(liveSTT.mediaStream);
+        // ScriptProcessorNode is deprecated but universally supported and
+        // sufficient for 16 kHz mono capture without a worklet file.
+        liveSTT.processor = liveSTT.audioContext.createScriptProcessor(4096, 1, 1);
+        liveSTT.processor.onaudioprocess = (event) => {
+            if (socket.readyState === WebSocket.OPEN) {
+                const float32 = event.inputBuffer.getChannelData(0);
+                socket.send(encodePCM16At16k(float32, liveSTT.audioContext.sampleRate));
+            }
+        };
+        liveSTT.source.connect(liveSTT.processor);
+        liveSTT.processor.connect(liveSTT.audioContext.destination);
+
+        liveSTT.active = true;
+        button.textContent = 'Stop Live Transcription';
+        showStatus('live-stt-status', 'info', 'Listening... speak into your microphone.');
+    };
+
+    socket.onmessage = (event) => {
+        let message;
+        try {
+            message = JSON.parse(event.data);
+        } catch {
+            return;
+        }
+        if (message.type === 'partial') {
+            confirmedEl.textContent = message.confirmed ? message.confirmed + ' ' : '';
+            pendingEl.textContent = message.pending || '';
+        } else if (message.type === 'final') {
+            confirmedEl.textContent = message.text || '';
+            pendingEl.textContent = '';
+            showStatus(
+                'live-stt-status',
+                'success',
+                `Final transcript ready (${escapeHtml(message.language || 'unknown')}, ${message.duration}s of audio).`
+            );
+        } else if (message.type === 'error') {
+            showStatus('live-stt-status', 'error', escapeHtml(message.error || 'Streaming error'));
+        }
+    };
+
+    socket.onerror = () => {
+        showStatus('live-stt-status', 'error', 'WebSocket connection failed. Is the Whisper service reachable?');
+        stopLiveTranscription(true);
+    };
+
+    socket.onclose = () => {
+        if (liveSTT.active) {
+            stopLiveTranscription(true);
+        }
+    };
+}
+
+/** Tear down the microphone capture chain and (optionally) the socket. */
+function stopLiveTranscription(skipStopMessage = false) {
+    const button = document.getElementById('live-stt-button');
+    liveSTT.active = false;
+
+    if (liveSTT.processor) { try { liveSTT.processor.disconnect(); } catch { /* noop */ } liveSTT.processor = null; }
+    if (liveSTT.source) { try { liveSTT.source.disconnect(); } catch { /* noop */ } liveSTT.source = null; }
+    if (liveSTT.audioContext) { try { liveSTT.audioContext.close(); } catch { /* noop */ } liveSTT.audioContext = null; }
+    if (liveSTT.mediaStream) {
+        liveSTT.mediaStream.getTracks().forEach(track => track.stop());
+        liveSTT.mediaStream = null;
+    }
+
+    const socket = liveSTT.socket;
+    if (socket && socket.readyState === WebSocket.OPEN && !skipStopMessage) {
+        // Ask for the final transcript; the server closes after sending it.
+        socket.send(JSON.stringify({ event: 'stop' }));
+        showStatus('live-stt-status', 'info', 'Finishing final transcript...');
+    } else if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.close();
+    }
+    liveSTT.socket = null;
+
+    if (button) button.textContent = 'Start Live Transcription';
+}
+
 /** Copy the current full transcription text to the clipboard. */
 function copyTranscription() {
     const el = document.getElementById('full-transcription');

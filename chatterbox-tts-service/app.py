@@ -11,6 +11,8 @@ contracts so the frontend gateway can proxy them like the other providers.
 import os
 import io
 import gc
+import re
+import struct
 import asyncio
 import tempfile
 import logging
@@ -208,6 +210,90 @@ async def text_to_speech(request: TTSRequest):
     except Exception as e:
         logger.error(f"TTS error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _split_sentences(text: str, min_chars: int = 20) -> list[str]:
+    """Split text into sentence chunks for incremental generation.
+
+    Short fragments are merged with the following sentence so we don't
+    generate tiny clips with poor prosody.
+    """
+    raw = re.split(r"(?<=[.!?;:])\s+", text.strip())
+    merged: list[str] = []
+    buf = ""
+    for part in raw:
+        buf = f"{buf} {part}".strip() if buf else part
+        if len(buf) >= min_chars:
+            merged.append(buf)
+            buf = ""
+    if buf:
+        if merged:
+            merged[-1] += " " + buf
+        else:
+            merged.append(buf)
+    return merged or [text]
+
+
+def _streaming_wav_header(sample_rate: int) -> bytes:
+    """PCM16 mono WAV header with unknown (maxed) sizes for chunked streaming."""
+    byte_rate = sample_rate * 2
+    return struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF", 0xFFFFFFFF, b"WAVE",
+        b"fmt ", 16, 1, 1, sample_rate, byte_rate, 2, 16,
+        b"data", 0xFFFFFFFF,
+    )
+
+
+def _to_pcm16(wav) -> bytes:
+    """Convert a model output tensor/array to raw PCM16 little-endian bytes."""
+    audio = wav.squeeze().detach().cpu().numpy() if torch.is_tensor(wav) else np.asarray(wav).squeeze()
+    audio = np.clip(audio.astype(np.float32), -1.0, 1.0)
+    return (audio * 32767.0).astype("<i2").tobytes()
+
+
+@app.post("/tts-stream")
+async def text_to_speech_stream(request: TTSRequest):
+    """Sentence-chunked streaming TTS: audio starts after the first sentence.
+
+    Returns a chunked `audio/wav` stream (PCM16 mono, unknown-length header).
+    The chatterbox package has no token-level streaming API, so this splits
+    the text into sentences and streams each one as soon as it is generated —
+    time-to-first-audio drops from total-length to first-sentence latency.
+    """
+    if not request.text.strip():
+        raise HTTPException(status_code=400, detail="Text not provided")
+
+    model = get_model()
+    language_id = _resolve_language(request.language)
+    sentences = _split_sentences(request.text)
+    sample_rate = model.sr
+
+    async def generate_chunks():
+        yield _streaming_wav_header(sample_rate)
+        for index, sentence in enumerate(sentences):
+            try:
+                wav, _sr = await asyncio.to_thread(
+                    _generate, model, sentence, language_id,
+                    None, request.exaggeration, request.cfg_weight,
+                )
+            except Exception as e:
+                logger.error(f"Streaming TTS failed at sentence {index + 1}/{len(sentences)}: {e}", exc_info=True)
+                break
+            yield _to_pcm16(wav)
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        gc.collect()
+
+    return StreamingResponse(
+        generate_chunks(),
+        media_type="audio/wav",
+        headers={
+            "X-Language": language_id,
+            "X-Sample-Rate": str(sample_rate),
+            "X-Sentence-Count": str(len(sentences)),
+        },
+    )
 
 
 async def _clone(text: str, lang: str, file: UploadFile,

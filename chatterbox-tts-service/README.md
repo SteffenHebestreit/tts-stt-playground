@@ -7,6 +7,7 @@ Multilingual text-to-speech and zero-shot voice cloning built on [Resemble AI Ch
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | POST | `/tts` | JSON `{text, language, exaggeration?, cfg_weight?}` → WAV (default voice) |
+| POST | `/tts-stream` | Same body → chunked WAV stream; sentences are generated and streamed one by one, so first audio arrives after ~1.5 s instead of after the whole text |
 | POST | `/clone` | Form `text`, `lang`, `file` (reference clip) → WAV in the cloned voice |
 | POST | `/clone-with-ref-text` | Contract alias of `/clone`; `ref_text` is ignored (not needed by Chatterbox) |
 | GET | `/languages` | Supported language ids + default |
