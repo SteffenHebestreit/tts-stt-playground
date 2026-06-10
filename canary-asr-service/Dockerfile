@@ -35,6 +35,11 @@ COPY transcription.py .
 # Uncomment to bake the model into the image for faster startup:
 # RUN python3 -c "import nemo.collections.asr as a; a.models.ASRModel.from_pretrained('nvidia/canary-180m-flash')"
 
+# torch 2.11's TorchScript compiler segfaults scripting NeMo's
+# online_clustering.py at import time; disable JIT scripting (functions
+# run eagerly — NeMo works fine without it).
+ENV PYTORCH_JIT=0
+
 EXPOSE 5006
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=3 \
