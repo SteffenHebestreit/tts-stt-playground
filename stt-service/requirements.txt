@@ -1,13 +1,17 @@
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-python-multipart==0.0.6
+fastapi==0.115.8
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
 # PyTorch - will be installed based on hardware availability in Dockerfile
 # torch>=2.1.0 (installed separately to detect hardware)
 # torchaudio>=2.1.0 (installed separately to detect hardware)
-faster-whisper==0.10.0
-# Essential dependencies for Faster Whisper
-ctranslate2>=3.8.0
+faster-whisper==1.1.1
+# ctranslate2 >=4.5 requires cuDNN 9 — provided by the cuda:12.8.1-cudnn base image
+ctranslate2>=4.5,<5
 tokenizers>=0.13.0
-huggingface-hub>=0.13.0
-onnxruntime>=1.13.0
+# huggingface-hub 1.x dropped the `requests` dependency (switched to httpx),
+# but faster-whisper 1.1.1 still imports `requests` directly — keep hub <1.0
+# and declare requests explicitly.
+huggingface-hub>=0.23,<1.0
+requests>=2.31.0
+onnxruntime>=1.18.0
 librosa

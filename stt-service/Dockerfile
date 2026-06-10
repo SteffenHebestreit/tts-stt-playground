@@ -1,4 +1,6 @@
-FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+# cuDNN 9 base (required by ctranslate2 >=4.5); CUDA 12.8 covers Blackwell
+# (RTX 50 series, sm_120) like the Qwen3 service images.
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
 
 WORKDIR /app
 
@@ -26,12 +28,12 @@ RUN apt-get update && apt-get install -y \
 # Create symlink for python command
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
-# Install PyTorch with CUDA 12.1 support first so requirements.txt cannot
+# Install PyTorch with CUDA 12.8 support first so requirements.txt cannot
 # pull in a CPU-only torch wheel as a transitive dependency
 COPY requirements.txt .
 RUN mkdir -p /root/.cache/pip && chmod 777 /root/.cache/pip
 RUN pip3 install --upgrade pip wheel setuptools
-RUN pip3 install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+RUN pip3 install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
 RUN pip3 install -r requirements.txt
 
 # Copy startup script and application
