@@ -261,8 +261,8 @@ Use smaller models (`WHISPER_MODEL_SIZE=small`, `WHISPER_MODEL=small`) to improv
 ### STT — whisper-cpp (port 5003)
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/v1/audio/transcriptions` | Transcribe audio — OpenAI-compatible (`file`, `language`, `response_format`) |
-| POST | `/inference` | Native whisper.cpp inference endpoint |
+| POST | `/inference` | Native whisper-server endpoint (`file`, `language`, `response_format`) — used by the frontend gateway |
+| POST | `/v1/audio/transcriptions` | OpenAI-compatible route — only on whisper.cpp builds that include it (current master does not) |
 
 This backend is optional and is only shown in the frontend when `ENABLE_WHISPER_CPP=true` is set for `frontend-service`.
 

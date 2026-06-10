@@ -653,8 +653,11 @@ async def text_to_speech(request: TTSRequest):
         model = get_model()
         start_time = time.time()
 
-        # Check if model has custom voice generation (CustomVoice model)
-        if hasattr(model, 'generate_custom_voice'):
+        # Route on declared capabilities: Base models expose a
+        # generate_custom_voice attribute but raise when it is called,
+        # so hasattr() alone picks the wrong path.
+        model_info = AVAILABLE_MODELS.get(current_model_name, {})
+        if "custom_voice" in model_info.get("capabilities", []) and hasattr(model, 'generate_custom_voice'):
             wavs, sr = await asyncio.to_thread(
                 model.generate_custom_voice,
                 text=request.text,

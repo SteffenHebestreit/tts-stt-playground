@@ -799,6 +799,10 @@ def _build_provider_registry() -> dict:
             "contracts": {
                 "transcribe": "openai-audio-transcriptions-v1",
             },
+            # whisper-server (current whisper.cpp) only serves its native
+            # /inference route; it accepts the same form fields as the OpenAI
+            # endpoint and returns {"text": ...}.
+            "transcribe_path": "/inference",
             "settings": {
                 "defaults": {
                     "language": "auto",
@@ -1190,8 +1194,14 @@ def _build_upstream_request_error(service_name: str, exc: httpx.RequestError) ->
 
 
 def _passthrough_headers(response: httpx.Response) -> dict:
-    """Return a filtered set of upstream headers safe to forward."""
-    keep = {"content-type", "content-disposition", "content-length"}
+    """Return a filtered set of upstream headers safe to forward.
+
+    Content-Length is intentionally NOT forwarded: adapters often re-serialize
+    the body (e.g. normalized STT JSON), and a stale upstream length makes
+    uvicorn fail with "Response content longer than Content-Length". Starlette
+    recomputes the correct length from the actual body.
+    """
+    keep = {"content-type", "content-disposition"}
     return {
         key: value
         for key, value in response.headers.items()
@@ -1403,7 +1413,8 @@ async def _build_frontend_stt_payload(provider_id: str, form, contract: str) -> 
         data["response_format"] = "json"
         if language and language != "auto":
             data["language"] = language
-        return "/v1/audio/transcriptions", data, files
+        backend_path = _get_provider(provider_id).get("transcribe_path") or "/v1/audio/transcriptions"
+        return backend_path, data, files
 
     raise HTTPException(status_code=400, detail=f"Unsupported STT contract for provider {provider_id}")
 

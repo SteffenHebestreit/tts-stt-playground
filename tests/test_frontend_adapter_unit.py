@@ -323,7 +323,7 @@ class _MockAsyncClient:
                 request=httpx.Request('POST', url),
             )
 
-        if url.endswith('/v1/audio/transcriptions'):
+        if url.endswith('/inference'):
             file_keys = [entry[0] for entry in files or []]
             data_map = dict(data or [])
             assert file_keys == ['file']

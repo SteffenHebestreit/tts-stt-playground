@@ -65,6 +65,26 @@ else:
 asr_model = None
 model_loaded = False
 
+# qwen_asr expects English language names, not ISO codes ("German", not "de").
+LANGUAGE_NAME_MAP = {
+    "zh": "Chinese", "en": "English", "yue": "Cantonese", "ar": "Arabic",
+    "de": "German", "fr": "French", "es": "Spanish", "pt": "Portuguese",
+    "id": "Indonesian", "it": "Italian", "ko": "Korean", "ru": "Russian",
+    "th": "Thai", "vi": "Vietnamese", "ja": "Japanese", "tr": "Turkish",
+    "hi": "Hindi", "ms": "Malay", "nl": "Dutch",
+}
+
+
+def _resolve_language(language):
+    """Map a request language ('auto', ISO code, or name) to qwen_asr's format."""
+    lang = (language or "").strip()
+    if not lang or lang.lower() == "auto":
+        return None
+    mapped = LANGUAGE_NAME_MAP.get(lang.lower().replace("-", "_").split("_")[0])
+    if mapped:
+        return mapped
+    return lang if lang[:1].isupper() else lang.capitalize()
+
 
 async def _save_upload(upload: UploadFile) -> tuple[str, bytes]:
     """Save an uploaded file to a temp path and return ``(tmp_path, raw_bytes)``."""
@@ -163,7 +183,7 @@ async def transcribe_audio(
         duration = librosa.get_duration(path=tmp_path)
 
         # Transcribe with Qwen3-ASR (off the event loop — model.transcribe is blocking)
-        lang_param = None if language == "auto" else language
+        lang_param = _resolve_language(language)
         results = await asyncio.to_thread(
             model.transcribe,
             audio=tmp_path,
@@ -292,7 +312,7 @@ async def transcribe_batch(
             tmp_path, _ = await _save_upload(audio_file)
 
             start_time = time.time()
-            lang_param = None if language == "auto" else language
+            lang_param = _resolve_language(language)
             asr_results = await asyncio.to_thread(
                 model.transcribe,
                 audio=tmp_path,
