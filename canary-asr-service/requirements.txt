@@ -1,0 +1,9 @@
+# Canary-ASR dependencies
+# torch and torchaudio are installed separately in the Dockerfile (CUDA wheels)
+nemo_toolkit[asr]>=2.0.0
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+librosa>=0.10.0
+soundfile>=0.12.0
+numpy>=1.24.0,<2.0.0

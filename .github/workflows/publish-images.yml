@@ -46,6 +46,10 @@ jobs:
             context: ./qwen3-tts-service
           - name: parakeet-asr
             context: ./parakeet-asr-service
+          - name: canary-asr
+            context: ./canary-asr-service
+          - name: chatterbox-tts
+            context: ./chatterbox-tts-service
           - name: whisper-cpp
             context: ./whisper-cpp-service
           - name: piper-training

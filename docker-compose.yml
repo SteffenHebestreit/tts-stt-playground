@@ -195,6 +195,78 @@ services:
     networks:
       - tts-stt-network
 
+  # Canary-ASR service (NVIDIA canary-180m-flash — fastest German/EU-language STT)
+  # Opt-in: heavy NeMo image, not part of the `all` profile. Enable it in the
+  # browser UI with ENABLE_CANARY_ASR=true on the frontend.
+  canary-asr-service:
+    profiles: [canary-asr]
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-canary-asr:${IMAGE_TAG:-latest}
+    build:
+      context: ./canary-asr-service
+      dockerfile: Dockerfile
+    ports:
+      - "${CANARY_ASR_PORT:-5006}:5006"
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+      CANARY_ASR_MODEL: ${CANARY_ASR_MODEL:-nvidia/canary-180m-flash}
+      CANARY_DEFAULT_LANGUAGE: ${CANARY_DEFAULT_LANGUAGE:-de}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
+      ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
+    volumes:
+      - "${CANARY_ASR_CACHE_DIR:-canary-asr-cache}:/root/.cache"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              count: 1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5006/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 180s
+      retries: 3
+    networks:
+      - tts-stt-network
+
+  # Chatterbox-TTS service (Resemble AI, MIT — multilingual TTS + cloning incl. German)
+  # Opt-in: enable in the browser UI with ENABLE_CHATTERBOX_TTS=true on the frontend.
+  chatterbox-tts-service:
+    profiles: [chatterbox-tts]
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-chatterbox-tts:${IMAGE_TAG:-latest}
+    build:
+      context: ./chatterbox-tts-service
+      dockerfile: Dockerfile
+    ports:
+      - "${CHATTERBOX_TTS_PORT:-5007}:5007"
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+      CHATTERBOX_DEFAULT_LANGUAGE: ${CHATTERBOX_DEFAULT_LANGUAGE:-de}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
+      ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
+    volumes:
+      - "${CHATTERBOX_TTS_CACHE_DIR:-chatterbox-tts-cache}:/root/.cache"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              count: 1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5007/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 180s
+      retries: 3
+    networks:
+      - tts-stt-network
+
   # Qwen3-TTS service (voice cloning + TTS, replaces XTTS)
   qwen3-tts-service:
     profiles: [qwen3-tts, all]
@@ -280,6 +352,10 @@ services:
       QWEN3_ASR_SERVICE_URL: http://qwen3-asr-service:5002
       PARAKEET_ASR_SERVICE_URL: ${PARAKEET_ASR_SERVICE_URL:-http://parakeet-asr-service:5005}
       ENABLE_PARAKEET_ASR: ${ENABLE_PARAKEET_ASR:-false}
+      CANARY_ASR_SERVICE_URL: ${CANARY_ASR_SERVICE_URL:-http://canary-asr-service:5006}
+      ENABLE_CANARY_ASR: ${ENABLE_CANARY_ASR:-false}
+      CHATTERBOX_TTS_SERVICE_URL: ${CHATTERBOX_TTS_SERVICE_URL:-http://chatterbox-tts-service:5007}
+      ENABLE_CHATTERBOX_TTS: ${ENABLE_CHATTERBOX_TTS:-false}
       WHISPER_CPP_SERVICE_URL: ${WHISPER_CPP_SERVICE_URL:-http://whisper-cpp:8080}
       ENABLE_WHISPER_CPP: ${ENABLE_WHISPER_CPP:-false}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
@@ -291,6 +367,8 @@ services:
       BROWSER_QWEN3_TTS_URL: ${BROWSER_QWEN3_TTS_URL:-http://localhost:${QWEN3_TTS_PORT:-5004}}
       BROWSER_QWEN3_ASR_URL: ${BROWSER_QWEN3_ASR_URL:-http://localhost:${QWEN3_ASR_PORT:-5002}}
       BROWSER_PARAKEET_ASR_URL: ${BROWSER_PARAKEET_ASR_URL:-http://localhost:${PARAKEET_ASR_PORT:-5005}}
+      BROWSER_CANARY_ASR_URL: ${BROWSER_CANARY_ASR_URL:-http://localhost:${CANARY_ASR_PORT:-5006}}
+      BROWSER_CHATTERBOX_TTS_URL: ${BROWSER_CHATTERBOX_TTS_URL:-http://localhost:${CHATTERBOX_TTS_PORT:-5007}}
       BROWSER_WHISPER_CPP_URL: ${BROWSER_WHISPER_CPP_URL:-http://localhost:${WHISPER_CPP_PORT:-5003}}
     restart: unless-stopped
     healthcheck:
@@ -315,6 +393,10 @@ volumes:
   qwen3-asr-cache:
     driver: local
   parakeet-asr-cache:
+    driver: local
+  canary-asr-cache:
+    driver: local
+  chatterbox-tts-cache:
     driver: local
   qwen3-tts-cache:
     driver: local

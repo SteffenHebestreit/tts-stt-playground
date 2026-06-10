@@ -65,6 +65,8 @@ VOICE_TRAINING_URL = os.getenv("VOICE_TRAINING_URL", "http://piper-training-serv
 QWEN3_TTS_SERVICE_URL = os.getenv("QWEN3_TTS_SERVICE_URL", "http://qwen3-tts-service:5004")
 QWEN3_ASR_SERVICE_URL = os.getenv("QWEN3_ASR_SERVICE_URL", "http://qwen3-asr-service:5002")
 PARAKEET_ASR_SERVICE_URL = os.getenv("PARAKEET_ASR_SERVICE_URL", "http://parakeet-asr-service:5005")
+CANARY_ASR_SERVICE_URL = os.getenv("CANARY_ASR_SERVICE_URL", "http://canary-asr-service:5006")
+CHATTERBOX_TTS_SERVICE_URL = os.getenv("CHATTERBOX_TTS_SERVICE_URL", "http://chatterbox-tts-service:5007")
 WHISPER_CPP_SERVICE_URL = os.getenv("WHISPER_CPP_SERVICE_URL", "http://whisper-cpp:8080")
 
 # Browser-facing URLs (host ports, used by client-side JavaScript)
@@ -74,9 +76,13 @@ BROWSER_VOICE_TRAINING_URL = os.getenv("BROWSER_TRAINING_URL", "http://localhost
 BROWSER_QWEN3_TTS_SERVICE_URL = os.getenv("BROWSER_QWEN3_TTS_URL", "http://localhost:5004")
 BROWSER_QWEN3_ASR_SERVICE_URL = os.getenv("BROWSER_QWEN3_ASR_URL", "http://localhost:5002")
 BROWSER_PARAKEET_ASR_SERVICE_URL = os.getenv("BROWSER_PARAKEET_ASR_URL", "http://localhost:5005")
+BROWSER_CANARY_ASR_SERVICE_URL = os.getenv("BROWSER_CANARY_ASR_URL", "http://localhost:5006")
+BROWSER_CHATTERBOX_TTS_SERVICE_URL = os.getenv("BROWSER_CHATTERBOX_TTS_URL", "http://localhost:5007")
 BROWSER_WHISPER_CPP_SERVICE_URL = os.getenv("BROWSER_WHISPER_CPP_URL", "http://localhost:5003")
 ENABLE_WHISPER_CPP = os.getenv("ENABLE_WHISPER_CPP", "false").strip().lower() in {"1", "true", "yes", "on"}
 ENABLE_PARAKEET_ASR = os.getenv("ENABLE_PARAKEET_ASR", "false").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_CANARY_ASR = os.getenv("ENABLE_CANARY_ASR", "false").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_CHATTERBOX_TTS = os.getenv("ENABLE_CHATTERBOX_TTS", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _build_basic_tts_messages() -> dict:
@@ -698,6 +704,89 @@ def _build_provider_registry() -> dict:
             },
         }
 
+    if ENABLE_CANARY_ASR:
+        providers["canary"] = {
+            "kind": "stt",
+            "display_name": "Canary-180M (realtime, en/de/es/fr)",
+            "short_name": "Canary ASR",
+            "internal_url": CANARY_ASR_SERVICE_URL,
+            "browser_url": BROWSER_CANARY_ASR_SERVICE_URL,
+            "health_endpoint": "/health",
+            "capabilities": ["transcribe", "segments"],
+            "contracts": {
+                "transcribe": "stt-form-v1",
+                "detect_language": "stt-detect-language-v1",
+            },
+            "settings": {
+                "defaults": {
+                    "language": "de",
+                    "enable_segmentation": True,
+                },
+                # Canary has no auto-detection — the language picks the decoder
+                "languages": [
+                    {"value": "de", "label": "German"},
+                    {"value": "en", "label": "English"},
+                    {"value": "fr", "label": "French"},
+                    {"value": "es", "label": "Spanish"},
+                ],
+            },
+            "ui": {
+                "selectable_as_stt": True,
+                "show_status": True,
+                "messages": {
+                    "transcription": _build_stt_messages(),
+                },
+            },
+        }
+
+    if ENABLE_CHATTERBOX_TTS:
+        providers["chatterbox"] = {
+            "kind": "tts",
+            "display_name": "Chatterbox (Multilingual, MIT)",
+            "short_name": "Chatterbox",
+            "internal_url": CHATTERBOX_TTS_SERVICE_URL,
+            "browser_url": BROWSER_CHATTERBOX_TTS_SERVICE_URL,
+            "health_endpoint": "/health",
+            "capabilities": ["tts", "voice_clone"],
+            "contracts": {
+                "tts": "simple-json-tts-v1",
+                "voice_clone": "voice-clone-tts-v1",
+            },
+            "settings": {
+                "defaults": {
+                    "language": "de",
+                },
+                "languages": [
+                    {"value": "de", "label": "German"},
+                    {"value": "en", "label": "English"},
+                    {"value": "fr", "label": "French"},
+                    {"value": "es", "label": "Spanish"},
+                    {"value": "it", "label": "Italian"},
+                    {"value": "nl", "label": "Dutch"},
+                    {"value": "pt", "label": "Portuguese"},
+                    {"value": "pl", "label": "Polish"},
+                ],
+            },
+            "ui": {
+                # Uses the generic TTS panel (same family as Piper)
+                "family": "piper",
+                "selectable_as_engine": True,
+                "show_status": True,
+                "tab_label": "Text-to-Speech",
+                "messages": {
+                    "tts_generation": _build_basic_tts_messages(),
+                },
+                "sections": {
+                    "tts": {
+                        "title": "Text-to-Speech (Chatterbox)",
+                        "description": "Generate multilingual speech with Resemble AI Chatterbox. Output is watermarked. Voice cloning is available via the API (/clone).",
+                        "text_placeholder": "Enter the text you want to convert to speech...",
+                        "text_sample": "Hallo! Dies ist ein Test von Chatterbox Multilingual.",
+                    }
+                },
+            },
+        }
+
     if ENABLE_WHISPER_CPP:
         providers["whisper-cpp"] = {
             "kind": "stt",
@@ -742,6 +831,8 @@ def _build_provider_registry() -> dict:
             "training_provider": os.getenv("TRAINING_PROVIDER", "piper-training"),
             "enable_whisper_cpp": ENABLE_WHISPER_CPP,
             "enable_parakeet_asr": ENABLE_PARAKEET_ASR,
+            "enable_canary_asr": ENABLE_CANARY_ASR,
+            "enable_chatterbox_tts": ENABLE_CHATTERBOX_TTS,
             "copy": {
                 "app_subtitle": "Neural Text-to-Speech with Voice Training & Cloning + Speech-to-Text",
                 "stt_tab_label": "Speech-to-Text",
@@ -1646,6 +1737,12 @@ async def frontend_tts(request: FrontendTTSRequest):
                 payload["gender"] = request.gender
 
             response = await client.post(f"{provider['internal_url']}/tts", json=payload, timeout=120.0)
+        elif contract == "simple-json-tts-v1" and request.provider == "chatterbox":
+            payload = {
+                "text": request.text,
+                "language": request.language or "auto",
+            }
+            response = await client.post(f"{provider['internal_url']}/tts", json=payload, timeout=300.0)
         elif contract == "simple-json-tts-v1" and request.provider == "qwen3":
             payload = {
                 "text": request.text,

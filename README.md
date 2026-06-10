@@ -13,6 +13,9 @@ A self-hosted, Docker-based platform for text-to-speech synthesis, speech-to-tex
 | **Piper Training** | 8080 | VITS neural network voice training pipeline |
 | **Qwen3-TTS** | 5004 | Voice cloning and multilingual TTS |
 | **Qwen3-ASR** | 5002 | Fast multilingual speech recognition |
+| **Parakeet-ASR** | 5005 | Optional realtime STT — 25 EU languages (NeMo) |
+| **Canary-ASR** | 5006 | Optional fastest STT — en/de/es/fr with punctuation (NeMo) |
+| **Chatterbox-TTS** | 5007 | Optional multilingual TTS + voice cloning (MIT, watermarked) |
 
 ## Quick Start
 

@@ -1,0 +1,8 @@
+# Chatterbox-TTS dependencies
+# torch and torchaudio are installed separately in the Dockerfile (CUDA wheels);
+# chatterbox-tts may re-resolve them — its PyPI torch builds are CUDA-enabled on Linux.
+chatterbox-tts>=0.1.2
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+soundfile>=0.12.0
