@@ -9,6 +9,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from faster_whisper import WhisperModel
 from typing import Any, Union, List
+from contextlib import asynccontextmanager
 import torch
 import os
 import logging
@@ -26,7 +27,21 @@ from json_utils import clean_json_inf_nan, ENGLISH_ONLY_MODELS
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="STT Service", description="Speech-to-Text Service with Hardware Acceleration")
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """Load the Whisper model on startup; release the executor on shutdown."""
+    load_model()
+    yield
+    logger.info("Shutting down thread pool executor...")
+    executor.shutdown(wait=False)
+
+
+app = FastAPI(
+    title="STT Service",
+    description="Speech-to-Text Service with Hardware Acceleration",
+    lifespan=_lifespan,
+)
 
 # Add CORS middleware (env-configurable)
 allowed_origins_str = os.getenv("ALLOWED_ORIGINS", "*")
@@ -161,18 +176,6 @@ def load_model():
                 logger.error(f"CPU fallback failed: {cpu_error}")
                 model_loaded = False
 
-# Load model on startup
-@app.on_event("startup")
-async def startup_event():
-    """Load the Whisper model when the service starts."""
-    load_model()
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Release executor resources during shutdown."""
-    logger.info("Shutting down thread pool executor...")
-    executor.shutdown(wait=False)
-
 # Add better error handling and logging
 @app.post("/transcribe")
 async def transcribe_audio(
@@ -225,10 +228,18 @@ async def transcribe_audio(
                 raise HTTPException(status_code=503, detail="Model not available")
 
         # Parse temperature once
-        if isinstance(temperature, str):
-            temperature = [float(t) for t in temperature.split(",")]
-        else:
-            temperature = [float(temperature)]
+        try:
+            if isinstance(temperature, str):
+                temperature = [float(t) for t in temperature.split(",") if t.strip()]
+            else:
+                temperature = [float(temperature)]
+            if not temperature:
+                raise ValueError("empty temperature list")
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid temperature value: expected a float or comma-separated floats",
+            )
 
         # Parse suppress_tokens once
         parsed_suppress_tokens = None

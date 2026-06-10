@@ -9,6 +9,7 @@ import time
 import asyncio
 import tempfile
 import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO)
@@ -21,9 +22,21 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """Pre-load the model on startup so the first request is fast."""
+    try:
+        get_model()
+    except Exception as e:
+        logger.warning(f"Could not preload model: {e}")
+    yield
+
+
 app = FastAPI(
     title="Qwen3-ASR Service",
-    description="Speech-to-Text using Qwen3-ASR with multilingual support"
+    description="Speech-to-Text using Qwen3-ASR with multilingual support",
+    lifespan=_lifespan,
 )
 
 allowed_origins_str = os.getenv("ALLOWED_ORIGINS", "*")
@@ -96,15 +109,6 @@ def get_model():
             logger.error(f"Failed to load Qwen3-ASR model: {e}", exc_info=True)
             raise
     return asr_model
-
-
-@app.on_event("startup")
-async def startup():
-    """Pre-load model on startup."""
-    try:
-        get_model()
-    except Exception as e:
-        logger.warning(f"Could not preload model: {e}")
 
 
 @app.get("/health")

@@ -14,6 +14,7 @@ import asyncio
 import subprocess
 import tempfile
 import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO)
@@ -28,9 +29,21 @@ import uvicorn
 
 from transcription import parse_hypothesis as _parse_hypothesis
 
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """Pre-load the model on startup so the first request is fast."""
+    try:
+        get_model()
+    except Exception as e:
+        logger.warning(f"Could not preload model: {e}")
+    yield
+
+
 app = FastAPI(
     title="Parakeet-ASR Service",
     description="Fast multilingual Speech-to-Text using NVIDIA Parakeet-TDT",
+    lifespan=_lifespan,
 )
 
 allowed_origins_str = os.getenv("ALLOWED_ORIGINS", "*")
@@ -147,15 +160,6 @@ async def status():
         status_info["gpu_memory_allocated"] = torch.cuda.memory_allocated()
         status_info["gpu_memory_total"] = torch.cuda.get_device_properties(0).total_memory
     return status_info
-
-
-@app.on_event("startup")
-async def startup():
-    """Pre-load the model on startup so the first request is fast."""
-    try:
-        get_model()
-    except Exception as e:
-        logger.warning(f"Could not preload model: {e}")
 
 
 @app.post("/transcribe")

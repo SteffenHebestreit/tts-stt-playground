@@ -14,6 +14,7 @@ import shutil
 import numpy as np
 import uuid
 import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional, List, Dict
 from datetime import datetime
@@ -40,7 +41,18 @@ from validation import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Piper Voice Training Service", description="VITS neural network training pipeline for custom Piper TTS voice models")
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """Restore interrupted training jobs from disk on startup."""
+    await restore_interrupted_jobs()
+    yield
+
+
+app = FastAPI(
+    title="Piper Voice Training Service",
+    description="VITS neural network training pipeline for custom Piper TTS voice models",
+    lifespan=_lifespan,
+)
 
 allowed_origins_str = os.getenv("ALLOWED_ORIGINS", "*")
 allowed_origins = [origin.strip() for origin in allowed_origins_str.split(",")] if allowed_origins_str else ["*"]
@@ -289,7 +301,6 @@ async def remove_model_from_deployment_target(model_name: str, target_id: Option
 
     logger.info(f"No removal implementation for deployment target {resolved_target_id}")
 
-@app.on_event("startup")
 async def restore_interrupted_jobs():
     """Scan checkpoints/ for jobs interrupted by a container restart and restore them."""
     checkpoints_root = Path("checkpoints")

@@ -14,6 +14,7 @@ import asyncio
 import subprocess
 import tempfile
 import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import torch
@@ -30,9 +31,21 @@ import uvicorn
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """Pre-load the model on startup so the first request is fast."""
+    try:
+        get_model()
+    except Exception as e:
+        logger.warning(f"Could not preload model: {e}")
+    yield
+
+
 app = FastAPI(
     title="Qwen3-TTS Service",
-    description="Text-to-Speech and Voice Cloning using Qwen3-TTS"
+    description="Text-to-Speech and Voice Cloning using Qwen3-TTS",
+    lifespan=_lifespan,
 )
 
 allowed_origins_str = os.getenv("ALLOWED_ORIGINS", "*")
@@ -152,15 +165,6 @@ def get_model():
     if tts_model is None:
         return load_model()
     return tts_model
-
-
-@app.on_event("startup")
-async def startup():
-    """Pre-load model on startup."""
-    try:
-        get_model()
-    except Exception as e:
-        logger.warning(f"Could not preload model: {e}")
 
 
 @app.get("/health")
@@ -659,15 +663,27 @@ async def text_to_speech(request: TTSRequest):
                 instruct=request.instruct or "",
             )
         else:
-            # Base model fallback — use voice cloning with empty ref
-            # For base model, we need a reference audio; generate simple output
-            wavs, sr = await asyncio.to_thread(
-                model.generate_voice_clone,
-                text=request.text,
-                language=request.lang,
-                ref_audio=None,
-                ref_text="",
-            )
+            # Base models have no built-in speakers. Attempt reference-free
+            # cloning for library versions that support it, but translate the
+            # (likely) failure into actionable guidance instead of a raw 500.
+            try:
+                wavs, sr = await asyncio.to_thread(
+                    model.generate_voice_clone,
+                    text=request.text,
+                    language=request.lang,
+                    ref_audio=None,
+                    ref_text="",
+                )
+            except Exception as fallback_err:
+                model_info = AVAILABLE_MODELS.get(current_model_name, {})
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Current model '{model_info.get('name', current_model_name)}' has no built-in "
+                        "speakers. Switch to the CustomVoice model for speaker TTS, or use voice "
+                        f"cloning / a saved voice instead. (Underlying error: {fallback_err})"
+                    ),
+                )
 
         generation_time = time.time() - start_time
         logger.info(f"TTS generated in {generation_time:.2f}s")

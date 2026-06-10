@@ -10,6 +10,7 @@ from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import httpx
 import json
@@ -21,7 +22,22 @@ from typing import Optional
 # Cache-busting version: bumped on every restart so browsers fetch fresh assets
 APP_VERSION = str(int(time.time()))
 
-app = FastAPI(title="TTS-STT Frontend Service", version="2.0.0")
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """Close the shared pooled HTTP client when the service stops."""
+    yield
+    global _http_client
+    client, _http_client = _http_client, None
+    aclose = getattr(client, "aclose", None) if client is not None else None
+    if aclose is not None:
+        try:
+            await aclose()
+        except Exception:
+            pass
+
+
+app = FastAPI(title="TTS-STT Frontend Service", version="2.0.0", lifespan=_lifespan)
 
 allowed_origins_str = os.getenv("ALLOWED_ORIGINS", "*")
 allowed_origins = [origin.strip() for origin in allowed_origins_str.split(",")] if allowed_origins_str else ["*"]
@@ -799,6 +815,7 @@ def _normalize_qwen3_language(language: str) -> str:
         "ko": "Korean",
         "zh": "Chinese",
         "zh_cn": "Chinese",
+        # Qwen3-TTS has no Dutch support; fall back to English rather than erroring
         "nl": "English",
     }
     normalized = (language or "English").strip().lower().replace("-", "_")
@@ -1124,19 +1141,6 @@ def _get_http_client() -> httpx.AsyncClient:
         _http_client = httpx.AsyncClient()
         _http_client_factory = httpx.AsyncClient
     return _http_client
-
-
-@app.on_event("shutdown")
-async def _shutdown_http_client():
-    """Close the shared HTTP client when the service stops."""
-    global _http_client
-    client, _http_client = _http_client, None
-    aclose = getattr(client, "aclose", None) if client is not None else None
-    if aclose is not None:
-        try:
-            await aclose()
-        except Exception:
-            pass
 
 
 async def _provider_get(provider_id: str, path: str, timeout: float = 30.0) -> httpx.Response:

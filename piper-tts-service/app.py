@@ -12,6 +12,7 @@ import tempfile
 import json
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 import shutil
 from typing import Dict, Optional
@@ -37,7 +38,18 @@ from naming import (
     normalize_phoneme_id_map,
 )
 
-app = FastAPI(title="PiperTTS Service", description="Text-to-Speech using Piper with custom and default models")
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """Scan the custom-models directory and register any valid voices on startup."""
+    await load_custom_voices()
+    yield
+
+
+app = FastAPI(
+    title="PiperTTS Service",
+    description="Text-to-Speech using Piper with custom and default models",
+    lifespan=_lifespan,
+)
 
 allowed_origins_str = os.getenv("ALLOWED_ORIGINS", "*")
 allowed_origins = [origin.strip() for origin in allowed_origins_str.split(",")] if allowed_origins_str else ["*"]
@@ -202,12 +214,6 @@ def _get_onnx_session(model_path: str):
     session = ort.InferenceSession(model_path, sess_options=sess_options)
     _ONNX_SESSION_CACHE[model_path] = (mtime, session)
     return session
-
-
-@app.on_event("startup")
-async def startup():
-    """Scan the custom-models directory and register any valid voices."""
-    await load_custom_voices()
 
 
 @app.get("/")
