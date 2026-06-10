@@ -395,7 +395,12 @@ async def transcribe_audio_stream(
     """Stream transcription results via Server-Sent Events as segments are decoded."""
     if not model_loaded:
         raise HTTPException(status_code=503, detail="Whisper model not loaded")
-    
+
+    # Match /transcribe semantics: "auto" (or empty) means auto-detect.
+    # faster-whisper rejects "auto" as a language code.
+    if not language or language.strip().lower() == "auto":
+        language = None
+
     req_id = uuid.uuid4().hex[:8]
     
     # Save uploaded file to a temporary location first
@@ -631,30 +636,54 @@ async def detect_language(
         # Runs in a worker thread so the event loop stays responsive.
         def _detect():
             """Blocking language-detection transcription, run off the event loop."""
-            segments, info = whisper_model.transcribe(
-                temp_audio_path,
-                task="transcribe",
-                language=None,  # Auto-detect
-                beam_size=1,    # Fastest setting
-                best_of=1,      # Fastest setting
-                vad_filter=True,
-                condition_on_previous_text=False,
-                # Only process first part for speed
-                vad_parameters={
-                    "threshold": 0.5,
-                    "min_speech_duration_ms": 250,
-                    "min_silence_duration_ms": 500,
-                }
-            )
-            sample = ""
-            count = 0
-            for segment in segments:
-                if count >= 3:  # Only need a few segments for detection
-                    break
-                if segment.no_speech_prob < 0.8:
-                    sample += segment.text.strip() + " "
-                    count += 1
-            return sample, info
+            # faster-whisper decodes the whole file up front, so trim long
+            # uploads to duration_limit seconds for fast detection.
+            detect_path = temp_audio_path
+            trimmed_path = None
+            if duration_limit and duration_limit > 0:
+                try:
+                    import librosa
+                    import soundfile as sf_lib
+                    audio_data, sr = librosa.load(temp_audio_path, sr=None, mono=True, duration=duration_limit)
+                    if len(audio_data) > 0:
+                        trimmed_fd, trimmed_path = tempfile.mkstemp(suffix=".wav")
+                        os.close(trimmed_fd)
+                        sf_lib.write(trimmed_path, audio_data, sr)
+                        detect_path = trimmed_path
+                except Exception as trim_err:
+                    logger.warning(f"Could not trim audio for language detection: {trim_err}")
+
+            try:
+                segments, info = whisper_model.transcribe(
+                    detect_path,
+                    task="transcribe",
+                    language=None,  # Auto-detect
+                    beam_size=1,    # Fastest setting
+                    best_of=1,      # Fastest setting
+                    vad_filter=True,
+                    condition_on_previous_text=False,
+                    # Only process first part for speed
+                    vad_parameters={
+                        "threshold": 0.5,
+                        "min_speech_duration_ms": 250,
+                        "min_silence_duration_ms": 500,
+                    }
+                )
+                sample = ""
+                count = 0
+                for segment in segments:
+                    if count >= 3:  # Only need a few segments for detection
+                        break
+                    if segment.no_speech_prob < 0.8:
+                        sample += segment.text.strip() + " "
+                        count += 1
+                return sample, info
+            finally:
+                if trimmed_path and os.path.exists(trimmed_path):
+                    try:
+                        os.unlink(trimmed_path)
+                    except OSError:
+                        pass
 
         loop = asyncio.get_running_loop()
         sample_text, info = await loop.run_in_executor(executor, _detect)

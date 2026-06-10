@@ -30,7 +30,12 @@ import aiofiles
 import librosa
 import io
 
-from naming import sanitize_voice_name, select_best_voice as _select_best_voice, prune_old_outputs
+from naming import (
+    sanitize_voice_name,
+    select_best_voice as _select_best_voice,
+    prune_old_outputs,
+    normalize_phoneme_id_map,
+)
 
 app = FastAPI(title="PiperTTS Service", description="Text-to-Speech using Piper with custom and default models")
 
@@ -374,6 +379,15 @@ def _custom_onnx_infer(model_path: str, text: str, voice_name: str) -> bytes:
             "Cannot perform inference without the phoneme vocabulary."
         )
 
+    # Piper-format configs map each phoneme to a *list* of ids ("_": [0]);
+    # training vocabs map to a plain int. Normalize to ints so ID lookup
+    # below never feeds lists into the int64 tensor.
+    phoneme_to_id = normalize_phoneme_id_map(phoneme_to_id)
+    if not phoneme_to_id:
+        raise RuntimeError(
+            f"phoneme_id_map for voice '{voice_name}' contains no usable integer ids."
+        )
+
     # Phonemize exactly as during training:
     #   phonemize(text, language=lang, backend='espeak', strip=True)
     ipa_text = phonemize(
@@ -426,6 +440,14 @@ async def text_to_speech(request: TTSRequest):
     try:
         if not request.text.strip():
             raise HTTPException(status_code=400, detail="Text must not be empty")
+
+        # Piper (and the custom ONNX path) only produce WAV; reject other
+        # formats instead of returning mislabeled audio.
+        if request.output_format.lower() != "wav":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported output_format '{request.output_format}': only 'wav' is supported",
+            )
 
         # Select voice if not specified
         if not request.voice:

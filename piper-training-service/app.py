@@ -153,14 +153,6 @@ class TrainingStatus(BaseModel):
     model_name: Optional[str] = None
     deployment_target: Optional[str] = None
 
-class AudioProcessingRequest(BaseModel):
-    """Payload for STT segmentation of a long source recording."""
-
-    audio_file_url: str
-    model_name: str
-    language: str = "en"
-    stt_service_url: str = "http://stt-service:8000"
-
 # Store training jobs
 training_jobs = {}
 
@@ -412,56 +404,11 @@ async def generate_missing_mels(model_name: str = "stst"):
             "processed": processed,
             "status": "success"
         }
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generating mel spectrograms: {str(e)}")
-
-@app.post("/process-audio")
-async def process_audio(request: AudioProcessingRequest):
-    """Process a long audio file via the STT service for segmentation and transcription."""
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{request.stt_service_url}/segment",
-                json={
-                    "audio_url": request.audio_file_url,
-                    "language": request.language,
-                    "min_segment_length": 2.0,
-                    "max_segment_length": 10.0,
-                },
-                timeout=aiohttp.ClientTimeout(total=120),
-            ) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
-                    raise HTTPException(status_code=500, detail=f"STT service error: {body}")
-                stt_data = await resp.json()
-        
-        # Convert STT segments to training segments
-        segments = []
-        for segment in stt_data.get("segments", []):
-            segments.append(SegmentData(
-                audio_path=segment["audio_path"],
-                text=segment["text"],
-                start_time=segment["start_time"],
-                end_time=segment["end_time"]
-            ))
-        
-        # Prepare dataset
-        dataset_result = await prepare_dataset(DatasetUpload(
-            segments=segments,
-            model_name=request.model_name
-        ))
-        
-        return {
-            "status": "success",
-            "message": f"Processed {len(segments)} segments from audio",
-            "segments_count": len(segments),
-            "dataset_path": dataset_result["dataset_path"],
-            "segments": [segment.model_dump() for segment in segments[:5]]  # Return first 5 for preview
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/prepare-dataset")
 async def prepare_dataset(dataset: DatasetUpload):
@@ -1200,7 +1147,9 @@ async def manual_export_model(job_id: str, model_name: str = Form(...), deployme
             "onnx_path": str(onnx_path),
             "deployment": deployment_result,
         }
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Export failed: {str(e)}")
 
@@ -1272,10 +1221,13 @@ async def list_jobs():
 
 @app.get("/download/{job_id}")
 async def download_model(job_id: str):
-    """Download the exported ONNX model for a training job."""
+    """Download the exported ONNX model for a training job.
+
+    Looks up the exported file directly (job_id is path-sanitised) so models
+    remain downloadable after a container restart, when completed jobs are no
+    longer present in the in-memory job registry.
+    """
     job_id = _safe_name(job_id, "job_id")
-    if job_id not in training_jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
 
     model_path = Path(f"models/{job_id}/{job_id}.onnx")
     if not model_path.exists():

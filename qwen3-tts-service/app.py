@@ -319,6 +319,18 @@ VOICES_DIR.mkdir(parents=True, exist_ok=True)
 
 
 _SAFE_VOICE_RE = re.compile(r"^[a-zA-Z0-9_\-]+$")
+_UNSAFE_VOICE_CHARS_RE = re.compile(r"[^a-zA-Z0-9_\-]+")
+
+
+def _voice_id_from_name(name: str) -> str:
+    """Derive a filesystem-safe voice id from a user-supplied display name."""
+    voice_id = _UNSAFE_VOICE_CHARS_RE.sub("_", (name or "").strip().lower()).strip("_")
+    if not voice_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Voice name must contain at least one letter, digit, dash, or underscore",
+        )
+    return voice_id
 
 
 def _voice_dir(voice_id: str) -> Path:
@@ -457,14 +469,19 @@ async def save_voice(
 ):
     """Upload reference audio, extract speaker prompt, and save for reuse.
     Trims audio to best segment via ASR timestamps + ffmpeg."""
-    model_info = AVAILABLE_MODELS.get(current_model_name, {})
-    if "voice_clone" not in model_info.get("capabilities", []):
-        raise HTTPException(status_code=400, detail="Current model does not support voice cloning. Switch to a Base model.")
+    # Validate the name up front so a bad name fails fast, before the
+    # expensive transcription + embedding work.
+    voice_id = _voice_id_from_name(name)
 
     tmp_path = None
     trimmed_path = None
     try:
+        # Ensure the model is loaded before checking capabilities, otherwise a
+        # cold start (failed preload) reports a misleading capability error.
         model = get_model()
+        model_info = AVAILABLE_MODELS.get(current_model_name, {})
+        if "voice_clone" not in model_info.get("capabilities", []):
+            raise HTTPException(status_code=400, detail="Current model does not support voice cloning. Switch to a Base model.")
         start_time = time.time()
 
         # Save uploaded file
@@ -503,7 +520,6 @@ async def save_voice(
         prompt_item = prompt_items[0]
 
         # Save to disk
-        voice_id = name.lower().replace(" ", "_").replace("/", "_")
         _save_voice_prompt(voice_id, prompt_item, {
             "name": name,
             "lang": lang,
@@ -559,12 +575,13 @@ async def tts_with_saved_voice(
     if not text:
         raise HTTPException(status_code=400, detail="Text not provided")
 
-    model_info = AVAILABLE_MODELS.get(current_model_name, {})
-    if "voice_clone" not in model_info.get("capabilities", []):
-        raise HTTPException(status_code=400, detail="Current model does not support voice cloning. Switch to a Base model.")
-
     try:
+        # Load the model before the capability check so a cold start
+        # (failed preload) doesn't report a misleading capability error.
         model = get_model()
+        model_info = AVAILABLE_MODELS.get(current_model_name, {})
+        if "voice_clone" not in model_info.get("capabilities", []):
+            raise HTTPException(status_code=400, detail="Current model does not support voice cloning. Switch to a Base model.")
         start_time = time.time()
 
         sentences = _split_sentences(text)
@@ -606,6 +623,8 @@ async def tts_with_saved_voice(
             },
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Saved-voice TTS error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

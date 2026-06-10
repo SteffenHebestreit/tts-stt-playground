@@ -74,6 +74,31 @@ def test_select_ultimate_fallback_on_empty_catalog():
     assert naming.select_best_voice({}, "de", "medium") == "en_US-lessac-medium"
 
 
+# --- normalize_phoneme_id_map ---
+
+def test_normalize_keeps_plain_int_ids():
+    assert naming.normalize_phoneme_id_map({"a": 1, "b": 2}) == {"a": 1, "b": 2}
+
+
+def test_normalize_unwraps_piper_style_lists():
+    assert naming.normalize_phoneme_id_map({"_": [0], "^": [1], "a": [5, 9]}) == {"_": 0, "^": 1, "a": 5}
+
+
+def test_normalize_drops_unusable_entries():
+    assert naming.normalize_phoneme_id_map({
+        "empty": [],
+        "string": "3",
+        "none": None,
+        "bool": True,
+        "ok": 7,
+    }) == {"ok": 7}
+
+
+def test_normalize_handles_none_and_empty():
+    assert naming.normalize_phoneme_id_map(None) == {}
+    assert naming.normalize_phoneme_id_map({}) == {}
+
+
 # --- prune_old_outputs ---
 
 def test_prune_removes_only_old_files(tmp_path):

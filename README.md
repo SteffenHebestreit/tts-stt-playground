@@ -269,7 +269,6 @@ This backend is optional and is only shown in the frontend when `ENABLE_WHISPER_
 | POST | `/resume-training` | Resume interrupted training from checkpoint |
 | POST | `/train-from-dataset` | Train from an already-prepared dataset |
 | POST | `/retrain-from-segments` | Re-transcribe existing clips and retrain |
-| POST | `/process-audio` | Segment/transcribe audio via STT |
 | POST | `/prepare-dataset` | Create dataset from STT segments |
 | POST | `/generate-missing-mels` | Regenerate missing mel spectrograms |
 | POST | `/export/{job_id}` | Export model to ONNX |

@@ -20,7 +20,6 @@ VITS training pipeline for creating ONNX voice bundles. The service can upload r
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/process-audio` | Segment and transcribe a long recording via STT |
 | POST | `/prepare-dataset` | Build a dataset from STT-derived segments |
 | POST | `/generate-missing-mels` | Regenerate missing mel spectrograms |
 | POST | `/restore-backup` | Restore a local backup dataset |
@@ -37,7 +36,7 @@ VITS training pipeline for creating ONNX voice bundles. The service can upload r
 
 ## Workflow
 
-1. Upload recordings with `/train`, or prepare data first with `/process-audio` and `/prepare-dataset`.
+1. Upload recordings with `/train`, or prepare data first with `/prepare-dataset`.
 2. Poll `/status/{job_id}` or `/jobs` while training runs.
 3. Resume with `/resume-training` if a container restart interrupts work.
 4. Export with `/export/{job_id}` or let the automatic post-training export complete.

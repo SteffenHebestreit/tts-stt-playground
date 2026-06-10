@@ -52,6 +52,23 @@ def select_best_voice(all_voices: dict, language: str, quality: str, gender: Opt
     return preferred[0][0]
 
 
+def normalize_phoneme_id_map(phoneme_to_id: dict) -> dict:
+    """Normalize a phoneme->id map to plain integer ids.
+
+    Piper-format configs map each phoneme to a *list* of ids (``"_": [0]``)
+    while training vocabs map to a plain int. Entries that yield no usable
+    integer id are dropped.
+    """
+    normalized = {}
+    for phoneme, ids in (phoneme_to_id or {}).items():
+        if isinstance(ids, (list, tuple)):
+            ids = ids[0] if ids else None
+        if isinstance(ids, bool) or not isinstance(ids, int):
+            continue
+        normalized[phoneme] = ids
+    return normalized
+
+
 def prune_old_outputs(output_dir: str, retention_hours: float, now: Optional[float] = None) -> int:
     """Best-effort removal of files in *output_dir* older than *retention_hours*.
 

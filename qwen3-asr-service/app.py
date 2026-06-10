@@ -168,6 +168,9 @@ async def transcribe_audio(
 
         processing_time = time.time() - start_time
 
+        if not results:
+            raise HTTPException(status_code=422, detail="Transcription produced no result (empty or unreadable audio)")
+
         # Build response matching the Whisper STT service format for compatibility
         result = results[0]
         detected_language = result.language if hasattr(result, 'language') else language
@@ -206,12 +209,17 @@ async def transcribe_audio(
             "model": "qwen3-asr",
         })
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Transcription error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 @app.post("/detect_language")
@@ -234,6 +242,10 @@ async def detect_language(
         )
 
         processing_time = time.time() - start_time
+
+        if not results:
+            raise HTTPException(status_code=422, detail="Language detection produced no result (empty or unreadable audio)")
+
         result = results[0]
         detected_language = result.language if hasattr(result, 'language') else "unknown"
         sample_text = result.text[:200] if hasattr(result, 'text') else ""
@@ -248,12 +260,17 @@ async def detect_language(
             "audio_duration": duration,
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Language detection error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 @app.post("/transcribe-batch")
@@ -279,6 +296,9 @@ async def transcribe_batch(
             )
             processing_time = time.time() - start_time
 
+            if not asr_results:
+                raise RuntimeError("Transcription produced no result (empty or unreadable audio)")
+
             result = asr_results[0]
             duration = librosa.get_duration(path=tmp_path)
 
@@ -297,7 +317,10 @@ async def transcribe_batch(
             })
         finally:
             if tmp_path and os.path.exists(tmp_path):
-                os.unlink(tmp_path)
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
     return {
         "batch": True,
