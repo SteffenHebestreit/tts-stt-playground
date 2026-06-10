@@ -250,6 +250,7 @@ Use smaller models (`WHISPER_MODEL_SIZE=small`, `WHISPER_MODEL=small`) to improv
 |--------|----------|-------------|
 | POST | `/transcribe` | Transcribe audio (`audio`, `task`, `language`, `beam_size`, `vad_filter`, `vad_threshold`, `no_speech_threshold`) |
 | POST | `/transcribe-stream` | SSE streaming transcription (same params) |
+| WS | `/ws/transcribe` | Live transcription: stream PCM16 mono 16 kHz frames, receive partial (confirmed/pending) and final transcripts; `{"language": "de"}` config frame, `{"event": "stop"}` to finish |
 | POST | `/detect_language` | Detect spoken language |
 | GET | `/health` | Health — includes `multilingual` and `model_size` |
 | GET | `/models` | List models with size and multilingual flag |
