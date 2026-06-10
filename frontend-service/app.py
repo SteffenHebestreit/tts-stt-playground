@@ -1108,11 +1108,16 @@ def _passthrough_headers(response: httpx.Response) -> dict:
     }
 
 
-async def _extract_form_payload(request: Request) -> tuple[list[tuple[str, str]], Optional[list[tuple[str, tuple[str, bytes, str]]]]]:
-    """Normalize a Starlette form request into httpx-compatible data/files payloads."""
+async def _extract_form_payload(request: Request) -> tuple[dict, Optional[list[tuple[str, tuple[str, bytes, str]]]]]:
+    """Normalize a Starlette form request into httpx-compatible data/files payloads.
+
+    Text fields are returned as a dict (repeated keys become lists): httpx
+    multipart encoding only accepts dict-shaped ``data`` — passing a list of
+    tuples makes AsyncClient raise "Attempted to send an sync request".
+    """
     form = await request.form()
 
-    data: list[tuple[str, str]] = []
+    data: dict = {}
     files: list[tuple[str, tuple[str, bytes, str]]] = []
     for key, value in form.multi_items():
         if hasattr(value, "filename"):
@@ -1122,7 +1127,15 @@ async def _extract_form_payload(request: Request) -> tuple[list[tuple[str, str]]
                 (value.filename or "upload.bin", content, value.content_type or "application/octet-stream"),
             ))
         else:
-            data.append((key, str(value)))
+            text = str(value)
+            if key in data:
+                existing = data[key]
+                if isinstance(existing, list):
+                    existing.append(text)
+                else:
+                    data[key] = [existing, text]
+            else:
+                data[key] = text
 
     return data, files or None
 
@@ -1272,8 +1285,12 @@ class ProviderVoiceDesignRequest(BaseModel):
     lang: str = "English"
 
 
-async def _build_frontend_stt_payload(provider_id: str, form, contract: str) -> tuple[str, list[tuple[str, str]], list[tuple[str, tuple[str, bytes, str]]]]:
-    """Translate normalized frontend STT form data into a provider-specific request."""
+async def _build_frontend_stt_payload(provider_id: str, form, contract: str) -> tuple[str, dict, list[tuple[str, tuple[str, bytes, str]]]]:
+    """Translate normalized frontend STT form data into a provider-specific request.
+
+    ``data`` is dict-shaped because httpx multipart encoding rejects sequence
+    payloads when files are present.
+    """
     audio = form.get("audio")
     if not hasattr(audio, "filename"):
         raise HTTPException(status_code=400, detail="Audio file not provided")
@@ -1283,18 +1300,18 @@ async def _build_frontend_stt_payload(provider_id: str, form, contract: str) -> 
     content = await audio.read()
     language = str(form.get("language", "auto")).strip()
 
-    data: list[tuple[str, str]] = []
+    data: dict = {}
     if contract == "stt-form-v1":
         files = [("audio", (filename, content, content_type))]
         if language and language != "auto":
-            data.append(("language", language))
+            data["language"] = language
         return "/transcribe", data, files
 
     if contract == "openai-audio-transcriptions-v1":
         files = [("file", (filename, content, content_type))]
-        data.append(("response_format", "json"))
+        data["response_format"] = "json"
         if language and language != "auto":
-            data.append(("language", language))
+            data["language"] = language
         return "/v1/audio/transcriptions", data, files
 
     raise HTTPException(status_code=400, detail=f"Unsupported STT contract for provider {provider_id}")
