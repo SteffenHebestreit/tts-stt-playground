@@ -96,11 +96,21 @@ jobs:
       - name: Assert ROCm overlay leaves no NVIDIA reservations
         run: |
           cp -n .env.example .env || true
-          count=$(docker compose --profile all --profile training \
-                  -f docker-compose.yml -f docker-compose.rocm.yml config \
-                  | grep -c "driver: nvidia" || true)
+          docker compose version
+
+          docker compose --profile all --profile training \
+            -f docker-compose.yml -f docker-compose.rocm.yml config > /tmp/rocm.yml
+
+          count=$(grep -c "driver: nvidia" /tmp/rocm.yml || true)
           echo "nvidia reservations surviving into ROCm overlay: $count"
-          test "$count" -eq 0
+
+          if [ "$count" -ne 0 ]; then
+            echo "--- services still reserving an NVIDIA device:"
+            # Print the owning service for each surviving reservation, so the
+            # failure names the culprit instead of just a count.
+            awk '/^  [a-z0-9-]+:/ {svc=$1} /driver: nvidia/ {print "    " svc}' /tmp/rocm.yml
+            exit 1
+          fi
 
   build:
     name: build ${{ matrix.name }}

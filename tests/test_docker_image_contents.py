@@ -205,3 +205,48 @@ def test_variants_keep_runtime_critical_env(service_dir: Path):
                 f"{var}={base_env[var]!r}. This value guards a segfault on "
                 f"model load and is not device-specific."
             )
+
+
+# --- test/runtime dependency parity ------------------------------------------
+#
+# The unit tests import frontend-service/app.py directly, so the FastAPI they
+# run against must be the FastAPI the image ships. A floating `fastapi>=0.104`
+# in tests/requirements.txt resolved to Starlette 1.x in CI, which removed the
+# legacy TemplateResponse(name, context) signature — CI failed on a code path
+# that worked fine in the container. Same name, two different frameworks.
+
+SHARED_WITH_FRONTEND = ("fastapi", "jinja2", "python-multipart", "httpx")
+
+
+def _pins(requirements: Path) -> dict[str, str]:
+    """{package: exact version} for `pkg==version` lines only."""
+    found: dict[str, str] = {}
+    for raw in requirements.read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if "==" not in line:
+            continue
+        name, _, version = line.partition("==")
+        # strip extras such as uvicorn[standard]
+        found[name.split("[", 1)[0].strip().lower()] = version.strip()
+    return found
+
+
+def test_test_deps_match_the_shipped_frontend_deps():
+    """Packages shared with the gateway must be pinned to the same version."""
+    service = _pins(REPO_ROOT / "frontend-service" / "requirements.txt")
+    tests = _pins(REPO_ROOT / "tests" / "requirements.txt")
+
+    mismatches = []
+    for package in SHARED_WITH_FRONTEND:
+        want = service.get(package)
+        got = tests.get(package)
+        if want is None:
+            continue  # not pinned by the service; nothing to match
+        if got != want:
+            mismatches.append(f"{package}: tests={got!r} frontend={want!r}")
+
+    assert not mismatches, (
+        "tests/requirements.txt must pin these to the same versions as "
+        "frontend-service/requirements.txt, or the suite tests a different "
+        "framework than the image ships:\n  " + "\n  ".join(mismatches)
+    )

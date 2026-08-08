@@ -1607,8 +1607,12 @@ def _normalize_frontend_stt_response(payload: dict, contract: str) -> dict:
 async def read_root(request: Request):
     """Render the main web UI page with service URLs injected into the template."""
     tts_providers, stt_providers, status_providers = _template_provider_lists()
-    return templates.TemplateResponse("index.html", {
-        "request": request,
+    # Request-first signature. The legacy TemplateResponse(name, context) form
+    # is not merely deprecated in Starlette 1.x, it is gone: the name slot takes
+    # the request, so the context dict lands where the template name belongs and
+    # the loader raises "unhashable type: 'dict'". Supported since Starlette
+    # 0.29, so this works on the pinned 0.115.8 and on anything newer.
+    return templates.TemplateResponse(request, "index.html", {
         "provider_registry_json": json.dumps(PROVIDER_REGISTRY),
         "tts_provider_options": tts_providers,
         "stt_provider_options": stt_providers,

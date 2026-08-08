@@ -87,17 +87,24 @@ x-rocm-devices: &rocm-devices
     - seccomp=unconfined
   cap_add:
     - SYS_PTRACE
-  deploy:
-    resources:
-      reservations:
-        # `!reset` is load-bearing. Compose MERGES sequences, so a plain
-        # `devices: []` here appends nothing and leaves the base file's NVIDIA
-        # reservation in place — every ROCm service then demands an NVIDIA
-        # device and cannot start on an AMD-only host.
-        # Verify: docker compose -f docker-compose.yml -f docker-compose.rocm.yml \
-        #           --profile all config | grep -c 'driver: nvidia'   ->  0
-        # Requires Compose >= 2.24.4.
-        devices: !reset []
+
+# The NVIDIA device reservation is cleared PER SERVICE below rather than here.
+#
+# `!reset` is load-bearing: Compose MERGES sequences, so a plain `devices: []`
+# appends nothing and leaves the base file's NVIDIA reservation in place. Every
+# ROCm service would then demand an NVIDIA device and fail to start on an
+# AMD-only host.
+#
+# It used to live in this anchor and reach services via `<<:`. That resolves
+# correctly on Compose v5 but is NOT portable — whether a custom YAML tag
+# survives merge-key resolution is implementation-defined, and on CI's older
+# Compose all four reservations came through untouched. Writing the tag at the
+# path it applies to removes the merge-key interaction entirely.
+#
+# Verify (expect 0):
+#   docker compose --profile all --profile training \
+#     -f docker-compose.yml -f docker-compose.rocm.yml config \
+#     | grep -c 'driver: nvidia'
 
 services:
   piper-training-service:
@@ -108,6 +115,11 @@ services:
     environment:
       <<: *rocm-env
     <<: *rocm-devices
+    deploy:
+      resources:
+        reservations:
+          # Cleared here, not in the anchor — see the note above `services:`.
+          devices: !reset []
 
   stt-service:
     image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-stt:${IMAGE_TAG:-latest}-rocm
@@ -118,6 +130,11 @@ services:
       <<: *rocm-env
       FORCE_ACCELERATION: rocm
     <<: *rocm-devices
+    deploy:
+      resources:
+        reservations:
+          # Cleared here, not in the anchor — see the note above `services:`.
+          devices: !reset []
 
   qwen3-asr-service:
     image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-qwen3-asr:${IMAGE_TAG:-latest}-rocm
@@ -127,6 +144,11 @@ services:
     environment:
       <<: *rocm-env
     <<: *rocm-devices
+    deploy:
+      resources:
+        reservations:
+          # Cleared here, not in the anchor — see the note above `services:`.
+          devices: !reset []
 
   qwen3-tts-service:
     image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-qwen3-tts:${IMAGE_TAG:-latest}-rocm
@@ -136,6 +158,11 @@ services:
     environment:
       <<: *rocm-env
     <<: *rocm-devices
+    deploy:
+      resources:
+        reservations:
+          # Cleared here, not in the anchor — see the note above `services:`.
+          devices: !reset []
 
   # parakeet-asr-service ships a Dockerfile.rocm but was missing from this
   # overlay, so `--profile parakeet-asr` with this file silently built the CUDA
@@ -154,6 +181,11 @@ services:
     environment:
       <<: *rocm-env
     <<: *rocm-devices
+    deploy:
+      resources:
+        reservations:
+          # Cleared here, not in the anchor — see the note above `services:`.
+          devices: !reset []
 
   # NOTE: canary-asr-service and chatterbox-tts-service have NO Dockerfile.rocm,
   # so they are deliberately absent here rather than silently building a CUDA
