@@ -12,7 +12,9 @@ The model stack is stubbed; these run offline.
 """
 
 import asyncio
+import os
 import sys
+import tempfile
 import types
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
@@ -57,6 +59,11 @@ def _install_stubs():
 @pytest.fixture(scope="module")
 def app_mod():
     _install_stubs()
+    # Point the voice library somewhere writable. The default is /app/voices,
+    # which only exists inside the container; leaving it unset made the import
+    # depend on the CWD being writable and on the caller's uid.
+    previous_voices_dir = os.environ.get("VOICES_DIR")
+    os.environ["VOICES_DIR"] = tempfile.mkdtemp(prefix="qwen3-tts-voices-")
     sys.path.insert(0, str(SERVICE_DIR))
     try:
         spec = spec_from_file_location("qwen3_tts_under_test", SERVICE_DIR / "app.py")
@@ -67,6 +74,10 @@ def app_mod():
         return module
     finally:
         sys.path.remove(str(SERVICE_DIR))
+        if previous_voices_dir is None:
+            os.environ.pop("VOICES_DIR", None)
+        else:
+            os.environ["VOICES_DIR"] = previous_voices_dir
 
 
 @pytest.fixture

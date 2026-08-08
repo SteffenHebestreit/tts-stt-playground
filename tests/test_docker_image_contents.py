@@ -250,3 +250,52 @@ def test_test_deps_match_the_shipped_frontend_deps():
         "frontend-service/requirements.txt, or the suite tests a different "
         "framework than the image ships:\n  " + "\n  ".join(mismatches)
     )
+
+
+# --- import-time side effects ------------------------------------------------
+#
+# `VOICES_DIR.mkdir(...)` at qwen3-tts module scope raised PermissionError on
+# /app for any non-root caller. It passed every local run — in the container the
+# path exists and the user is root — and only failed on CI. The same line would
+# break a read-only rootfs.
+#
+# Importing a module must not require write access. Anything a service needs on
+# disk should be created where it is used, which is also where the failure can
+# be reported sensibly.
+
+_WRITE_CALLS = {"mkdir", "makedirs", "mkdtemp", "touch", "write_text", "write_bytes"}
+
+
+def _module_level_nodes(tree: ast.Module):
+    """Walk statements that execute at import, skipping function/class bodies."""
+    stack = list(tree.body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue  # only runs when called
+        yield node
+        for child in ast.iter_child_nodes(node):
+            stack.append(child)
+
+
+@pytest.mark.parametrize("service_dir", _service_dirs(), ids=lambda p: p.name)
+def test_no_filesystem_writes_at_import(service_dir: Path):
+    """No service may create files or directories just by being imported."""
+    source = (service_dir / "app.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    offenders = []
+    for node in _module_level_nodes(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+        if name in _WRITE_CALLS:
+            offenders.append(f"line {node.lineno}: {ast.unparse(node)[:80]}")
+
+    assert not offenders, (
+        f"{service_dir.name}/app.py writes to the filesystem at import time:\n  "
+        + "\n  ".join(offenders)
+        + "\nThis fails for any caller without write access to the path (non-root "
+          "CI, read-only rootfs). Create it where it is used instead."
+    )

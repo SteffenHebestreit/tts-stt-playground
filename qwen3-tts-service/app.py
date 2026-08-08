@@ -566,7 +566,11 @@ def _pick_best_segment(segments: list, min_dur: float = 3.0, max_dur: float = 10
 # --- Voice Library: persistent speaker prompt cache ---
 
 VOICES_DIR = Path(os.getenv("VOICES_DIR", "/app/voices"))
-VOICES_DIR.mkdir(parents=True, exist_ok=True)
+# Deliberately NOT created here. Importing a module must not require write access
+# to the filesystem: this line raised PermissionError on /app for any caller
+# without root, which broke the offline unit tests and would break a read-only
+# rootfs. Nothing needs it eagerly — _save_voice_prompt() creates it with
+# parents=True on write, and _list_voices() returns [] when it is absent.
 
 
 _SAFE_VOICE_RE = re.compile(r"^[a-zA-Z0-9_\-]+$")
