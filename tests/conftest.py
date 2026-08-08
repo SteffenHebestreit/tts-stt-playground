@@ -7,6 +7,54 @@ import math
 import pytest
 import httpx
 
+# Tests in this suite come in two kinds:
+#
+#   * unit tests, which import service modules straight off the filesystem and
+#     run anywhere;
+#   * live tests, which drive a running container over HTTP.
+#
+# The live ones resolve Docker-network hostnames like `stt-service`, so outside
+# the stack they used to produce ~33 identical `getaddrinfo failed` errors. That
+# is noise, not signal: it buries a genuine regression in a wall of red and
+# makes the suite useless as a pre-commit check.
+#
+# So a live fixture probes its service once per session and skips if it is not
+# there. Inside the compose stack the services *must* be up, and skipping would
+# hide real breakage -- set REQUIRE_LIVE_SERVICES=1 there to turn the skip back
+# into a hard failure (docker-compose.yml does this for the `tests` service).
+REQUIRE_LIVE_SERVICES = os.getenv("REQUIRE_LIVE_SERVICES", "").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+_reachability_cache: dict[str, bool] = {}
+
+
+def _service_is_up(base_url: str) -> bool:
+    """One cached probe per base URL, so N fixtures cost at most N connects."""
+    if base_url not in _reachability_cache:
+        try:
+            # Any response at all proves the service is listening; a 404 on /
+            # is still a live service, so the status code is irrelevant here.
+            httpx.get(base_url, timeout=httpx.Timeout(3.0, connect=2.0))
+            _reachability_cache[base_url] = True
+        except httpx.HTTPError:
+            _reachability_cache[base_url] = False
+    return _reachability_cache[base_url]
+
+
+def live_client(base_url: str, timeout: float) -> httpx.Client:
+    """Client for a live service, or skip the tests that need it."""
+    if not REQUIRE_LIVE_SERVICES and not _service_is_up(base_url):
+        pytest.skip(
+            f"live service not reachable at {base_url} — start the stack with "
+            f"`docker compose up -d` to run these, or set "
+            f"REQUIRE_LIVE_SERVICES=1 to make this a failure instead"
+        )
+    return httpx.Client(base_url=base_url, timeout=timeout)
+
+
 # Service URLs from environment or defaults
 PIPER_TTS_URL = os.getenv("PIPER_TTS_URL", "http://piper-tts-service:5000")
 STT_URL = os.getenv("STT_URL", "http://stt-service:8000")
@@ -54,40 +102,40 @@ def test_audio_bytes() -> bytes:
 @pytest.fixture(scope="session")
 def piper_tts_client():
     """HTTP client for the Piper TTS service."""
-    with httpx.Client(base_url=PIPER_TTS_URL, timeout=30.0) as client:
+    with live_client(PIPER_TTS_URL, 30.0) as client:
         yield client
 
 
 @pytest.fixture(scope="session")
 def stt_client():
     """HTTP client for the STT service."""
-    with httpx.Client(base_url=STT_URL, timeout=60.0) as client:
+    with live_client(STT_URL, 60.0) as client:
         yield client
 
 
 @pytest.fixture(scope="session")
 def training_client():
     """HTTP client for the training service."""
-    with httpx.Client(base_url=TRAINING_URL, timeout=30.0) as client:
+    with live_client(TRAINING_URL, 30.0) as client:
         yield client
 
 
 @pytest.fixture(scope="session")
 def qwen3_tts_client():
     """HTTP client for the Qwen3 TTS service."""
-    with httpx.Client(base_url=QWEN3_TTS_URL, timeout=120.0) as client:
+    with live_client(QWEN3_TTS_URL, 120.0) as client:
         yield client
 
 
 @pytest.fixture(scope="session")
 def qwen3_asr_client():
     """HTTP client for the Qwen3 ASR service."""
-    with httpx.Client(base_url=QWEN3_ASR_URL, timeout=60.0) as client:
+    with live_client(QWEN3_ASR_URL, 60.0) as client:
         yield client
 
 
 @pytest.fixture(scope="session")
 def frontend_client():
     """HTTP client for the frontend service."""
-    with httpx.Client(base_url=FRONTEND_URL, timeout=10.0) as client:
+    with live_client(FRONTEND_URL, 10.0) as client:
         yield client

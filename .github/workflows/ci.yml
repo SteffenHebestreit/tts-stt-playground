@@ -1,0 +1,146 @@
+name: CI
+
+# The repo had no test job at all: `publish-images.yml` only runs on master and
+# tags, and only builds. So nothing verified a change before it shipped, and
+# nothing ever built the `-rocm` / `-vulkan` variants — which is exactly how a
+# missing `COPY json_utils.py` and a missing `ENV PYTORCH_JIT=0` reached users.
+#
+# This runs on every branch and PR.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: tests/requirements.txt
+
+      - name: Install test dependencies
+        run: pip install -r tests/requirements.txt
+
+      # Tests that need a running container skip themselves here (no stack on
+      # the runner) and are reported as skips, not passes. The in-stack run
+      # sets REQUIRE_LIVE_SERVICES=1 so they cannot skip silently there.
+      - name: Run tests
+        run: pytest tests/ -v --tb=short --ignore=tests/test_integration.py
+
+  compile:
+    name: compile all services
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Catches syntax and scope errors (e.g. a bad `global`) without needing
+      # any service's heavy dependencies installed. ast.parse is not enough —
+      # it accepts code that py_compile rejects.
+      - name: Byte-compile every service
+        run: |
+          set -e
+          for f in */*.py; do
+            python -m py_compile "$f" || { echo "FAILED: $f"; exit 1; }
+          done
+          echo "compiled $(ls */*.py | wc -l) modules"
+
+  compose:
+    name: validate compose overlays
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Overlay merges fail silently in ways that are invisible until deploy:
+      # a `deploy.resources` reservation that survives into the ROCm overlay
+      # pins an AMD host to a device it does not have.
+      - name: Validate every overlay combination
+        run: |
+          set -e
+          cp -n .env.example .env || true
+          check() {
+            echo "--- $*"
+            docker compose "$@" config -q
+          }
+          # Every service sits behind a profile, so a bare `config` resolves to
+          # an empty project and would validate nothing. `all` is the core set;
+          # piper-training-service is only in `training`.
+          ALL="--profile all --profile training"
+          check -f docker-compose.yml
+          check $ALL -f docker-compose.yml
+          check $ALL -f docker-compose.yml -f docker-compose.rocm.yml
+          check $ALL -f docker-compose.yml -f docker-compose.vulkan.yml
+          check $ALL -f docker-compose.yml -f docker-compose.arm64.yml
+          check $ALL -f docker-compose.yml -f tests/docker-compose.test.yml
+          # truenas.yml is an overlay, not a standalone project.
+          check $ALL -f docker-compose.yml -f docker-compose.truenas.yml
+          check -f docker-compose.truenas-app.yml
+
+      # The ROCm overlay exists to remove NVIDIA reservations. Assert it, rather
+      # than trusting that the `!reset` merge behaved — it silently did not for
+      # a long time.
+      - name: Assert ROCm overlay leaves no NVIDIA reservations
+        run: |
+          cp -n .env.example .env || true
+          count=$(docker compose --profile all --profile training \
+                  -f docker-compose.yml -f docker-compose.rocm.yml config \
+                  | grep -c "driver: nvidia" || true)
+          echo "nvidia reservations surviving into ROCm overlay: $count"
+          test "$count" -eq 0
+
+  build:
+    name: build ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Only the images that fit a runner. The CUDA and ROCm bases do not:
+          # `rocm/dev-ubuntu-22.04:6.2-complete` alone is ~30 GB unpacked
+          # against ~14 GB of free disk. Those variants are covered statically
+          # by tests/test_docker_image_contents.py, which asserts the same two
+          # things a build would have caught — that every locally-imported
+          # module is COPYd, and that runtime-critical ENVs survive into the
+          # variant.
+          - { name: frontend,           context: ./frontend-service,    file: Dockerfile }
+          - { name: piper-tts,          context: ./piper-tts-service,   file: Dockerfile }
+          - { name: whisper-cpp,        context: ./whisper-cpp-service, file: Dockerfile }
+          - { name: whisper-cpp-vulkan, context: ./whisper-cpp-service, file: Dockerfile.vulkan }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.context }}/${{ matrix.file }}
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: ci-${{ matrix.name }}:test
+          cache-from: type=gha,scope=ci-${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=ci-${{ matrix.name }}
+
+      # A built image that cannot import its own entrypoint is the failure mode
+      # this whole job exists for. Only meaningful for the Python services.
+      - name: Verify the app imports inside the image
+        if: matrix.name == 'frontend' || matrix.name == 'piper-tts'
+        run: |
+          docker run --rm --entrypoint python ci-${{ matrix.name }}:test \
+            -c "import app; print('import ok:', app.__name__)"
