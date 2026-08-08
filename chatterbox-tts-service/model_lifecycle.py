@@ -154,12 +154,27 @@ class ModelSlot:
 
     def unload(self) -> bool:
         """Unload now. Returns False and does nothing if the model is in use."""
+        return self.try_unload()["unloaded"]
+
+    def try_unload(self) -> dict:
+        """Unload now, reporting *why* if it did not happen.
+
+        ``unload()`` returns False both for "in use" and for "already gone",
+        which an HTTP caller has to tell apart: the first is a 409 worth
+        retrying, the second is a success. Decided under the lock, so the answer
+        cannot be stale by the time it is returned.
+
+        Returns ``{"unloaded": bool, "reason": "ok"|"busy"|"not_resident",
+        "refs": int}``.
+        """
         with self._lock:
             if self._refs > 0:
                 logger.info("%s still in use (%d refs), not unloading", self._name, self._refs)
-                return False
+                return {"unloaded": False, "reason": "busy", "refs": self._refs}
+            if self._model is None:
+                return {"unloaded": False, "reason": "not_resident", "refs": 0}
             self._cancel_timer()
-            return self._unload_locked()
+            return {"unloaded": self._unload_locked(), "reason": "ok", "refs": 0}
 
     def _unload_locked(self) -> bool:
         if self._model is None:

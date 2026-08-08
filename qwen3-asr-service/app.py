@@ -215,6 +215,26 @@ async def health():
     }
 
 
+@app.post("/unload")
+async def unload():
+    """Release the model and its VRAM now, without stopping the container.
+
+    The idle TTL covers the common case; this is the deliberate one — you are
+    about to run something else on the same GPU and want the memory back
+    immediately. The next request reloads transparently.
+
+    200 when released or already unloaded; **409 while a request is in flight**,
+    because freeing memory a running generation still reads would crash the
+    worker. Retry once `active_requests` reaches zero.
+    """
+    result = _model_slot.try_unload()
+    if result["reason"] == "busy":
+        return JSONResponse(
+            status_code=409,
+            content={"detail": "Model is in use; retry when idle", **result},
+        )
+    return {"model_resident": _model_slot.resident, **result}
+
 @app.get("/status")
 async def status():
     """Return detailed service status including GPU memory information."""

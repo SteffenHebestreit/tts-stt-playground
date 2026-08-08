@@ -26,7 +26,7 @@ import torch
 import numpy as np
 import soundfile as sf
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
@@ -219,6 +219,26 @@ async def health():
         "device": device,
     }
 
+
+@app.post("/unload")
+async def unload():
+    """Release the model and its VRAM now, without stopping the container.
+
+    The idle TTL covers the common case; this is the deliberate one — you are
+    about to run something else on the same GPU and want the memory back
+    immediately. The next request reloads transparently.
+
+    200 when released or already unloaded; **409 while a request is in flight**,
+    because freeing memory a running generation still reads would crash the
+    worker. Retry once `active_requests` reaches zero.
+    """
+    result = _model_slot.try_unload()
+    if result["reason"] == "busy":
+        return JSONResponse(
+            status_code=409,
+            content={"detail": "Model is in use; retry when idle", **result},
+        )
+    return {"model_resident": _model_slot.resident, **result}
 
 @app.get("/status")
 async def status():

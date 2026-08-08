@@ -20,6 +20,9 @@ import json
 import asyncio
 import time
 import uuid
+import gc
+import threading
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 
 from json_utils import clean_json_inf_nan, ENGLISH_ONLY_MODELS
@@ -235,6 +238,87 @@ model_size_loaded = None
 model_warmed = False
 startup_error = None
 
+# Reference counting for the shared model.
+#
+# Until POST /unload existed the model was loaded once at startup and never
+# dropped, so reading the `whisper_model` global at call time was always safe.
+# It is not any more: several transcribe paths read the global directly inside a
+# worker thread, and an unload landing between the check and the read would give
+# them None. Callers therefore take a reference for the duration of their work,
+# and unload refuses while any reference is outstanding rather than pulling the
+# model out from under a request in flight.
+_model_refs = 0
+_model_ref_lock = threading.Lock()
+
+
+def acquire_model():
+    """Take a reference to the Whisper model, loading it on demand.
+
+    Returns the model object — use the returned value, never the global, or the
+    race this exists to close reopens. Loading on demand is what makes idle
+    unloading transparent to clients.
+
+    Every call must be paired with exactly one release_model(); prefer
+    model_in_use() unless the work outlives the calling frame.
+    """
+    global _model_refs
+
+    with _model_ref_lock:
+        model = whisper_model
+        if model is None:
+            # Released by unload, or never loaded. load_model() sets the global.
+            load_model()
+            model = whisper_model
+            if model is None:
+                raise HTTPException(status_code=503, detail="Model not available")
+        _model_refs += 1
+    return model
+
+
+def release_model():
+    """Drop one reference taken by acquire_model()."""
+    global _model_refs
+    with _model_ref_lock:
+        if _model_refs > 0:
+            _model_refs -= 1
+
+
+@contextmanager
+def model_in_use():
+    """Hold the Whisper model for the duration of a block."""
+    model = acquire_model()
+    try:
+        yield model
+    finally:
+        release_model()
+
+
+def unload_model() -> dict:
+    """Drop the Whisper model and free its memory. Safe to call when unloaded.
+
+    Returns a result dict rather than raising, so the caller decides the status
+    code. Refuses while a transcription holds a reference — the alternative is
+    freeing memory that a running decode is still reading from.
+    """
+    global whisper_model, model_loaded, model_warmed
+
+    with _model_ref_lock:
+        if _model_refs > 0:
+            return {"unloaded": False, "reason": "busy", "refs": _model_refs}
+        if whisper_model is None:
+            return {"unloaded": False, "reason": "not_resident", "refs": 0}
+
+        whisper_model = None
+        model_loaded = False
+        model_warmed = False
+
+    # CTranslate2 owns its device memory directly and frees it when the object
+    # is finalised, so the collect is what actually returns the VRAM — there is
+    # no torch caching allocator in this path for empty_cache() to drain.
+    gc.collect()
+    logger.info("Whisper model unloaded; memory released")
+    return {"unloaded": True, "reason": "ok", "refs": 0}
+
 def ensure_hardware_detected():
     """Run hardware detection once (lazy initialisation)."""
     global device, compute_type
@@ -320,7 +404,8 @@ def warm_up_model():
     consumed or no compute happens at all.
     """
     global model_warmed
-    if not model_loaded or whisper_model is None:
+    model = whisper_model
+    if not model_loaded or model is None:
         return
     try:
         t0 = time.monotonic()
@@ -328,7 +413,7 @@ def warm_up_model():
         # cuDNN autotune is keyed on input shape; warm the short and long cases.
         for seconds in (1.0, 5.0):
             noise = (rng.standard_normal(int(seconds * WS_SAMPLE_RATE)) * 1e-3).astype(np.float32)
-            segments, _info = whisper_model.transcribe(
+            segments, _info = model.transcribe(
                 noise, language="en", beam_size=1, best_of=1,
                 temperature=0.0, without_timestamps=True, vad_filter=False,
             )
@@ -399,14 +484,6 @@ async def transcribe_audio(
         total_processing_time = 0.0
         total_audio_duration = 0.0
 
-        # Ensure model is loaded (once)
-        global whisper_model
-        if whisper_model is None:
-            logger.error("Model not loaded, attempting to load...")
-            load_model()  # Sets global whisper_model internally
-            if whisper_model is None:
-                raise HTTPException(status_code=503, detail="Model not available")
-
         # Parse temperature once
         try:
             if isinstance(temperature, str):
@@ -452,59 +529,63 @@ async def transcribe_audio(
                 here, so this whole step runs off the event loop to keep /health
                 and concurrent requests responsive during transcription.
                 """
-                segments, info = whisper_model.transcribe(
-                    path,
-                    task=task,
-                    language=None if language == "auto" else language,
-                    beam_size=beam_size,
-                    best_of=best_of,
-                    patience=patience,
-                    temperature=temperature,
-                    suppress_tokens=parsed_suppress_tokens,
-                    initial_prompt=initial_prompt,
-                    condition_on_previous_text=condition_on_previous_text,
-                    compression_ratio_threshold=compression_ratio_threshold,
-                    no_speech_threshold=no_speech_threshold,
-                    vad_filter=vad_filter,
-                    vad_parameters={
-                        "threshold": vad_threshold,
-                        "min_speech_duration_ms": 500,
-                        "min_silence_duration_ms": 1500,
-                        "speech_pad_ms": 300,
-                    } if vad_filter else None,
-                )
+                # Hold a reference for the whole call: the segment generator
+                # below is lazy, so an unload during iteration would free the
+                # model mid-decode.
+                with model_in_use() as model:
+                    segments, info = model.transcribe(
+                        path,
+                        task=task,
+                        language=None if language == "auto" else language,
+                        beam_size=beam_size,
+                        best_of=best_of,
+                        patience=patience,
+                        temperature=temperature,
+                        suppress_tokens=parsed_suppress_tokens,
+                        initial_prompt=initial_prompt,
+                        condition_on_previous_text=condition_on_previous_text,
+                        compression_ratio_threshold=compression_ratio_threshold,
+                        no_speech_threshold=no_speech_threshold,
+                        vad_filter=vad_filter,
+                        vad_parameters={
+                            "threshold": vad_threshold,
+                            "min_speech_duration_ms": 500,
+                            "min_silence_duration_ms": 1500,
+                            "speech_pad_ms": 300,
+                        } if vad_filter else None,
+                    )
 
-                segs = []
-                full = ""
-                last = ""
-                processed = 0
-                duration = info.duration or 0
-                for segment in segments:
-                    processed += 1
-                    text = segment.text.strip()
-                    seg_duration = segment.end - segment.start
+                    segs = []
+                    full = ""
+                    last = ""
+                    processed = 0
+                    duration = info.duration or 0
+                    for segment in segments:
+                        processed += 1
+                        text = segment.text.strip()
+                        seg_duration = segment.end - segment.start
 
-                    if processed % 50 == 0:
-                        if duration > 0:
-                            progress_pct = min((segment.end / duration) * 100, 100)
-                            logger.info(f"Progress: {processed} segments, {segment.end:.1f}s/{duration:.1f}s ({progress_pct:.1f}%)")
-                        else:
-                            logger.info(f"Progress: {processed} segments, current time: {segment.end:.1f}s")
+                        if processed % 50 == 0:
+                            if duration > 0:
+                                progress_pct = min((segment.end / duration) * 100, 100)
+                                logger.info(f"Progress: {processed} segments, {segment.end:.1f}s/{duration:.1f}s ({progress_pct:.1f}%)")
+                            else:
+                                logger.info(f"Progress: {processed} segments, current time: {segment.end:.1f}s")
 
-                    if seg_duration < 0.2 or segment.no_speech_prob > 0.8:
-                        continue
-                    if text == last or not text:
-                        continue
-                    segs.append({
-                        "start": segment.start,
-                        "end": segment.end,
-                        "text": text,
-                        "avg_logprob": segment.avg_logprob,
-                        "no_speech_prob": segment.no_speech_prob,
-                    })
-                    full += text + " "
-                    last = text
-                return segs, full, processed, info
+                        if seg_duration < 0.2 or segment.no_speech_prob > 0.8:
+                            continue
+                        if text == last or not text:
+                            continue
+                        segs.append({
+                            "start": segment.start,
+                            "end": segment.end,
+                            "text": text,
+                            "avg_logprob": segment.avg_logprob,
+                            "no_speech_prob": segment.no_speech_prob,
+                        })
+                        full += text + " "
+                        last = text
+                    return segs, full, processed, info
 
             loop = asyncio.get_running_loop()
             segments_list, full_text, processed_segments, info = await loop.run_in_executor(executor, _do_transcribe)
@@ -611,6 +692,11 @@ async def transcribe_audio_stream(
     async def generate_transcription():
         """SSE generator that yields transcription segments as JSON events."""
         effective_target_lang = target_language  # capture outer scope value
+        # Reference held across the whole stream, not just the transcribe() call:
+        # the segment generator is lazy and is pulled one item at a time by the
+        # loop below, so the model must stay resident until the last yield.
+        # Released in the finally, including when the client disconnects early.
+        model = None
         try:
             logger.info(f"[{req_id}] /transcribe-stream request received: filename={audio.filename}, content_type={audio.content_type}, language={language}, task={task}")
             logger.info(f"[{req_id}] Uploaded audio size: {len(audio_content)} bytes")
@@ -624,10 +710,12 @@ async def transcribe_audio_stream(
             yield f"data: {json.dumps({'status': 'processing', 'task': task})}\n\n"
             logger.info(f"[{req_id}] Starting streaming transcription...")
             
+            model = acquire_model()
+
             # Run transcription in executor to avoid blocking
             def run_transcription():
                 """Execute the blocking whisper transcription call inside a thread."""
-                return whisper_model.transcribe(
+                return model.transcribe(
                     tmp_file_path,
                     beam_size=beam_size,
                     best_of=beam_size,
@@ -661,7 +749,7 @@ async def transcribe_audio_stream(
             yield f"data: {json.dumps(clean_json_inf_nan({'metadata': metadata}))}\n\n"
             
             # Stream segments as they're processed.
-            # whisper_model.transcribe returns a *lazy* generator: the encoder and
+            # model.transcribe returns a *lazy* generator: the encoder and
             # decoder run on iteration, not on the call above. Iterating it here
             # would run that work on the event loop and freeze every concurrent
             # live WebSocket session (and /health) for the file's duration, so each
@@ -702,6 +790,8 @@ async def transcribe_audio_stream(
             error_data = {"error": f"Transcription failed: {str(e)}", "status": "error"}
             yield f"data: {json.dumps(error_data)}\n\n"
         finally:
+            if model is not None:
+                release_model()
             # Cleanup temporary file
             if os.path.exists(tmp_file_path):
                 try:
@@ -755,25 +845,28 @@ def _ws_decode(audio: np.ndarray, language):
     them a hallucinated phrase repeats across consecutive windows and the
     agreement check below *promotes it to confirmed* precisely because it repeats.
     """
-    segments, info = whisper_model.transcribe(
-        audio,
-        language=language,
-        beam_size=1,
-        best_of=1,
-        # A single temperature cannot escape a repetition loop; one fallback step
-        # costs nothing on clean audio because it is only used on failure.
-        temperature=(0.0, 0.2),
-        condition_on_previous_text=False,
-        without_timestamps=True,
-        no_speech_threshold=WS_NO_SPEECH_THRESHOLD,
-        vad_filter=True,
-    )
-    parts = [
-        s.text.strip() for s in segments
-        if s.no_speech_prob < WS_NO_SPEECH_THRESHOLD
-        and s.avg_logprob > WS_MIN_AVG_LOGPROB
-        and s.text.strip()
-    ]
+    with model_in_use() as model:
+        segments, info = model.transcribe(
+            audio,
+            language=language,
+            beam_size=1,
+            best_of=1,
+            # A single temperature cannot escape a repetition loop; one fallback
+            # step costs nothing on clean audio because it is only used on failure.
+            temperature=(0.0, 0.2),
+            condition_on_previous_text=False,
+            without_timestamps=True,
+            no_speech_threshold=WS_NO_SPEECH_THRESHOLD,
+            vad_filter=True,
+        )
+        # The generator is lazy — it must be consumed inside the block, or the
+        # reference is released before any decoding actually happens.
+        parts = [
+            s.text.strip() for s in segments
+            if s.no_speech_prob < WS_NO_SPEECH_THRESHOLD
+            and s.avg_logprob > WS_MIN_AVG_LOGPROB
+            and s.text.strip()
+        ]
     return " ".join(parts).strip(), info
 
 
@@ -783,21 +876,22 @@ def _ws_final_decode(audio: np.ndarray, language):
     The interim path is deliberately greedy; reusing it for the final made the
     live transcript measurably worse than uploading the same audio as a file.
     """
-    segments, info = whisper_model.transcribe(
-        audio,
-        language=language,
-        beam_size=5,
-        best_of=5,
-        temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
-        condition_on_previous_text=True,
-        compression_ratio_threshold=2.4,
-        no_speech_threshold=WS_NO_SPEECH_THRESHOLD,
-        vad_filter=True,
-    )
-    parts = [
-        s.text.strip() for s in segments
-        if s.no_speech_prob < 0.8 and s.text.strip()
-    ]
+    with model_in_use() as model:
+        segments, info = model.transcribe(
+            audio,
+            language=language,
+            beam_size=5,
+            best_of=5,
+            temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
+            condition_on_previous_text=True,
+            compression_ratio_threshold=2.4,
+            no_speech_threshold=WS_NO_SPEECH_THRESHOLD,
+            vad_filter=True,
+        )
+        parts = [
+            s.text.strip() for s in segments
+            if s.no_speech_prob < 0.8 and s.text.strip()
+        ]
     return " ".join(parts).strip(), info
 
 
@@ -835,9 +929,13 @@ async def websocket_transcribe(websocket: WebSocket):
 
     await websocket.accept()
 
-    if whisper_model is None:
-        load_model()
-    if whisper_model is None:
+    try:
+        # Load now if an unload released the model, so a dead session fails at
+        # the handshake instead of at the first audio frame. The reference is
+        # dropped immediately — each decode below takes its own.
+        acquire_model()
+        release_model()
+    except HTTPException:
         await websocket.send_json({"type": "error", "error": "Model not available"})
         await websocket.close(code=1011)
         return
@@ -1070,6 +1168,8 @@ async def health_check():
         "model_size": current_model,
         "multilingual": current_model not in ENGLISH_ONLY_MODELS,
         "live_sessions": _live_sessions,
+        # Outstanding references. POST /unload refuses while this is non-zero.
+        "model_refs": _model_refs,
         "torch_version": torch.__version__,
         "cuda_available": torch.cuda.is_available()
     }
@@ -1092,6 +1192,35 @@ async def service_info():
         "gpu_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
         "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
     }
+
+@app.post("/unload")
+async def unload():
+    """Release the model and its memory now, without stopping the container.
+
+    The idle TTL handles the common case; this is for the deliberate one — you
+    are about to run something else on the same GPU and want the VRAM back
+    immediately. The next request reloads transparently, so this is safe to call
+    at any time.
+
+    Returns 200 when the model was released or was already unloaded, and **409
+    when a transcription is in flight** — freeing memory a running decode is
+    still reading would crash the worker, so the caller is told to retry instead.
+    """
+    result = unload_model()
+    if result["reason"] == "busy":
+        return SafeJSONResponse(
+            status_code=409,
+            content={
+                "detail": "Model is in use; retry when idle",
+                "model_refs": result["refs"],
+                **result,
+            },
+        )
+    return SafeJSONResponse(content={
+        "model_resident": whisper_model is not None,
+        **result,
+    })
+
 
 @app.get("/models")
 async def available_models():
@@ -1205,29 +1334,32 @@ async def detect_language(
                     logger.warning(f"Could not trim audio for language detection: {trim_err}")
 
             try:
-                segments, info = whisper_model.transcribe(
-                    detect_path,
-                    task="transcribe",
-                    language=None,  # Auto-detect
-                    beam_size=1,    # Fastest setting
-                    best_of=1,      # Fastest setting
-                    vad_filter=True,
-                    condition_on_previous_text=False,
-                    # Only process first part for speed
-                    vad_parameters={
-                        "threshold": 0.5,
-                        "min_speech_duration_ms": 250,
-                        "min_silence_duration_ms": 500,
-                    }
-                )
-                sample = ""
-                count = 0
-                for segment in segments:
-                    if count >= 3:  # Only need a few segments for detection
-                        break
-                    if segment.no_speech_prob < 0.8:
-                        sample += segment.text.strip() + " "
-                        count += 1
+                # Lazy generator again: the reference must outlive the loop that
+                # consumes it, not just the transcribe() call.
+                with model_in_use() as model:
+                    segments, info = model.transcribe(
+                        detect_path,
+                        task="transcribe",
+                        language=None,  # Auto-detect
+                        beam_size=1,    # Fastest setting
+                        best_of=1,      # Fastest setting
+                        vad_filter=True,
+                        condition_on_previous_text=False,
+                        # Only process first part for speed
+                        vad_parameters={
+                            "threshold": 0.5,
+                            "min_speech_duration_ms": 250,
+                            "min_silence_duration_ms": 500,
+                        }
+                    )
+                    sample = ""
+                    count = 0
+                    for segment in segments:
+                        if count >= 3:  # Only need a few segments for detection
+                            break
+                        if segment.no_speech_prob < 0.8:
+                            sample += segment.text.strip() + " "
+                            count += 1
                 return sample, info
             finally:
                 if trimmed_path and os.path.exists(trimmed_path):

@@ -194,6 +194,38 @@ is present before relying on it.
 
 ---
 
+## Freeing VRAM on demand
+
+`POST /api/providers/{provider}/unload` releases a model and its memory immediately. The idle TTL
+already does this on its own schedule; this is for when you are about to run something else on the
+same GPU and want the memory back now. The next request reloads transparently, so it is always safe
+to call.
+
+| Status | Meaning |
+|---|---|
+| `200` `{"unloaded": true, "reason": "ok"}` | Released |
+| `200` `{"unloaded": false, "reason": "not_resident"}` | Already unloaded — not an error |
+| `409` `{"reason": "busy", ...}` | A request is in flight. Retry when idle. |
+
+The **409 is the point**. Freeing memory a running decode is still reading would crash the worker,
+so every service refuses while a reference is outstanding rather than unloading and hoping. The
+response carries the outstanding count (`model_refs`, or `inflight` on qwen3-tts) so you know
+whether a retry is worthwhile.
+
+Supported where the provider lists the `model_unload` capability — currently `whisper`,
+`qwen3-asr`, `qwen3` (TTS) and `chatterbox`. Asking any other provider returns 400. Piper is
+CPU-only ONNX with no VRAM to reclaim, and the NeMo services hold their models for the process
+lifetime.
+
+```bash
+curl -X POST http://your-host:3000/api/providers/whisper/unload
+```
+
+On qwen3-tts this also clears a model selected via `/load_model`; the next request reloads whichever
+model is currently desired, not the environment default.
+
+---
+
 ## Not implemented
 
 Deliberately, because no mainstream client exercises them — the research checked

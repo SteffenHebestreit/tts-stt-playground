@@ -364,6 +364,47 @@ async def health():
     }
 
 
+@app.post("/unload")
+async def unload():
+    """Release the model and its VRAM now, without stopping the container.
+
+    The idle reaper covers the common case; this is the deliberate one — you are
+    about to run something else on the same GPU and want the memory back
+    immediately. The next request reloads transparently.
+
+    200 when released or already unloaded; **409 while a generation is in
+    flight**, because freeing weights a worker thread is still generating with
+    would crash it. Retry once `inflight` reaches zero.
+
+    Note this also clears the model selected via POST /load_model — the next
+    request reloads whichever model is currently desired, not the env default.
+    """
+    with _inflight_lock:
+        if _inflight > 0:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "detail": "Model is in use; retry when idle",
+                    "unloaded": False,
+                    "reason": "busy",
+                    "inflight": _inflight,
+                },
+            )
+        if tts_model is None:
+            return {
+                "unloaded": False, "reason": "not_resident",
+                "inflight": 0, "model_resident": False,
+            }
+        # Unload while still holding the lock: releasing it first would let a
+        # request slip in, take the model, and have it freed underneath.
+        _unload_qwen3_tts()
+
+    return {
+        "unloaded": True, "reason": "ok",
+        "inflight": 0, "model_resident": tts_model is not None,
+    }
+
+
 @app.get("/status")
 async def status():
     """Return detailed service status including GPU memory and loaded model."""

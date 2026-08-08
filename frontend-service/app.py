@@ -232,7 +232,7 @@ def _build_provider_registry() -> dict:
             "short_name": "Qwen3-TTS",
             "internal_url": QWEN3_TTS_SERVICE_URL,
             "health_endpoint": "/health",
-            "capabilities": ["tts", "voice_clone", "saved_voices", "model_switching"],
+            "capabilities": ["tts", "voice_clone", "saved_voices", "model_switching", "model_unload"],
             "contracts": {
                 "tts": "simple-json-tts-v1",
                 "voice_catalog": "speaker-catalog-v1",
@@ -454,7 +454,7 @@ def _build_provider_registry() -> dict:
             "short_name": "Whisper STT",
             "internal_url": STT_SERVICE_URL,
             "health_endpoint": "/health",
-            "capabilities": ["transcribe", "segments", "detect_language", "streaming"],
+            "capabilities": ["transcribe", "segments", "detect_language", "streaming", "model_unload"],
             # `language_detect` is the machine-readable truth for API clients.
             # Some backends expose a /detect_language route that always returns
             # null, so route-exists is not the same as capability-exists.
@@ -492,7 +492,7 @@ def _build_provider_registry() -> dict:
             "short_name": "Qwen3-ASR",
             "internal_url": QWEN3_ASR_SERVICE_URL,
             "health_endpoint": "/health",
-            "capabilities": ["transcribe", "segments", "detect_language"],
+            "capabilities": ["transcribe", "segments", "detect_language", "model_unload"],
             "language_detect": True,
             "contracts": {
                 "transcribe": "stt-form-v1",
@@ -780,7 +780,7 @@ def _build_provider_registry() -> dict:
             "short_name": "Chatterbox",
             "internal_url": CHATTERBOX_TTS_SERVICE_URL,
             "health_endpoint": "/health",
-            "capabilities": ["tts", "voice_clone", "tts_stream"],
+            "capabilities": ["tts", "voice_clone", "tts_stream", "model_unload"],
             "contracts": {
                 "tts": "simple-json-tts-v1",
                 "voice_clone": "voice-clone-tts-v1",
@@ -1774,6 +1774,36 @@ async def provider_status(provider_id: str):
 
     response = await _provider_get(provider_id, "/status")
     return _normalize_qwen3_runtime_status(response.json(), provider_id)
+
+
+@app.post("/api/providers/{provider_id}/unload")
+async def provider_unload(provider_id: str):
+    """Ask a provider to release its model and free the memory now.
+
+    Passes the upstream status and body through verbatim rather than going via
+    `_provider_json_post`, which raises on any >=400 and would flatten the
+    upstream body to its `detail`. A 409 here is a normal, actionable answer —
+    the model is busy — and the caller needs the reference count that comes with
+    it to know when retrying is worthwhile.
+    """
+    provider = _get_provider(provider_id)
+    if not provider.get("capabilities") or "model_unload" not in provider["capabilities"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Provider {provider_id} does not support unloading",
+        )
+
+    client = _get_http_client()
+    try:
+        response = await client.post(f"{provider['internal_url']}/unload", timeout=30.0)
+    except httpx.RequestError as exc:
+        raise _build_upstream_request_error(provider.get("display_name", provider_id), exc) from exc
+
+    try:
+        body = response.json()
+    except Exception:
+        body = {"detail": response.text}
+    return JSONResponse(status_code=response.status_code, content={"provider": provider_id, **body})
 
 
 @app.get("/api/providers/{provider_id}/saved-voices")
