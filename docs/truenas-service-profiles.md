@@ -1,6 +1,6 @@
 # TrueNAS Service Profile Recommendations
 
-These recommendations assume one NVIDIA RTX 5060 Ti with 16 GB of VRAM dedicated to this repository.
+These recommendations assume one NVIDIA RTX 5060 Ti with 12 GB of VRAM dedicated to this repository.
 
 ## Always-On Services
 
@@ -85,12 +85,20 @@ docker compose --env-file .env -f docker-compose.yml -f docker-compose.truenas.y
 
 ## Browser Access Strategy
 
-If the frontend is accessed from another machine on the network, do not leave the browser-facing URLs at `localhost`. Set these in `.env`:
+The browser talks only to the frontend on port 3000, which proxies everything
+else over the internal Docker network (`/api/*`, `/api/health`, `/ws/stt`).
 
-- `BROWSER_TTS_URL`
-- `BROWSER_STT_URL`
-- `BROWSER_TRAINING_URL`
-- `BROWSER_QWEN3_ASR_URL`
-- `BROWSER_QWEN3_TTS_URL`
+So when the frontend is accessed from another machine, there is exactly one
+thing to set:
 
-Also set `ALLOWED_ORIGINS` to the exact frontend origin.
+```env
+ALLOWED_ORIGINS=http://truenas.example.local:3000
+```
+
+You do **not** need to publish backend ports, and the `BROWSER_*_URL` variables
+are not used by the web UI. Set them only if you deliberately publish backend
+ports to call those APIs directly from your own tools.
+
+To use the **microphone** from another machine you need HTTPS — browsers only
+grant microphone access in a secure context. See
+[`truenas-installation-guide.md`](./truenas-installation-guide.md#7-reverse-proxy--https).

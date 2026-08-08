@@ -124,7 +124,7 @@ docker compose -f docker-compose.yml -f docker-compose.rocm.yml --profile qwen3-
 
 The ROCm overlay (`docker-compose.rocm.yml`) replaces CUDA-based images with ROCm variants, removes NVIDIA device reservations, and mounts `/dev/kfd` + `/dev/dri`.
 
-**Strix Halo (gfx1201 / RDNA 4):** gfx1201 is not in ROCm 6.2's official support list. The overlay defaults `HSA_OVERRIDE_GFX_VERSION=11.0.0` to make ROCm treat it as gfx1100 (RDNA 3), which runs correctly on RDNA 4. `PYTORCH_HIP_ALLOC_CONF=expandable_segments:True` is also set automatically for the unified LPDDR5x memory pool.
+**Strix Halo (gfx1151 / RDNA 3.5 / Radeon 8060S):** gfx1151 is supported by current ROCm. The overlay defaults `HSA_OVERRIDE_GFX_VERSION=11.0.0` only because the `Dockerfile.rocm` images pin the rocm6.2 PyTorch wheel index, whose wheels carry no gfx1151 kernels; rocm7.0+ wheels do, so clear the override when those base images are bumped. `PYTORCH_ALLOC_CONF=expandable_segments:True` is set automatically for the unified LPDDR5X pool. See `docker-compose.rocm.yml` for the full gfx target table.
 
 > **WSL2 limitation:** `/dev/kfd` is not exposed by Docker Desktop's VM, nor by the WSL2 GPU-PV driver. ROCm requires bare-metal Linux or a Linux VM with direct PCIe GPU passthrough.
 
@@ -150,7 +150,7 @@ docker compose -f docker-compose.yml -f docker-compose.vulkan.yml --profile whis
 
 The Vulkan overlay (`docker-compose.vulkan.yml`) replaces the CPU `Dockerfile` with `Dockerfile.vulkan` (compiled with `-DGGML_VULKAN=1`), mounts `/dev/dri`, and sets `GGML_VULKAN_DEVICE=0`.
 
-**Strix Halo (gfx1201 / Radeon 890M):** No GFX version override needed — the Radeon 890M is natively Vulkan 1.3 capable. Set `GGML_VULKAN_DEVICE=1` if you have a discrete GPU and want to use device index 1 instead.
+**Strix Halo (gfx1151 / Radeon 8060S):** No GFX version override needed — Vulkan requires no per-target kernel compilation, which is what makes it the portable AMD path. Set `GGML_VULKAN_DEVICE=1` if you have a discrete GPU and want device index 1 instead.
 
 #### Vulkan on WSL2 with Docker Engine (no Docker Desktop)
 
@@ -316,7 +316,7 @@ Copy `.env.example` to `.env` and adjust as needed.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `WHISPER_MODEL_SIZE` | `small` | faster-whisper model: `tiny` `base` `small` `medium` `large-v3` `distil-large-v3` |
+| `WHISPER_MODEL_SIZE` | `large-v3-turbo` | faster-whisper model: `tiny` `base` `small` `medium` `large-v3` `large-v3-turbo` `distil-large-v3`. Turbo is the best latency/accuracy trade for live use but **cannot translate**; unknown names fall back to `large-v3` |
 | `WHISPER_MODEL` | `large-v3` | whisper-cpp GGUF model: `tiny` `base` `small` `medium` `large-v3` `large-v3-turbo` |
 | `FORCE_ACCELERATION` | `cuda` | faster-whisper backend: `cuda` `rocm` `cpu` |
 | `WHISPER_CPP_PORT` | `5003` | Host port for whisper-cpp |
@@ -467,10 +467,10 @@ everything with one variable; see `docs/truenas-deployment.md`.
 
 ---
 
-## TrueNAS Deployment (RTX 5060 Ti 16 GB)
+## TrueNAS Deployment (RTX 5060 Ti 12 GB)
 
 This project supports deployment on a dedicated TrueNAS SCALE server with an
-NVIDIA RTX 5060 Ti (16 GB VRAM). Use the `docker-compose.truenas.yml` overlay
+NVIDIA RTX 5060 Ti (12 GB VRAM). Use the `docker-compose.truenas.yml` overlay
 for optimised GPU memory allocation and single-GPU pinning.
 
 Start from `.env.truenas.example` (copy it to `.env`) and set `APP_DATA_DIR` to a
@@ -488,7 +488,33 @@ so you can deploy on TrueNAS **without cloning or building**:
   catalog; see [`truenas/README.md`](truenas/README.md) and the
   [`truenas/tts-stt/`](truenas/tts-stt/) scaffold (`questions.yaml`).
 
-See [`truenas/README.md`](truenas/README.md) for both paths and their caveats.
+## API
+
+The stack is usable as a drop-in **OpenAI-compatible speech API** — point the official SDK at
+the gateway and it works unchanged across every device:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://your-host:3000/v1", api_key="unused")
+client.audio.transcriptions.create(model="whisper-1", file=open("audio.wav", "rb")).text
+```
+
+`POST /v1/audio/transcriptions` · `POST /v1/audio/speech` · `GET /v1/models`
+
+The same request returns the same response shape whether the backend is whisper-cpp on an ARM
+SBC or faster-whisper on a workstation GPU. Full reference, including the language-handling
+rules that matter for German: **[`docs/api.md`](docs/api.md)**.
+
+The richer project-native `/api/*` surface (segment timestamps, streaming TTS, voice training)
+is unchanged and documented in [`docs/provider-contracts.md`](docs/provider-contracts.md).
+
+See [`truenas/README.md`](truenas/README.md) for both paths and their caveats, and
+**[`docs/truenas-installation-guide.md`](docs/truenas-installation-guide.md) for the full
+step-by-step installation walkthrough** (prerequisites, GPU setup, VRAM budgets,
+reverse proxy, troubleshooting).
+
+Only the web UI port (3000) needs publishing: the frontend proxies every backend call,
+including live microphone transcription over WebSocket.
 
 For the build-from-source workflow, dataset layout, and profile strategy, see
 `docs/truenas-deployment.md`.
@@ -503,7 +529,7 @@ For always-on versus training-window service recommendations, use
 3. **NVIDIA Container Toolkit** configured (`nvidia-ctk runtime configure`)
 4. Clone this repo to a dataset: `/mnt/pool/apps/tts-stt`
 
-### VRAM Budget (16 GB)
+### VRAM Budget (12 GB)
 
 | Service | Estimated VRAM | Notes |
 |---------|---------------:|-------|

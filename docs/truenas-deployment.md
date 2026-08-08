@@ -1,6 +1,11 @@
 # TrueNAS SCALE Deployment Guide
 
-This guide prepares the repository for use as a dedicated app stack on a TrueNAS SCALE host with one NVIDIA RTX 5060 Ti (16 GB).
+> **Installing for the first time?** Use
+> **[`docs/truenas-installation-guide.md`](./truenas-installation-guide.md)** instead — it is the
+> complete step-by-step walkthrough. This page is the reference for building from source,
+> storage layout, and VRAM planning.
+
+This guide prepares the repository for use as a dedicated app stack on a TrueNAS SCALE host with one NVIDIA RTX 5060 Ti (12 GB).
 
 ## Deployment Goal
 
@@ -30,7 +35,7 @@ Training is supported, but should be treated as a scheduled workload rather than
 | File | Role |
 |------|------|
 | `docker-compose.yml` | Base stack. Runs **from the built images** and persists data through configurable host paths. This is what you deploy. |
-| `docker-compose.truenas.yml` | Single-GPU host overlay: pins all GPU services to card `0` and picks 16 GB-friendly models. |
+| `docker-compose.truenas.yml` | Single-GPU host overlay: pins all GPU services to card `0` and picks 12 GB-friendly models. |
 | `docker-compose.dev.yml` | **Local development only** — live-mounts source files over the images. Do **not** use it on TrueNAS. |
 
 So the base file is deployment-ready on its own; you no longer need the repo's source files mounted into the containers at runtime (only to build the images).
@@ -61,9 +66,14 @@ ENABLE_WHISPER_CPP=true docker compose \
 
 If you rename `.env.example` to `.env`, you can omit `--env-file`.
 
-When the frontend is opened from another machine, edit `ALLOWED_ORIGINS` and the
-`BROWSER_*_URL` values in `.env` so the browser calls the TrueNAS host instead
-of `localhost`.
+When the frontend is opened from another machine, edit `ALLOWED_ORIGINS` to the
+origin the browser loads.
+
+> **`BROWSER_*_URL` is no longer needed for the web UI.** The browser now reaches
+> every backend through the frontend gateway on port 3000 (`/api/*`,
+> `/api/health`, `/ws/stt`), so backend ports do not have to be published or
+> reachable. Set the `BROWSER_*_URL` values only if you deliberately publish
+> backend ports to call them directly from your own tools.
 
 Additional deployment aids:
 
@@ -129,11 +139,14 @@ Approximate GPU memory usage on this hardware class:
 
 | Service | Expected VRAM | Notes |
 |---------|---------------|-------|
-| `stt-service` (`medium`) | 2 to 3 GB | Good default for always-on STT |
+| `stt-service` (`large-v3-turbo`) | ~1.6 GB | Default. Best latency/accuracy trade; cannot translate |
+| `stt-service` (`large-v3`) | ~3.1 GB | Only option that supports `task=translate` |
 | `qwen3-asr-service` | ~4 GB | Practical multilingual ASR |
-| `qwen3-tts-service` (`0.6B`) | 2.5 to 3 GB | Better fit than 1.7B for 16 GB hosts |
+| `qwen3-tts-service` (`0.6B`) | 2.5 to 3 GB | The default. Required on a 12 GB card; the 1.7B does not fit alongside STT |
 | `piper-training-service` | 2 to 4 GB | Depends on batch pressure and dataset |
-| `parakeet-asr-service` (optional) | ~2 to 3 GB | Fastest STT; 25 EU langs incl. German. Opt-in (`--profile parakeet-asr` + `ENABLE_PARAKEET_ASR=true`) |
+| `canary-asr-service` (optional) | ~2 GB | Fastest German STT (180M). Opt-in (`--profile canary-asr` + `ENABLE_CANARY_ASR=true`) |
+| `parakeet-asr-service` (optional) | ~2 to 3 GB | 25 EU langs incl. German. Opt-in (`--profile parakeet-asr` + `ENABLE_PARAKEET_ASR=true`) |
+| `chatterbox-tts-service` (optional) | ~4 GB | Streaming German TTS — lowest time-to-first-audio. Opt-in (`--profile chatterbox-tts` + `ENABLE_CHATTERBOX_TTS=true`) |
 
 ### Recommended Operating Modes
 
@@ -194,34 +207,47 @@ GPU-facing environment variables to `0` for the single-GPU host profile.
 
 ## Reverse Proxy / Hostname
 
-If TrueNAS exposes this stack behind a hostname instead of `localhost`, set explicit CORS origins and browser-facing backend URLs:
+All browser traffic goes through the frontend on port 3000, so a reverse proxy
+needs exactly one upstream. Set only the CORS origin:
 
 ```env
-ALLOWED_ORIGINS=http://truenas.example.local:3000
+ALLOWED_ORIGINS=https://voice.example.com
 ALLOW_CREDENTIALS=false
-BROWSER_TTS_URL=http://truenas.example.local:5000
-BROWSER_STT_URL=http://truenas.example.local:5001
-BROWSER_TRAINING_URL=http://truenas.example.local:8080
-BROWSER_QWEN3_ASR_URL=http://truenas.example.local:5002
-BROWSER_QWEN3_TTS_URL=http://truenas.example.local:5004
 ```
 
-Only set `ALLOWED_ORIGINS` to the frontend origin that the browser will load,
-not to every backend URL. Leave `ALLOW_CREDENTIALS=false` unless you introduce
-cookie-based auth.
+Two proxy settings are load-bearing:
+
+- Forward the `Upgrade`/`Connection` headers — live transcription is a WebSocket
+  (`/ws/stt`) and silently fails without them.
+- Disable response buffering — streaming TTS starts playing before synthesis
+  finishes, and a buffering proxy restores full-text latency.
+
+A worked nginx config is in
+[`truenas-installation-guide.md`](./truenas-installation-guide.md#7-reverse-proxy--https).
+
+HTTPS is **required** to use the microphone from any machine other than the NAS
+itself: browsers only grant microphone access in a secure context.
+
+Leave `ALLOW_CREDENTIALS=false` unless you introduce cookie-based auth.
 
 ## Health Checks
 
-Once deployed, verify the stack:
+One call probes every backend concurrently over the internal network:
+
+```bash
+curl http://localhost:3000/api/health | jq
+```
+
+Each entry reports `healthy`, `latency_ms`, `model_loaded`, `model_size` and
+`device` — so `"device": "cpu"` immediately tells you the GPU was not allocated.
+
+The gateway's own liveness probe stays lightweight:
 
 ```bash
 curl http://localhost:3000/health
-curl http://localhost:5000/health
-curl http://localhost:5001/health
-curl http://localhost:5002/health
-curl http://localhost:5004/health
-curl http://localhost:8080/health
 ```
+
+Backend ports only answer directly if you chose to publish them.
 
 ## Maintenance
 
