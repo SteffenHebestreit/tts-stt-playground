@@ -35,12 +35,15 @@ questions:
       required: true
 
   - variable: expose_backend_ports
-    label: Also expose backend service ports (5000-5005, 8080)
-    description: Needed because the browser calls TTS/STT backends directly.
+    label: Also expose backend service ports (5000-5007, 8080)
+    description: >-
+      NOT needed for the web UI. Everything the browser uses is proxied through
+      the frontend on the Web UI port, including live microphone transcription.
+      Turn this on only to call the TTS/STT APIs directly from your own scripts.
     group: Network
     schema:
       type: boolean
-      default: true
+      default: false
 
   # --- Storage ---
   - variable: host_path
@@ -71,16 +74,20 @@ questions:
   # --- Models ---
   - variable: whisper_model_size
     label: Whisper STT model
+    description: >-
+      large-v3-turbo is the best latency/accuracy trade for live transcription.
+      Choose large-v3 only if you need speech translation, which turbo cannot do.
     group: Models
     schema:
       type: string
-      default: medium
+      default: large-v3-turbo
       enum:
-        - {value: tiny, description: tiny (fastest)}
+        - {value: large-v3-turbo, description: large-v3-turbo (recommended — fastest at near-best accuracy)}
+        - {value: tiny, description: tiny (fastest, low accuracy)}
         - {value: base, description: base}
         - {value: small, description: small}
         - {value: medium, description: medium (balanced)}
-        - {value: large-v3, description: large-v3 (best, most VRAM)}
+        - {value: large-v3, description: large-v3 (best accuracy, only option that can translate)}
 
   - variable: qwen3_tts_model
     label: Qwen3-TTS model
@@ -103,6 +110,27 @@ questions:
   - variable: enable_parakeet
     label: Enable Parakeet-ASR (realtime, 25 EU langs incl. German)
     description: Fast multilingual STT. Heavy NeMo image; uses extra VRAM.
+    group: Backends
+    schema:
+      type: boolean
+      default: false
+
+  - variable: enable_canary
+    label: Enable Canary-ASR (fastest German STT, 180M params)
+    description: >-
+      NVIDIA canary-180m-flash. Smallest and fastest German STT in the stack.
+      Heavy NeMo image; ~2 GB VRAM.
+    group: Backends
+    schema:
+      type: boolean
+      default: false
+
+  - variable: enable_chatterbox
+    label: Enable Chatterbox-TTS (streaming German TTS + cloning)
+    description: >-
+      Resemble AI Chatterbox Multilingual (MIT). The only TTS backend that
+      streams sentence-by-sentence, so speech starts before the whole text is
+      synthesized. ~4 GB VRAM.
     group: Backends
     schema:
       type: boolean
@@ -132,10 +160,11 @@ questions:
       default: "*"
 
   - variable: browser_host
-    label: Browser-facing host
+    label: Browser-facing host (legacy — usually leave as-is)
     description: >-
-      Hostname/IP the browser uses to reach the backends (not "localhost" when
-      accessed from another machine). Example: 192.168.1.50 or truenas.local.
+      Only used when "expose backend service ports" is enabled, so that direct
+      API callers get correct URLs. The web UI does not need this: it reaches
+      every backend through the frontend proxy on the Web UI port.
     group: Access
     schema:
       type: string

@@ -1,4 +1,4 @@
-# ROCm override for AMD GPU support (ROCm 6.2+, tested on RDNA 3/4 including Strix Halo)
+# ROCm override for AMD GPU support.
 #
 # Usage:
 #   docker-compose -f docker-compose.yml -f docker-compose.rocm.yml --profile <profile> up -d
@@ -7,24 +7,70 @@
 #   docker-compose -f docker-compose.yml -f docker-compose.rocm.yml --profile all up -d
 #   docker-compose -f docker-compose.yml -f docker-compose.rocm.yml --profile qwen3-asr up -d
 #
-# Strix Halo (gfx1201 / RDNA 4):
-#   gfx1201 is not in ROCm 6.2's official support list; the GFX override makes ROCm
-#   treat it as gfx1100 (RDNA 3) which is fully supported and runs correctly on RDNA 4.
-#   HSA_OVERRIDE_GFX_VERSION defaults to 11.0.0 here; override in .env if needed.
+# --- Strix Halo (AMD Ryzen AI Max+ 395) --------------------------------------
+#   iGPU:    Radeon 8060S, 40 CUs
+#   Arch:    RDNA 3.5
+#   Target:  gfx1151
 #
-# Shared-memory APU note:
-#   Strix Halo uses unified LPDDR5x as both system RAM and VRAM. Set
-#   PYTORCH_HIP_ALLOC_CONF to avoid the allocator fragmenting the shared pool.
+#   Earlier revisions of this file described Strix Halo as "gfx1201 / RDNA 4 /
+#   Radeon 890M". That conflated three different parts and was wrong on all
+#   three counts:
+#     gfx1201      = RDNA 4 discrete (Radeon RX 9070 series), NOT an APU
+#     Radeon 890M  = Strix Point (gfx1150), a different, much smaller APU
+#     gfx1151      = Strix Halo's Radeon 8060S — the actual target here
+#
+#   gfx1151 IS officially supported by current ROCm. Note that it is listed in
+#   the radeon-ryzen docs project, not the general install-on-linux system
+#   requirements matrix — checking only the latter suggests it is unsupported:
+#   https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/
+#   https://rocm.docs.amd.com/en/latest/how-to/system-optimization/strixhalo.html
+#
+#   HSA_OVERRIDE_GFX_VERSION is scoped to the PyTorch WHEEL INDEX, not to ROCm:
+#     * rocm6.2 wheels (torch <= 2.5.1) carry NO gfx1151 kernels, so gfx1151
+#       needs HSA_OVERRIDE_GFX_VERSION=11.0.0 to run gfx1100 kernels instead.
+#       The Dockerfile.rocm images pin rocm6.2 today, so that is the default.
+#     * rocm7.0+ wheels (torch >= 2.10) carry gfx1151 natively.
+#       https://github.com/pytorch/pytorch/pull/167299
+#       CLEAR THE OVERRIDE IN THE SAME COMMIT THAT BUMPS THE BASE IMAGES.
+#
+#   Forcing 11.0.0 on a wheel that has native gfx1151 kernels is actively
+#   harmful: it breaks torchaudio resampling with hipErrorInvalidImage
+#   (https://github.com/ROCm/TheRock/issues/5105) — and resampling to 16 kHz is
+#   on every ASR and TTS path in this stack.
+#
+# --- Shared-memory APU note --------------------------------------------------
+#   Strix Halo uses unified LPDDR5X as both system RAM and VRAM, so capacity is
+#   plentiful but memory BANDWIDTH is shared with the CPU and is the real limit.
+#   PYTORCH_ALLOC_CONF keeps the allocator from fragmenting that shared pool.
+#
+#   Reported VRAM is misleading here: mem_get_info() returns the GTT pool, i.e.
+#   system RAM, so "free VRAM" can read as tens of GB that the CPU also needs.
+#   Set GPU_MEMORY_BUDGET_GB rather than trusting auto-detection.
+#
+#   Host prep (do this once, it is not automatable from a container): keep the
+#   BIOS dedicated-VRAM reservation SMALL and raise the shared GTT limit instead
+#   — memory is mapped, not partitioned. See
+#   https://rocm.docs.amd.com/en/latest/how-to/system-optimization/strixhalo.html
 
 # Common ROCm environment shared by all services
 x-rocm-env: &rocm-env
   NVIDIA_VISIBLE_DEVICES: ""
   NVIDIA_DRIVER_CAPABILITIES: ""
   HIP_VISIBLE_DEVICES: ${HIP_VISIBLE_DEVICES:-0}
-  # Default to gfx1100 override for Strix Halo (gfx1201); set to "" in .env to disable
-  HSA_OVERRIDE_GFX_VERSION: ${HSA_OVERRIDE_GFX_VERSION:-11.0.0}
-  # Prevent HIP allocator from fragmenting unified memory on APUs
-  PYTORCH_HIP_ALLOC_CONF: ${PYTORCH_HIP_ALLOC_CONF:-expandable_segments:True,max_split_size_mb:512}
+  # 11.0.0 = run gfx1100 kernels. Required only because the Dockerfile.rocm
+  # images pin the rocm6.2 wheel index, which has no gfx1151 kernels.
+  # Note the `-` (not `:-`): with `:-`, setting this to empty in .env would
+  # silently re-apply the default. `-` lets an explicitly empty value through.
+  HSA_OVERRIDE_GFX_VERSION: ${HSA_OVERRIDE_GFX_VERSION-11.0.0}
+  # Unified name since PyTorch 2.x; the legacy PYTORCH_HIP_ALLOC_CONF /
+  # PYTORCH_CUDA_ALLOC_CONF spellings are read first-match-wins, so setting a
+  # mixture means only one of them takes effect. max_split_size_mb is omitted
+  # deliberately — it is inert alongside expandable_segments.
+  PYTORCH_ALLOC_CONF: ${PYTORCH_ALLOC_CONF:-expandable_segments:True}
+  # First-request MIOpen autotuning can stall for minutes; FAST skips the
+  # exhaustive search, and a persistent DB keeps results across restarts.
+  MIOPEN_FIND_MODE: ${MIOPEN_FIND_MODE:-FAST}
+  MIOPEN_USER_DB_PATH: /root/.config/miopen
 
 # Common ROCm device passthrough shared by all services
 x-rocm-devices: &rocm-devices
@@ -34,13 +80,29 @@ x-rocm-devices: &rocm-devices
   group_add:
     - video
     - render
+  # AMD's documented container flags for PyTorch on ROCm.
+  ipc: host
+  shm_size: 8gb
+  security_opt:
+    - seccomp=unconfined
+  cap_add:
+    - SYS_PTRACE
   deploy:
     resources:
       reservations:
-        devices: []
+        # `!reset` is load-bearing. Compose MERGES sequences, so a plain
+        # `devices: []` here appends nothing and leaves the base file's NVIDIA
+        # reservation in place — every ROCm service then demands an NVIDIA
+        # device and cannot start on an AMD-only host.
+        # Verify: docker compose -f docker-compose.yml -f docker-compose.rocm.yml \
+        #           --profile all config | grep -c 'driver: nvidia'   ->  0
+        # Requires Compose >= 2.24.4.
+        devices: !reset []
 
 services:
   piper-training-service:
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-piper-training:${IMAGE_TAG:-latest}-rocm
+    pull_policy: build
     build:
       dockerfile: Dockerfile.rocm
     environment:
@@ -48,6 +110,8 @@ services:
     <<: *rocm-devices
 
   stt-service:
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-stt:${IMAGE_TAG:-latest}-rocm
+    pull_policy: build
     build:
       dockerfile: Dockerfile.rocm
     environment:
@@ -56,6 +120,8 @@ services:
     <<: *rocm-devices
 
   qwen3-asr-service:
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-qwen3-asr:${IMAGE_TAG:-latest}-rocm
+    pull_policy: build
     build:
       dockerfile: Dockerfile.rocm
     environment:
@@ -63,8 +129,33 @@ services:
     <<: *rocm-devices
 
   qwen3-tts-service:
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-qwen3-tts:${IMAGE_TAG:-latest}-rocm
+    pull_policy: build
     build:
       dockerfile: Dockerfile.rocm
     environment:
       <<: *rocm-env
     <<: *rocm-devices
+
+  # parakeet-asr-service ships a Dockerfile.rocm but was missing from this
+  # overlay, so `--profile parakeet-asr` with this file silently built the CUDA
+  # image and then failed to find a device.
+  #
+  # CAVEAT: this builds, but NVIDIA NeMo declares CUDA in its requirements and
+  # has no AMD backend, so GPU inference here is UNVERIFIED on ROCm. Treat it as
+  # experimental; if it falls back to CPU or fails, that is expected. The
+  # supported AMD speech-to-text paths are stt-service (faster-whisper) and the
+  # Vulkan whisper-cpp overlay.
+  parakeet-asr-service:
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-parakeet-asr:${IMAGE_TAG:-latest}-rocm
+    pull_policy: build
+    build:
+      dockerfile: Dockerfile.rocm
+    environment:
+      <<: *rocm-env
+    <<: *rocm-devices
+
+  # NOTE: canary-asr-service and chatterbox-tts-service have NO Dockerfile.rocm,
+  # so they are deliberately absent here rather than silently building a CUDA
+  # image. canary is NeMo (same caveat as above); run them on CPU, or use the
+  # Vulkan whisper-cpp path for AMD speech-to-text.

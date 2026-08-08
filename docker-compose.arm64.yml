@@ -1,0 +1,44 @@
+# =============================================================================
+# ARM64 / no-GPU overlay — for the RK3588S SBC and any CPU-only host
+# =============================================================================
+# Usage (note the explicit profiles — do NOT use `--profile all` here):
+#
+#   docker compose --env-file deploy/profiles/rk3588.env \
+#     -f docker-compose.yml -f docker-compose.arm64.yml \
+#     --profile frontend --profile piper-tts --profile whisper-cpp up -d
+#
+# This overlay covers ONLY the three services that can run on ARM64:
+#   frontend-service   python:3.10-slim  (multi-arch)
+#   piper-tts-service  python:3.10-slim + piper_arm64 (multi-arch)
+#   whisper-cpp        ubuntu:22.04, ggml compiled from source with NEON
+#
+# Everything else in this repo is built on nvidia/cuda:* or rocm/* bases, which
+# have no usable ARM64 story, and NeMo/Qwen bring their own CUDA requirements.
+# Those services are intentionally absent rather than listed-and-broken.
+#
+# The base compose file attaches an NVIDIA device reservation to seven services.
+# `!reset` is required to remove it — Compose MERGES sequences, so a plain `[]`
+# would append nothing and leave the reservation in place, and the service would
+# refuse to start on a machine with no NVIDIA runtime. Requires Compose >= 2.24.4.
+#
+# Verify before deploying:
+#   docker compose -f docker-compose.yml -f docker-compose.arm64.yml \
+#     --profile frontend --profile piper-tts --profile whisper-cpp config \
+#     | grep -c 'driver: nvidia'      ->  0
+# =============================================================================
+
+x-no-gpu: &no-gpu
+  deploy:
+    resources:
+      reservations:
+        devices: !reset []
+
+services:
+  frontend-service:
+    <<: *no-gpu
+
+  piper-tts-service:
+    <<: *no-gpu
+
+  whisper-cpp:
+    <<: *no-gpu

@@ -26,14 +26,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     vulkan-sdk \
     && rm -rf /var/lib/apt/lists/*
 
-# Clone and build whisper.cpp with Vulkan backend enabled
-RUN git clone https://github.com/ggerganov/whisper.cpp.git /src && \
+# Clone and build whisper.cpp with the Vulkan backend enabled.
+# Pinned ref and GGML_NATIVE=OFF for the same reasons as the CPU Dockerfile:
+# an unpinned clone lets two builds of the same published tag diverge, and a
+# host-tuned CPU fallback path can SIGILL on a different machine.
+ARG TARGETARCH
+ARG WHISPER_CPP_REF=v1.7.6
+RUN git clone --depth 1 --branch "${WHISPER_CPP_REF}" \
+      https://github.com/ggml-org/whisper.cpp.git /src && \
     cd /src && \
+    if [ "$TARGETARCH" = "arm64" ]; then \
+      ARCH_FLAGS="-DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16"; \
+    else \
+      ARCH_FLAGS=""; \
+    fi && \
     cmake -B build \
         -DCMAKE_BUILD_TYPE=Release \
         -DGGML_VULKAN=1 \
         -DWHISPER_BUILD_SERVER=ON \
-        -DBUILD_SHARED_LIBS=OFF && \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DGGML_NATIVE=OFF \
+        ${ARCH_FLAGS} && \
     cmake --build build -j$(nproc) --target whisper-server
 
 # ── Runtime ──────────────────────────────────────────────────────────────────

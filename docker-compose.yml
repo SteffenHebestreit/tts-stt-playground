@@ -24,6 +24,9 @@ services:
       PIPER_DATA_DIR: /app/models
       PIPER_OUTPUT_DIR: /app/output
       OUTPUT_RETENTION_HOURS: ${OUTPUT_RETENTION_HOURS:-24}
+      # A German request with no German voice otherwise returns English audio
+      # at HTTP 200. Always reported via X-Language-Fallback; set true to 400.
+      PIPER_STRICT_LANGUAGE: ${PIPER_STRICT_LANGUAGE:-false}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
@@ -40,8 +43,11 @@ services:
       - tts-stt-network
 
   # PiperTTS Training service for custom voice models
+  # Deliberately NOT in the `all` profile: training is an episodic workload,
+  # and an idle container still holds a CUDA context (~0.5 GB). Start it with
+  # `--profile training` when you actually want to train.
   piper-training-service:
-    profiles: [training, all]
+    profiles: [training]
     image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-piper-training:${IMAGE_TAG:-latest}
     build:
       context: ./piper-training-service
@@ -84,8 +90,14 @@ services:
               count: 1
     networks:
       - tts-stt-network
+    # Long form with `required: false`: these services live in different
+    # profiles, so a short-form dependency makes the whole project invalid
+    # ("depends on undefined service") whenever a profile selection omits
+    # them — which is exactly what the ARM64 / CPU-only deployments do.
     depends_on:
-      - stt-service
+      stt-service:
+        condition: service_started
+        required: false
 
   # Whisper STT service (used for training transcription)
   stt-service:
@@ -100,8 +112,25 @@ services:
       FORCE_ACCELERATION: ${FORCE_ACCELERATION:-cuda}
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
       NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
-      WHISPER_MODEL_SIZE: ${WHISPER_MODEL_SIZE:-medium}
+      # large-v3-turbo: 4 decoder layers vs large-v3's 32 at comparable accuracy.
+      # Decoder depth dominates greedy realtime decoding, so this is the single
+      # biggest live-latency lever. It cannot do task="translate" — set
+      # large-v3 here if you need translation.
+      WHISPER_MODEL_SIZE: ${WHISPER_MODEL_SIZE:-large-v3-turbo}
       WORKERS: 1
+      # Live-transcription tuning. WS_WINDOW_S bounds how much trailing audio
+      # each interim decode re-transcribes. Whisper pads the mel to a fixed 30 s
+      # before the encoder, so this does NOT change encoder cost — it bounds the
+      # decoder tokens regenerated per tick. Real, but a moderate saving.
+      WS_WINDOW_S: ${WS_WINDOW_S:-8.0}
+      WS_MIN_NEW_AUDIO_S: ${WS_MIN_NEW_AUDIO_S:-0.5}
+      WS_MAX_SESSIONS: ${WS_MAX_SESSIONS:-4}
+      WHISPER_NUM_WORKERS: ${WHISPER_NUM_WORKERS:-2}
+      # CT2 spawns WHISPER_NUM_WORKERS model replicas, each running
+      # cpu_threads threads. Without an explicit cap the BLAS layer also
+      # spawns one thread per core on top, oversubscribing the CPU.
+      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-4}
+      PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
@@ -138,6 +167,15 @@ services:
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
       NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
       QWEN3_ASR_MODEL: ${QWEN3_ASR_MODEL:-Qwen/Qwen3-ASR-1.7B}
+      # One shared model on one GPU: bound concurrent inference rather than
+      # letting the default thread pool multiply peak VRAM.
+      ASR_MAX_CONCURRENCY: ${ASR_MAX_CONCURRENCY:-1}
+      # expandable_segments avoids the fragmentation that per-request
+      # empty_cache() calls used to (badly) paper over.
+      PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+      # Release the ~4 GB model after this many idle seconds.
+      # >0 seconds | 0 = unload when idle | -1 = never unload.
+      ASR_MODEL_TTL: ${ASR_MODEL_TTL:-300}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
@@ -174,6 +212,12 @@ services:
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
       NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
       PARAKEET_ASR_MODEL: ${PARAKEET_ASR_MODEL:-nvidia/parakeet-tdt-0.6b-v3}
+      # One shared model on one GPU: bound concurrent inference rather than
+      # letting the default thread pool multiply peak VRAM.
+      ASR_MAX_CONCURRENCY: ${ASR_MAX_CONCURRENCY:-1}
+      # expandable_segments avoids the fragmentation that per-request
+      # empty_cache() calls used to (badly) paper over.
+      PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
@@ -211,6 +255,12 @@ services:
       NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
       CANARY_ASR_MODEL: ${CANARY_ASR_MODEL:-nvidia/canary-180m-flash}
       CANARY_DEFAULT_LANGUAGE: ${CANARY_DEFAULT_LANGUAGE:-de}
+      # One shared model on one GPU: bound concurrent inference rather than
+      # letting the default thread pool multiply peak VRAM.
+      ASR_MAX_CONCURRENCY: ${ASR_MAX_CONCURRENCY:-1}
+      # expandable_segments avoids the fragmentation that per-request
+      # empty_cache() calls used to (badly) paper over.
+      PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
@@ -246,6 +296,16 @@ services:
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
       NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
       CHATTERBOX_DEFAULT_LANGUAGE: ${CHATTERBOX_DEFAULT_LANGUAGE:-de}
+      # Unload the ~4 GB model after this many idle seconds so it can share a
+      # 12 GB card with the STT/ASR stack (which already sits at ~9.7 GB).
+      # >0 seconds | 0 = unload immediately | -1 = never unload.
+      TTS_MODEL_TTL: ${TTS_MODEL_TTL:-300}
+      # One shared model on one GPU: bound concurrent generation rather than
+      # letting the default thread pool multiply peak VRAM.
+      TTS_MAX_CONCURRENCY: ${TTS_MAX_CONCURRENCY:-1}
+      # expandable_segments avoids the fragmentation that per-request
+      # empty_cache() calls used to (badly) paper over.
+      PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
@@ -279,7 +339,19 @@ services:
     environment:
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
       NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
-      QWEN3_TTS_MODEL: ${QWEN3_TTS_MODEL:-Qwen/Qwen3-TTS-12Hz-1.7B-Base}
+      # 0.6B by default so the stack fits an 8-12 GB card (repo labels:
+      # 2.5 GB vs the 1.7B's 4.5 GB). Both list German. Raise to
+      # Qwen/Qwen3-TTS-12Hz-1.7B-Base if you have the headroom.
+      QWEN3_TTS_MODEL: ${QWEN3_TTS_MODEL:-Qwen/Qwen3-TTS-12Hz-0.6B-Base}
+      # One shared model on one GPU: bound concurrent generation rather than
+      # letting the default thread pool multiply peak VRAM.
+      TTS_MAX_CONCURRENCY: ${TTS_MAX_CONCURRENCY:-1}
+      # Release the model after this many idle seconds. Reloads whatever was
+      # last selected via /load_model, not the env default.
+      TTS_MODEL_TTL: ${TTS_MODEL_TTL:-300}
+      # expandable_segments avoids the fragmentation that per-request
+      # empty_cache() calls used to (badly) paper over.
+      PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
       QWEN3_ASR_SERVICE_URL: http://qwen3-asr-service:5002
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
@@ -300,8 +372,14 @@ services:
       timeout: 10s
       start_period: 120s
       retries: 3
+    # Long form with `required: false`: these services live in different
+    # profiles, so a short-form dependency makes the whole project invalid
+    # ("depends on undefined service") whenever a profile selection omits
+    # them — which is exactly what the ARM64 / CPU-only deployments do.
     depends_on:
-      - qwen3-asr-service
+      qwen3-asr-service:
+        condition: service_started
+        required: false
     networks:
       - tts-stt-network
 
@@ -318,7 +396,13 @@ services:
     environment:
       # Model name maps to ggml-<name>.bin downloaded from HuggingFace on first start
       # Available: tiny, base, small, medium, large-v1, large-v2, large-v3, large-v3-turbo
-      WHISPER_MODEL: ${WHISPER_MODEL:-large-v3}
+      # Quantised turbo: large f16 needs ~3.9 GB RAM, q5_0 a fraction of it,
+      # which is the difference between running and swapping on a no-GPU box.
+      # NOTE: quantised builds are not published for every size. large-v3-turbo
+      # has q5_0; 'small' and 'base' have only q5_1 and q8_0. A name that does
+      # not exist now fails loudly at startup instead of poisoning the volume.
+      # On an ARM SBC use small-q5_1 — turbo is too slow there.
+      WHISPER_MODEL: ${WHISPER_MODEL:-large-v3-turbo-q5_0}
       # Optional extra whisper-server CLI flags (e.g. "--language de --threads 4")
       EXTRA_ARGS: ${WHISPER_CPP_EXTRA_ARGS:-}
     volumes:
@@ -379,9 +463,17 @@ services:
       retries: 3
     networks:
       - tts-stt-network
+    # Long form with `required: false`: these services live in different
+    # profiles, so a short-form dependency makes the whole project invalid
+    # ("depends on undefined service") whenever a profile selection omits
+    # them — which is exactly what the ARM64 / CPU-only deployments do.
     depends_on:
-      - piper-tts-service
-      - stt-service
+      piper-tts-service:
+        condition: service_started
+        required: false
+      stt-service:
+        condition: service_started
+        required: false
 
 networks:
   tts-stt-network:

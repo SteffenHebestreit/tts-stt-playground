@@ -1,7 +1,9 @@
 # Vulkan overlay — GPU acceleration via Vulkan API (no ROCm or CUDA required)
 #
 # Supported hardware:
-#   AMD  — RDNA 2/3/4 including Strix Halo (gfx1201 / Radeon 890M)
+#   AMD  — RDNA 2/3/3.5/4, including Strix Halo (gfx1151 / Radeon 8060S)
+#          See docker-compose.rocm.yml for the full gfx target table;
+#          do not restate the part identities here or the two will drift.
 #   Intel — Arc (Xe HPG/LPG) and integrated Xe graphics
 #   NVIDIA — any GPU with Vulkan 1.2+ (driver ≥ 470)
 #
@@ -16,8 +18,15 @@
 #   GGML_VULKAN_DEVICE=0  (default — first Vulkan-capable GPU)
 #
 # Strix Halo note:
-#   The integrated Radeon 890M (gfx1201) is fully Vulkan 1.3 capable via the
-#   AMD Adrenalin driver on Windows / AMDGPU on Linux. No GFX version override needed.
+#   The integrated Radeon 8060S (gfx1151) is fully Vulkan 1.3 capable via the
+#   AMD Adrenalin driver on Windows / AMDGPU on Linux. No GFX override needed —
+#   Vulkan needs no per-target kernel compilation, which is exactly why it is
+#   the more portable AMD path.
+#
+# Scope: this overlay covers whisper-cpp ONLY, and that is deliberate.
+#   PyTorch's Vulkan backend is no longer maintained, so the PyTorch services
+#   (stt, qwen3-*, parakeet, canary, chatterbox) cannot use Vulkan at all.
+#   Only ggml-based services can. Use docker-compose.rocm.yml for those.
 
 # Vulkan device passthrough shared by all services in this overlay
 x-vulkan-devices: &vulkan-devices
@@ -30,10 +39,18 @@ x-vulkan-devices: &vulkan-devices
   deploy:
     resources:
       reservations:
-        devices: []
+        # `!reset` is required: Compose MERGES sequences, so a plain `[]`
+        # leaves the base file's NVIDIA reservation in place and the service
+        # cannot start on a non-NVIDIA host. Requires Compose >= 2.24.4.
+        devices: !reset []
 
 services:
   whisper-cpp:
+    # A distinct tag plus pull_policy: build is required. Without them Compose
+    # pulls the published CPU image and Dockerfile.vulkan is never executed —
+    # the overlay would appear to work while running no Vulkan code at all.
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-whisper-cpp:${IMAGE_TAG:-latest}-vulkan
+    pull_policy: build
     build:
       dockerfile: Dockerfile.vulkan
     environment:

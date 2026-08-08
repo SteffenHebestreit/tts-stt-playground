@@ -1,18 +1,23 @@
 FROM python:3.10-slim
 
-# Install system dependencies
+# Install system dependencies.
+# alsa-utils and pulseaudio were removed deliberately: this service only ever
+# writes WAV files, it never opens a sound card.
 RUN apt-get update && apt-get install -y \
     wget \
     curl \
     espeak-ng \
-    alsa-utils \
-    pulseaudio \
     libsndfile1 \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Piper TTS
-RUN wget -O /tmp/piper.tar.gz https://github.com/rhasspy/piper/releases/download/v1.2.0/piper_amd64.tar.gz \
+# Install Piper TTS.
+# TARGETARCH is supplied by BuildKit and is exactly "amd64" or "arm64", which
+# matches the release asset names. Hardcoding piper_amd64 made this image
+# unbuildable for ARM SBCs (RK3588), where Piper is the primary TTS engine.
+ARG TARGETARCH
+RUN wget -O /tmp/piper.tar.gz \
+      "https://github.com/rhasspy/piper/releases/download/v1.2.0/piper_${TARGETARCH}.tar.gz" \
     && tar -xzf /tmp/piper.tar.gz -C /opt/ \
     && rm /tmp/piper.tar.gz \
     && ln -s /opt/piper/piper /usr/local/bin/piper

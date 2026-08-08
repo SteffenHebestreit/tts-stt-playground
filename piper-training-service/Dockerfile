@@ -1,4 +1,9 @@
-FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+# CUDA 12.8 + cu128 wheels, matching every other GPU service in this repo.
+# This was the last service still on 11.8/cu118, which caps kernel support at
+# ~sm_90 and therefore fails on Blackwell (RTX 50-series, sm_120) with
+# cudaErrorNoKernelImageForDevice. Nothing here pins an old torch — the 11.8
+# base was simply never bumped with its siblings.
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
 
 # Install system dependencies including AMD ROCm support detection tools
 RUN apt-get update && apt-get install -y \
@@ -37,7 +42,7 @@ RUN pip3 install --upgrade pip setuptools wheel
 COPY requirements.txt .
 
 # Install core dependencies first with CUDA support
-RUN pip3 install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cu118
+RUN pip3 install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cu128
 
 # Install the rest of the requirements
 RUN pip3 install --no-cache-dir -r requirements.txt

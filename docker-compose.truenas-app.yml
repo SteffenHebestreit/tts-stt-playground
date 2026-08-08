@@ -2,24 +2,45 @@ name: tts-stt
 # =============================================================================
 # TrueNAS SCALE — Custom App (Install via YAML)
 # =============================================================================
-# A self-contained, image-only stack: no repository or build step required. It
-# pulls prebuilt images from GHCR and stores all data on a TrueNAS dataset.
+# A self-contained, image-only stack: no repository, no build step. It pulls
+# prebuilt images from GHCR and stores all data on a TrueNAS dataset.
 #
-# How to use (TrueNAS SCALE, Electric Eel / Fangtooth+):
-#   1. Apps -> Discover Apps -> Custom App -> "Install via YAML".
-#   2. Paste this file.
-#   3. Edit APP_DATA_DIR below to your dataset, e.g. /mnt/tank/apps/tts-stt,
-#      and create that dataset first.
-#   4. Allocate the NVIDIA GPU to the app (Apps settings) if using CUDA.
+# QUICK START (TrueNAS SCALE Electric Eel / Fangtooth / Goldeye+):
+#   1. Create a dataset for the data, e.g. /mnt/tank/apps/tts-stt
+#   2. Apps -> Discover Apps -> Custom App -> "Install via YAML"
+#   3. Paste this file
+#   4. Set APP_DATA_DIR (below) to your dataset path
+#   5. Allocate the NVIDIA GPU to the app
+#   6. Open http://<truenas-host>:3000
 #
-# Every value uses ${VAR:-default} so it works as-is and can be overridden from
-# the app's environment. Optional backends (training, parakeet, whisper-cpp) are
-# at the bottom, commented out — uncomment to enable.
+# Full step-by-step guide: docs/truenas-installation-guide.md
 #
-# Default web UI:  http://<truenas-host>:3000
+# -----------------------------------------------------------------------------
+# SINGLE-PORT BY DESIGN
+# -----------------------------------------------------------------------------
+# Only the web UI port (3000) is published. The browser talks exclusively to the
+# frontend, which proxies everything over the internal Docker network:
+#   /api/*            TTS, STT, voices, training
+#   /api/health       all backend health probes, run concurrently
+#   /ws/stt           live microphone transcription (WebSocket relay)
+#
+# So you do NOT need to publish backend ports, and you do NOT need to set any
+# BROWSER_*_URL variable — including when you reach the NAS from another machine
+# or put it behind an HTTPS reverse proxy. Publishing the backend ports is now
+# opt-in and only useful for calling the services directly from your own scripts
+# (see the "direct API access" block at the bottom of each service).
 # =============================================================================
 
-x-data-dir: &_note "Set APP_DATA_DIR to a real dataset path before deploying."
+# -----------------------------------------------------------------------------
+# THE ONE THING YOU MUST CHANGE
+# -----------------------------------------------------------------------------
+# APP_DATA_DIR decides where models, generated audio and caches live. Set it in
+# the app's environment, or search-and-replace the fallback path below.
+# Default fallback: /mnt/pool/apps/tts-stt
+#
+# NOTE: this file deliberately avoids YAML anchors/merge keys. They are valid
+# Compose, but this file's job is to be pasted into a UI and work first time on
+# every TrueNAS release, so every service spells its settings out in full.
 
 services:
   frontend-service:
@@ -27,34 +48,45 @@ services:
     ports:
       - "${FRONTEND_PORT:-3000}:3000"
     environment:
+      # Internal service URLs — container-to-container, do not change.
       TTS_SERVICE_URL: http://piper-tts-service:5000
       STT_SERVICE_URL: http://stt-service:8000
       VOICE_TRAINING_URL: http://piper-training-service:8080
       QWEN3_TTS_SERVICE_URL: http://qwen3-tts-service:5004
       QWEN3_ASR_SERVICE_URL: http://qwen3-asr-service:5002
       PARAKEET_ASR_SERVICE_URL: http://parakeet-asr-service:5005
+      CANARY_ASR_SERVICE_URL: http://canary-asr-service:5006
+      CHATTERBOX_TTS_SERVICE_URL: http://chatterbox-tts-service:5007
       WHISPER_CPP_SERVICE_URL: http://whisper-cpp:8080
+      # Show these backends in the UI. Set true only if you also uncommented the
+      # matching service below, or the UI will show a permanently red indicator.
       ENABLE_PARAKEET_ASR: ${ENABLE_PARAKEET_ASR:-false}
+      ENABLE_CANARY_ASR: ${ENABLE_CANARY_ASR:-false}
+      ENABLE_CHATTERBOX_TTS: ${ENABLE_CHATTERBOX_TTS:-false}
       ENABLE_WHISPER_CPP: ${ENABLE_WHISPER_CPP:-false}
+      # LAN use: "*" is fine. Behind a reverse proxy, set the exact origin the
+      # browser loads, e.g. https://voice.example.com
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
-      # IMPORTANT: when reached over the network, set these to the TrueNAS host.
-      BROWSER_TTS_URL: ${BROWSER_TTS_URL:-http://localhost:${PIPER_TTS_PORT:-5000}}
-      BROWSER_STT_URL: ${BROWSER_STT_URL:-http://localhost:${STT_PORT:-5001}}
-      BROWSER_TRAINING_URL: ${BROWSER_TRAINING_URL:-http://localhost:${TRAINING_PORT:-8080}}
-      BROWSER_QWEN3_TTS_URL: ${BROWSER_QWEN3_TTS_URL:-http://localhost:${QWEN3_TTS_PORT:-5004}}
-      BROWSER_QWEN3_ASR_URL: ${BROWSER_QWEN3_ASR_URL:-http://localhost:${QWEN3_ASR_PORT:-5002}}
-      BROWSER_PARAKEET_ASR_URL: ${BROWSER_PARAKEET_ASR_URL:-http://localhost:${PARAKEET_ASR_PORT:-5005}}
-      BROWSER_WHISPER_CPP_URL: ${BROWSER_WHISPER_CPP_URL:-http://localhost:${WHISPER_CPP_PORT:-5003}}
+      # NOTE: BROWSER_*_URL variables are intentionally not set. Everything the
+      # browser needs is proxied through this service on port 3000.
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+      retries: 3
     depends_on: [piper-tts-service, stt-service]
     networks: [tts-stt-network]
 
   piper-tts-service:
     image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-piper-tts:${IMAGE_TAG:-latest}
-    ports:
-      - "${PIPER_TTS_PORT:-5000}:5000"
+    # Direct API access (optional): uncomment to reach Piper from your own tools.
+    # ports: ["${PIPER_TTS_PORT:-5000}:5000"]
     environment:
+      PIPER_DATA_DIR: /app/models
+      PIPER_OUTPUT_DIR: /app/output
       OUTPUT_RETENTION_HOURS: ${OUTPUT_RETENTION_HOURS:-24}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
@@ -62,88 +94,189 @@ services:
       - "${APP_DATA_DIR:-/mnt/pool/apps/tts-stt}/models:/app/models"
       - "${APP_DATA_DIR:-/mnt/pool/apps/tts-stt}/output:/app/output"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
     networks: [tts-stt-network]
 
   stt-service:
     image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-stt:${IMAGE_TAG:-latest}
-    ports:
-      - "${STT_PORT:-5001}:8000"
+    # ports: ["${STT_PORT:-5001}:8000"]
     environment:
+      NVIDIA_VISIBLE_DEVICES: ${GPU_DEVICE_ID:-0}
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      # Avoids allocator fragmentation when several models share one card.
+      PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
       USE_CUDA: "true"
       FORCE_ACCELERATION: ${FORCE_ACCELERATION:-cuda}
-      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-0}
-      NVIDIA_DRIVER_CAPABILITIES: compute,utility
-      WHISPER_MODEL_SIZE: ${WHISPER_MODEL_SIZE:-medium}
+      # large-v3-turbo: 4 decoder layers vs large-v3's 32 at comparable accuracy.
+      # Decoder depth dominates greedy realtime decoding, so this is the biggest
+      # live-latency lever. It cannot do task="translate" — use large-v3 for that.
+      WHISPER_MODEL_SIZE: ${WHISPER_MODEL_SIZE:-large-v3-turbo}
+      # Live-transcription tuning. WS_WINDOW_S bounds how much trailing audio
+      # each interim decode re-transcribes. Whisper pads the mel to a fixed 30 s
+      # before the encoder, so this does NOT change encoder cost — it bounds the
+      # decoder tokens regenerated per tick. Real, but a moderate saving.
+      WS_WINDOW_S: ${WS_WINDOW_S:-8.0}
+      WS_MIN_NEW_AUDIO_S: ${WS_MIN_NEW_AUDIO_S:-0.5}
+      WS_MAX_SESSIONS: ${WS_MAX_SESSIONS:-4}
+      WHISPER_NUM_WORKERS: ${WHISPER_NUM_WORKERS:-2}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${APP_DATA_DIR:-/mnt/pool/apps/tts-stt}/models:/app/models"
       - "${APP_DATA_DIR:-/mnt/pool/apps/tts-stt}/.cache:/root/.cache"
     restart: unless-stopped
+    healthcheck:
+      # Returns 503 until the model is actually loaded, so "healthy" means ready.
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 180s
+      retries: 3
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ["0"]
+              device_ids: ["${GPU_DEVICE_ID:-0}"]
               capabilities: [gpu]
     networks: [tts-stt-network]
 
   qwen3-asr-service:
     image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-qwen3-asr:${IMAGE_TAG:-latest}
-    ports:
-      - "${QWEN3_ASR_PORT:-5002}:5002"
+    # ports: ["${QWEN3_ASR_PORT:-5002}:5002"]
     environment:
-      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-0}
+      NVIDIA_VISIBLE_DEVICES: ${GPU_DEVICE_ID:-0}
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      # Avoids allocator fragmentation when several models share one card.
+      PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
       QWEN3_ASR_MODEL: ${QWEN3_ASR_MODEL:-Qwen/Qwen3-ASR-1.7B}
+      # One shared model on one GPU: bound concurrent inference instead of
+      # letting the thread pool multiply peak VRAM.
+      ASR_MAX_CONCURRENCY: ${ASR_MAX_CONCURRENCY:-1}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${APP_DATA_DIR:-/mnt/pool/apps/tts-stt}/hf-cache/qwen3-asr:/root/.cache"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5002/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 180s
+      retries: 3
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ["0"]
+              device_ids: ["${GPU_DEVICE_ID:-0}"]
               capabilities: [gpu]
     networks: [tts-stt-network]
 
   qwen3-tts-service:
     image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-qwen3-tts:${IMAGE_TAG:-latest}
-    ports:
-      - "${QWEN3_TTS_PORT:-5004}:5004"
+    # ports: ["${QWEN3_TTS_PORT:-5004}:5004"]
     environment:
-      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-0}
+      NVIDIA_VISIBLE_DEVICES: ${GPU_DEVICE_ID:-0}
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      # Avoids allocator fragmentation when several models share one card.
+      PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+      # 0.6B fits a 16 GB card comfortably alongside STT; 1.7B sounds better.
       QWEN3_TTS_MODEL: ${QWEN3_TTS_MODEL:-Qwen/Qwen3-TTS-12Hz-0.6B-Base}
       QWEN3_ASR_SERVICE_URL: http://qwen3-asr-service:5002
+      TTS_MAX_CONCURRENCY: ${TTS_MAX_CONCURRENCY:-1}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${APP_DATA_DIR:-/mnt/pool/apps/tts-stt}/hf-cache/qwen3-tts:/root/.cache"
       - "${APP_DATA_DIR:-/mnt/pool/apps/tts-stt}/qwen3-voices:/app/voices"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5004/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 180s
+      retries: 3
     depends_on: [qwen3-asr-service]
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ["0"]
+              device_ids: ["${GPU_DEVICE_ID:-0}"]
               capabilities: [gpu]
     networks: [tts-stt-network]
 
-  # --- Optional backends: uncomment to enable -------------------------------
+  # ===========================================================================
+  # OPTIONAL BACKENDS — uncomment a block AND set its ENABLE_* flag above.
+  # Each one costs VRAM; see docs/truenas-installation-guide.md for a budget.
+  # ===========================================================================
   #
+  # --- Chatterbox-TTS: streaming German TTS, lowest time-to-first-audio -------
+  # chatterbox-tts-service:
+  #   image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-chatterbox-tts:${IMAGE_TAG:-latest}
+  #   environment:
+  #     NVIDIA_VISIBLE_DEVICES: ${GPU_DEVICE_ID:-0}
+  #     NVIDIA_DRIVER_CAPABILITIES: compute,utility
+  #     PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+  #     CHATTERBOX_DEFAULT_LANGUAGE: ${CHATTERBOX_DEFAULT_LANGUAGE:-de}
+  #     TTS_MAX_CONCURRENCY: ${TTS_MAX_CONCURRENCY:-1}
+  #     ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
+  #   volumes:
+  #     - "${APP_DATA_DIR:-/mnt/pool/apps/tts-stt}/hf-cache/chatterbox:/root/.cache"
+  #   restart: unless-stopped
+  #   healthcheck: {test: ["CMD", "curl", "-f", "http://localhost:5007/health"], interval: 30s, timeout: 10s, start_period: 180s, retries: 3}
+  #   deploy: {resources: {reservations: {devices: [{driver: nvidia, device_ids: ["${GPU_DEVICE_ID:-0}"], capabilities: [gpu]}]}}}
+  #   networks: [tts-stt-network]
+  #
+  # --- Canary-ASR: fastest German STT (180M params) --------------------------
+  # canary-asr-service:
+  #   image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-canary-asr:${IMAGE_TAG:-latest}
+  #   environment:
+  #     NVIDIA_VISIBLE_DEVICES: ${GPU_DEVICE_ID:-0}
+  #     NVIDIA_DRIVER_CAPABILITIES: compute,utility
+  #     PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+  #     CANARY_ASR_MODEL: ${CANARY_ASR_MODEL:-nvidia/canary-180m-flash}
+  #     CANARY_DEFAULT_LANGUAGE: ${CANARY_DEFAULT_LANGUAGE:-de}
+  #     ASR_MAX_CONCURRENCY: ${ASR_MAX_CONCURRENCY:-1}
+  #     ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
+  #   volumes:
+  #     - "${APP_DATA_DIR:-/mnt/pool/apps/tts-stt}/hf-cache/canary:/root/.cache"
+  #   restart: unless-stopped
+  #   healthcheck: {test: ["CMD", "curl", "-f", "http://localhost:5006/health"], interval: 30s, timeout: 10s, start_period: 240s, retries: 3}
+  #   deploy: {resources: {reservations: {devices: [{driver: nvidia, device_ids: ["${GPU_DEVICE_ID:-0}"], capabilities: [gpu]}]}}}
+  #   networks: [tts-stt-network]
+  #
+  # --- Parakeet-ASR: 25 EU languages incl. German ----------------------------
+  # parakeet-asr-service:
+  #   image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-parakeet-asr:${IMAGE_TAG:-latest}
+  #   environment:
+  #     NVIDIA_VISIBLE_DEVICES: ${GPU_DEVICE_ID:-0}
+  #     NVIDIA_DRIVER_CAPABILITIES: compute,utility
+  #     PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+  #     PARAKEET_ASR_MODEL: ${PARAKEET_ASR_MODEL:-nvidia/parakeet-tdt-0.6b-v3}
+  #     ASR_MAX_CONCURRENCY: ${ASR_MAX_CONCURRENCY:-1}
+  #     ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
+  #   volumes:
+  #     - "${APP_DATA_DIR:-/mnt/pool/apps/tts-stt}/hf-cache/parakeet:/root/.cache"
+  #   restart: unless-stopped
+  #   healthcheck: {test: ["CMD", "curl", "-f", "http://localhost:5005/health"], interval: 30s, timeout: 10s, start_period: 240s, retries: 3}
+  #   deploy: {resources: {reservations: {devices: [{driver: nvidia, device_ids: ["${GPU_DEVICE_ID:-0}"], capabilities: [gpu]}]}}}
+  #   networks: [tts-stt-network]
+  #
+  # --- Voice training: run on demand, not always-on --------------------------
   # piper-training-service:
   #   image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-piper-training:${IMAGE_TAG:-latest}
-  #   ports: ["${TRAINING_PORT:-8080}:8080"]
   #   environment:
-  #     NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-0}
+  #     NVIDIA_VISIBLE_DEVICES: ${GPU_DEVICE_ID:-0}
   #     NVIDIA_DRIVER_CAPABILITIES: compute,utility
+  #     STT_SERVICE_URL: http://stt-service:8000
+  #     PIPER_TTS_SERVICE_URL: http://piper-tts-service:5000
   #     MAX_TRAIN_BATCH_SIZE: ${MAX_TRAIN_BATCH_SIZE:-4}
   #     ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
   #   shm_size: 1gb
@@ -151,28 +284,16 @@ services:
   #     - "${APP_DATA_DIR:-/mnt/pool/apps/tts-stt}/piper-training-service/data:/app/data"
   #     - "${APP_DATA_DIR:-/mnt/pool/apps/tts-stt}/piper-training-service/checkpoints:/app/checkpoints"
   #     - "${APP_DATA_DIR:-/mnt/pool/apps/tts-stt}/piper-training-service/models:/app/models"
+  #     - "${APP_DATA_DIR:-/mnt/pool/apps/tts-stt}/piper-training-service/configs:/app/configs"
   #     - "${APP_DATA_DIR:-/mnt/pool/apps/tts-stt}/models:/app/shared_models"
   #   restart: unless-stopped
-  #   deploy: {resources: {reservations: {devices: [{driver: nvidia, device_ids: ["0"], capabilities: [gpu]}]}}}
+  #   healthcheck: {test: ["CMD", "curl", "-f", "http://localhost:8080/health"], interval: 30s, timeout: 10s, start_period: 120s, retries: 3}
+  #   deploy: {resources: {reservations: {devices: [{driver: nvidia, device_ids: ["${GPU_DEVICE_ID:-0}"], capabilities: [gpu]}]}}}
   #   networks: [tts-stt-network]
   #
-  # parakeet-asr-service:   # realtime multilingual STT (25 EU langs incl. German); set ENABLE_PARAKEET_ASR=true
-  #   image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-parakeet-asr:${IMAGE_TAG:-latest}
-  #   ports: ["${PARAKEET_ASR_PORT:-5005}:5005"]
-  #   environment:
-  #     NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-0}
-  #     NVIDIA_DRIVER_CAPABILITIES: compute,utility
-  #     PARAKEET_ASR_MODEL: ${PARAKEET_ASR_MODEL:-nvidia/parakeet-tdt-0.6b-v3}
-  #     ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
-  #   volumes:
-  #     - "${APP_DATA_DIR:-/mnt/pool/apps/tts-stt}/hf-cache/parakeet:/root/.cache"
-  #   restart: unless-stopped
-  #   deploy: {resources: {reservations: {devices: [{driver: nvidia, device_ids: ["0"], capabilities: [gpu]}]}}}
-  #   networks: [tts-stt-network]
-  #
-  # whisper-cpp:            # CPU OpenAI-compatible STT; set ENABLE_WHISPER_CPP=true
+  # --- whisper.cpp: CPU-only STT, no GPU needed ------------------------------
+  # whisper-cpp:
   #   image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-whisper-cpp:${IMAGE_TAG:-latest}
-  #   ports: ["${WHISPER_CPP_PORT:-5003}:8080"]
   #   environment:
   #     WHISPER_MODEL: ${WHISPER_MODEL:-large-v3}
   #   volumes:
@@ -182,4 +303,3 @@ services:
 
 networks:
   tts-stt-network:
-    driver: bridge

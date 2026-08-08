@@ -22,11 +22,21 @@ check_amd() {
     if command -v rocm-smi &> /dev/null; then
         echo "✅ AMD GPU (ROCm) detected:"
         rocm-smi --showproductname --showmeminfo
-        export HIP_VISIBLE_DEVICES=0
-        export ROC_ENABLE_PRE_VEGA=1
-        # Optimizations for Strix Halo AI Max 395
-        export HSA_OVERRIDE_GFX_VERSION=11.0.0
-        export ROCM_PATH=/opt/rocm
+        # Only set these if the container environment did not. A bare `export`
+        # here silently overrode whatever docker-compose.rocm.yml configured,
+        # making HSA_OVERRIDE_GFX_VERSION unreachable for this service — and
+        # forcing gfx1100 kernels is actively wrong once the base image moves to
+        # a wheel index that has native gfx1151 support.
+        : "${HIP_VISIBLE_DEVICES:=0}"
+        : "${ROC_ENABLE_PRE_VEGA:=1}"
+        : "${ROCM_PATH:=/opt/rocm}"
+        export HIP_VISIBLE_DEVICES ROC_ENABLE_PRE_VEGA ROCM_PATH
+        # HSA_OVERRIDE_GFX_VERSION is deliberately NOT defaulted here: it belongs
+        # to the compose overlay, which knows which wheel index the image uses.
+        if [ -n "${HSA_OVERRIDE_GFX_VERSION:-}" ]; then
+            export HSA_OVERRIDE_GFX_VERSION
+            echo "   using HSA_OVERRIDE_GFX_VERSION=${HSA_OVERRIDE_GFX_VERSION}"
+        fi
         return 0
     elif lspci | grep -i amd | grep -i vga &> /dev/null; then
         echo "✅ AMD GPU detected (no ROCm, using CPU fallback)"
