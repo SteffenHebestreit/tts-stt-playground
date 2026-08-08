@@ -479,12 +479,6 @@
     <!-- Service Configuration -->
     <script>
         window.PROVIDER_REGISTRY = {{ provider_registry_json | safe }};
-        window.TTS_SERVICE_URL = window.PROVIDER_REGISTRY.providers.piper?.browser_url || "{{ tts_service_url }}";
-        window.STT_SERVICE_URL = window.PROVIDER_REGISTRY.providers.whisper?.browser_url || "{{ stt_service_url }}";
-        window.VOICE_TRAINING_URL = window.PROVIDER_REGISTRY.providers['piper-training']?.browser_url || "{{ voice_training_url }}";
-        window.QWEN3_TTS_SERVICE_URL = window.PROVIDER_REGISTRY.providers.qwen3?.browser_url || "{{ qwen3_tts_service_url }}";
-        window.QWEN3_ASR_SERVICE_URL = window.PROVIDER_REGISTRY.providers['qwen3-asr']?.browser_url || "{{ qwen3_asr_service_url }}";
-        window.WHISPER_CPP_SERVICE_URL = window.PROVIDER_REGISTRY.providers['whisper-cpp']?.browser_url || "{{ whisper_cpp_service_url }}";
         // Used to cache-bust the audio worklet module, which app.js loads itself.
         window.APP_VERSION = "{{ app_version }}";
     </script>

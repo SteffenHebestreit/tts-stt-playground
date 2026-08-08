@@ -108,15 +108,6 @@ CHATTERBOX_TTS_SERVICE_URL = os.getenv("CHATTERBOX_TTS_SERVICE_URL", "http://cha
 WHISPER_CPP_SERVICE_URL = os.getenv("WHISPER_CPP_SERVICE_URL", "http://whisper-cpp:8080")
 
 # Browser-facing URLs (host ports, used by client-side JavaScript)
-BROWSER_TTS_SERVICE_URL = os.getenv("BROWSER_TTS_URL", "http://localhost:5000")
-BROWSER_STT_SERVICE_URL = os.getenv("BROWSER_STT_URL", "http://localhost:5001")
-BROWSER_VOICE_TRAINING_URL = os.getenv("BROWSER_TRAINING_URL", "http://localhost:8080")
-BROWSER_QWEN3_TTS_SERVICE_URL = os.getenv("BROWSER_QWEN3_TTS_URL", "http://localhost:5004")
-BROWSER_QWEN3_ASR_SERVICE_URL = os.getenv("BROWSER_QWEN3_ASR_URL", "http://localhost:5002")
-BROWSER_PARAKEET_ASR_SERVICE_URL = os.getenv("BROWSER_PARAKEET_ASR_URL", "http://localhost:5005")
-BROWSER_CANARY_ASR_SERVICE_URL = os.getenv("BROWSER_CANARY_ASR_URL", "http://localhost:5006")
-BROWSER_CHATTERBOX_TTS_SERVICE_URL = os.getenv("BROWSER_CHATTERBOX_TTS_URL", "http://localhost:5007")
-BROWSER_WHISPER_CPP_SERVICE_URL = os.getenv("BROWSER_WHISPER_CPP_URL", "http://localhost:5003")
 ENABLE_WHISPER_CPP = os.getenv("ENABLE_WHISPER_CPP", "false").strip().lower() in {"1", "true", "yes", "on"}
 ENABLE_PARAKEET_ASR = os.getenv("ENABLE_PARAKEET_ASR", "false").strip().lower() in {"1", "true", "yes", "on"}
 ENABLE_CANARY_ASR = os.getenv("ENABLE_CANARY_ASR", "false").strip().lower() in {"1", "true", "yes", "on"}
@@ -161,7 +152,6 @@ def _build_provider_registry() -> dict:
             "display_name": "PiperTTS (Local Training)",
             "short_name": "PiperTTS",
             "internal_url": TTS_SERVICE_URL,
-            "browser_url": BROWSER_TTS_SERVICE_URL,
             "health_endpoint": "/health",
             "capabilities": ["tts", "voice_catalog", "custom_models", "training_target"],
             "contracts": {
@@ -241,7 +231,6 @@ def _build_provider_registry() -> dict:
             "display_name": "Qwen3-TTS (Voice Cloning)",
             "short_name": "Qwen3-TTS",
             "internal_url": QWEN3_TTS_SERVICE_URL,
-            "browser_url": BROWSER_QWEN3_TTS_SERVICE_URL,
             "health_endpoint": "/health",
             "capabilities": ["tts", "voice_clone", "saved_voices", "model_switching"],
             "contracts": {
@@ -464,7 +453,6 @@ def _build_provider_registry() -> dict:
             "display_name": "Whisper (faster-whisper)",
             "short_name": "Whisper STT",
             "internal_url": STT_SERVICE_URL,
-            "browser_url": BROWSER_STT_SERVICE_URL,
             "health_endpoint": "/health",
             "capabilities": ["transcribe", "segments", "detect_language", "streaming"],
             # `language_detect` is the machine-readable truth for API clients.
@@ -503,7 +491,6 @@ def _build_provider_registry() -> dict:
             "display_name": "Qwen3-ASR (multilingual)",
             "short_name": "Qwen3-ASR",
             "internal_url": QWEN3_ASR_SERVICE_URL,
-            "browser_url": BROWSER_QWEN3_ASR_SERVICE_URL,
             "health_endpoint": "/health",
             "capabilities": ["transcribe", "segments", "detect_language"],
             "language_detect": True,
@@ -539,7 +526,6 @@ def _build_provider_registry() -> dict:
             "display_name": "Piper Training",
             "short_name": "Voice Training",
             "internal_url": VOICE_TRAINING_URL,
-            "browser_url": BROWSER_VOICE_TRAINING_URL,
             "health_endpoint": "/health",
             "capabilities": ["dataset_preparation", "voice_training", "model_export"],
             "contracts": {
@@ -716,7 +702,6 @@ def _build_provider_registry() -> dict:
             "display_name": "Parakeet-TDT (realtime, 25 EU langs)",
             "short_name": "Parakeet ASR",
             "internal_url": PARAKEET_ASR_SERVICE_URL,
-            "browser_url": BROWSER_PARAKEET_ASR_SERVICE_URL,
             "health_endpoint": "/health",
             # /detect_language exists but is a stub that always returns null,
             # so the capability is NOT declared. Parakeet auto-detects
@@ -756,7 +741,6 @@ def _build_provider_registry() -> dict:
             "display_name": "Canary-180M (realtime, en/de/es/fr)",
             "short_name": "Canary ASR",
             "internal_url": CANARY_ASR_SERVICE_URL,
-            "browser_url": BROWSER_CANARY_ASR_SERVICE_URL,
             "health_endpoint": "/health",
             "capabilities": ["transcribe", "segments"],
             # Canary has no language identification at all — its /detect_language
@@ -795,7 +779,6 @@ def _build_provider_registry() -> dict:
             "display_name": "Chatterbox (Multilingual, MIT)",
             "short_name": "Chatterbox",
             "internal_url": CHATTERBOX_TTS_SERVICE_URL,
-            "browser_url": BROWSER_CHATTERBOX_TTS_SERVICE_URL,
             "health_endpoint": "/health",
             "capabilities": ["tts", "voice_clone", "tts_stream"],
             "contracts": {
@@ -847,7 +830,6 @@ def _build_provider_registry() -> dict:
             "display_name": "whisper.cpp (OpenAI-compatible)",
             "short_name": "whisper.cpp",
             "internal_url": WHISPER_CPP_SERVICE_URL,
-            "browser_url": BROWSER_WHISPER_CPP_SERVICE_URL,
             "health_endpoint": "/",
             "capabilities": ["transcribe", "openai_compatible"],
             # whisper.cpp auto-detects when language=auto is sent (which the
@@ -1627,13 +1609,6 @@ async def read_root(request: Request):
     tts_providers, stt_providers, status_providers = _template_provider_lists()
     return templates.TemplateResponse("index.html", {
         "request": request,
-        "tts_service_url": BROWSER_TTS_SERVICE_URL,
-        "stt_service_url": BROWSER_STT_SERVICE_URL,
-        "voice_training_url": BROWSER_VOICE_TRAINING_URL,
-        "qwen3_tts_service_url": BROWSER_QWEN3_TTS_SERVICE_URL,
-        "qwen3_asr_service_url": BROWSER_QWEN3_ASR_SERVICE_URL,
-        "parakeet_asr_service_url": BROWSER_PARAKEET_ASR_SERVICE_URL,
-        "whisper_cpp_service_url": BROWSER_WHISPER_CPP_SERVICE_URL,
         "provider_registry_json": json.dumps(PROVIDER_REGISTRY),
         "tts_provider_options": tts_providers,
         "stt_provider_options": stt_providers,

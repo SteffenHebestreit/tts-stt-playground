@@ -475,7 +475,7 @@ for optimised GPU memory allocation and single-GPU pinning.
 
 Start from `.env.truenas.example` (copy it to `.env`) and set `APP_DATA_DIR` to a
 dataset path. If the frontend is opened from another machine, change
-`ALLOWED_ORIGINS` and the `BROWSER_*_URL` values before deployment.
+`ALLOWED_ORIGINS` before deployment.
 
 ### Install without building (prebuilt images)
 
@@ -581,10 +581,10 @@ already defined in the base compose file — they persist automatically on TrueN
 
 ### Remote Browser Access
 
-If the frontend is opened from another machine on the network, do not leave the
-browser-facing URLs at `localhost`. Set `ALLOWED_ORIGINS` to the frontend origin
-and update the `BROWSER_TTS_URL`, `BROWSER_STT_URL`, `BROWSER_TRAINING_URL`,
-`BROWSER_QWEN3_ASR_URL`, and `BROWSER_QWEN3_TTS_URL` variables in `.env`.
+Set `ALLOWED_ORIGINS` to the frontend origin. That is all — the browser only ever
+talks to port 3000, which proxies `/api/*`, `/api/health` and the `/ws/stt`
+relay to the backends over the internal Docker network. No backend port needs
+publishing, and there are no browser-facing backend URLs to configure.
 
 ### Cleanup (optional)
 

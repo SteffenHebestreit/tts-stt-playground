@@ -15,7 +15,6 @@ This repository now exposes a frontend provider registry that describes which se
       "display_name": "Human readable name",
       "short_name": "Compact UI label",
       "internal_url": "http://service:port",
-      "browser_url": "http://localhost:port",
       "health_endpoint": "/health",
       "capabilities": ["capability-name"],
       "contracts": {
