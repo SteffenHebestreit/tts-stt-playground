@@ -32,6 +32,7 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY app.py .
+COPY model_lifecycle.py .
 
 # Pre-download model during build (cached in Docker layer)
 # Uncomment to bake model into image for faster startup:
