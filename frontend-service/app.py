@@ -4,23 +4,61 @@ Serves the web UI, static assets, and API documentation pages.
 Acts as a gateway that provides browser-facing URLs for all backend services.
 """
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.background import BackgroundTask
+
+from openai_router import build_router as build_openai_router
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+import asyncio
+import hashlib
 import httpx
 import json
+import logging
 import os
 import time
 from pathlib import Path
 from typing import Optional
 
-# Cache-busting version: bumped on every restart so browsers fetch fresh assets
-APP_VERSION = str(int(time.time()))
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def _asset_version() -> str:
+    """Cache-busting token derived from the static assets themselves.
+
+    It has to satisfy two things at once:
+    - identical across uvicorn workers, or they hand out different asset URLs
+      for the same files and thrash the browser cache;
+    - different whenever the assets actually change, or browsers keep serving a
+      stale app.js after an update.
+
+    A restart timestamp fails the first, and a pinned image tag fails the second
+    (deployments on `:latest` would never bust). Hashing the files satisfies both.
+    """
+    explicit = os.getenv("APP_VERSION")
+    if explicit:
+        return explicit
+
+    digest = hashlib.sha256()
+    static_dir = Path(__file__).parent / "static"
+    try:
+        for path in sorted(static_dir.rglob("*")):
+            if path.is_file():
+                digest.update(path.name.encode())
+                digest.update(str(path.stat().st_mtime_ns).encode())
+                digest.update(str(path.stat().st_size).encode())
+    except OSError:
+        # Fall back to a per-process token rather than failing to start.
+        return str(int(time.time()))
+    return digest.hexdigest()[:12]
+
+
+APP_VERSION = _asset_version()
 
 
 @asynccontextmanager
@@ -429,6 +467,10 @@ def _build_provider_registry() -> dict:
             "browser_url": BROWSER_STT_SERVICE_URL,
             "health_endpoint": "/health",
             "capabilities": ["transcribe", "segments", "detect_language", "streaming"],
+            # `language_detect` is the machine-readable truth for API clients.
+            # Some backends expose a /detect_language route that always returns
+            # null, so route-exists is not the same as capability-exists.
+            "language_detect": True,
             "contracts": {
                 "transcribe": "stt-form-v1",
                 "detect_language": "stt-detect-language-v1",
@@ -464,6 +506,7 @@ def _build_provider_registry() -> dict:
             "browser_url": BROWSER_QWEN3_ASR_SERVICE_URL,
             "health_endpoint": "/health",
             "capabilities": ["transcribe", "segments", "detect_language"],
+            "language_detect": True,
             "contracts": {
                 "transcribe": "stt-form-v1",
                 "detect_language": "stt-detect-language-v1",
@@ -675,10 +718,13 @@ def _build_provider_registry() -> dict:
             "internal_url": PARAKEET_ASR_SERVICE_URL,
             "browser_url": BROWSER_PARAKEET_ASR_SERVICE_URL,
             "health_endpoint": "/health",
-            "capabilities": ["transcribe", "segments", "detect_language"],
+            # /detect_language exists but is a stub that always returns null,
+            # so the capability is NOT declared. Parakeet auto-detects
+            # internally during transcription but does not report it.
+            "capabilities": ["transcribe", "segments"],
+            "language_detect": False,
             "contracts": {
                 "transcribe": "stt-form-v1",
-                "detect_language": "stt-detect-language-v1",
             },
             "settings": {
                 "defaults": {
@@ -713,9 +759,13 @@ def _build_provider_registry() -> dict:
             "browser_url": BROWSER_CANARY_ASR_SERVICE_URL,
             "health_endpoint": "/health",
             "capabilities": ["transcribe", "segments"],
+            # Canary has no language identification at all — its /detect_language
+            # route transcribes with the default language and returns null. The
+            # contract is therefore NOT declared: a client must not be told it
+            # can detect language here.
+            "language_detect": False,
             "contracts": {
                 "transcribe": "stt-form-v1",
-                "detect_language": "stt-detect-language-v1",
             },
             "settings": {
                 "defaults": {
@@ -747,10 +797,14 @@ def _build_provider_registry() -> dict:
             "internal_url": CHATTERBOX_TTS_SERVICE_URL,
             "browser_url": BROWSER_CHATTERBOX_TTS_SERVICE_URL,
             "health_endpoint": "/health",
-            "capabilities": ["tts", "voice_clone"],
+            "capabilities": ["tts", "voice_clone", "tts_stream"],
             "contracts": {
                 "tts": "simple-json-tts-v1",
                 "voice_clone": "voice-clone-tts-v1",
+                # Sentence-chunked streaming: audio starts after the first
+                # chunk instead of after the whole text. The gateway routes
+                # here automatically when the contract key is present.
+                "tts_stream": "chunked-wav-stream-v1",
             },
             "settings": {
                 "defaults": {
@@ -796,6 +850,9 @@ def _build_provider_registry() -> dict:
             "browser_url": BROWSER_WHISPER_CPP_SERVICE_URL,
             "health_endpoint": "/",
             "capabilities": ["transcribe", "openai_compatible"],
+            # whisper.cpp auto-detects when language=auto is sent (which the
+            # gateway now always does), but exposes no separate LID route.
+            "language_detect": True,
             "contracts": {
                 "transcribe": "openai-audio-transcriptions-v1",
             },
@@ -1247,14 +1304,96 @@ async def _extract_form_payload(request: Request) -> tuple[dict, Optional[list[t
 _http_client: Optional[httpx.AsyncClient] = None
 _http_client_factory = None
 
+# Upstream uvicorn workers are started with --timeout-keep-alive 120; the client
+# expiry must stay <= that, or the pool hands out sockets the server has already
+# closed and every such request pays a silent retry.
+_KEEPALIVE_EXPIRY_S = float(os.getenv("UPSTREAM_KEEPALIVE_EXPIRY", "115"))
+_POOL_LIMITS = httpx.Limits(
+    max_connections=int(os.getenv("UPSTREAM_MAX_CONNECTIONS", "100")),
+    max_keepalive_connections=int(os.getenv("UPSTREAM_MAX_KEEPALIVE", "20")),
+    keepalive_expiry=_KEEPALIVE_EXPIRY_S,
+)
+
+
+# Health probes must stay well under the UI's refresh cadence; a slow backend
+# should show as unhealthy quickly rather than stalling the status row.
+PROVIDER_HEALTH_TIMEOUT_S = float(os.getenv("PROVIDER_HEALTH_TIMEOUT", "6"))
+
+
+def _timeout(read: float) -> httpx.Timeout:
+    """Per-phase timeouts.
+
+    A bare float applies the *whole* budget to each phase including connect, so a
+    600 s synthesis budget also meant a 600 s wait for a dead upstream. Connect
+    should fail fast; only the read phase needs the long budget.
+    """
+    return httpx.Timeout(connect=3.0, read=read, write=120.0, pool=10.0)
+
 
 def _get_http_client() -> httpx.AsyncClient:
     """Return the process-wide pooled AsyncClient (per-call timeouts are passed explicitly)."""
     global _http_client, _http_client_factory
     if _http_client is None or _http_client_factory is not httpx.AsyncClient:
-        _http_client = httpx.AsyncClient()
+        _http_client = httpx.AsyncClient(limits=_POOL_LIMITS)
         _http_client_factory = httpx.AsyncClient
     return _http_client
+
+
+async def _stream_upstream(
+    method: str,
+    url: str,
+    *,
+    display_name: str,
+    extra_headers: Optional[dict] = None,
+    read_timeout: float = 600.0,
+    **request_kwargs,
+) -> StreamingResponse:
+    """Proxy an upstream response body through without buffering it.
+
+    Reading `response.content` here would defeat the whole point of the
+    providers' sentence-streaming endpoints: the backend would stream, and the
+    gateway would sit on the bytes until the last one arrived. Instead the
+    upstream response is opened in streaming mode and its raw chunks are handed
+    straight to the client as they land.
+    """
+    client = _get_http_client()
+    req = client.build_request(method, url, timeout=_timeout(read_timeout), **request_kwargs)
+    try:
+        upstream = await client.send(req, stream=True)
+    except httpx.RequestError as exc:
+        raise _build_upstream_request_error(display_name, exc) from exc
+
+    if upstream.status_code >= 400:
+        # Error bodies are small: read it, close the connection, and report.
+        # The read itself can fail mid-body (upstream died while sending its
+        # error); that must still surface as a 502 with the provider named,
+        # not as an unhandled 500 from a raw httpx exception.
+        try:
+            await upstream.aread()
+        except httpx.RequestError as exc:
+            await upstream.aclose()
+            raise _build_upstream_request_error(display_name, exc) from exc
+        finally:
+            await upstream.aclose()
+        raise _build_error_from_response(upstream)
+
+    headers = {k: v for k, v in upstream.headers.items() if k.lower().startswith("x-")}
+    if extra_headers:
+        headers.update(extra_headers)
+    # Tell any intermediary not to buffer this, which would re-introduce the
+    # exact latency the streaming path exists to remove.
+    headers["Cache-Control"] = "no-cache"
+    headers["X-Accel-Buffering"] = "no"
+
+    return StreamingResponse(
+        upstream.aiter_raw(),
+        status_code=upstream.status_code,
+        media_type=upstream.headers.get("content-type", "audio/wav"),
+        headers=headers,
+        # Mandatory: the client is process-wide, so without this every streamed
+        # request leaks its pooled connection.
+        background=BackgroundTask(upstream.aclose),
+    )
 
 
 async def _provider_get(provider_id: str, path: str, timeout: float = 30.0) -> httpx.Response:
@@ -1289,6 +1428,29 @@ async def _provider_json_post(provider_id: str, path: str, payload: dict, timeou
     client = _get_http_client()
     try:
         response = await client.post(f"{provider['internal_url']}{path}", json=payload, timeout=timeout)
+    except httpx.RequestError as exc:
+        raise _build_upstream_request_error(provider.get("display_name", provider_id), exc) from exc
+    if response.status_code >= 400:
+        raise _build_error_from_response(response)
+    return response
+
+
+async def _provider_form_post_raw(provider_id: str, path: str, *, data: dict,
+                                  files: list, timeout: float = 300.0) -> httpx.Response:
+    """Multipart POST with an already-built payload.
+
+    `_provider_form_post` re-parses the incoming Request, which suits the
+    `/api/*` adapters that forward a browser form verbatim. The `/v1` router has
+    already translated the request into OpenAI-shaped fields, so it needs to
+    hand the payload over directly instead.
+    """
+    provider = _get_provider(provider_id)
+    client = _get_http_client()
+    try:
+        request_kwargs = {"data": data, "timeout": _timeout(timeout)}
+        if files:
+            request_kwargs["files"] = files
+        response = await client.post(f"{provider['internal_url']}{path}", **request_kwargs)
     except httpx.RequestError as exc:
         raise _build_upstream_request_error(provider.get("display_name", provider_id), exc) from exc
     if response.status_code >= 400:
@@ -1411,8 +1573,14 @@ async def _build_frontend_stt_payload(provider_id: str, form, contract: str) -> 
     if contract == "openai-audio-transcriptions-v1":
         files = [("file", (filename, content, content_type))]
         data["response_format"] = "json"
-        if language and language != "auto":
-            data["language"] = language
+        # Send "auto" EXPLICITLY rather than omitting the field. whisper.cpp's
+        # server defaults to `std::string language = "en"` and only overrides it
+        # when the form field is present, so omitting it here meant "auto"
+        # silently transcribed German audio as English on every whisper-cpp
+        # deployment. "auto" is an explicitly supported value there
+        # (`-l LANG ... 'auto' for auto-detect`, and it is special-cased in the
+        # server's language validation), so this restores real auto-detection.
+        data["language"] = language if language else "auto"
         backend_path = _get_provider(provider_id).get("transcribe_path") or "/v1/audio/transcriptions"
         return backend_path, data, files
 
@@ -1504,6 +1672,59 @@ async def health():
 async def providers():
     """Return the UI provider registry and provider contracts."""
     return PROVIDER_REGISTRY
+
+
+@app.get("/api/health")
+async def provider_health():
+    """Probe every provider's health endpoint concurrently.
+
+    The browser used to do this itself, one cross-origin request per provider,
+    sequentially — so a single unreachable backend stalled the whole status row
+    for its full timeout, and every backend port had to be reachable from the
+    browser just to render an indicator.
+
+    Doing it here means the browser makes one same-origin call, the probes run in
+    parallel, and the stack no longer needs its backend ports published.
+    """
+    client = _get_http_client()
+    providers_map = PROVIDER_REGISTRY.get("providers", {})
+
+    async def probe(provider_id: str, provider: dict) -> tuple[str, dict]:
+        url = f"{provider['internal_url']}{provider.get('health_endpoint', '/health')}"
+        started = time.monotonic()
+        try:
+            response = await client.get(url, timeout=_timeout(PROVIDER_HEALTH_TIMEOUT_S))
+            body = {}
+            try:
+                body = response.json()
+            except Exception:
+                pass
+            return provider_id, {
+                "healthy": response.status_code < 400,
+                "status_code": response.status_code,
+                "latency_ms": round((time.monotonic() - started) * 1000, 1),
+                # Surfacing these lets the UI show *why* a service is not ready
+                # instead of a bare red dot.
+                "model_loaded": body.get("model_loaded"),
+                # A service can be healthy with no model in memory once idle
+                # unloading is on. "idle" is not "down" — the next request
+                # loads it. Absent on providers that do not report residency.
+                "model_resident": body.get("model_resident"),
+                "model_size": body.get("model_size") or body.get("current_model"),
+                "device": body.get("device"),
+            }
+        except Exception as exc:
+            return provider_id, {
+                "healthy": False,
+                "status_code": None,
+                "latency_ms": round((time.monotonic() - started) * 1000, 1),
+                "error": type(exc).__name__,
+            }
+
+    results = await asyncio.gather(
+        *(probe(pid, p) for pid, p in providers_map.items() if p.get("internal_url"))
+    )
+    return {"providers": dict(results)}
 
 
 @app.get("/api/providers/{provider_id}/voices")
@@ -1692,6 +1913,103 @@ async def provider_voice_design(provider_id: str, request: ProviderVoiceDesignRe
     return Response(content=response.content, media_type=response.headers.get("content-type", "audio/wav"), headers=headers)
 
 
+@app.websocket("/ws/stt")
+async def frontend_ws_stt(websocket: WebSocket):
+    """Relay the live-transcription WebSocket to the STT provider.
+
+    Without this the browser has to dial the STT container's published port
+    directly. getUserMedia requires a secure context, so any real deployment is
+    HTTPS — and there a `ws://localhost:5001` handshake is hard-blocked as mixed
+    content. Behind single-port ingress that port is not routable at all.
+
+    Query string is forwarded, so ?provider=whisper selects the upstream.
+    """
+    import websockets
+
+    # Starlette's CORSMiddleware does not run on WebSocket routes, so the
+    # allow-list has to be enforced here or this endpoint is the one hole in an
+    # otherwise restricted deployment.
+    origin = websocket.headers.get("origin")
+    if "*" not in allowed_origins and origin and origin not in allowed_origins:
+        await websocket.close(code=1008)  # policy violation
+        return
+
+    provider_id = websocket.query_params.get("provider", "whisper")
+    try:
+        provider = _get_provider(provider_id, kind="stt")
+    except HTTPException as exc:
+        await websocket.close(code=1008, reason=str(exc.detail)[:120])
+        return
+
+    upstream_url = provider["internal_url"].replace("http://", "ws://").replace("https://", "wss://") + "/ws/transcribe"
+
+    await websocket.accept()
+    try:
+        async with websockets.connect(
+            upstream_url,
+            max_size=None,        # audio frames are not size-bounded by the protocol
+            ping_interval=20,
+            open_timeout=10,
+            # Forward the browser's origin so the STT service can apply its own
+            # allow-list; without it the upstream only ever sees no origin.
+            additional_headers={"Origin": origin} if origin else None,
+        ) as upstream:
+            async def client_to_upstream():
+                while True:
+                    message = await websocket.receive()
+                    if message.get("type") == "websocket.disconnect":
+                        return
+                    if message.get("bytes") is not None:
+                        await upstream.send(message["bytes"])
+                    elif message.get("text") is not None:
+                        await upstream.send(message["text"])
+
+            async def upstream_to_client():
+                async for message in upstream:
+                    if isinstance(message, bytes):
+                        await websocket.send_bytes(message)
+                    else:
+                        await websocket.send_text(message)
+
+            done, pending = await asyncio.wait(
+                [asyncio.create_task(client_to_upstream()),
+                 asyncio.create_task(upstream_to_client())],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            for task in done:
+                # Surface a relay-side failure rather than closing silently.
+                exc = task.exception()
+                if exc:
+                    raise exc
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        # The handshake with the browser already succeeded, so a plain close
+        # here would reach the page as a normal 1000 — no `error` event fires
+        # and the UI would keep claiming it is listening. Send an explicit
+        # error frame, which the client already knows how to render.
+        logger.warning(f"WebSocket relay to {provider_id} failed: {e}")
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "error": f"Live transcription unavailable: {provider_id} could not be reached.",
+            })
+        except Exception:
+            pass
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
+        return
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
 @app.post("/api/stt")
 async def frontend_stt(request: Request):
     """Transcribe audio through a normalized frontend STT adapter."""
@@ -1730,58 +2048,52 @@ async def frontend_tts(request: FrontendTTSRequest):
     if not request.text.strip():
         raise HTTPException(status_code=400, detail="Text not provided")
 
-    client = _get_http_client()
-    try:
-        if contract == "simple-json-tts-v1" and request.provider == "piper":
-            payload = {
-                "text": request.text,
-                "output_format": request.output_format,
-                "speed": request.speed if request.speed is not None else 1.0,
-            }
-            if request.voice:
-                payload["voice"] = request.voice
-            if request.language and request.language != "auto":
-                payload["language"] = request.language
-            if request.quality:
-                payload["quality"] = request.quality
-            if request.gender:
-                payload["gender"] = request.gender
+    if contract == "simple-json-tts-v1" and request.provider == "piper":
+        payload = {
+            "text": request.text,
+            "output_format": request.output_format,
+            "speed": request.speed if request.speed is not None else 1.0,
+        }
+        if request.voice:
+            payload["voice"] = request.voice
+        if request.language and request.language != "auto":
+            payload["language"] = request.language
+        if request.quality:
+            payload["quality"] = request.quality
+        if request.gender:
+            payload["gender"] = request.gender
+        read_timeout = 120.0
+    elif contract == "simple-json-tts-v1" and request.provider == "chatterbox":
+        payload = {
+            "text": request.text,
+            "language": request.language or "auto",
+        }
+        read_timeout = 300.0
+    elif contract == "simple-json-tts-v1" and request.provider == "qwen3":
+        payload = {
+            "text": request.text,
+            "lang": _normalize_qwen3_language(request.language),
+            "speaker": request.voice or "Vivian",
+            "instruct": request.instructions or "",
+        }
+        read_timeout = 120.0
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported TTS contract for provider {request.provider}")
 
-            response = await client.post(f"{provider['internal_url']}/tts", json=payload, timeout=120.0)
-        elif contract == "simple-json-tts-v1" and request.provider == "chatterbox":
-            payload = {
-                "text": request.text,
-                "language": request.language or "auto",
-            }
-            response = await client.post(f"{provider['internal_url']}/tts", json=payload, timeout=300.0)
-        elif contract == "simple-json-tts-v1" and request.provider == "qwen3":
-            payload = {
-                "text": request.text,
-                "lang": _normalize_qwen3_language(request.language),
-                "speaker": request.voice or "Vivian",
-                "instruct": request.instructions or "",
-            }
-            response = await client.post(f"{provider['internal_url']}/tts", json=payload, timeout=120.0)
-        else:
-            raise HTTPException(status_code=400, detail=f"Unsupported TTS contract for provider {request.provider}")
-    except httpx.RequestError as exc:
-        raise _build_upstream_request_error(provider.get("display_name", request.provider), exc) from exc
+    # Prefer the provider's chunked streaming endpoint when it declares one:
+    # time-to-first-audio then tracks the first sentence instead of the whole
+    # text. The body is proxied without buffering (see _stream_upstream) —
+    # buffering here would throw the entire benefit away.
+    path = "/tts-stream" if "tts_stream" in provider.get("contracts", {}) else "/tts"
 
-    if response.status_code >= 400:
-        detail = response.text
-        try:
-            detail = response.json().get("detail", detail)
-        except Exception:
-            pass
-        raise HTTPException(status_code=response.status_code, detail=detail)
-
-    passthrough_headers = {
-        key: value
-        for key, value in response.headers.items()
-        if key.lower().startswith("x-")
-    }
-    passthrough_headers["X-Provider"] = request.provider
-    return Response(content=response.content, media_type=response.headers.get("content-type", "audio/wav"), headers=passthrough_headers)
+    return await _stream_upstream(
+        "POST",
+        f"{provider['internal_url']}{path}",
+        display_name=provider.get("display_name", request.provider),
+        json=payload,
+        read_timeout=read_timeout,
+        extra_headers={"X-Provider": request.provider},
+    )
 
 
 @app.get("/api/training/deployment-targets")
@@ -1852,6 +2164,25 @@ async def frontend_training_cancel_job(job_id: str):
     """Cancel a training job through the frontend adapter."""
     response = await _proxy_training_delete(f"/job/{job_id}")
     return response.json()
+
+
+# --- OpenAI-compatible /v1 surface ------------------------------------------
+#
+# Mounted last so every helper it depends on is defined. Dependencies are passed
+# in rather than imported, so openai_router.py never imports this module and
+# there is no circular dependency.
+#
+# /api/* is unchanged and remains the browser contract; /v1/* is the surface
+# that lets an OpenAI client talk to any of the four devices identically.
+app.include_router(
+    build_openai_router(
+        get_provider=_get_provider,
+        registry=PROVIDER_REGISTRY,
+        post_form=_provider_form_post_raw,
+        post_json=_provider_json_post,
+        provider_health=provider_health,
+    )
+)
 
 
 if __name__ == "__main__":

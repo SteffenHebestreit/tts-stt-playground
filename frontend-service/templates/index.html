@@ -104,6 +104,7 @@
                     <span id="live-stt-confirmed"></span>
                     <span id="live-stt-pending" style="opacity: 0.55; font-style: italic;"></span>
                 </div>
+                <div id="live-stt-latency" style="margin-top: 6px; font-size: 0.8em; opacity: 0.6; font-variant-numeric: tabular-nums;"></div>
             </div>
         </div>
 
@@ -484,8 +485,10 @@
         window.QWEN3_TTS_SERVICE_URL = window.PROVIDER_REGISTRY.providers.qwen3?.browser_url || "{{ qwen3_tts_service_url }}";
         window.QWEN3_ASR_SERVICE_URL = window.PROVIDER_REGISTRY.providers['qwen3-asr']?.browser_url || "{{ qwen3_asr_service_url }}";
         window.WHISPER_CPP_SERVICE_URL = window.PROVIDER_REGISTRY.providers['whisper-cpp']?.browser_url || "{{ whisper_cpp_service_url }}";
+        // Used to cache-bust the audio worklet module, which app.js loads itself.
+        window.APP_VERSION = "{{ app_version }}";
     </script>
 
-    <script src="{{ url_for('static', path='/js/app.js') }}?v={{ app_version }}"></script>
+    <script defer src="{{ url_for('static', path='/js/app.js') }}?v={{ app_version }}"></script>
 </body>
 </html>

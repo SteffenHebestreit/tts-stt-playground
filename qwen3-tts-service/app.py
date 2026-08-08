@@ -12,6 +12,7 @@ import re
 import time
 import asyncio
 import subprocess
+import threading
 import tempfile
 import logging
 from contextlib import asynccontextmanager
@@ -34,12 +35,22 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
-    """Pre-load the model on startup so the first request is fast."""
+    """Pre-load the model on startup so the first request is fast.
+
+    The idle reaper then releases it if nothing uses it for TTS_MODEL_TTL
+    seconds, so an untouched service does not hold multiple GB forever on a
+    card it shares with the ASR stack.
+    """
     try:
         get_model()
+        _touch_model()
     except Exception as e:
         logger.warning(f"Could not preload model: {e}")
-    yield
+    reaper = asyncio.create_task(_idle_reaper())
+    try:
+        yield
+    finally:
+        reaper.cancel()
 
 
 app = FastAPI(
@@ -70,6 +81,124 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 tts_model = None
 model_loaded = False
 current_model_name = ""
+# What the operator asked for via /load_model. Distinct from
+# current_model_name (which is "" while a load is in flight): this is what
+# an idle-TTL reload must restore, otherwise unloading would silently revert
+# the user back to the env default.
+_desired_model_name = None
+
+# One process-global model on one GPU. Without this, requests dispatched onto the
+# default thread pool (min(32, cpu+4) workers) all enter the model at once and
+# multiply peak VRAM while making every individual request slower.
+_GEN_SEM = asyncio.Semaphore(max(1, int(os.getenv("TTS_MAX_CONCURRENCY", "1"))))
+# Serialises model switching against itself; generation is kept out by _GEN_SEM.
+_LOAD_LOCK = asyncio.Lock()
+
+
+# Idle unloading. This service cannot use the simple ModelSlot pattern because
+# the model identity can CHANGE at runtime via /load_model, so residency is
+# tracked here instead: a last-used timestamp, gated by an in-flight counter.
+# The counter is the safety property — a timestamp alone would happily free the
+# weights while a worker thread was still generating with them.
+#   >0 = seconds idle before unloading | 0 = unload as soon as idle | -1 = never
+MODEL_TTL = float(os.getenv("TTS_MODEL_TTL", os.getenv("MODEL_TTL", "300")))
+_inflight = 0
+_inflight_lock = threading.Lock()
+_last_used = time.monotonic()
+
+
+def _touch_model() -> None:
+    """Mark the model as used now, restarting its idle countdown."""
+    global _last_used
+    _last_used = time.monotonic()
+
+
+def _should_unload(now: Optional[float] = None) -> bool:
+    """Whether the idle model may be released right now.
+
+    Split out from the loop so the decision is testable without waiting on a
+    real sleep. The in-flight check is the safety property: a timestamp alone
+    would happily free weights a worker thread is still generating with.
+    """
+    if MODEL_TTL < 0:
+        return False
+    if tts_model is None:
+        return False
+    with _inflight_lock:
+        if _inflight > 0:
+            return False
+    elapsed = (now if now is not None else time.monotonic()) - _last_used
+    return elapsed >= MODEL_TTL
+
+
+def _reaper_tick_seconds() -> float:
+    """Poll interval: often enough to honour the TTL, rarely enough to be free."""
+    if MODEL_TTL <= 0:
+        return 5.0
+    return max(1.0, min(30.0, MODEL_TTL / 4))
+
+
+async def _idle_reaper() -> None:
+    """Unload the model once it has been idle for MODEL_TTL seconds."""
+    if MODEL_TTL < 0:
+        logger.info("Qwen3-TTS idle unloading disabled (TTS_MODEL_TTL=-1)")
+        return
+    while True:
+        await asyncio.sleep(_reaper_tick_seconds())
+        try:
+            if not _should_unload():
+                continue
+            # _LOAD_LOCK keeps this from racing a /load_model swap or a
+            # concurrent first-load in _acquire_model(). Re-check after taking
+            # it: a request may have arrived while we were waiting for the lock.
+            async with _LOAD_LOCK:
+                if _should_unload():
+                    await asyncio.to_thread(_unload_qwen3_tts)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("Idle reaper error: %s", e)
+
+
+def _unload_qwen3_tts() -> None:
+    """Drop the model and let the caching allocator return VRAM to the driver."""
+    global tts_model, model_loaded, current_model_name
+    if tts_model is None:
+        return
+    logger.info("Unloading Qwen3-TTS model '%s' (idle)", current_model_name)
+    tts_model = None
+    model_loaded = False
+    current_model_name = ""
+    gc.collect()
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
+
+async def _gen(fn, *args, **kwargs):
+    """Run a blocking model call off the event loop, bounded by _GEN_SEM.
+
+    Also marks the model as in use for the duration, so the idle reaper
+    cannot free the weights while a worker thread is generating with them.
+    """
+    global _inflight
+    async with _GEN_SEM:
+        with _inflight_lock:
+            _inflight += 1
+        try:
+            return await asyncio.to_thread(fn, *args, **kwargs)
+        finally:
+            with _inflight_lock:
+                _inflight -= 1
+            _touch_model()
+
+
+def _safe_header(value: str) -> str:
+    """Make a string safe to use as an HTTP header value.
+
+    Header values must be latin-1 encodable. Without this a non-latin-1
+    reference filename turned an already-completed generation into a 500.
+    """
+    return (value or "").encode("latin-1", "replace").decode("latin-1")
 
 # Available Qwen3-TTS model variants
 AVAILABLE_MODELS = {
@@ -161,18 +290,76 @@ def load_model(model_name=None):
 
 
 def get_model():
-    """Return the currently-loaded model, loading the default if needed."""
+    """Return the currently-loaded model, loading the default if needed.
+
+    Prefer ``_acquire_model()`` from request handlers — this variant cannot be
+    made safe against a concurrent model swap.
+    """
     if tts_model is None:
         return load_model()
     return tts_model
 
 
+async def _acquire_model():
+    """Return ``(model, model_name)`` as a single consistent snapshot.
+
+    Taking ``_LOAD_LOCK`` matters twice:
+
+    - ``load_model`` blanks ``tts_model`` before it starts loading the new
+      weights, so an unguarded ``get_model()`` landing in that window would
+      kick off a *second* concurrent ``from_pretrained`` — two multi-GB models
+      allocating at once, on the event loop.
+    - ``current_model_name`` is blanked in the same window. Reading it
+      separately made capability checks fail with a spurious
+      "does not support voice cloning" for the whole duration of a swap.
+
+    Note this reloads ``_desired_model_name``, not the env default: after the
+    idle TTL has unloaded a model the user explicitly switched to, reloading the
+    env default instead would silently revert their choice.
+    """
+    async with _LOAD_LOCK:
+        model = tts_model
+        if model is None:
+            model = await asyncio.to_thread(load_model, _desired_model_name)
+        return model, current_model_name
+
+
+@asynccontextmanager
+async def _acquire_all_gen_permits():
+    """Acquire every _GEN_SEM permit, so no generation can be in flight.
+
+    ``async with _GEN_SEM`` only takes one permit; with TTS_MAX_CONCURRENCY > 1
+    that would leave other generations running against a model being unloaded.
+    """
+    permits = max(1, int(os.getenv("TTS_MAX_CONCURRENCY", "1")))
+    acquired = 0
+    try:
+        for _ in range(permits):
+            await _GEN_SEM.acquire()
+            acquired += 1
+        yield
+    finally:
+        for _ in range(acquired):
+            _GEN_SEM.release()
+
+
 @app.get("/health")
 async def health():
-    """Basic liveness / readiness probe."""
+    """Liveness probe.
+
+    `model_resident: false` is NOT an error — the idle reaper released the
+    weights to free VRAM and the next request reloads them (restoring the
+    switched-to model, not the env default). A non-200 here would make an idle
+    container report unhealthy under Docker's `curl -f` check.
+    """
     return {
         "status": "ok",
         "model_loaded": model_loaded,
+        "model_resident": tts_model is not None,
+        "model_ttl_seconds": MODEL_TTL,
+        "active_requests": _inflight,
+        "current_model": current_model_name,
+        "desired_model": _desired_model_name,
         "device": device,
     }
 
@@ -226,8 +413,19 @@ async def switch_model(request: LoadModelRequest):
     if model_name == current_model_name:
         return {"status": "ok", "message": "Model already loaded", "model": model_name}
 
+    # A switch can mean a multi-GB download, so it runs off the event loop.
+    # _LOAD_LOCK excludes _acquire_model(), which is what every handler uses to
+    # read the model and its name together; draining _GEN_SEM entirely (not just
+    # taking one permit) makes sure no generation is still running against the
+    # model that is about to be unloaded, even with TTS_MAX_CONCURRENCY > 1.
     try:
-        load_model(model_name)
+        async with _acquire_all_gen_permits(), _LOAD_LOCK:
+            if model_name == current_model_name:
+                return {"status": "ok", "message": "Model already loaded", "model": model_name}
+            await asyncio.to_thread(load_model, model_name)
+            global _desired_model_name
+            _desired_model_name = model_name
+            _touch_model()
         return {
             "status": "ok",
             "message": f"Model switched to {model_name}",
@@ -248,9 +446,17 @@ async def list_speakers():
 
 
 def _cleanup_temp(path):
-    """Safely remove a temp file."""
-    if path and os.path.exists(path):
+    """Remove a temp file, never raising.
+
+    Called from `finally` blocks: an OSError escaping here replaced an already
+    successful audio response with a 500 and skipped the second temp file.
+    """
+    if not path:
+        return
+    try:
         os.unlink(path)
+    except OSError:
+        pass
 
 
 async def _auto_transcribe(audio_path: str, filename: str = "audio.wav") -> dict:
@@ -431,8 +637,6 @@ def _split_sentences(text: str) -> list[str]:
 
 def _generate_chunks(model, sentences: list[str], language: str, voice_clone_prompt, sample_rate: int = 24000) -> tuple[np.ndarray, int]:
     """Generate audio for sentences using batch mode for speed, then concatenate with gaps."""
-    gap = np.zeros(int(sample_rate * 0.15), dtype=np.float32)  # 150ms gap
-
     # Batch mode: generate all sentences at once (2x+ faster than sequential)
     prompt_item = voice_clone_prompt[0] if voice_clone_prompt else None
     prompts = [prompt_item] * len(sentences)
@@ -448,7 +652,10 @@ def _generate_chunks(model, sentences: list[str], language: str, voice_clone_pro
     elapsed = time.time() - start
     logger.info(f"  Batch generation done in {elapsed:.2f}s")
 
-    # Concatenate with gaps
+    # Concatenate with gaps. The gap is sized from the rate the model actually
+    # returned, not the 24000 default — a model at any other rate produced
+    # audibly wrong pauses.
+    gap = np.zeros(int((sr or sample_rate) * 0.15), dtype=np.float32)  # 150ms
     all_audio = []
     for i, wav in enumerate(wavs):
         all_audio.append(np.array(wav))
@@ -482,8 +689,8 @@ async def save_voice(
     try:
         # Ensure the model is loaded before checking capabilities, otherwise a
         # cold start (failed preload) reports a misleading capability error.
-        model = get_model()
-        model_info = AVAILABLE_MODELS.get(current_model_name, {})
+        model, model_name = await _acquire_model()
+        model_info = AVAILABLE_MODELS.get(model_name, {})
         if "voice_clone" not in model_info.get("capabilities", []):
             raise HTTPException(status_code=400, detail="Current model does not support voice cloning. Switch to a Base model.")
         start_time = time.time()
@@ -516,7 +723,7 @@ async def save_voice(
                 logger.info(f"Trimmed reference to {dur:.1f}s segment: '{segment_text[:60]}...'")
 
         # Extract speaker embedding (x_vector_only for fast TTS); off the event loop
-        prompt_items = await asyncio.to_thread(
+        prompt_items = await _gen(
             model.create_voice_clone_prompt,
             ref_audio=audio_path,
             x_vector_only_mode=True,
@@ -582,8 +789,8 @@ async def tts_with_saved_voice(
     try:
         # Load the model before the capability check so a cold start
         # (failed preload) doesn't report a misleading capability error.
-        model = get_model()
-        model_info = AVAILABLE_MODELS.get(current_model_name, {})
+        model, model_name = await _acquire_model()
+        model_info = AVAILABLE_MODELS.get(model_name, {})
         if "voice_clone" not in model_info.get("capabilities", []):
             raise HTTPException(status_code=400, detail="Current model does not support voice cloning. Switch to a Base model.")
         start_time = time.time()
@@ -592,9 +799,9 @@ async def tts_with_saved_voice(
         logger.info(f"Saved-voice TTS: {len(sentences)} chunks for voice={voice_id}")
 
         if len(sentences) > 1:
-            audio, sr = await asyncio.to_thread(_generate_chunks, model, sentences, lang, [prompt_item])
+            audio, sr = await _gen(_generate_chunks, model, sentences, lang, [prompt_item])
         else:
-            wavs, sr = await asyncio.to_thread(
+            wavs, sr = await _gen(
                 model.generate_voice_clone,
                 text=text,
                 language=lang,
@@ -612,9 +819,9 @@ async def tts_with_saved_voice(
         buffer.seek(0)
 
         del audio
-        if device == "cuda":
-            torch.cuda.empty_cache()
-        gc.collect()
+        # No empty_cache()/gc.collect() here: on a response path they force a
+        # device synchronise plus a full gen-2 GC, and discarding the caching
+        # allocator makes the *next* generation re-pay cudaMalloc.
 
         return StreamingResponse(
             buffer,
@@ -650,15 +857,15 @@ async def text_to_speech(request: TTSRequest):
         raise HTTPException(status_code=400, detail="Text not provided")
 
     try:
-        model = get_model()
+        model, model_name = await _acquire_model()
         start_time = time.time()
 
         # Route on declared capabilities: Base models expose a
         # generate_custom_voice attribute but raise when it is called,
         # so hasattr() alone picks the wrong path.
-        model_info = AVAILABLE_MODELS.get(current_model_name, {})
+        model_info = AVAILABLE_MODELS.get(model_name, {})
         if "custom_voice" in model_info.get("capabilities", []) and hasattr(model, 'generate_custom_voice'):
-            wavs, sr = await asyncio.to_thread(
+            wavs, sr = await _gen(
                 model.generate_custom_voice,
                 text=request.text,
                 language=request.lang,
@@ -670,7 +877,7 @@ async def text_to_speech(request: TTSRequest):
             # cloning for library versions that support it, but translate the
             # (likely) failure into actionable guidance instead of a raw 500.
             try:
-                wavs, sr = await asyncio.to_thread(
+                wavs, sr = await _gen(
                     model.generate_voice_clone,
                     text=request.text,
                     language=request.lang,
@@ -678,7 +885,7 @@ async def text_to_speech(request: TTSRequest):
                     ref_text="",
                 )
             except Exception as fallback_err:
-                model_info = AVAILABLE_MODELS.get(current_model_name, {})
+                model_info = AVAILABLE_MODELS.get(model_name, {})
                 raise HTTPException(
                     status_code=400,
                     detail=(
@@ -698,9 +905,9 @@ async def text_to_speech(request: TTSRequest):
 
         # Memory cleanup
         del wavs
-        if device == "cuda":
-            torch.cuda.empty_cache()
-        gc.collect()
+        # No empty_cache()/gc.collect() here: on a response path they force a
+        # device synchronise plus a full gen-2 GC, and discarding the caching
+        # allocator makes the *next* generation re-pay cudaMalloc.
 
         return StreamingResponse(
             buffer,
@@ -734,9 +941,9 @@ async def clone_voice(
 
     tmp_path = None
     try:
-        model = get_model()
+        model, model_name = await _acquire_model()
 
-        model_info = AVAILABLE_MODELS.get(current_model_name, {})
+        model_info = AVAILABLE_MODELS.get(model_name, {})
         capabilities = model_info.get("capabilities", [])
         if "voice_clone" not in capabilities:
             raise HTTPException(
@@ -755,15 +962,14 @@ async def clone_voice(
 
         logger.info(f"Voice clone request: text='{text[:50]}...', lang={lang}, ref={file.filename}")
 
-        # Auto-transcribe the reference audio using Qwen3-ASR
-        asr_result = await _auto_transcribe(tmp_path, file.filename or "reference.wav")
-        ref_text = asr_result.get("text", "").strip() if asr_result else ""
-        if not ref_text:
-            logger.info("Auto-transcription returned empty, trying clone without ref_text")
+        # NOTE: this path deliberately does *not* auto-transcribe the reference.
+        # It clones via `x_vector_only_mode=True` (speaker embedding only), which
+        # never consumes a reference transcript — the previous full Qwen3-ASR-1.7B
+        # round trip produced a string that was then never read.
 
         # Extract speaker embedding first (fast), then use it for chunked generation
         try:
-            prompt_items = await asyncio.to_thread(
+            prompt_items = await _gen(
                 model.create_voice_clone_prompt,
                 ref_audio=tmp_path,
                 x_vector_only_mode=True,
@@ -785,9 +991,9 @@ async def clone_voice(
 
         try:
             if len(sentences) > 1:
-                audio, sr = await asyncio.to_thread(_generate_chunks, model, sentences, lang, [prompt_item])
+                audio, sr = await _gen(_generate_chunks, model, sentences, lang, [prompt_item])
             else:
-                wavs, sr = await asyncio.to_thread(
+                wavs, sr = await _gen(
                     model.generate_voice_clone,
                     text=text,
                     language=lang,
@@ -816,9 +1022,9 @@ async def clone_voice(
 
         # Cleanup
         del audio
-        if device == "cuda":
-            torch.cuda.empty_cache()
-        gc.collect()
+        # No empty_cache()/gc.collect() here: on a response path they force a
+        # device synchronise plus a full gen-2 GC, and discarding the caching
+        # allocator makes the *next* generation re-pay cudaMalloc.
 
         return StreamingResponse(
             buffer,
@@ -826,7 +1032,9 @@ async def clone_voice(
             headers={
                 "X-Generation-Time": f"{generation_time:.3f}",
                 "X-Audio-Duration": f"{audio_duration:.3f}",
-                "X-Clone-Source": file.filename or "unknown",
+                # Header values must be latin-1 encodable; an umlaut in the
+                # reference filename used to turn a finished clone into a 500.
+                "X-Clone-Source": _safe_header(file.filename or "unknown"),
                 "X-Language": lang,
             },
         )
@@ -858,7 +1066,7 @@ async def clone_voice_with_ref_text(
 
     tmp_path = None
     try:
-        model = get_model()
+        model, model_name = await _acquire_model()
         start_time = time.time()
 
         suffix = Path(file.filename).suffix if file.filename else ".wav"
@@ -867,7 +1075,7 @@ async def clone_voice_with_ref_text(
             tmp.write(content)
             tmp_path = tmp.name
 
-        wavs, sr = await asyncio.to_thread(
+        wavs, sr = await _gen(
             model.generate_voice_clone,
             text=text,
             language=lang,
@@ -883,9 +1091,9 @@ async def clone_voice_with_ref_text(
         buffer.seek(0)
 
         del wavs
-        if device == "cuda":
-            torch.cuda.empty_cache()
-        gc.collect()
+        # No empty_cache()/gc.collect() here: on a response path they force a
+        # device synchronise plus a full gen-2 GC, and discarding the caching
+        # allocator makes the *next* generation re-pay cudaMalloc.
 
         return StreamingResponse(
             buffer,
@@ -926,11 +1134,11 @@ async def voice_design(request: VoiceDesignRequest):
         raise HTTPException(status_code=400, detail="Voice description not provided")
 
     try:
-        model = get_model()
+        model, model_name = await _acquire_model()
         start_time = time.time()
 
         if hasattr(model, 'generate_voice_design'):
-            wavs, sr = await asyncio.to_thread(
+            wavs, sr = await _gen(
                 model.generate_voice_design,
                 text=request.text,
                 language=request.lang,
@@ -950,9 +1158,9 @@ async def voice_design(request: VoiceDesignRequest):
         buffer.seek(0)
 
         del wavs
-        if device == "cuda":
-            torch.cuda.empty_cache()
-        gc.collect()
+        # No empty_cache()/gc.collect() here: on a response path they force a
+        # device synchronise plus a full gen-2 GC, and discarding the caching
+        # allocator makes the *next* generation re-pay cudaMalloc.
 
         return StreamingResponse(
             buffer,
@@ -960,8 +1168,7 @@ async def voice_design(request: VoiceDesignRequest):
             headers={
                 "X-Generation-Time": f"{generation_time:.3f}",
                 "X-Language": request.lang,
-                # HTTP header values must be latin-1 encodable; drop other chars
-                "X-Voice-Description": request.voice_description[:100].encode("ascii", "replace").decode("ascii"),
+                "X-Voice-Description": _safe_header(request.voice_description[:100]),
             },
         )
 

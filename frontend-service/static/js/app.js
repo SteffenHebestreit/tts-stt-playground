@@ -56,10 +56,6 @@ function getProviderContract(providerId, contractName) {
     return getProvider(providerId)?.contracts?.[contractName] || null;
 }
 
-function getProviderHealthEndpoint(providerId) {
-    return getProvider(providerId)?.health_endpoint || '/health';
-}
-
 function getProviderApiPath(providerId, path) {
     return `/api/providers/${providerId}${path}`;
 }
@@ -703,33 +699,54 @@ function setupRangeSliders() {
 // Service Health Checks
 // ============================================================
 
-/** Poll each backend health endpoint and update its status indicator. */
+/**
+ * Refresh every backend status indicator from one same-origin call.
+ *
+ * The gateway probes the providers concurrently over the internal Docker
+ * network. Doing it here in the browser meant one cross-origin request per
+ * provider, issued sequentially — a single unreachable backend stalled the whole
+ * row for its full timeout — and it forced every backend port to be published
+ * just so the browser could reach it.
+ */
 async function checkServiceHealth() {
-    const services = Object.entries(providerRegistry.providers || {})
+    const ids = Object.entries(providerRegistry.providers || {})
         .filter(([, provider]) => provider.ui?.show_status)
-        .map(([providerId, provider]) => ({
-            providerId,
-            url: provider.browser_url,
-            healthEndpoint: getProviderHealthEndpoint(providerId),
-        }));
+        .map(([providerId]) => providerId);
 
-    for (const service of services) {
-        const element = document.getElementById(`service-status-${service.providerId}`);
+    const elements = new Map();
+    for (const providerId of ids) {
+        const element = document.getElementById(`service-status-${providerId}`);
         if (!element) continue;
-
+        elements.set(providerId, element);
         element.classList.remove('healthy', 'error');
         element.classList.add('loading');
+    }
+    if (!elements.size) return;
 
-        try {
-            const timeout = service.providerId === 'piper-training' ? 15000 : 5000;
-            const response = await fetch(`${service.url}${service.healthEndpoint}`, {
-                signal: AbortSignal.timeout(timeout)
-            });
-            element.classList.remove('loading');
-            element.classList.add(response.ok ? 'healthy' : 'error');
-        } catch {
-            element.classList.remove('loading');
-            element.classList.add('error');
+    let health = {};
+    try {
+        const response = await fetch('/api/health', { signal: AbortSignal.timeout(15000) });
+        if (response.ok) health = (await response.json()).providers || {};
+    } catch {
+        // Leave `health` empty: every indicator falls through to 'error' below.
+    }
+
+    for (const [providerId, element] of elements) {
+        const entry = health[providerId];
+        element.classList.remove('loading');
+        element.classList.add(entry && entry.healthy ? 'healthy' : 'error');
+        if (entry) {
+            const detail = [entry.model_size, entry.device].filter(Boolean).join(' · ');
+            if (!entry.healthy) {
+                element.title = `unavailable${entry.error ? ` (${entry.error})` : ''}`;
+            } else if (entry.model_resident === false) {
+                // Healthy but idle: the model was unloaded to free memory and
+                // the next request will reload it. Not an error state.
+                element.classList.add('idle');
+                element.title = `idle — model unloaded to free memory${detail ? ` (${detail})` : ''}`;
+            } else {
+                element.title = `ready${detail ? ` (${detail})` : ''} — ${entry.latency_ms} ms`;
+            }
         }
     }
 }
@@ -775,6 +792,32 @@ function formatTimestamp(value) {
 function toggleRefText() {
     const checked = document.getElementById('enable-ref-text').checked;
     document.getElementById('ref-text-group').style.display = checked ? '' : 'none';
+}
+
+// Object URLs live until explicitly revoked. Keyed on the container element so
+// that replacing a player — including when refreshCustomVoices() rebuilds the
+// containers wholesale — releases the blob the old player was holding.
+const _playerUrls = new WeakMap();
+
+/**
+ * Render an <audio> player for `blob` inside `container`, releasing whatever
+ * blob the previous player in that container was holding.
+ *
+ * `autoplay` matters for perceived latency: without it every synthesis result
+ * waits on a human noticing the player and clicking it, which dwarfs anything
+ * the backend can save.
+ */
+function setAudioPlayer(container, blob, extraStyle = '') {
+    if (!container) return null;
+    const previous = _playerUrls.get(container);
+    if (previous) URL.revokeObjectURL(previous);
+
+    const url = URL.createObjectURL(blob);
+    _playerUrls.set(container, url);
+    container.innerHTML =
+        `<audio controls autoplay preload="auto" style="width: 100%;${extraStyle}">` +
+        `<source src="${url}" type="${blob.type || 'audio/wav'}"></audio>`;
+    return url;
 }
 
 // ============================================================
@@ -830,14 +873,7 @@ async function generateTTS() {
             throw new Error(errorData.detail || `TTS generation failed: ${response.statusText}`);
         }
 
-        const blob = await response.blob();
-        const audioUrl = URL.createObjectURL(blob);
-
-        audioPlayer.innerHTML = `
-            <audio controls style="width: 100%;">
-                <source src="${audioUrl}" type="audio/wav">
-            </audio>
-        `;
+        setAudioPlayer(audioPlayer, await response.blob());
 
         showStatus('tts-result-status', 'success', messages.success || 'Speech generated successfully!');
     } catch (error) {
@@ -955,9 +991,7 @@ async function testVoice(voiceId, lang = 'en') {
 
         if (!response.ok) throw new Error('Test generation failed');
 
-        const blob = await response.blob();
-        const audioUrl = URL.createObjectURL(blob);
-        playerDiv.innerHTML = `<audio controls autoplay style="width: 100%; margin-top: 8px;"><source src="${audioUrl}" type="audio/wav"></audio>`;
+        setAudioPlayer(playerDiv, await response.blob(), ' margin-top: 8px;');
     } catch (error) {
         playerDiv.innerHTML = `<div class="error" style="padding: 8px; font-size: 0.9rem;">${formatMessage(messages.test_error, { error: error.message }) || `Test failed: ${error.message}`}</div>`;
     }
@@ -1328,15 +1362,8 @@ async function generateQwen3BuiltinTTS() {
             throw new Error(errorData.detail || `Generation failed: ${response.statusText}`);
         }
 
-        const blob = await response.blob();
-        const audioUrl = URL.createObjectURL(blob);
         const duration = ((Date.now() - startTime) / 1000).toFixed(1);
-
-        audioPlayer.innerHTML = `
-            <audio controls autoplay style="width: 100%;">
-                <source src="${audioUrl}" type="audio/wav">
-            </audio>
-        `;
+        setAudioPlayer(audioPlayer, await response.blob());
 
         showStatus(
             'qwen3-builtin-status',
@@ -1429,17 +1456,10 @@ async function generateWithSavedVoice() {
             throw new Error(errorData.detail || `Generation failed: ${response.statusText}`);
         }
 
-        const blob = await response.blob();
-        const audioUrl = URL.createObjectURL(blob);
         const duration = ((Date.now() - startTime) / 1000).toFixed(1);
         const genTime = response.headers.get('X-Generation-Time');
         const audioDur = response.headers.get('X-Audio-Duration');
-
-        audioPlayer.innerHTML = `
-            <audio controls autoplay style="width: 100%;">
-                <source src="${audioUrl}" type="audio/wav">
-            </audio>
-        `;
+        setAudioPlayer(audioPlayer, await response.blob());
 
         const audioDuration = audioDur ? parseFloat(audioDur).toFixed(1) : null;
         const statusMsg = audioDuration
@@ -1531,15 +1551,8 @@ async function generateQwen3VoiceClone() {
             throw new Error(errorData.detail || `Voice cloning failed: ${response.statusText}`);
         }
 
-        const blob = await response.blob();
-        const audioUrl = URL.createObjectURL(blob);
         const duration = ((Date.now() - startTime) / 1000).toFixed(1);
-
-        audioPlayer.innerHTML = `
-            <audio controls autoplay style="width: 100%;">
-                <source src="${audioUrl}" type="audio/wav">
-            </audio>
-        `;
+        setAudioPlayer(audioPlayer, await response.blob());
 
         const msg = saveName
             ? (formatMessage(messages.success_with_save, { duration, name: saveName }) || `Voice cloning completed in ${duration}s (voice "${saveName}" saved for fast reuse)`)
@@ -1607,15 +1620,8 @@ async function generateQwen3VoiceDesign() {
             throw new Error(errorData.detail || `Voice design failed: ${response.statusText}`);
         }
 
-        const blob = await response.blob();
-        const audioUrl = URL.createObjectURL(blob);
         const duration = ((Date.now() - startTime) / 1000).toFixed(1);
-
-        audioPlayer.innerHTML = `
-            <audio controls autoplay style="width: 100%;">
-                <source src="${audioUrl}" type="audio/wav">
-            </audio>
-        `;
+        setAudioPlayer(audioPlayer, await response.blob());
 
         showStatus(
             'qwen3-generation-status',
@@ -1790,33 +1796,185 @@ async function processSTT() {
 // Live microphone transcription (WebSocket to the Whisper service)
 // ============================================================
 
+const LIVE_STT_SAMPLE_RATE = 16000;
+// ~4 s of PCM16 @ 16 kHz. Past this the network is not keeping up, and queueing
+// more only adds latency the user cannot see until they press Stop.
+const LIVE_STT_MAX_BUFFERED_BYTES = 131072;
+
 const liveSTT = {
     socket: null,
     audioContext: null,
     processor: null,
     source: null,
+    filter: null,
+    sink: null,
     mediaStream: null,
     active: false,
+    starting: false,
+    droppedFrames: 0,
+    worletWatchdog: null,
+    // Incremented on every start. Callbacks belonging to a retired socket
+    // compare against their captured value and bail out, so a late close from
+    // session N can no longer reset state that now belongs to session N+1.
+    generation: 0,
 };
 
-/** Resample a Float32 buffer to 16 kHz and encode as PCM16 little-endian. */
-function encodePCM16At16k(float32, inputRate) {
-    const targetRate = 16000;
-    let samples = float32;
-    if (inputRate !== targetRate) {
-        const ratio = inputRate / targetRate;
-        const outLength = Math.floor(float32.length / ratio);
-        samples = new Float32Array(outLength);
-        for (let i = 0; i < outLength; i++) {
-            samples[i] = float32[Math.floor(i * ratio)];
-        }
-    }
-    const pcm = new Int16Array(samples.length);
-    for (let i = 0; i < samples.length; i++) {
-        const s = Math.max(-1, Math.min(1, samples[i]));
+/** Encode a Float32 buffer already at 16 kHz as PCM16 little-endian. */
+function encodePCM16(float32) {
+    const pcm = new Int16Array(float32.length);
+    for (let i = 0; i < float32.length; i++) {
+        const s = Math.max(-1, Math.min(1, float32[i]));
         pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
     }
     return pcm.buffer;
+}
+
+/**
+ * Create an AudioContext locked to 16 kHz so the browser's own (properly
+ * filtered) resampler does the rate conversion.
+ *
+ * The previous code resampled by picking every n-th sample with no anti-alias
+ * filter, which folded everything above 8 kHz back into the speech band and
+ * cost real accuracy. Returns {context, needsFallbackFilter}.
+ */
+function createCaptureContext() {
+    const Ctor = window.AudioContext || window.webkitAudioContext;
+    try {
+        const context = new Ctor({ sampleRate: LIVE_STT_SAMPLE_RATE, latencyHint: 'interactive' });
+        if (context.sampleRate === LIVE_STT_SAMPLE_RATE) {
+            return { context, needsFallbackFilter: false };
+        }
+        // Safari historically ignores the hint; fall through to the filtered path.
+        try { context.close(); } catch { /* noop */ }
+    } catch {
+        // NotSupportedError on browsers that cannot honour an explicit rate.
+    }
+    return { context: new Ctor({ latencyHint: 'interactive' }), needsFallbackFilter: true };
+}
+
+/** Decimate to 16 kHz. Only used when the context rate could not be forced. */
+function decimateTo16k(float32, inputRate) {
+    if (inputRate === LIVE_STT_SAMPLE_RATE) return float32;
+    const ratio = inputRate / LIVE_STT_SAMPLE_RATE;
+    const outLength = Math.floor(float32.length / ratio);
+    const out = new Float32Array(outLength);
+    for (let i = 0; i < outLength; i++) {
+        out[i] = float32[Math.floor(i * ratio)];
+    }
+    return out;
+}
+
+/** Send one PCM block, dropping it if the socket is already backed up. */
+function sendLiveAudio(socket, buffer) {
+    if (socket.readyState !== WebSocket.OPEN) return;
+    if (socket.bufferedAmount > LIVE_STT_MAX_BUFFERED_BYTES) {
+        // The network is not keeping up. Queueing more would only add latency
+        // the user cannot see until they press Stop, so drop instead.
+        liveSTT.droppedFrames++;
+        return;
+    }
+    socket.send(buffer);
+}
+
+/** Build the capture graph, preferring an AudioWorklet over the main thread. */
+async function startCapture(socket) {
+    const { context, needsFallbackFilter } = createCaptureContext();
+    liveSTT.audioContext = context;
+    // Autoplay policy can hand back a suspended context.
+    if (context.state === 'suspended') {
+        try { await context.resume(); } catch { /* noop */ }
+    }
+    liveSTT.source = context.createMediaStreamSource(liveSTT.mediaStream);
+
+    let head = liveSTT.source;
+    if (needsFallbackFilter) {
+        // Band-limit below the 8 kHz Nyquist of the target rate before decimating.
+        liveSTT.filter = context.createBiquadFilter();
+        liveSTT.filter.type = 'lowpass';
+        liveSTT.filter.frequency.value = 7500;
+        liveSTT.source.connect(liveSTT.filter);
+        head = liveSTT.filter;
+    }
+
+    // Preferred path: capture on the audio rendering thread, where main-thread
+    // work (rendering partials, layout, GC) cannot drop frames.
+    if (!needsFallbackFilter && context.audioWorklet) {
+        try {
+            await context.audioWorklet.addModule(`/static/js/mic-worklet.js?v=${window.APP_VERSION || '1'}`);
+            // numberOfOutputs: 1 routed through a muted gain node to the
+            // destination, exactly like the ScriptProcessor path below. A
+            // zero-output node is only rendered if the browser keeps it in the
+            // graph, and that behaviour is not reliable across engines — if it
+            // is skipped, process() never runs and the session silently sends
+            // no audio at all with no error to fall back on.
+            const node = new AudioWorkletNode(context, 'mic-capture', {
+                numberOfInputs: 1,
+                numberOfOutputs: 1,
+                outputChannelCount: [1],
+                processorOptions: { sampleRate: LIVE_STT_SAMPLE_RATE },
+            });
+            let gotAudio = false;
+            node.port.onmessage = (event) => {
+                if (event.data && event.data.type === 'error') {
+                    console.warn('mic-worklet:', event.data.message);
+                    return;
+                }
+                gotAudio = true;
+                sendLiveAudio(socket, event.data);
+            };
+            head.connect(node);
+            const sink = context.createGain();
+            sink.gain.value = 0;
+            node.connect(sink);
+            sink.connect(context.destination);
+            liveSTT.processor = node;
+            liveSTT.sink = sink;
+
+            // Belt and braces: if the worklet is never pulled, fall back rather
+            // than leaving the user with a permanently silent session.
+            liveSTT.worletWatchdog = setTimeout(() => {
+                if (!gotAudio && liveSTT.processor === node) {
+                    console.warn('AudioWorklet produced no audio; falling back to ScriptProcessor');
+                    try { node.disconnect(); } catch { /* noop */ }
+                    try { sink.disconnect(); } catch { /* noop */ }
+                    liveSTT.processor = null;
+                    liveSTT.sink = null;
+                    attachScriptProcessor(context, head, socket);
+                }
+            }, 2000);
+            return;
+        } catch (err) {
+            console.warn('AudioWorklet unavailable, falling back to ScriptProcessor:', err);
+        }
+    }
+
+    attachScriptProcessor(context, head, socket);
+}
+
+/**
+ * Fallback capture path: ScriptProcessorNode.
+ *
+ * Deprecated and main-thread, but universally supported. 1024 frames @ 16 kHz
+ * is 64 ms of granularity (the old 4096 @ 48 kHz was 85 ms and ran on the main
+ * thread regardless).
+ */
+function attachScriptProcessor(context, head, socket) {
+    const bufferSize = context.sampleRate === LIVE_STT_SAMPLE_RATE ? 1024 : 4096;
+    const processor = context.createScriptProcessor(bufferSize, 1, 1);
+    processor.onaudioprocess = (event) => {
+        const float32 = event.inputBuffer.getChannelData(0);
+        sendLiveAudio(socket, encodePCM16(decimateTo16k(float32, context.sampleRate)));
+    };
+    head.connect(processor);
+    // A ScriptProcessor only fires while it is part of a rendering graph, but
+    // routing it to the speakers would be a feedback path. A muted gain node
+    // keeps it pulling without making a sound.
+    const sink = context.createGain();
+    sink.gain.value = 0;
+    processor.connect(sink);
+    sink.connect(context.destination);
+    liveSTT.processor = processor;
+    liveSTT.sink = sink;
 }
 
 /** Start or stop the live microphone transcription session. */
@@ -1825,56 +1983,89 @@ async function toggleLiveTranscription() {
         stopLiveTranscription();
         return;
     }
+    // `active` is only set once the socket opens, two awaits later — without a
+    // synchronous guard a double-click strands a mic stream, an AudioContext
+    // and a socket that keeps decoding forever.
+    if (liveSTT.starting) return;
+    liveSTT.starting = true;
+    const session = ++liveSTT.generation;
 
     const button = document.getElementById('live-stt-button');
     const transcript = document.getElementById('live-stt-transcript');
     const confirmedEl = document.getElementById('live-stt-confirmed');
     const pendingEl = document.getElementById('live-stt-pending');
+    if (button) button.disabled = true;
 
-    // The streaming endpoint lives on the Whisper service
-    const whisperUrl = getProviderUrl('whisper');
-    if (!whisperUrl) {
-        showStatus('live-stt-status', 'error', 'Whisper service URL not configured.');
-        return;
-    }
-    const wsUrl = whisperUrl.replace(/^http/, 'ws') + '/ws/transcribe';
+    // Only the current session may clear the guard. The previous socket stays
+    // open after Stop so the server can deliver its final transcript, and its
+    // close can land *after* a new session has already started.
+    const release = () => {
+        if (liveSTT.generation !== session) return;
+        liveSTT.starting = false;
+        if (button) button.disabled = false;
+    };
+
+    // Go through the same-origin relay rather than dialling the STT container's
+    // published port. getUserMedia needs a secure context, and under HTTPS a
+    // ws:// handshake to another port is blocked as mixed content; behind
+    // single-port ingress that port is not reachable at all.
+    const wsScheme = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    const wsUrl = `${wsScheme}://${window.location.host}/ws/stt?provider=whisper`;
 
     try {
         liveSTT.mediaStream = await navigator.mediaDevices.getUserMedia({
-            audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+            audio: {
+                channelCount: 1,
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true,
+            },
         });
     } catch (err) {
         showStatus('live-stt-status', 'error', `Microphone access denied: ${err.message}`);
+        release();
         return;
     }
 
     confirmedEl.textContent = '';
     pendingEl.textContent = '';
     transcript.style.display = '';
+    liveSTT.droppedFrames = 0;
     showStatus('live-stt-status', 'info', 'Connecting...');
 
     const socket = new WebSocket(wsUrl);
+    socket.binaryType = 'arraybuffer';
     liveSTT.socket = socket;
+    // Distinguishes "server delivered the final transcript and closed" from
+    // "the connection died", which look identical at the onclose callback.
+    let sawFinal = false;
 
-    socket.onopen = () => {
+    socket.onopen = async () => {
+        if (liveSTT.generation !== session) return;
         const language = document.getElementById('stt-language')?.value || 'auto';
         socket.send(JSON.stringify({ language: language || 'auto' }));
 
-        liveSTT.audioContext = new (window.AudioContext || window.webkitAudioContext)();
-        liveSTT.source = liveSTT.audioContext.createMediaStreamSource(liveSTT.mediaStream);
-        // ScriptProcessorNode is deprecated but universally supported and
-        // sufficient for 16 kHz mono capture without a worklet file.
-        liveSTT.processor = liveSTT.audioContext.createScriptProcessor(4096, 1, 1);
-        liveSTT.processor.onaudioprocess = (event) => {
-            if (socket.readyState === WebSocket.OPEN) {
-                const float32 = event.inputBuffer.getChannelData(0);
-                socket.send(encodePCM16At16k(float32, liveSTT.audioContext.sampleRate));
-            }
-        };
-        liveSTT.source.connect(liveSTT.processor);
-        liveSTT.processor.connect(liveSTT.audioContext.destination);
+        try {
+            await startCapture(socket);
+        } catch (err) {
+            showStatus('live-stt-status', 'error', `Could not start capture: ${err.message}`);
+            release();
+            stopLiveTranscription(true);
+            return;
+        }
+
+        // startCapture awaits (worklet module fetch), so the server may have
+        // rejected and closed us in the meantime — e.g. "too many live
+        // sessions". Publishing "Listening..." then would leave the microphone
+        // hot on a dead socket.
+        if (liveSTT.generation !== session || socket.readyState !== WebSocket.OPEN) {
+            release();
+            stopLiveTranscription(true);
+            return;
+        }
 
         liveSTT.active = true;
+        release();
         button.textContent = 'Stop Live Transcription';
         showStatus('live-stt-status', 'info', 'Listening... speak into your microphone.');
     };
@@ -1887,31 +2078,62 @@ async function toggleLiveTranscription() {
             return;
         }
         if (message.type === 'partial') {
+            // Read scroll state before writing — afterwards scrollHeight has
+            // already changed and "was the user at the bottom" is unanswerable.
+            const atBottom = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 40;
             confirmedEl.textContent = message.confirmed ? message.confirmed + ' ' : '';
             pendingEl.textContent = message.pending || '';
+            if (atBottom) transcript.scrollTop = transcript.scrollHeight;
+            updateLiveLatency(message);
         } else if (message.type === 'final') {
+            sawFinal = true;
             confirmedEl.textContent = message.text || '';
             pendingEl.textContent = '';
+            transcript.scrollTop = transcript.scrollHeight;
+            const dropped = liveSTT.droppedFrames
+                ? ` — ${liveSTT.droppedFrames} audio blocks dropped (slow connection)` : '';
             showStatus(
                 'live-stt-status',
                 'success',
-                `Final transcript ready (${escapeHtml(message.language || 'unknown')}, ${message.duration}s of audio).`
+                `Final transcript ready (${escapeHtml(message.language || 'unknown')}, ${message.duration}s of audio)${dropped}.`
             );
+        } else if (message.type === 'warning') {
+            showStatus('live-stt-status', 'info', escapeHtml(message.message || 'Warning'));
         } else if (message.type === 'error') {
             showStatus('live-stt-status', 'error', escapeHtml(message.error || 'Streaming error'));
         }
     };
 
     socket.onerror = () => {
+        if (liveSTT.generation !== session) return;
         showStatus('live-stt-status', 'error', 'WebSocket connection failed. Is the Whisper service reachable?');
+        release();
         stopLiveTranscription(true);
     };
 
     socket.onclose = () => {
+        if (liveSTT.generation !== session) return;
+        release();
         if (liveSTT.active) {
+            // Closed without us asking: the relay could not reach the STT
+            // service, or it went away mid-session. Say so — the status
+            // otherwise keeps claiming "Listening..." on a dead socket.
+            if (!sawFinal) {
+                showStatus('live-stt-status', 'error', 'Live transcription connection lost.');
+            }
             stopLiveTranscription(true);
         }
     };
+}
+
+/** Surface the server's decode timings so latency is visible, not guessed. */
+function updateLiveLatency(message) {
+    const el = document.getElementById('live-stt-latency');
+    if (!el || message.decode_ms === undefined) return;
+    const parts = [`decode ${Math.round(message.decode_ms)} ms`];
+    if (message.pending_seconds) parts.push(`${message.pending_seconds.toFixed(1)} s behind`);
+    if (liveSTT.droppedFrames) parts.push(`${liveSTT.droppedFrames} dropped`);
+    el.textContent = parts.join(' · ');
 }
 
 /** Tear down the microphone capture chain and (optionally) the socket. */
@@ -1919,7 +2141,15 @@ function stopLiveTranscription(skipStopMessage = false) {
     const button = document.getElementById('live-stt-button');
     liveSTT.active = false;
 
-    if (liveSTT.processor) { try { liveSTT.processor.disconnect(); } catch { /* noop */ } liveSTT.processor = null; }
+    if (liveSTT.worletWatchdog) { clearTimeout(liveSTT.worletWatchdog); liveSTT.worletWatchdog = null; }
+    if (liveSTT.processor) {
+        try { liveSTT.processor.disconnect(); } catch { /* noop */ }
+        if (liveSTT.processor.port) liveSTT.processor.port.onmessage = null;
+        liveSTT.processor.onaudioprocess = null;
+        liveSTT.processor = null;
+    }
+    if (liveSTT.sink) { try { liveSTT.sink.disconnect(); } catch { /* noop */ } liveSTT.sink = null; }
+    if (liveSTT.filter) { try { liveSTT.filter.disconnect(); } catch { /* noop */ } liveSTT.filter = null; }
     if (liveSTT.source) { try { liveSTT.source.disconnect(); } catch { /* noop */ } liveSTT.source = null; }
     if (liveSTT.audioContext) { try { liveSTT.audioContext.close(); } catch { /* noop */ } liveSTT.audioContext = null; }
     if (liveSTT.mediaStream) {
@@ -1937,7 +2167,7 @@ function stopLiveTranscription(skipStopMessage = false) {
     }
     liveSTT.socket = null;
 
-    if (button) button.textContent = 'Start Live Transcription';
+    if (button) { button.textContent = 'Start Live Transcription'; button.disabled = false; }
 }
 
 /** Copy the current full transcription text to the clipboard. */

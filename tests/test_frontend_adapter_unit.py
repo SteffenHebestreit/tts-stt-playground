@@ -3,6 +3,7 @@
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 import os
+import sys
 
 import httpx
 import pytest
@@ -21,6 +22,10 @@ def frontend_module():
     previous_cwd = os.getcwd()
     previous_enable_whisper_cpp = os.environ.get("ENABLE_WHISPER_CPP")
     previous_enable_parakeet_asr = os.environ.get("ENABLE_PARAKEET_ASR")
+    # app.py imports sibling modules (openai_router). Loading it by path does
+    # not put its directory on sys.path, so those imports must be made
+    # resolvable explicitly — chdir alone is not enough.
+    sys.path.insert(0, str(app_path.parent))
     try:
         os.environ["ENABLE_WHISPER_CPP"] = "true"
         os.environ["ENABLE_PARAKEET_ASR"] = "true"
@@ -28,6 +33,7 @@ def frontend_module():
         assert spec.loader is not None
         spec.loader.exec_module(module)
     finally:
+        sys.path.remove(str(app_path.parent))
         if previous_enable_whisper_cpp is None:
             os.environ.pop("ENABLE_WHISPER_CPP", None)
         else:
@@ -96,6 +102,33 @@ def test_stt_adapter_rejects_unknown_provider(frontend_test_client, test_audio_b
     assert response.status_code == 404
 
 
+class _StreamableResponse(httpx.Response):
+    """An httpx.Response that also satisfies the streaming-proxy interface.
+
+    The gateway proxies audio with `client.send(..., stream=True)` and forwards
+    `aiter_raw()`, so the doubles have to answer those as well as `.json()`.
+    Content is already fully materialised here, so it is handed over in one chunk.
+    """
+
+    async def aiter_raw(self, chunk_size=None):
+        yield self.content
+
+    async def aread(self):
+        return self.content
+
+    async def aclose(self):
+        return None
+
+
+class _MockRequest:
+    """What `build_request` hands back to `send` — just the captured call."""
+
+    def __init__(self, method, url, kwargs):
+        self.method = method
+        self.url = url
+        self.kwargs = kwargs
+
+
 class _MockAsyncClient:
     """Minimal async httpx client stub used by the adapter tests."""
 
@@ -107,6 +140,24 @@ class _MockAsyncClient:
 
     async def __aexit__(self, exc_type, exc, tb):
         return False
+
+    def build_request(self, method, url, **kwargs):
+        return _MockRequest(method, url, kwargs)
+
+    async def send(self, request, stream=False):
+        """Dispatch through get/post so subclass overrides still apply."""
+        kwargs = dict(request.kwargs)
+        kwargs.pop("timeout", None)
+        if request.method.upper() == "GET":
+            response = await self.get(request.url, timeout=None)
+        else:
+            response = await self.post(request.url, timeout=None, **kwargs)
+        return _StreamableResponse(
+            status_code=response.status_code,
+            headers=response.headers,
+            content=response.content,
+            request=response.request,
+        )
 
     async def get(self, url, timeout=None):
         if url.endswith('/deployment-targets'):
@@ -1076,3 +1127,64 @@ def test_health_is_lean(frontend_test_client):
     assert body['status'] == 'healthy'
     assert 'services' in body
     assert 'provider_registry' not in body
+
+# --- language forwarding across contracts ------------------------------------
+#
+# whisper.cpp's server defaults to `std::string language = "en"` and only
+# overrides it when the form field is PRESENT. So omitting the field on
+# language="auto" made auto-detect mean "English", silently transcribing German
+# audio as English on every whisper-cpp deployment (the ARM SBC and Strix Halo).
+# "auto" is an explicitly supported value there, so it must be sent through.
+
+
+class _Upload:
+    """Minimal stand-in for a Starlette UploadFile."""
+
+    filename = "a.wav"
+    content_type = "audio/wav"
+
+    async def read(self):
+        return b"RIFF"
+
+
+def _form(**kw):
+    form = {"audio": _Upload()}
+    form.update(kw)
+    return form
+
+
+def _build(frontend_module, contract, **kw):
+    import asyncio
+    return asyncio.run(
+        frontend_module._build_frontend_stt_payload("whisper-cpp", _form(**kw), contract)
+    )
+
+
+def test_openai_contract_sends_auto_language_explicitly(frontend_module):
+    """The regression: 'auto' must reach whisper.cpp, not be dropped."""
+    _path, data, _files = _build(frontend_module, "openai-audio-transcriptions-v1", language="auto")
+    assert data.get("language") == "auto", (
+        "language=auto was omitted; whisper.cpp would default to English and "
+        "silently mis-transcribe German audio"
+    )
+
+
+def test_openai_contract_defaults_to_auto_when_language_absent(frontend_module):
+    _path, data, _files = _build(frontend_module, "openai-audio-transcriptions-v1")
+    assert data.get("language") == "auto"
+
+
+def test_openai_contract_forwards_an_explicit_language(frontend_module):
+    _path, data, _files = _build(frontend_module, "openai-audio-transcriptions-v1", language="de")
+    assert data.get("language") == "de"
+
+
+def test_native_contract_still_omits_auto(frontend_module):
+    """stt-form-v1 backends auto-detect when the field is absent, and
+    faster-whisper rejects the literal string 'auto' — so this one must NOT
+    start sending it."""
+    _path, data, _files = _build(frontend_module, "stt-form-v1", language="auto")
+    assert "language" not in data
+
+    _path, data, _files = _build(frontend_module, "stt-form-v1", language="de")
+    assert data.get("language") == "de"

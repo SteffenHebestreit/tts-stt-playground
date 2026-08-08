@@ -4,3 +4,10 @@ jinja2==3.1.5
 python-multipart==0.0.20
 aiofiles==24.1.0
 httpx==0.28.1
+# Client side of the /ws/stt relay. uvicorn[standard] already pulls this in as
+# its WebSocket server implementation; declared explicitly because app.py
+# imports it directly rather than relying on that transitive dependency.
+# >=14 required: the relay passes `additional_headers=` to websockets.connect()
+# to forward the browser Origin upstream. That parameter was named
+# `extra_headers` before 14.0, so an older resolve would raise TypeError.
+websockets>=14.0

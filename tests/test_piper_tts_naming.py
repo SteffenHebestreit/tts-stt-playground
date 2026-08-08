@@ -127,3 +127,56 @@ def test_prune_disabled_when_retention_zero(tmp_path):
 
 def test_prune_missing_dir_is_safe():
     assert naming.prune_old_outputs("/no/such/dir", retention_hours=24) == 0
+
+
+# --- language matching / fallback detection ---------------------------------
+#
+# select_best_voice() degrades to an English voice when nothing serves the
+# requested language. That is deliberate (the service keeps working) but it means
+# a German request can return English audio with HTTP 200. language_matches() is
+# what lets the service detect and report that, so these lock the semantics down.
+
+
+def test_language_matches_on_base_tag():
+    assert naming.language_matches("de_DE", "de")
+    assert naming.language_matches("de_DE", "de_DE")
+    assert naming.language_matches("en_US", "en")
+    assert naming.language_matches("en_GB", "en_US")   # same base language
+
+
+def test_language_mismatch_is_detected():
+    assert not naming.language_matches("en_US", "de")
+    assert not naming.language_matches("de_DE", "fr")
+    assert not naming.language_matches("nl_NL", "de")  # near neighbours must not match
+
+
+def test_auto_or_empty_request_matches_anything():
+    """No specific language was asked for, so nothing was substituted."""
+    for req in ("auto", "AUTO", "", None):
+        assert naming.language_matches("de_DE", req)
+
+
+def test_language_matching_is_case_insensitive():
+    assert naming.language_matches("DE_DE", "de")
+    assert naming.language_matches("de_DE", "DE")
+
+
+def test_english_fallback_is_reported_as_a_mismatch():
+    """The exact silent-failure case: a German request served by the hardcoded
+    en_US default must be detectable by the service."""
+    voices = {
+        "en_US-lessac-medium": _voice("en_US", "medium"),
+    }
+    chosen = naming.select_best_voice(voices, "de", "medium")
+    assert chosen == "en_US-lessac-medium"          # the fallback happened
+    assert not naming.language_matches(voices[chosen].language, "de")  # and is visible
+
+
+def test_german_request_served_by_german_voice_is_not_a_mismatch():
+    voices = {
+        "en_US-lessac-medium": _voice("en_US", "medium"),
+        "de_DE-thorsten-medium": _voice("de_DE", "medium"),
+    }
+    chosen = naming.select_best_voice(voices, "de", "medium")
+    assert chosen == "de_DE-thorsten-medium"
+    assert naming.language_matches(voices[chosen].language, "de")

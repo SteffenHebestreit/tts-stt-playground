@@ -52,6 +52,18 @@ def select_best_voice(all_voices: dict, language: str, quality: str, gender: Opt
     return preferred[0][0]
 
 
+def language_matches(voice_language: str, requested_language: str) -> bool:
+    """True if *voice_language* serves *requested_language* (base-tag comparison).
+
+    ``de`` matches ``de_DE``; ``en`` matches ``en_US`` and ``en_GB``. An empty or
+    ``auto`` request matches anything, since no specific language was asked for.
+    """
+    requested = (requested_language or "").strip().lower()
+    if not requested or requested == "auto":
+        return True
+    return (voice_language or "").lower().split("_")[0] == requested.split("_")[0]
+
+
 def normalize_phoneme_id_map(phoneme_to_id: dict) -> dict:
     """Normalize a phoneme->id map to plain integer ids.
 

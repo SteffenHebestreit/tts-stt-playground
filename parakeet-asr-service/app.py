@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 import torch
 import librosa
+import soundfile as sf
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -76,6 +77,21 @@ model_loaded = False
 
 _FFMPEG = shutil.which("ffmpeg")
 
+# NeMo's transcribe() defaults spin up DataLoader worker processes and print a
+# tqdm bar per call. At one-file-per-request granularity that setup costs more
+# than the inference; a bounded semaphore keeps concurrent requests from
+# multiplying peak VRAM on the single shared model.
+_NEMO_RUNTIME_KWARGS = {"batch_size": 1, "num_workers": 0, "verbose": False}
+_NEMO_MAX_BATCH = max(1, int(os.getenv("ASR_MAX_BATCH", "8")))
+_ASR_SEM = asyncio.Semaphore(max(1, int(os.getenv("ASR_MAX_CONCURRENCY", "1"))))
+
+
+async def _asr(fn, *args, **kwargs):
+    """Run a blocking model call off the event loop, bounded by _ASR_SEM."""
+    async with _ASR_SEM:
+        return await asyncio.to_thread(fn, *args, **kwargs)
+
+
 
 def get_model():
     """Load or return the cached Parakeet model (lazy singleton)."""
@@ -106,9 +122,32 @@ async def _save_upload(upload: UploadFile) -> tuple[str, bytes]:
         return tmp.name, content
 
 
+def _needs_conversion(src_path: str) -> bool:
+    """True unless the file is already a 16 kHz mono WAV.
+
+    Probing costs microseconds; the ffmpeg fork/exec it avoids costs tens of
+    milliseconds, which is a large fraction of a short-utterance request.
+    """
+    try:
+        info = sf.info(src_path)
+    except Exception:
+        return True
+    return not (info.format == "WAV" and info.samplerate == TARGET_SAMPLE_RATE and info.channels == 1)
+
+
+def _audio_duration(path: str) -> float:
+    """Duration in seconds, read from the header rather than decoding the file."""
+    try:
+        info = sf.info(path)
+        return info.frames / float(info.samplerate) if info.samplerate else 0.0
+    except Exception:
+        # Formats libsndfile cannot open (some mp3/opus builds) still need librosa.
+        return float(librosa.get_duration(path=path))
+
+
 def _prepare_audio(src_path: str) -> str:
     """Convert any input to 16 kHz mono WAV via ffmpeg; fall back to the original."""
-    if not _FFMPEG:
+    if not _FFMPEG or not _needs_conversion(src_path):
         return src_path
     out_path = f"{src_path}.16k.wav"
     cmd = [
@@ -128,13 +167,14 @@ def _prepare_audio(src_path: str) -> str:
 
 def _run_transcription(audio_path: str) -> tuple[str, list]:
     """Run Parakeet on a single prepared audio file; return ``(text, segments)``."""
-    output = get_model().transcribe([audio_path], timestamps=True)
+    output = get_model().transcribe([audio_path], timestamps=True, **_NEMO_RUNTIME_KWARGS)
     return _parse_hypothesis(output[0]) if output else ("", [])
 
 
 def _run_transcription_batch(audio_paths: list) -> list:
     """Run Parakeet on several prepared files in one batched call (NeMo batches internally)."""
-    outputs = get_model().transcribe(audio_paths, timestamps=True)
+    kwargs = {**_NEMO_RUNTIME_KWARGS, "batch_size": min(len(audio_paths), _NEMO_MAX_BATCH)}
+    outputs = get_model().transcribe(audio_paths, timestamps=True, **kwargs)
     return [_parse_hypothesis(hyp) for hyp in (outputs or [])]
 
 
@@ -177,13 +217,13 @@ async def transcribe_audio(
     try:
         start_time = time.time()
         tmp_path, content = await _save_upload(audio)
-        prepared_path = _prepare_audio(tmp_path)
+        prepared_path = await asyncio.to_thread(_prepare_audio, tmp_path)
 
         file_size_mb = len(content) / (1024 * 1024)
         logger.info(f"Transcribing: {audio.filename} ({file_size_mb:.1f}MB)")
 
-        duration = librosa.get_duration(path=prepared_path)
-        text, segments = await asyncio.to_thread(_run_transcription, prepared_path)
+        duration = _audio_duration(prepared_path)
+        text, segments = await _asr(_run_transcription, prepared_path)
 
         if not segments and text:
             segments = [{"start": 0.0, "end": duration, "text": text}]
@@ -229,8 +269,8 @@ async def openai_transcriptions(
     prepared_path = None
     try:
         tmp_path, _ = await _save_upload(file)
-        prepared_path = _prepare_audio(tmp_path)
-        text, segments = await asyncio.to_thread(_run_transcription, prepared_path)
+        prepared_path = await asyncio.to_thread(_prepare_audio, tmp_path)
+        text, segments = await _asr(_run_transcription, prepared_path)
 
         if response_format == "text":
             return JSONResponse(content=text)
@@ -260,9 +300,9 @@ async def detect_language(file: UploadFile = File(...)):
     try:
         start_time = time.time()
         tmp_path, _ = await _save_upload(file)
-        prepared_path = _prepare_audio(tmp_path)
-        duration = librosa.get_duration(path=prepared_path)
-        text, _ = await asyncio.to_thread(_run_transcription, prepared_path)
+        prepared_path = await asyncio.to_thread(_prepare_audio, tmp_path)
+        duration = _audio_duration(prepared_path)
+        text, _ = await _asr(_run_transcription, prepared_path)
         return {
             "detected_language": None,
             "language_probability": None,
@@ -301,19 +341,23 @@ async def transcribe_batch(
             try:
                 tmp_path, _ = await _save_upload(audio_file)
                 cleanup.add(tmp_path)
-                prepared_path = _prepare_audio(tmp_path)
+                prepared_path = await asyncio.to_thread(_prepare_audio, tmp_path)
                 cleanup.add(prepared_path)
-                duration = librosa.get_duration(path=prepared_path)
+                duration = _audio_duration(prepared_path)
                 entries.append((idx, audio_file.filename, prepared_path, duration))
             except Exception as e:
                 results[idx] = {"filename": audio_file.filename, "error": str(e)}
 
         if entries:
             start_time = time.time()
-            batch_out = await asyncio.to_thread(
+            # Must go through the same guard as the single-file path: this is the
+            # widest forward pass in the service, so leaving it outside the
+            # semaphore let it run concurrently with /transcribe on the same
+            # model — exactly the VRAM spike ASR_MAX_CONCURRENCY=1 exists to stop.
+            batch_out = await _asr(
                 _run_transcription_batch, [entry[2] for entry in entries]
             )
-            per_file_time = (time.time() - start_time) / len(entries)
+            batch_time = time.time() - start_time
             for (idx, filename, _path, duration), parsed in zip(entries, batch_out):
                 text, segments = parsed
                 results[idx] = {
@@ -321,10 +365,15 @@ async def transcribe_batch(
                     "text": text,
                     "segments": segments,
                     "duration": duration,
-                    "processing_time": per_file_time,
                 }
 
-        return {"batch": True, "file_count": len(results), "results": results}
+        response = {"batch": True, "file_count": len(results), "results": results}
+        if entries:
+            # Reported once for the batch. Dividing it per file was wrong by
+            # construction — the files are transcribed in one batched forward
+            # pass, so any per-file latency measured through this API was fiction.
+            response["batch_processing_time"] = batch_time
+        return response
     finally:
         for path in cleanup:
             if path and os.path.exists(path):

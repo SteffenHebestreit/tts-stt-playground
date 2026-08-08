@@ -17,10 +17,13 @@ logger = logging.getLogger(__name__)
 
 import torch
 import librosa
+import soundfile as sf
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
+
+from model_lifecycle import ModelSlot, ttl_from_env
 
 
 @asynccontextmanager
@@ -65,6 +68,23 @@ else:
 asr_model = None
 model_loaded = False
 
+# One process-global 1.7B model on one GPU: without a bound, concurrent requests
+# dispatched onto the default thread pool all enter the model at once and
+# multiply peak VRAM while making each individual request slower.
+_ASR_SEM = asyncio.Semaphore(max(1, int(os.getenv("ASR_MAX_CONCURRENCY", "1"))))
+
+
+async def _asr(method: str, *args, **kwargs):
+    """Run a model method off the event loop, bounded by _ASR_SEM.
+
+    Takes a method NAME rather than a bound method so this function owns the
+    model reference: the slot is acquired here and held across the await, so the
+    idle timer cannot unload the weights while a worker thread is using them.
+    """
+    async with _model_slot.acquire_async() as model, _ASR_SEM:
+        return await asyncio.to_thread(getattr(model, method), *args, **kwargs)
+
+
 # qwen_asr expects English language names, not ISO codes ("German", not "de").
 LANGUAGE_NAME_MAP = {
     "zh": "Chinese", "en": "English", "yue": "Cantonese", "ar": "Arabic",
@@ -83,7 +103,25 @@ def _resolve_language(language):
     mapped = LANGUAGE_NAME_MAP.get(lang.lower().replace("-", "_").split("_")[0])
     if mapped:
         return mapped
-    return lang if lang[:1].isupper() else lang.capitalize()
+    # Never synthesize a language *name* from an unmapped code: "sv" became
+    # "Sv", which the model does not recognise. Falling back to auto-detect
+    # gives a correct result instead of a confidently wrong one.
+    logger.info(f"Language '{language}' has no Qwen3-ASR mapping; using auto-detect")
+    return None
+
+
+def _audio_duration(path: str) -> float:
+    """Duration in seconds, read from the header rather than decoding the file.
+
+    librosa.get_duration() decodes the audio; on the event loop that stalled
+    every other request for the length of the decode.
+    """
+    try:
+        info = sf.info(path)
+        return info.frames / float(info.samplerate) if info.samplerate else 0.0
+    except Exception:
+        # Formats libsndfile cannot open (some mp3/opus builds) still need librosa.
+        return float(librosa.get_duration(path=path))
 
 
 async def _save_upload(upload: UploadFile) -> tuple[str, bytes]:
@@ -95,48 +133,84 @@ async def _save_upload(upload: UploadFile) -> tuple[str, bytes]:
         return tmp.name, content
 
 
-def get_model():
-    """Load or return the cached Qwen3-ASR model (lazy singleton)."""
+def _load_qwen3_asr():
+    """Construct the Qwen3-ASR model (called by the lifecycle slot)."""
     global asr_model, model_loaded
-    if asr_model is None:
-        logger.info("Loading Qwen3-ASR model...")
-        try:
-            from qwen_asr import Qwen3ASRModel
+    logger.info("Loading Qwen3-ASR model...")
+    try:
+        from qwen_asr import Qwen3ASRModel
 
-            model_name = os.getenv("QWEN3_ASR_MODEL", "Qwen/Qwen3-ASR-1.7B")
+        model_name = os.getenv("QWEN3_ASR_MODEL", "Qwen/Qwen3-ASR-1.7B")
 
-            # Prefer bfloat16 on CUDA; fall back to float16 (ROCm/older GPUs),
-            # then float32 on CPU.
-            if device == "cuda":
-                if torch.cuda.is_bf16_supported():
-                    dtype = torch.bfloat16
-                else:
-                    logger.warning("bfloat16 not supported on this GPU, using float16")
-                    dtype = torch.float16
+        # Prefer bfloat16 on CUDA; fall back to float16 (ROCm/older GPUs),
+        # then float32 on CPU.
+        if device == "cuda":
+            if torch.cuda.is_bf16_supported():
+                dtype = torch.bfloat16
             else:
-                dtype = torch.float32
+                logger.warning("bfloat16 not supported on this GPU, using float16")
+                dtype = torch.float16
+        else:
+            dtype = torch.float32
 
-            asr_model = Qwen3ASRModel.from_pretrained(
-                model_name,
-                dtype=dtype,
-                device_map=f"{device}:0" if device == "cuda" else "cpu",
-                max_inference_batch_size=32,
-                max_new_tokens=512,
-            )
-            model_loaded = True
-            logger.info(f"Qwen3-ASR model loaded on {device} ({dtype})")
-        except Exception as e:
-            logger.error(f"Failed to load Qwen3-ASR model: {e}", exc_info=True)
-            raise
-    return asr_model
+        asr_model = Qwen3ASRModel.from_pretrained(
+            model_name,
+            dtype=dtype,
+            device_map=f"{device}:0" if device == "cuda" else "cpu",
+            max_inference_batch_size=32,
+            max_new_tokens=512,
+        )
+        model_loaded = True
+        logger.info(f"Qwen3-ASR model loaded on {device} ({dtype})")
+        return asr_model
+    except Exception as e:
+        logger.error(f"Failed to load Qwen3-ASR model: {e}", exc_info=True)
+        raise
+
+
+def _forget_qwen3_asr(_model) -> None:
+    """Clear the module-level aliases so nothing keeps the weights alive."""
+    global asr_model, model_loaded
+    asr_model = None
+    model_loaded = False
+
+
+# This model is ~4 GB — the single largest resident cost in the default stack.
+# On a 12 GB card that stack already sits at ~9.7 GB, so giving this back when
+# idle is what leaves room for a TTS model alongside it. Reference counted, so
+# a transcription in flight is never unloaded underneath itself.
+#   >0 = seconds idle before unloading | 0 = unload immediately | -1 = never
+MODEL_TTL = ttl_from_env(os.getenv, "ASR_MODEL_TTL", "MODEL_TTL", default=300.0)
+_model_slot = ModelSlot(
+    _load_qwen3_asr, ttl_seconds=MODEL_TTL, name="Qwen3-ASR",
+    on_unload=_forget_qwen3_asr,
+)
+
+
+def get_model():
+    """Load or return the cached Qwen3-ASR model (lazy singleton).
+
+    Kept for startup preload and status endpoints. Request handlers go through
+    ``_asr()``, which pins the model for the duration of the call.
+    """
+    with _model_slot.acquire() as model:
+        return model
 
 
 @app.get("/health")
 async def health():
-    """Basic liveness / readiness probe."""
+    """Liveness probe.
+
+    `model_resident: false` is NOT an error — the idle TTL released the weights
+    to free VRAM and the next request reloads them. A non-200 here would make an
+    idle container report unhealthy under Docker's `curl -f` check.
+    """
     return {
         "status": "ok",
         "model_loaded": model_loaded,
+        "model_resident": _model_slot.resident,
+        "model_ttl_seconds": MODEL_TTL,
+        "active_requests": _model_slot.refs,
         "device": device,
     }
 
@@ -170,7 +244,6 @@ async def transcribe_audio(
     """
     tmp_path = None
     try:
-        model = get_model()
         start_time = time.time()
 
         # Save uploaded file
@@ -180,12 +253,12 @@ async def transcribe_audio(
         logger.info(f"Transcribing: {audio.filename} ({file_size_mb:.1f}MB), language={language}")
 
         # Get audio duration
-        duration = librosa.get_duration(path=tmp_path)
+        duration = _audio_duration(tmp_path)
 
         # Transcribe with Qwen3-ASR (off the event loop — model.transcribe is blocking)
         lang_param = _resolve_language(language)
-        results = await asyncio.to_thread(
-            model.transcribe,
+        results = await _asr(
+            "transcribe",
             audio=tmp_path,
             language=lang_param,
         )
@@ -253,14 +326,13 @@ async def detect_language(
     """Detect the language of an audio file using Qwen3-ASR."""
     tmp_path = None
     try:
-        model = get_model()
         start_time = time.time()
 
         tmp_path, _ = await _save_upload(file)
 
         # Transcribe to detect language (off the event loop)
-        results = await asyncio.to_thread(
-            model.transcribe,
+        results = await _asr(
+            "transcribe",
             audio=tmp_path,
             language=None,  # Auto-detect
         )
@@ -274,7 +346,7 @@ async def detect_language(
         detected_language = result.language if hasattr(result, 'language') else "unknown"
         sample_text = result.text[:200] if hasattr(result, 'text') else ""
 
-        duration = librosa.get_duration(path=tmp_path)
+        duration = _audio_duration(tmp_path)
 
         return {
             "detected_language": detected_language,
@@ -303,7 +375,6 @@ async def transcribe_batch(
     language: str = Form("auto"),
 ):
     """Batch-transcribe multiple audio files, returning per-file results."""
-    model = get_model()
     results = []
 
     for audio_file in audios:
@@ -313,8 +384,8 @@ async def transcribe_batch(
 
             start_time = time.time()
             lang_param = _resolve_language(language)
-            asr_results = await asyncio.to_thread(
-                model.transcribe,
+            asr_results = await _asr(
+                "transcribe",
                 audio=tmp_path,
                 language=lang_param,
             )
@@ -324,7 +395,7 @@ async def transcribe_batch(
                 raise RuntimeError("Transcription produced no result (empty or unreadable audio)")
 
             result = asr_results[0]
-            duration = librosa.get_duration(path=tmp_path)
+            duration = _audio_duration(tmp_path)
 
             results.append({
                 "filename": audio_file.filename,

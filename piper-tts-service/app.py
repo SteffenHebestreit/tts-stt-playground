@@ -12,6 +12,8 @@ import tempfile
 import json
 import asyncio
 import logging
+import threading
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from pathlib import Path
 import shutil
@@ -25,7 +27,8 @@ import soundfile as sf
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from starlette.background import BackgroundTask
+from pydantic import BaseModel, Field
 import uvicorn
 import aiofiles
 import librosa
@@ -33,6 +36,7 @@ import io
 
 from naming import (
     sanitize_voice_name,
+    language_matches,
     select_best_voice as _select_best_voice,
     prune_old_outputs,
     normalize_phoneme_id_map,
@@ -42,7 +46,28 @@ from naming import (
 async def _lifespan(_app: FastAPI):
     """Scan the custom-models directory and register any valid voices on startup."""
     await load_custom_voices()
-    yield
+    pruner = asyncio.create_task(_prune_loop())
+    try:
+        yield
+    finally:
+        pruner.cancel()
+
+
+async def _prune_loop():
+    """Sweep expired outputs on a timer instead of on the request path.
+
+    The sweep is O(files written in the retention window) and used to run
+    synchronously inside /tts — so it got slower the more the service was used,
+    and it ran on the event loop.
+    """
+    while True:
+        try:
+            await asyncio.to_thread(_prune_old_outputs)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"Output prune failed: {e}")
+        await asyncio.sleep(PRUNE_INTERVAL_S)
 
 
 app = FastAPI(
@@ -69,6 +94,11 @@ app.add_middleware(
 # indefinitely. Files older than the retention window are pruned best-effort.
 OUTPUT_DIR = os.getenv("PIPER_OUTPUT_DIR", "/app/output")
 OUTPUT_RETENTION_HOURS = float(os.getenv("OUTPUT_RETENTION_HOURS", "24"))
+PRUNE_INTERVAL_S = float(os.getenv("OUTPUT_PRUNE_INTERVAL_S", "3600"))
+# When a requested language has no voice, select_best_voice() substitutes an
+# English one. Default keeps that (non-breaking) but reports it; set true to
+# return 400 instead, which is usually what an API consumer wants.
+STRICT_LANGUAGE = os.getenv("PIPER_STRICT_LANGUAGE", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _prune_old_outputs() -> None:
@@ -88,7 +118,9 @@ class TTSRequest(BaseModel):
     language: str = "en_US"
     quality: str = "medium"  # x_low, low, medium, high
     gender: Optional[str] = None  # male, female
-    speed: float = 1.0
+    # gt=0 guards the `1.0 / speed` length-scale conversion, which turned
+    # speed=0 into a ZeroDivisionError -> 500, and passed negatives to the binary.
+    speed: float = Field(1.0, gt=0.0, le=4.0)
     output_format: str = "wav"
 
 class VoiceInfo(BaseModel):
@@ -108,7 +140,9 @@ class VoiceCloneRequest(BaseModel):
     text: str
     voice_name: str
     reference_audio: Optional[str] = None
-    speed: float = 1.0
+    # gt=0 guards the `1.0 / speed` length-scale conversion, which turned
+    # speed=0 into a ZeroDivisionError -> 500, and passed negatives to the binary.
+    speed: float = Field(1.0, gt=0.0, le=4.0)
 
 # Available default voices by language
 DEFAULT_VOICES = {
@@ -197,7 +231,15 @@ CUSTOM_VOICES: Dict[str, VoiceInfo] = {}
 
 # Cache of loaded ONNX inference sessions keyed by model path. Each entry stores
 # the file mtime so a re-trained/re-uploaded model is reloaded automatically.
-_ONNX_SESSION_CACHE: Dict[str, tuple] = {}
+# Bounded and lock-guarded: sessions are multi-hundred-MB and requests build them
+# from a thread pool, so an unbounded unsynchronised dict both grew without limit
+# and let concurrent first-requests each construct their own session.
+_ONNX_SESSION_CACHE: "OrderedDict[str, tuple]" = OrderedDict()
+_ONNX_CACHE_SIZE = max(1, int(os.getenv("ONNX_SESSION_CACHE_SIZE", "4")))
+_ONNX_CACHE_LOCK = threading.Lock()
+# Fewer threads than cores on purpose: these are short sequences where ORT's
+# thread ramp-up costs more than the parallelism returns.
+_ONNX_THREADS = max(1, int(os.getenv("ONNX_NUM_THREADS", "2")))
 
 
 def _get_onnx_session(model_path: str):
@@ -205,16 +247,24 @@ def _get_onnx_session(model_path: str):
     import onnxruntime as ort
 
     mtime = os.path.getmtime(model_path)
-    cached = _ONNX_SESSION_CACHE.get(model_path)
-    if cached and cached[0] == mtime:
-        return cached[1]
+    with _ONNX_CACHE_LOCK:
+        cached = _ONNX_SESSION_CACHE.get(model_path)
+        if cached and cached[0] == mtime:
+            _ONNX_SESSION_CACHE.move_to_end(model_path)
+            return cached[1]
 
-    sess_options = ort.SessionOptions()
-    sess_options.inter_op_num_threads = 2
-    sess_options.intra_op_num_threads = 2
-    session = ort.InferenceSession(model_path, sess_options=sess_options)
-    _ONNX_SESSION_CACHE[model_path] = (mtime, session)
-    return session
+        sess_options = ort.SessionOptions()
+        sess_options.inter_op_num_threads = _ONNX_THREADS
+        sess_options.intra_op_num_threads = _ONNX_THREADS
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        session = ort.InferenceSession(model_path, sess_options=sess_options)
+
+        _ONNX_SESSION_CACHE[model_path] = (mtime, session)
+        _ONNX_SESSION_CACHE.move_to_end(model_path)
+        while len(_ONNX_SESSION_CACHE) > _ONNX_CACHE_SIZE:
+            _ONNX_SESSION_CACHE.popitem(last=False)
+        return session
 
 
 @app.get("/")
@@ -481,7 +531,29 @@ async def text_to_speech(request: TTSRequest):
                 raise HTTPException(status_code=404, detail=f"No suitable voice found for language '{request.language}' and quality '{request.quality}'")
         
         voice_info = all_voices[request.voice]
-        
+
+        # select_best_voice() degrades to English (and ultimately to a hardcoded
+        # en_US voice) when nothing serves the requested language. That keeps the
+        # service working, but on its own it means a client asking for German TTS
+        # on a deployment with no German voice gets ENGLISH AUDIO for German text
+        # — wrong output, HTTP 200, no signal. Make the substitution explicit.
+        lang_fallback = not language_matches(voice_info.language, request.language)
+        if lang_fallback:
+            logger.warning(
+                "No voice for language '%s'; falling back to '%s' (%s). "
+                "Set PIPER_STRICT_LANGUAGE=true to fail instead.",
+                request.language, request.voice, voice_info.language,
+            )
+            if STRICT_LANGUAGE:
+                available = sorted({v.language for v in all_voices.values()})
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"No voice available for language '{request.language}'. "
+                        f"Available languages: {', '.join(available)}"
+                    ),
+                )
+
         # Determine model path
         if voice_info.model_type == "default":
             model_path = f"/app/models/default/{request.voice}.onnx"
@@ -502,12 +574,14 @@ async def text_to_speech(request: TTSRequest):
                 headers={
                     "X-Voice-Used": request.voice,
                     "X-Language": voice_info.language,
+                    "X-Language-Requested": request.language or "auto",
+                    "X-Language-Fallback": "true" if lang_fallback else "false",
                     "X-Quality": voice_info.quality,
                 },
             )
 
-        # Standard Piper binary for default models
-        _prune_old_outputs()  # keep the output dir from growing unbounded
+        # Standard Piper binary for default models. Output pruning runs on a
+        # background timer (see _prune_loop), not here.
         output_filename = f"{uuid.uuid4()}.{request.output_format}"
         output_path = os.path.join(OUTPUT_DIR, output_filename)
 
@@ -527,7 +601,11 @@ async def text_to_speech(request: TTSRequest):
             stderr=asyncio.subprocess.PIPE
         )
 
-        stdout, stderr = await process.communicate(input=request.text.encode())
+        # Collapse newlines: the piper CLI treats each input line as a separate
+        # utterance and writes them over the same --output_file, so multi-line
+        # text would return only the last line's audio.
+        piper_input = " ".join(request.text.split())
+        stdout, stderr = await process.communicate(input=piper_input.encode())
 
         if process.returncode != 0:
             error_msg = stderr.decode() if stderr else "Unknown error"
@@ -543,8 +621,13 @@ async def text_to_speech(request: TTSRequest):
             headers={
                 "X-Voice-Used": request.voice,
                 "X-Language": voice_info.language,
+                "X-Language-Requested": request.language or "auto",
+                "X-Language-Fallback": "true" if lang_fallback else "false",
                 "X-Quality": voice_info.quality
-            }
+            },
+            # Nothing else serves OUTPUT_DIR (there is no StaticFiles mount), so
+            # the file is dead the moment it has been streamed.
+            background=BackgroundTask(os.unlink, output_path),
         )
         
     except HTTPException:
@@ -735,6 +818,10 @@ async def load_custom_voices():
 async def refresh_voices():
     """Re-scan the custom models directory and update the voice registry."""
     CUSTOM_VOICES.clear()
+    # Drop cached sessions too — a removed voice would otherwise keep serving
+    # from a session whose model file no longer exists.
+    with _ONNX_CACHE_LOCK:
+        _ONNX_SESSION_CACHE.clear()
     await load_custom_voices()
     
     return {

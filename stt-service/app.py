@@ -31,10 +31,12 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
-    """Load the Whisper model on startup; release the executor on shutdown."""
+    """Load the Whisper model on startup; release the executors on shutdown."""
     load_model()
+    warm_up_model()
     yield
-    logger.info("Shutting down thread pool executor...")
+    logger.info("Shutting down thread pool executors...")
+    rt_executor.shutdown(wait=False)
     executor.shutdown(wait=False)
 
 
@@ -60,8 +62,20 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
-# Create a thread pool for running blocking IO
-executor = ThreadPoolExecutor(max_workers=os.cpu_count())
+# Two pools so a long batch upload cannot starve live sessions of a worker.
+# CTranslate2 itself serialises on the shared model (see WHISPER_NUM_WORKERS), so
+# these bound queueing, not GPU parallelism.
+#
+# The realtime pool must have a slot per admitted session, plus one. Cancelling
+# an asyncio task that is awaiting run_in_executor does NOT stop the worker
+# thread — the decode runs to completion regardless — so an abandoned interim
+# keeps occupying its slot until it finishes. Sized at 2 with WS_MAX_SESSIONS=4,
+# two stopping sessions could freeze the other two.
+_MAX_LIVE_SESSIONS = int(os.getenv("WS_MAX_SESSIONS", "4"))
+rt_executor = ThreadPoolExecutor(
+    max_workers=max(2, _MAX_LIVE_SESSIONS + 1), thread_name_prefix="whisper-rt"
+)
+executor = ThreadPoolExecutor(max_workers=os.cpu_count(), thread_name_prefix="whisper-batch")
 
 class SafeJSONResponse(JSONResponse):
     """JSONResponse that sanitises NaN/Infinity before encoding."""
@@ -74,6 +88,50 @@ class SafeJSONResponse(JSONResponse):
             indent=None,
             separators=(",", ":"),
         ).encode("utf-8")
+
+def _select_cuda_compute_type() -> str:
+    """Pick the CT2 compute type for this GPU.
+
+    Defaults to int8_float16: faster-whisper's own table measures int8 at ~35%
+    less VRAM than float16 at equal-or-better speed, which is the difference
+    between fitting and not fitting on an 8-12 GB card. Set WHISPER_COMPUTE_TYPE
+    to pin it (float16, int8_float16, int8_bfloat16, int8, float32).
+
+    int8_bfloat16 is deliberately NOT auto-selected below compute capability 8.0:
+    on Turing, CTranslate2 silently falls back to int8_float32, which costs
+    activation memory rather than saving it.
+    """
+    requested = os.getenv("WHISPER_COMPUTE_TYPE", "").strip().lower()
+
+    supported = set()
+    try:
+        import ctranslate2
+        supported = set(ctranslate2.get_supported_compute_types("cuda"))
+    except Exception as e:
+        logger.warning(f"Could not probe CT2 compute types ({e}); assuming float16 is safe")
+
+    if requested and requested != "auto":
+        if supported and requested not in supported:
+            logger.warning(
+                f"WHISPER_COMPUTE_TYPE={requested} is not supported by this GPU "
+                f"(supported: {sorted(supported)}); falling back to auto-selection"
+            )
+        else:
+            return requested
+
+    # Most memory-efficient first; every entry must be verified as supported.
+    preference = ["int8_float16", "int8", "float16", "float32"]
+    try:
+        if torch.cuda.get_device_capability(0)[0] >= 8:
+            preference.insert(0, "int8_bfloat16")
+    except Exception:
+        pass
+
+    for candidate in preference:
+        if not supported or candidate in supported:
+            return candidate
+    return "float16"
+
 
 # Hardware detection and optimization (re-check after startup)
 def detect_hardware():
@@ -107,9 +165,9 @@ def detect_hardware():
 
     if torch.cuda.is_available():
         device = "cuda"
-        compute_type = "float16"
+        compute_type = _select_cuda_compute_type()
         logger.info(f"CUDA available with {torch.cuda.device_count()} GPU(s)")
-        logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
+        logger.info(f"GPU: {torch.cuda.get_device_name(0)} using {compute_type}")
     elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
         device = "cpu"  # faster-whisper doesn't support MPS
         compute_type = "int8"
@@ -125,10 +183,57 @@ def detect_hardware():
 device = None
 compute_type = None
 
+# large-v3-turbo has 4 decoder layers against large-v3's 32 at comparable accuracy,
+# which dominates greedy realtime decoding. FALLBACK_MODEL_SIZE is used if the
+# configured name cannot be resolved, so an unknown alias cannot brick startup.
+DEFAULT_MODEL_SIZE = "large-v3-turbo"
+FALLBACK_MODEL_SIZE = "large-v3"
+# Used only when a load fails for resource reasons, so it must be SMALLER than
+# the default and still multilingual. `small` is ~0.5 GB against turbo's ~1.6 GB.
+# Never use distil-large-v3 here: it is English-only despite having no `.en`
+# suffix, so it would silently drop German on exactly the constrained devices
+# this ladder exists to serve.
+OOM_FALLBACK_MODEL_SIZE = os.getenv("WHISPER_OOM_FALLBACK", "small")
+
+# Approximate weight sizes in MB, used only to keep the fallback ladder
+# descending. Multilingual models only — English-only variants (*.en,
+# distil-large-v3) are excluded on purpose so they can never be auto-selected
+# and silently drop German.
+KNOWN_MODEL_SIZES = {
+    "tiny": 75,
+    "base": 145,
+    "small": 490,
+    "medium": 1500,
+    "large-v1": 2900,
+    "large-v2": 2900,
+    "large-v3": 3100,
+    "large-v3-turbo": 1600,
+    "turbo": 1600,
+}
+
+
+def _model_rank(name: str) -> int:
+    """Approximate memory cost, for ordering fallbacks.
+
+    Unknown names sort as very large so an unrecognised model is never treated
+    as a safe step down.
+    """
+    return KNOWN_MODEL_SIZES.get(name, 10_000)
+# Models that only ever emit English and therefore cannot serve task="translate".
+TURBO_MODELS = {"large-v3-turbo", "turbo"}
+
+
+def configured_model_size() -> str:
+    """The model name requested via env, or the project default."""
+    return os.getenv("WHISPER_MODEL_SIZE", "").strip() or DEFAULT_MODEL_SIZE
+
+
 # Initialize Whisper model with error handling
 whisper_model = None
 model_loaded = False
 model_size_loaded = None
+model_warmed = False
+startup_error = None
 
 def ensure_hardware_detected():
     """Run hardware detection once (lazy initialisation)."""
@@ -137,45 +242,117 @@ def ensure_hardware_detected():
         device, compute_type = detect_hardware()
 
 def load_model():
-    """Load the Whisper model, falling back to CPU int8 on failure."""
-    global whisper_model, model_loaded, model_size_loaded
-    
+    """Load the Whisper model, falling back to a known model name then to CPU int8."""
+    global whisper_model, model_loaded, model_size_loaded, device, compute_type, startup_error
+
     # Ensure hardware is detected first
     ensure_hardware_detected()
-    
+
+    # CTranslate2 serialises calls per worker; 2 gives live and batch traffic
+    # independent slots without doubling activation memory for every request.
+    num_workers = max(1, int(os.getenv("WHISPER_NUM_WORKERS", "2")))
+    # cpu_threads maps to CT2's intra_threads and num_workers to inter_threads,
+    # and CT2 spawns inter_threads model replicas each running intra_threads
+    # threads — so os.cpu_count() here would demand num_workers x cpu_count.
+    cpu_threads = max(1, (os.cpu_count() or 4) // num_workers)
+    requested = configured_model_size()
+
+    # (model_size, device, compute_type). Resource use must never INCREASE down
+    # the ladder — responding to a failure by asking for more memory cannot help.
+    #
+    # The two failure modes need different responses, so they are separated by
+    # inspecting the requested name rather than by inspecting the exception:
+    #   - unknown name  -> fall back to a known-good name (a size step is fine,
+    #                      because the requested model does not exist at all).
+    #   - anything else -> step DOWN in size, then off the GPU.
+    attempts = [(requested, device, compute_type)]
+
+    if requested not in KNOWN_MODEL_SIZES:
+        # Name-resolution safety net: an unknown alias must not brick startup.
+        # Only reachable when `requested` is not a real model, so this cannot
+        # escalate memory for a working configuration.
+        attempts.append((FALLBACK_MODEL_SIZE, device, compute_type))
+
+    if device != "cpu":
+        # Smaller multilingual model before abandoning the GPU entirely, but
+        # only if it is genuinely smaller than what was asked for.
+        # `small` is multilingual — do NOT use distil-large-v3 here, it is
+        # English-only and would silently drop German.
+        if _model_rank(OOM_FALLBACK_MODEL_SIZE) < _model_rank(requested):
+            attempts.append((OOM_FALLBACK_MODEL_SIZE, device, "int8_float16"))
+        attempts.append((requested, "cpu", "int8"))
+        if _model_rank(OOM_FALLBACK_MODEL_SIZE) < _model_rank(requested):
+            attempts.append((OOM_FALLBACK_MODEL_SIZE, "cpu", "int8"))
+
+    last_error = None
+    for model_size, dev, ctype in attempts:
+        try:
+            logger.info(f"Loading {model_size} Whisper model on {dev} with {ctype}...")
+            whisper_model = WhisperModel(
+                model_size,
+                device=dev,
+                compute_type=ctype,
+                cpu_threads=cpu_threads if dev == "cpu" else 4,
+                num_workers=num_workers,
+            )
+            # Keep the reported runtime honest — /health used to keep advertising
+            # cuda/float16 after silently falling back to CPU.
+            device, compute_type = dev, ctype
+            model_size_loaded = model_size
+            model_loaded = True
+            startup_error = None
+            logger.info(f"Model loaded successfully: {model_size} on {dev}/{ctype}")
+            return
+        except Exception as e:
+            last_error = e
+            logger.error(f"Failed to load {model_size} on {dev}/{ctype}: {e}")
+
+    model_loaded = False
+    startup_error = str(last_error)
+    logger.error(f"All model load attempts failed; service is unhealthy: {last_error}")
+
+
+def warm_up_model():
+    """Run one throwaway inference so the first real request doesn't pay autotune.
+
+    Uses low-amplitude noise with ``vad_filter=False`` — silence plus VAD short-
+    circuits before any kernel runs and would warm nothing. The generator must be
+    consumed or no compute happens at all.
+    """
+    global model_warmed
+    if not model_loaded or whisper_model is None:
+        return
     try:
-        model_size = os.getenv("WHISPER_MODEL_SIZE", "large-v3")
-        model_size_loaded = model_size
-        logger.info(f"Loading {model_size} Whisper model on {device} with {compute_type}...")
-        
-        whisper_model = WhisperModel(
-            model_size,
-            device=device,
-            compute_type=compute_type,
-            cpu_threads=os.cpu_count() if device == "cpu" else 4,
-            num_workers=1  # Reduce memory usage
-        )
-        model_loaded = True
-        logger.info("Model loaded successfully")
+        t0 = time.monotonic()
+        rng = np.random.default_rng(0)
+        # cuDNN autotune is keyed on input shape; warm the short and long cases.
+        for seconds in (1.0, 5.0):
+            noise = (rng.standard_normal(int(seconds * WS_SAMPLE_RATE)) * 1e-3).astype(np.float32)
+            segments, _info = whisper_model.transcribe(
+                noise, language="en", beam_size=1, best_of=1,
+                temperature=0.0, without_timestamps=True, vad_filter=False,
+            )
+            list(segments)
+        model_warmed = True
+        logger.info(f"Model warm-up complete in {time.monotonic() - t0:.2f}s")
     except Exception as e:
-        logger.error(f"Failed to load model: {e}")
-        # Try CPU fallback with int8
-        if device != "cpu" or compute_type != "int8":
-            logger.info("Trying CPU int8 fallback...")
-            try:
-                whisper_model = WhisperModel(
-                    os.getenv("WHISPER_MODEL_SIZE", "large-v3"),
-                    device="cpu",
-                    compute_type="int8",
-                    cpu_threads=os.cpu_count(),
-                    num_workers=1
-                )
-                model_loaded = True
-                model_size_loaded = os.getenv("WHISPER_MODEL_SIZE", "large-v3")
-                logger.info("Model loaded on CPU with int8")
-            except Exception as cpu_error:
-                logger.error(f"CPU fallback failed: {cpu_error}")
-                model_loaded = False
+        logger.warning(f"Model warm-up failed (first request will be slower): {e}")
+
+
+def _reject_unsupported_translate(task: str):
+    """Reject task='translate' on turbo models, which have no translate capability.
+
+    Whisper's turbo variants were distilled on transcription only; asking them to
+    translate silently returns source-language text instead of English.
+    """
+    if task == "translate" and (model_size_loaded or configured_model_size()) in TURBO_MODELS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Model '{model_size_loaded}' does not support translation. "
+                "Set WHISPER_MODEL_SIZE to large-v3 (or another non-turbo model) to use task=translate."
+            ),
+        )
 
 # Add better error handling and logging
 @app.post("/transcribe")
@@ -203,7 +380,9 @@ async def transcribe_audio(
     Returns per-file results with segments, language, and timing information.
     """
     logger.info(f"Transcription request - task: {task}, language: {language}")
-    
+
+    _reject_unsupported_translate(task)
+
     try:
         # Normalize file list
         file_list: List[UploadFile] = []
@@ -408,6 +587,8 @@ async def transcribe_audio_stream(
     if not model_loaded:
         raise HTTPException(status_code=503, detail="Whisper model not loaded")
 
+    _reject_unsupported_translate(task)
+
     # Match /transcribe semantics: "auto" (or empty) means auto-detect.
     # faster-whisper rejects "auto" as a language code.
     if not language or language.strip().lower() == "auto":
@@ -479,10 +660,22 @@ async def transcribe_audio_stream(
             
             yield f"data: {json.dumps(clean_json_inf_nan({'metadata': metadata}))}\n\n"
             
-            # Stream segments as they're processed
+            # Stream segments as they're processed.
+            # whisper_model.transcribe returns a *lazy* generator: the encoder and
+            # decoder run on iteration, not on the call above. Iterating it here
+            # would run that work on the event loop and freeze every concurrent
+            # live WebSocket session (and /health) for the file's duration, so each
+            # step is pulled through the executor instead. The `None` sentinel is
+            # required — StopIteration cannot propagate across a Future.
             full_text = ""
             segment_count = 0
-            for i, segment in enumerate(segments):
+            segment_iter = iter(segments)
+            i = -1
+            while True:
+                segment = await loop.run_in_executor(executor, next, segment_iter, None)
+                if segment is None:
+                    break
+                i += 1
                 segment_count = i + 1
                 segment_data = {
                     "segment_id": i,
@@ -529,25 +722,83 @@ async def transcribe_audio_stream(
 # --- WebSocket live transcription ---
 
 WS_SAMPLE_RATE = 16000          # required input rate (PCM16 little-endian mono)
-WS_MIN_NEW_AUDIO_S = 1.0        # decode again once this much new audio arrived
-WS_WINDOW_S = 25.0              # interim decodes look at the most recent window
-WS_MAX_BUFFER_S = 600.0         # hard cap on buffered audio per connection
+# How much trailing audio each interim decode looks at.
+#
+# Note on cost, because it is easy to get wrong: faster-whisper pads the mel to
+# a fixed 3000 frames (30 s) before the encoder, so the ENCODER pass costs the
+# same whether this is 8 s or 25 s. What shrinking the window actually saves is
+# decoder work — every tick regenerates all the tokens in the window from
+# scratch (condition_on_previous_text=False), and that scales with the speech
+# inside it. On turbo's 4 decoder layers that is a real but moderate saving,
+# not the several-fold win a naive reading suggests.
+#
+# 8 s keeps enough left context for punctuation while bounding the token count.
+# Raising it back toward 25 s costs less than it appears to and buys context.
+WS_WINDOW_S = float(os.getenv("WS_WINDOW_S", "8.0"))
+# Floor on how often a partial can be produced. The decode is single-flight, so
+# this is a floor and not a schedule — decodes never queue up behind each other.
+WS_MIN_NEW_AUDIO_S = float(os.getenv("WS_MIN_NEW_AUDIO_S", "0.5"))
+WS_MAX_BUFFER_S = float(os.getenv("WS_MAX_BUFFER_S", "600.0"))
+WS_MAX_SESSIONS = _MAX_LIVE_SESSIONS
+# Interim hypotheses are greedy and unconditioned, so silence reliably produces
+# hallucinated stock phrases. These are the same guards /transcribe already uses.
+WS_NO_SPEECH_THRESHOLD = float(os.getenv("WS_NO_SPEECH_THRESHOLD", "0.6"))
+WS_MIN_AVG_LOGPROB = float(os.getenv("WS_MIN_AVG_LOGPROB", "-1.0"))
+
+_live_sessions = 0
 
 
 def _ws_decode(audio: np.ndarray, language):
-    """Greedy low-latency decode of a float32 16 kHz buffer (runs in the executor)."""
+    """Greedy low-latency decode of a float32 16 kHz buffer (runs in the executor).
+
+    Segments failing the no-speech / average-logprob guards are dropped: without
+    them a hallucinated phrase repeats across consecutive windows and the
+    agreement check below *promotes it to confirmed* precisely because it repeats.
+    """
     segments, info = whisper_model.transcribe(
         audio,
         language=language,
         beam_size=1,
         best_of=1,
-        temperature=0.0,
+        # A single temperature cannot escape a repetition loop; one fallback step
+        # costs nothing on clean audio because it is only used on failure.
+        temperature=(0.0, 0.2),
         condition_on_previous_text=False,
         without_timestamps=True,
+        no_speech_threshold=WS_NO_SPEECH_THRESHOLD,
         vad_filter=True,
     )
-    text = " ".join(s.text.strip() for s in segments).strip()
-    return text, info
+    parts = [
+        s.text.strip() for s in segments
+        if s.no_speech_prob < WS_NO_SPEECH_THRESHOLD
+        and s.avg_logprob > WS_MIN_AVG_LOGPROB
+        and s.text.strip()
+    ]
+    return " ".join(parts).strip(), info
+
+
+def _ws_final_decode(audio: np.ndarray, language):
+    """Accurate decode of the whole session buffer, used once at end of stream.
+
+    The interim path is deliberately greedy; reusing it for the final made the
+    live transcript measurably worse than uploading the same audio as a file.
+    """
+    segments, info = whisper_model.transcribe(
+        audio,
+        language=language,
+        beam_size=5,
+        best_of=5,
+        temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
+        condition_on_previous_text=True,
+        compression_ratio_threshold=2.4,
+        no_speech_threshold=WS_NO_SPEECH_THRESHOLD,
+        vad_filter=True,
+    )
+    parts = [
+        s.text.strip() for s in segments
+        if s.no_speech_prob < 0.8 and s.text.strip()
+    ]
+    return " ".join(parts).strip(), info
 
 
 @app.websocket("/ws/transcribe")
@@ -564,10 +815,24 @@ async def websocket_transcribe(websocket: WebSocket):
     Server messages: {"type": "partial", "confirmed": str, "pending": str}
     after each interim decode (confirmed = word-level prefix stable across the
     last two decodes), then {"type": "final", "text", "language", "duration"}.
+    Partials also carry "decode_ms", "lag_ms" and "pending_seconds" so latency is
+    observable from the client without a profiler.
 
-    Interim decodes only look at the most recent 25 s window; the final decode
-    covers the whole session buffer (capped at 10 minutes).
+    Ingest and decode are decoupled: the receive loop only ever appends audio,
+    and at most one decode is in flight at a time. When a decode is slower than
+    realtime the audio that arrived meanwhile is *skipped over* rather than
+    queued, so lag stays bounded by one decode instead of growing without limit.
     """
+    global _live_sessions
+
+    # Starlette's CORSMiddleware does not run on WebSocket routes, so the origin
+    # allow-list has to be applied by hand here or this endpoint is the one hole
+    # in an otherwise restricted deployment.
+    origin = websocket.headers.get("origin")
+    if "*" not in allowed_origins and origin and origin not in allowed_origins:
+        await websocket.close(code=1008)  # policy violation
+        return
+
     await websocket.accept()
 
     if whisper_model is None:
@@ -577,13 +842,97 @@ async def websocket_transcribe(websocket: WebSocket):
         await websocket.close(code=1011)
         return
 
+    if _live_sessions >= WS_MAX_SESSIONS:
+        await websocket.send_json({
+            "type": "error",
+            "error": f"Too many live sessions (limit {WS_MAX_SESSIONS})",
+        })
+        await websocket.close(code=1013)  # try again later
+        return
+    _live_sessions += 1
+
     language = None
     chunks: list[np.ndarray] = []
-    total_samples = 0
+    buffered_samples = 0        # samples currently held in `chunks`
+    received_samples = 0        # monotonic; never decremented by the rolling window
     decoded_at_samples = 0
     prev_words: list[str] = []
+    rolled = False
     max_samples = int(WS_MAX_BUFFER_S * WS_SAMPLE_RATE)
+    window_samples = int(WS_WINDOW_S * WS_SAMPLE_RATE)
+    min_new_samples = int(WS_MIN_NEW_AUDIO_S * WS_SAMPLE_RATE)
     loop = asyncio.get_running_loop()
+    send_lock = asyncio.Lock()  # the decode task and the receive loop both send
+    decode_task: asyncio.Task | None = None
+
+    async def _send(payload: dict):
+        """Serialise sends — the ingest loop and the decode task share the socket."""
+        async with send_lock:
+            await websocket.send_json(clean_json_inf_nan(payload))
+
+    def _tail(n_samples: int) -> np.ndarray:
+        """Concatenate only the most recent `n_samples`.
+
+        Copying the whole buffer here used to mean a 38 MB memcpy on the event
+        loop at the 10-minute cap, ~96% of which the window slice then threw away.
+        """
+        if n_samples <= 0:
+            return np.empty(0, dtype=np.float32)
+        collected: list[np.ndarray] = []
+        got = 0
+        for chunk in reversed(chunks):
+            collected.append(chunk)
+            got += len(chunk)
+            if got >= n_samples:
+                break
+        if not collected:
+            return np.empty(0, dtype=np.float32)
+        buf = np.concatenate(list(reversed(collected)))
+        return buf[-n_samples:] if len(buf) > n_samples else buf
+
+    async def _interim_decode():
+        """One interim decode over the current tail; sends a single partial."""
+        nonlocal prev_words
+        started = time.monotonic()
+        window = _tail(window_samples)
+        if not len(window):
+            return
+        covered_samples = received_samples
+        try:
+            text, _info = await loop.run_in_executor(rt_executor, _ws_decode, window, language)
+        except asyncio.CancelledError:
+            raise
+        except Exception as decode_err:
+            logger.warning(f"WS interim decode failed: {decode_err}")
+            return
+
+        decode_ms = (time.monotonic() - started) * 1000.0
+        if not text:
+            # Silence or an all-filtered window: keep the last partial on screen
+            # rather than blanking the panel the user is reading.
+            return
+
+        words = text.split()
+        agree = 0
+        while agree < len(words) and agree < len(prev_words) and words[agree] == prev_words[agree]:
+            agree += 1
+        prev_words = words
+        # A send failure here (client vanished mid-decode) would otherwise
+        # surface as an unretrieved task exception at GC time rather than
+        # ending the session; the receive loop notices the disconnect anyway.
+        try:
+            await _send({
+                "type": "partial",
+                "confirmed": " ".join(words[:agree]),
+                "pending": " ".join(words[agree:]),
+                "buffered_seconds": round(received_samples / WS_SAMPLE_RATE, 2),
+                # Audio received but not yet reflected in this partial.
+                "pending_seconds": round(max(0, received_samples - covered_samples) / WS_SAMPLE_RATE, 2),
+                "decode_ms": round(decode_ms, 1),
+                "lag_ms": round((time.monotonic() - started) * 1000.0, 1),
+            })
+        except Exception as send_err:
+            logger.debug(f"WS partial send failed (client likely gone): {send_err}")
 
     try:
         while True:
@@ -592,12 +941,32 @@ async def websocket_transcribe(websocket: WebSocket):
                 return
 
             if message.get("bytes") is not None:
-                samples = np.frombuffer(message["bytes"], dtype=np.int16).astype(np.float32) / 32768.0
-                if total_samples + len(samples) > max_samples:
-                    samples = samples[: max(0, max_samples - total_samples)]
+                raw = message["bytes"]
+                # A truncated frame would make frombuffer raise and kill the
+                # whole session; drop the odd trailing byte instead.
+                if len(raw) % 2:
+                    raw = raw[:-1]
+                samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
                 if len(samples):
                     chunks.append(samples)
-                    total_samples += len(samples)
+                    buffered_samples += len(samples)
+                    received_samples += len(samples)
+                    # Roll the oldest audio out instead of refusing new audio.
+                    # Truncating the newest froze `total_samples`, so the decode
+                    # gate could never fire again and the session went silently
+                    # dead at 10 minutes while the client kept uploading.
+                    while buffered_samples > max_samples and len(chunks) > 1:
+                        buffered_samples -= len(chunks.pop(0))
+                        if not rolled:
+                            rolled = True
+                            await _send({
+                                "type": "warning",
+                                "code": "buffer_rolled",
+                                "message": (
+                                    f"Session exceeded {WS_MAX_BUFFER_S:.0f}s; "
+                                    "the final transcript covers only the most recent audio."
+                                ),
+                            })
             elif message.get("text") is not None:
                 try:
                     control = json.loads(message["text"])
@@ -608,67 +977,106 @@ async def websocket_transcribe(websocket: WebSocket):
                 lang = str(control.get("language", "") or "").strip().lower()
                 language = None if lang in ("", "auto") else lang
 
-            # Interim decode once enough new audio has arrived
-            if total_samples - decoded_at_samples >= int(WS_MIN_NEW_AUDIO_S * WS_SAMPLE_RATE):
-                buffer = np.concatenate(chunks)
-                window = buffer[-int(WS_WINDOW_S * WS_SAMPLE_RATE):]
-                decoded_at_samples = total_samples
-                try:
-                    text, _info = await loop.run_in_executor(executor, _ws_decode, window, language)
-                except Exception as decode_err:
-                    logger.warning(f"WS interim decode failed: {decode_err}")
-                    continue
-                words = text.split()
-                agree = 0
-                while agree < len(words) and agree < len(prev_words) and words[agree] == prev_words[agree]:
-                    agree += 1
-                prev_words = words
-                await websocket.send_json(clean_json_inf_nan({
-                    "type": "partial",
-                    "confirmed": " ".join(words[:agree]),
-                    "pending": " ".join(words[agree:]),
-                    "buffered_seconds": round(total_samples / WS_SAMPLE_RATE, 2),
-                }))
+            # Single-flight interim decode. While one is running the loop keeps
+            # draining the socket, so frames are never left queued in the
+            # transport; the next decode simply starts from the newest audio.
+            if (
+                (decode_task is None or decode_task.done())
+                and received_samples - decoded_at_samples >= min_new_samples
+            ):
+                decoded_at_samples = received_samples
+                decode_task = asyncio.create_task(_interim_decode())
 
-        # Final decode over the whole session buffer
-        if total_samples:
-            buffer = np.concatenate(chunks)
-            text, info = await loop.run_in_executor(executor, _ws_decode, buffer, language)
-            await websocket.send_json(clean_json_inf_nan({
+        # Stop requested. Cancelling only detaches the task so it cannot emit a
+        # partial after the final — the worker thread keeps running its decode
+        # to completion, because a thread in an executor cannot be interrupted.
+        # That is why the final runs on the batch pool below: waiting for the
+        # abandoned interim to free a realtime slot would delay every other
+        # live session's partials.
+        if decode_task is not None and not decode_task.done():
+            decode_task.cancel()
+            try:
+                await decode_task
+            except asyncio.CancelledError:
+                # Expected: we just cancelled it. Do not let this be mistaken
+                # for cancellation of this handler.
+                pass
+            except Exception:
+                pass
+            decode_task = None
+
+        if buffered_samples:
+            buffer = _tail(buffered_samples)
+            # Batch pool: this is a beam-search decode over the whole session
+            # buffer and has no business holding a realtime slot.
+            text, info = await loop.run_in_executor(executor, _ws_final_decode, buffer, language)
+            await _send({
                 "type": "final",
                 "text": text,
                 "language": info.language,
                 "language_probability": info.language_probability,
-                "duration": round(total_samples / WS_SAMPLE_RATE, 2),
-            }))
+                # Duration of the audio this text actually covers. When the
+                # rolling window has dropped older audio the two differ, and
+                # reporting the session total here made the transcript look
+                # like it was missing content rather than bounded on purpose.
+                "duration": round(buffered_samples / WS_SAMPLE_RATE, 2),
+                "received_duration": round(received_samples / WS_SAMPLE_RATE, 2),
+                "truncated": rolled,
+            })
         else:
-            await websocket.send_json({"type": "final", "text": "", "language": None, "duration": 0.0})
+            await _send({"type": "final", "text": "", "language": None, "duration": 0.0})
         await websocket.close()
     except WebSocketDisconnect:
         pass
     except Exception as e:
         logger.error(f"WebSocket transcription error: {e}", exc_info=True)
         try:
-            await websocket.send_json({"type": "error", "error": str(e)})
+            await _send({"type": "error", "error": str(e)})
             await websocket.close(code=1011)
         except Exception:
             pass
+    finally:
+        # A client that vanishes mid-decode must not leave the task holding a
+        # model slot for the rest of the decode.
+        if decode_task is not None and not decode_task.done():
+            decode_task.cancel()
+        _live_sessions -= 1
 
 
 @app.get("/health", response_class=SafeJSONResponse)
 async def health_check():
-    """Return model, device, and readiness information for health monitoring."""
-    current_model = model_size_loaded or os.getenv("WHISPER_MODEL_SIZE", "large-v3")
-    return {
-        "status": "ok",
+    """Liveness + readiness for health monitoring.
+
+    Distinguishes two states that both mean "no model in memory" but need
+    opposite handling:
+
+    - **not resident** — the model was unloaded to free VRAM, or has not been
+      loaded yet. The service is fine and the next request will load it, so
+      this returns 200. Returning 503 here would make an idle container go
+      `unhealthy` under Docker's `curl -f` check and show as down in the UI.
+    - **broken** — every load attempt failed. That is a real outage: 503.
+    """
+    current_model = model_size_loaded or configured_model_size()
+    resident = whisper_model is not None
+    body = {
+        "status": "error" if startup_error else "ok",
+        # Kept for API compatibility: existing clients read model_loaded.
         "model_loaded": model_loaded,
+        "model_resident": resident,
+        "can_load": startup_error is None,
+        "model_warmed": model_warmed,
         "device": device,
         "compute_type": compute_type,
         "model_size": current_model,
         "multilingual": current_model not in ENGLISH_ONLY_MODELS,
+        "live_sessions": _live_sessions,
         "torch_version": torch.__version__,
         "cuda_available": torch.cuda.is_available()
     }
+    if startup_error:
+        body["startup_error"] = startup_error
+        return SafeJSONResponse(content=body, status_code=503)
+    return body
 
 @app.get("/info", response_class=SafeJSONResponse)
 async def service_info():
@@ -678,7 +1086,7 @@ async def service_info():
         "device": device,
         "compute_type": compute_type,
         "model_loaded": model_loaded,
-        "model_size": os.getenv("WHISPER_MODEL_SIZE", "large-v3"),
+        "model_size": model_size_loaded or configured_model_size(),
         "torch_version": torch.__version__,
         "cuda_available": torch.cuda.is_available(),
         "gpu_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
@@ -701,9 +1109,11 @@ async def available_models():
             {"name": "large-v1",        "multilingual": True,  "size_mb": 2900},
             {"name": "large-v2",        "multilingual": True,  "size_mb": 2900},
             {"name": "large-v3",        "multilingual": True,  "size_mb": 3100},
+            {"name": "large-v3-turbo",  "multilingual": True,  "size_mb": 1600,
+             "note": "Default. 4 decoder layers vs large-v3's 32 — fastest multilingual option; cannot translate"},
             {"name": "distil-large-v3", "multilingual": False, "size_mb": 1500, "note": "English-only, fastest"},
         ],
-        "current_model": os.getenv("WHISPER_MODEL_SIZE", "large-v3"),
+        "current_model": model_size_loaded or configured_model_size(),
         "supported_languages": [
             "en", "zh", "de", "es", "ru", "ko", "fr", "ja", "pt", "tr", "pl", "ca", "nl",
             "ar", "sv", "it", "id", "hi", "fi", "vi", "he", "uk", "el", "ms", "cs", "ro",

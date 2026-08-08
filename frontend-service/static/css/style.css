@@ -216,6 +216,19 @@ body {
     animation: pulse 1.5s infinite;
 }
 
+/* Healthy, but the model was unloaded to free memory. Distinct from both
+   "ready" and "down": the next request reloads it, so it must not read as an
+   error — it reads as a hollow dot instead of a filled one. */
+.service-indicator.healthy.idle {
+    background: rgba(73, 199, 122, 0.06);
+    border-color: rgba(73, 199, 122, 0.25);
+    opacity: 0.75;
+}
+
+.service-indicator.healthy.idle::before {
+    content: "○";
+}
+
 /* Tabs */
 .tabs {
     display: flex;
