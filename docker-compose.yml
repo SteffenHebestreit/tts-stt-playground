@@ -24,6 +24,11 @@ services:
       PIPER_DATA_DIR: /app/models
       PIPER_OUTPUT_DIR: /app/output
       OUTPUT_RETENTION_HOURS: ${OUTPUT_RETENTION_HOURS:-24}
+      OUTPUT_PRUNE_INTERVAL_S: ${OUTPUT_PRUNE_INTERVAL_S:-3600}
+      # Piper is CPU-only ONNX, so these two decide its throughput. They matter
+      # most on the RK3588S, the one target with no GPU at all.
+      ONNX_NUM_THREADS: ${ONNX_NUM_THREADS:-2}
+      ONNX_SESSION_CACHE_SIZE: ${ONNX_SESSION_CACHE_SIZE:-4}
       # A German request with no German voice otherwise returns English audio
       # at HTTP 200. Always reported via X-Language-Fallback; set true to 400.
       PIPER_STRICT_LANGUAGE: ${PIPER_STRICT_LANGUAGE:-false}
@@ -109,7 +114,9 @@ services:
       - "${STT_PORT:-5001}:8000"
     environment:
       USE_CUDA: "true"
-      FORCE_ACCELERATION: ${FORCE_ACCELERATION:-cuda}
+      # Only the value `rocm` changes behaviour; everything else falls through
+      # to auto-detection. Default empty to match .env.example.
+      FORCE_ACCELERATION: ${FORCE_ACCELERATION:-}
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
       NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
       # large-v3-turbo: 4 decoder layers vs large-v3's 32 at comparable accuracy.
@@ -117,6 +124,14 @@ services:
       # biggest live-latency lever. It cannot do task="translate" — set
       # large-v3 here if you need translation.
       WHISPER_MODEL_SIZE: ${WHISPER_MODEL_SIZE:-large-v3-turbo}
+      # Empty = probe the device and pick the most memory-efficient supported
+      # type. Passed through explicitly because benchmarks/run_german_eval.py
+      # A/Bs float16 against int8_float16 by setting exactly this variable; if
+      # compose swallowed it, the comparison would measure one config twice and
+      # confidently report "no significant difference".
+      WHISPER_COMPUTE_TYPE: ${WHISPER_COMPUTE_TYPE:-}
+      # Last resort before a 503 when the chosen model will not fit in VRAM.
+      WHISPER_OOM_FALLBACK: ${WHISPER_OOM_FALLBACK:-small}
       WORKERS: 1
       # Live-transcription tuning. WS_WINDOW_S bounds how much trailing audio
       # each interim decode re-transcribes. Whisper pads the mel to a fixed 30 s
@@ -125,6 +140,12 @@ services:
       WS_WINDOW_S: ${WS_WINDOW_S:-8.0}
       WS_MIN_NEW_AUDIO_S: ${WS_MIN_NEW_AUDIO_S:-0.5}
       WS_MAX_SESSIONS: ${WS_MAX_SESSIONS:-4}
+      # Cap on retained audio per session, and the two hallucination filters.
+      # Documented in .env.example and read by the code, so they must actually
+      # reach the container — see tests/test_env_wiring.py.
+      WS_MAX_BUFFER_S: ${WS_MAX_BUFFER_S:-600.0}
+      WS_NO_SPEECH_THRESHOLD: ${WS_NO_SPEECH_THRESHOLD:-0.6}
+      WS_MIN_AVG_LOGPROB: ${WS_MIN_AVG_LOGPROB:--1.0}
       WHISPER_NUM_WORKERS: ${WHISPER_NUM_WORKERS:-2}
       # CT2 spawns WHISPER_NUM_WORKERS model replicas, each running
       # cpu_threads threads. Without an explicit cap the BLAS layer also
@@ -176,6 +197,8 @@ services:
       # Release the ~4 GB model after this many idle seconds.
       # >0 seconds | 0 = unload when idle | -1 = never unload.
       ASR_MODEL_TTL: ${ASR_MODEL_TTL:-300}
+      # Global fallback the code reads when the specific TTL is unset.
+      MODEL_TTL: ${MODEL_TTL:-300}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
@@ -212,6 +235,8 @@ services:
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
       NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
       PARAKEET_ASR_MODEL: ${PARAKEET_ASR_MODEL:-nvidia/parakeet-tdt-0.6b-v3}
+      # Peak VRAM scales with this; lower it before lowering model size.
+      ASR_MAX_BATCH: ${ASR_MAX_BATCH:-8}
       # One shared model on one GPU: bound concurrent inference rather than
       # letting the default thread pool multiply peak VRAM.
       ASR_MAX_CONCURRENCY: ${ASR_MAX_CONCURRENCY:-1}
@@ -254,6 +279,8 @@ services:
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
       NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
       CANARY_ASR_MODEL: ${CANARY_ASR_MODEL:-nvidia/canary-180m-flash}
+      # Peak VRAM scales with this; lower it before lowering model size.
+      ASR_MAX_BATCH: ${ASR_MAX_BATCH:-8}
       CANARY_DEFAULT_LANGUAGE: ${CANARY_DEFAULT_LANGUAGE:-de}
       # One shared model on one GPU: bound concurrent inference rather than
       # letting the default thread pool multiply peak VRAM.
@@ -300,6 +327,8 @@ services:
       # 12 GB card with the STT/ASR stack (which already sits at ~9.7 GB).
       # >0 seconds | 0 = unload immediately | -1 = never unload.
       TTS_MODEL_TTL: ${TTS_MODEL_TTL:-300}
+      # Global fallback the code reads when the specific TTL is unset.
+      MODEL_TTL: ${MODEL_TTL:-300}
       # One shared model on one GPU: bound concurrent generation rather than
       # letting the default thread pool multiply peak VRAM.
       TTS_MAX_CONCURRENCY: ${TTS_MAX_CONCURRENCY:-1}
@@ -349,6 +378,8 @@ services:
       # Release the model after this many idle seconds. Reloads whatever was
       # last selected via /load_model, not the env default.
       TTS_MODEL_TTL: ${TTS_MODEL_TTL:-300}
+      # Global fallback the code reads when the specific TTL is unset.
+      MODEL_TTL: ${MODEL_TTL:-300}
       # expandable_segments avoids the fragmentation that per-request
       # empty_cache() calls used to (badly) paper over.
       PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
@@ -444,7 +475,17 @@ services:
       ENABLE_WHISPER_CPP: ${ENABLE_WHISPER_CPP:-false}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
-      # Browser-facing URLs (uses host ports for the browser to connect)
+      # Which backend the UI preselects; must be an id from GET /providers.
+      DEFAULT_STT_PROVIDER: ${DEFAULT_STT_PROVIDER:-whisper}
+      DEFAULT_TTS_PROVIDER: ${DEFAULT_TTS_PROVIDER:-piper}
+      # Per-provider timeout for GET /api/health. Probes run concurrently, so
+      # this bounds the whole call rather than each probe in sequence.
+      PROVIDER_HEALTH_TIMEOUT: ${PROVIDER_HEALTH_TIMEOUT:-6}
+      # Upstream pool. KEEPALIVE_EXPIRY must stay BELOW the backends' keep-alive
+      # timeout, or the gateway hands out sockets they have already closed.
+      UPSTREAM_MAX_CONNECTIONS: ${UPSTREAM_MAX_CONNECTIONS:-100}
+      UPSTREAM_MAX_KEEPALIVE: ${UPSTREAM_MAX_KEEPALIVE:-20}
+      UPSTREAM_KEEPALIVE_EXPIRY: ${UPSTREAM_KEEPALIVE_EXPIRY:-115}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
