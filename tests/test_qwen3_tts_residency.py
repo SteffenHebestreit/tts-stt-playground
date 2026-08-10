@@ -15,6 +15,7 @@ import asyncio
 import os
 import sys
 import tempfile
+import time
 import types
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
@@ -152,11 +153,22 @@ def test_nothing_to_unload_when_not_resident(clean):
 
 
 def test_touch_resets_the_idle_countdown(clean):
+    """_touch_model must restart the countdown against the real clock.
+
+    This is the one test that cannot inject `now`: the whole point is that
+    _touch_model() stamps time.monotonic() itself, so the assertion has to use
+    the same clock.
+
+    _last_used is therefore anchored RELATIVE to that clock. It used to be set
+    to 0.0 and the test assumed `time.monotonic() - 0.0 >= 300`, which is
+    seconds since boot — true on any long-running machine, false on a freshly
+    booted CI runner. It passed locally for months and failed on GitHub.
+    """
     m = clean
     m.tts_model = object()
     m.MODEL_TTL = 300.0
     m._inflight = 0
-    m._last_used = 0.0
+    m._last_used = time.monotonic() - (m.MODEL_TTL + 1.0)
 
     assert m._should_unload() is True
     m._touch_model()
