@@ -454,7 +454,15 @@ def _build_provider_registry() -> dict:
             "short_name": "Whisper STT",
             "internal_url": STT_SERVICE_URL,
             "health_endpoint": "/health",
-            "capabilities": ["transcribe", "segments", "detect_language", "streaming", "model_unload"],
+            # "streaming" is the SSE route /transcribe-stream (a whole file,
+            # segments pushed as they decode). "live_transcribe" is the
+            # WebSocket route /ws/transcribe (a microphone, partials as you
+            # speak). They are different things and only this provider has
+            # either — see the gate in /ws/stt.
+            "capabilities": [
+                "transcribe", "segments", "detect_language",
+                "streaming", "live_transcribe", "model_unload",
+            ],
             # `language_detect` is the machine-readable truth for API clients.
             # Some backends expose a /detect_language route that always returns
             # null, so route-exists is not the same as capability-exists.
@@ -1948,6 +1956,19 @@ async def frontend_ws_stt(websocket: WebSocket):
         provider = _get_provider(provider_id, kind="stt")
     except HTTPException as exc:
         await websocket.close(code=1008, reason=str(exc.detail)[:120])
+        return
+
+    # Only stt-service implements /ws/transcribe. The other STT backends are
+    # request/response only — qwen3-asr, parakeet and canary expose no
+    # WebSocket at all, and whisper-cpp is the upstream whisper-server binary
+    # with no Python layer. Without this check the relay happily dialled
+    # ws://<backend>/ws/transcribe, and the caller got an opaque connection
+    # failure instead of being told the provider cannot do this.
+    if "live_transcribe" not in (provider.get("capabilities") or []):
+        await websocket.close(
+            code=1008,
+            reason=f"provider '{provider_id}' does not support live transcription"[:120],
+        )
         return
 
     upstream_url = provider["internal_url"].replace("http://", "ws://").replace("https://", "wss://") + "/ws/transcribe"

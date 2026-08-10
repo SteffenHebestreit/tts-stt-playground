@@ -262,3 +262,55 @@ def test_stt_health_exposes_the_reference_count():
     """Callers need to know when a retry is worthwhile."""
     source = (REPO_ROOT / "stt-service" / "app.py").read_text(encoding="utf-8")
     assert '"model_refs": _model_refs' in source
+
+
+# --- live transcription capability -------------------------------------------
+#
+# Same truthfulness rule as model_unload and language_detect: only stt-service
+# implements @app.websocket("/ws/transcribe"). qwen3-asr, parakeet and canary
+# expose no WebSocket at all, and whisper-cpp has no Python layer — it is the
+# upstream whisper-server binary. The /ws/stt relay used to dial
+# ws://<backend>/ws/transcribe for any stt provider, so selecting one of those
+# produced an opaque connection failure rather than a clear refusal.
+
+LIVE_CAPABILITY = "live_transcribe"
+
+
+def _has_websocket_route(service_dir: str) -> bool:
+    source_path = REPO_ROOT / service_dir / "app.py"
+    if not source_path.exists():
+        return False  # whisper-cpp ships no app.py
+    return "@app.websocket" in source_path.read_text(encoding="utf-8")
+
+
+def test_only_providers_with_a_websocket_claim_live_transcribe(declared_capabilities):
+    """Declared exactly where @app.websocket("/ws/transcribe") exists."""
+    service_of = {
+        "whisper": "stt-service",
+        "qwen3-asr": "qwen3-asr-service",
+        "parakeet": "parakeet-asr-service",
+        "canary": "canary-asr-service",
+        "whisper-cpp": "whisper-cpp-service",
+    }
+    for provider, service_dir in service_of.items():
+        if provider not in declared_capabilities:
+            continue
+        declared = LIVE_CAPABILITY in declared_capabilities[provider]
+        implemented = _has_websocket_route(service_dir)
+        assert declared == implemented, (
+            f"provider '{provider}': registry says {LIVE_CAPABILITY}={declared} but "
+            f"{service_dir} {'has' if implemented else 'has no'} a websocket route"
+        )
+
+
+def test_relay_refuses_providers_without_live_transcribe():
+    """The gate must exist in the relay, not just in the registry."""
+    source = (REPO_ROOT / "frontend-service" / "app.py").read_text(encoding="utf-8")
+    relay = source[source.index("async def websocket_stt_relay"):] if \
+        "async def websocket_stt_relay" in source else source[source.index('"/ws/stt"'):]
+    head = relay[:3000]
+    assert LIVE_CAPABILITY in head, (
+        "/ws/stt does not check live_transcribe before dialling the backend; "
+        "selecting a provider with no websocket gives an opaque failure"
+    )
+    assert "1008" in head, "refusal should close with a policy-violation code and a reason"

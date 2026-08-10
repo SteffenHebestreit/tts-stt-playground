@@ -70,6 +70,13 @@ services:
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
       # NOTE: BROWSER_*_URL variables are intentionally not set. Everything the
       # browser needs is proxied through this service on port 3000.
+      # Parity with docker-compose.yml — see tests/test_env_wiring.py.
+      DEFAULT_STT_PROVIDER: ${DEFAULT_STT_PROVIDER:-whisper}
+      DEFAULT_TTS_PROVIDER: ${DEFAULT_TTS_PROVIDER:-piper}
+      PROVIDER_HEALTH_TIMEOUT: ${PROVIDER_HEALTH_TIMEOUT:-6}
+      UPSTREAM_MAX_CONNECTIONS: ${UPSTREAM_MAX_CONNECTIONS:-100}
+      UPSTREAM_MAX_KEEPALIVE: ${UPSTREAM_MAX_KEEPALIVE:-20}
+      UPSTREAM_KEEPALIVE_EXPIRY: ${UPSTREAM_KEEPALIVE_EXPIRY:-115}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
@@ -90,6 +97,11 @@ services:
       OUTPUT_RETENTION_HOURS: ${OUTPUT_RETENTION_HOURS:-24}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
+      # Parity with docker-compose.yml — see tests/test_env_wiring.py.
+      OUTPUT_PRUNE_INTERVAL_S: ${OUTPUT_PRUNE_INTERVAL_S:-3600}
+      ONNX_NUM_THREADS: ${ONNX_NUM_THREADS:-2}
+      ONNX_SESSION_CACHE_SIZE: ${ONNX_SESSION_CACHE_SIZE:-4}
+      PIPER_STRICT_LANGUAGE: ${PIPER_STRICT_LANGUAGE:-false}
     volumes:
       - "${APP_DATA_DIR:-/mnt/pool/apps/tts-stt}/models:/app/models"
       - "${APP_DATA_DIR:-/mnt/pool/apps/tts-stt}/output:/app/output"
@@ -126,6 +138,14 @@ services:
       WHISPER_NUM_WORKERS: ${WHISPER_NUM_WORKERS:-2}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
+      # Parity with docker-compose.yml — see tests/test_env_wiring.py.
+      WHISPER_COMPUTE_TYPE: ${WHISPER_COMPUTE_TYPE:-}
+      WHISPER_OOM_FALLBACK: ${WHISPER_OOM_FALLBACK:-small}
+      WORKERS: 1
+      WS_MAX_BUFFER_S: ${WS_MAX_BUFFER_S:-600.0}
+      WS_NO_SPEECH_THRESHOLD: ${WS_NO_SPEECH_THRESHOLD:-0.6}
+      WS_MIN_AVG_LOGPROB: ${WS_MIN_AVG_LOGPROB:--1.0}
+      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-4}
     volumes:
       - "${APP_DATA_DIR:-/mnt/pool/apps/tts-stt}/models:/app/models"
       - "${APP_DATA_DIR:-/mnt/pool/apps/tts-stt}/.cache:/root/.cache"
@@ -160,6 +180,9 @@ services:
       ASR_MAX_CONCURRENCY: ${ASR_MAX_CONCURRENCY:-1}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
+      # Parity with docker-compose.yml — see tests/test_env_wiring.py.
+      ASR_MODEL_TTL: ${ASR_MODEL_TTL:-300}
+      MODEL_TTL: ${MODEL_TTL:-300}
     volumes:
       - "${APP_DATA_DIR:-/mnt/pool/apps/tts-stt}/hf-cache/qwen3-asr:/root/.cache"
     restart: unless-stopped
@@ -192,6 +215,9 @@ services:
       TTS_MAX_CONCURRENCY: ${TTS_MAX_CONCURRENCY:-1}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
+      # Parity with docker-compose.yml — see tests/test_env_wiring.py.
+      TTS_MODEL_TTL: ${TTS_MODEL_TTL:-300}
+      MODEL_TTL: ${MODEL_TTL:-300}
     volumes:
       - "${APP_DATA_DIR:-/mnt/pool/apps/tts-stt}/hf-cache/qwen3-tts:/root/.cache"
       - "${APP_DATA_DIR:-/mnt/pool/apps/tts-stt}/qwen3-voices:/app/voices"
