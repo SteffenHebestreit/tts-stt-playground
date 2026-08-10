@@ -487,3 +487,68 @@ def test_translate_is_rejected_on_turbo_models(client, stt_app):
         stt_app._reject_unsupported_translate("translate")
     finally:
         stt_app.model_size_loaded = original
+
+
+def test_control_frame_without_language_does_not_reset_it(client):
+    """A control frame that omits `language` must leave the session language alone.
+
+    The language line used to run on every non-stop text frame, so any control
+    message that did not repeat the language — a keepalive, a future event type —
+    silently reset a German session to auto-detect and told no one. The browser
+    only ever sends {language} then {event:"stop"}, so it never tripped this;
+    an API client sending anything else did, and this is used mostly as an API.
+
+    Auto-detect on short or noisy German is exactly where Whisper guesses
+    English, so the failure is silent and German-shaped.
+    """
+    client.fake_model.default = [_Segment("guten tag")]
+
+    with client.websocket_connect("/ws/transcribe") as ws:
+        ws.send_json({"language": "de"})
+        ws.send_bytes(pcm(0.2))
+        _drain_until(ws, "partial")
+
+        # Any other control frame — no `language` key anywhere in it.
+        ws.send_json({"event": "ping"})
+        ws.send_bytes(pcm(0.4))
+        _drain_until(ws, "partial")
+
+    languages = [call.get("language") for call in client.fake_model.calls]
+    assert languages, "no decode ran"
+    assert all(lang == "de" for lang in languages), (
+        f"the session language was reset by a control frame: {languages}"
+    )
+
+
+def test_control_frame_can_still_change_the_language(client):
+    """The reset guard must not make `language` immutable mid-session."""
+    client.fake_model.default = [_Segment("hello")]
+
+    with client.websocket_connect("/ws/transcribe") as ws:
+        ws.send_json({"language": "de"})
+        ws.send_bytes(pcm(0.2))
+        _drain_until(ws, "partial")
+        first = [c.get("language") for c in client.fake_model.calls]
+
+        ws.send_json({"language": "en"})
+        ws.send_bytes(pcm(0.4))
+        _drain_until(ws, "partial")
+
+    languages = [c.get("language") for c in client.fake_model.calls]
+    assert first and first[0] == "de"
+    assert languages[-1] == "en", f"explicit language change was ignored: {languages}"
+
+
+def test_explicit_auto_still_means_auto_detect(client):
+    """`{"language": "auto"}` must map to None, not to the literal string."""
+    client.fake_model.default = [_Segment("hello")]
+
+    with client.websocket_connect("/ws/transcribe") as ws:
+        ws.send_json({"language": "auto"})
+        ws.send_bytes(pcm(0.2))
+        _drain_until(ws, "partial")
+
+    languages = [c.get("language") for c in client.fake_model.calls]
+    assert languages and all(lang is None for lang in languages), (
+        f"faster-whisper rejects the literal 'auto'; got {languages}"
+    )

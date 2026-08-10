@@ -1072,8 +1072,15 @@ async def websocket_transcribe(websocket: WebSocket):
                     continue
                 if control.get("event") == "stop":
                     break
-                lang = str(control.get("language", "") or "").strip().lower()
-                language = None if lang in ("", "auto") else lang
+                # Only touch the language when the frame actually carries the
+                # key. This used to run unconditionally, so ANY control frame
+                # that omitted it — a keepalive, a future event type — reset a
+                # German session to auto-detect and never told the caller.
+                # The browser only ever sends {language} then {event:"stop"}, so
+                # it never tripped; an API client sending anything else did.
+                if "language" in control:
+                    lang = str(control.get("language") or "").strip().lower()
+                    language = None if lang in ("", "auto") else lang
 
             # Single-flight interim decode. While one is running the loop keeps
             # draining the socket, so frames are never left queued in the
