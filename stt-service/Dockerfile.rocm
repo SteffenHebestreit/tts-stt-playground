@@ -50,6 +50,7 @@ COPY app.py .
 # the ROCm image crash before uvicorn ever bound its port — masked in dev only
 # because docker-compose.dev.yml mounts the source over the image.
 COPY json_utils.py .
+COPY residency.py .
 
 RUN mkdir -p /app/models && chmod 755 /app/models
 

@@ -61,13 +61,25 @@ def _documented() -> set[str]:
 
 
 def _consumed_by_service() -> dict[str, set[str]]:
-    """{service_dir_name: variables its Python reads via os.getenv/environ.get}."""
+    """{service_dir_name: variables its Python reads}.
+
+    Two shapes, because the second one hid the exact class of bug this file
+    exists to catch. `ttl_from_env(os.getenv, "STT_MODEL_TTL", "MODEL_TTL")`
+    passes `os.getenv` as a *callable* and the names as later arguments, so the
+    direct-call pattern below never matched it — and the idle-unload TTLs, which
+    the deployment-parity section calls "the whole VRAM story on a 12 GB card",
+    were the one family of knobs this guard could not see.
+    """
     out: dict[str, set[str]] = {}
     for path in REPO_ROOT.glob("*-service/*.py"):
         source = path.read_text(encoding="utf-8", errors="ignore")
         names = set(re.findall(
             r"os\.(?:getenv|environ\.get)\(\s*[\"']([A-Z0-9_]+)[\"']", source
         ))
+        for call in re.findall(
+            r"ttl_from_env\(\s*os\.(?:getenv|environ\.get)\s*,([^)]*)\)", source
+        ):
+            names.update(re.findall(r"[\"']([A-Z0-9_]+)[\"']", call))
         out.setdefault(path.parent.name, set()).update(names)
     return out
 

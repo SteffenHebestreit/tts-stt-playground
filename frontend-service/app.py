@@ -1316,6 +1316,12 @@ def _timeout(read: float) -> httpx.Timeout:
     A bare float applies the *whole* budget to each phase including connect, so a
     600 s synthesis budget also meant a 600 s wait for a dead upstream. Connect
     should fail fast; only the read phase needs the long budget.
+
+    Every upstream call in this module goes through here. Passing a bare float
+    to httpx directly is the bug this function exists to prevent, and it was
+    still doing exactly that on nine call sites — including voice cloning and
+    saved-voice TTS at 600 s, where stopping the qwen3 container left the
+    browser's spinner running for ten minutes before the "unavailable" arrived.
     """
     return httpx.Timeout(connect=3.0, read=read, write=120.0, pool=10.0)
 
@@ -1391,7 +1397,7 @@ async def _provider_get(provider_id: str, path: str, timeout: float = 30.0) -> h
     provider = _get_provider(provider_id)
     client = _get_http_client()
     try:
-        response = await client.get(f"{provider['internal_url']}{path}", timeout=timeout)
+        response = await client.get(f"{provider['internal_url']}{path}", timeout=_timeout(timeout))
     except httpx.RequestError as exc:
         raise _build_upstream_request_error(provider.get("display_name", provider_id), exc) from exc
     if response.status_code >= 400:
@@ -1404,7 +1410,7 @@ async def _provider_delete(provider_id: str, path: str, timeout: float = 30.0) -
     provider = _get_provider(provider_id)
     client = _get_http_client()
     try:
-        response = await client.delete(f"{provider['internal_url']}{path}", timeout=timeout)
+        response = await client.delete(f"{provider['internal_url']}{path}", timeout=_timeout(timeout))
     except httpx.RequestError as exc:
         raise _build_upstream_request_error(provider.get("display_name", provider_id), exc) from exc
     if response.status_code >= 400:
@@ -1417,7 +1423,7 @@ async def _provider_json_post(provider_id: str, path: str, payload: dict, timeou
     provider = _get_provider(provider_id)
     client = _get_http_client()
     try:
-        response = await client.post(f"{provider['internal_url']}{path}", json=payload, timeout=timeout)
+        response = await client.post(f"{provider['internal_url']}{path}", json=payload, timeout=_timeout(timeout))
     except httpx.RequestError as exc:
         raise _build_upstream_request_error(provider.get("display_name", provider_id), exc) from exc
     if response.status_code >= 400:
@@ -1455,7 +1461,7 @@ async def _provider_form_post(provider_id: str, path: str, request: Request, tim
     client = _get_http_client()
 
     try:
-        request_kwargs = {"data": data, "timeout": timeout}
+        request_kwargs = {"data": data, "timeout": _timeout(timeout)}
         if files:
             request_kwargs["files"] = files
         response = await client.post(f"{provider['internal_url']}{path}", **request_kwargs)
@@ -1471,7 +1477,7 @@ async def _proxy_training_get(path: str, timeout: float = 30.0):
     provider = _get_provider("piper-training", kind="training")
     client = _get_http_client()
     try:
-        response = await client.get(f"{provider['internal_url']}{path}", timeout=timeout)
+        response = await client.get(f"{provider['internal_url']}{path}", timeout=_timeout(timeout))
     except httpx.RequestError as exc:
         raise _build_upstream_request_error(provider.get("display_name", "training service"), exc) from exc
     if response.status_code >= 400:
@@ -1484,7 +1490,7 @@ async def _proxy_training_delete(path: str, timeout: float = 30.0):
     provider = _get_provider("piper-training", kind="training")
     client = _get_http_client()
     try:
-        response = await client.delete(f"{provider['internal_url']}{path}", timeout=timeout)
+        response = await client.delete(f"{provider['internal_url']}{path}", timeout=_timeout(timeout))
     except httpx.RequestError as exc:
         raise _build_upstream_request_error(provider.get("display_name", "training service"), exc) from exc
     if response.status_code >= 400:
@@ -1499,7 +1505,7 @@ async def _proxy_training_form_post(path: str, request: Request, timeout: float 
     client = _get_http_client()
 
     try:
-        request_kwargs = {"data": data, "timeout": timeout}
+        request_kwargs = {"data": data, "timeout": _timeout(timeout)}
         if files:
             request_kwargs["files"] = files
         response = await client.post(f"{provider['internal_url']}{path}", **request_kwargs)
@@ -1522,6 +1528,71 @@ class FrontendTTSRequest(BaseModel):
     speed: Optional[float] = None
     instructions: Optional[str] = None
     output_format: str = "wav"
+
+
+def _build_tts_payload(
+    provider_id: str,
+    provider: dict,
+    *,
+    text: str,
+    voice: Optional[str] = None,
+    language: str = "auto",
+    quality: Optional[str] = None,
+    gender: Optional[str] = None,
+    speed: Optional[float] = None,
+    instructions: Optional[str] = None,
+    output_format: str = "wav",
+) -> tuple[dict, float]:
+    """Translate a normalized TTS request into one provider's native body.
+
+    Shared by `/api/tts` and the OpenAI-compatible `/v1/audio/speech`, and that
+    sharing is the point: `/v1` used to build Piper's body unconditionally, so
+    on a deployment with DEFAULT_TTS_PROVIDER=qwen3 it sent `language` and
+    `voice` to a service whose fields are `lang` and `speaker`. Pydantic ignores
+    unknown keys, so both were dropped in silence and every request came back as
+    the default speaker reading German text in English — HTTP 200, wrong audio,
+    no signal. The same failure mode the whisper.cpp language default had.
+
+    Returns ``(payload, read_timeout_seconds)``.
+    """
+    contract = provider.get("contracts", {}).get("tts")
+    if contract != "simple-json-tts-v1":
+        raise HTTPException(
+            status_code=400, detail=f"Unsupported TTS contract for provider {provider_id}"
+        )
+
+    if provider_id == "piper":
+        payload = {
+            "text": text,
+            "output_format": output_format,
+            "speed": speed if speed is not None else 1.0,
+        }
+        if voice:
+            payload["voice"] = voice
+        if language and language != "auto":
+            payload["language"] = language
+        if quality:
+            payload["quality"] = quality
+        if gender:
+            payload["gender"] = gender
+        return payload, 120.0
+
+    if provider_id == "chatterbox":
+        # No speed control in the chatterbox API; "auto" resolves to
+        # CHATTERBOX_DEFAULT_LANGUAGE service-side.
+        return {"text": text, "language": language or "auto"}, 300.0
+
+    if provider_id == "qwen3":
+        return {
+            "text": text,
+            "lang": _normalize_qwen3_language(language),
+            "speaker": voice or "Vivian",
+            "instruct": instructions or "",
+        }, 120.0
+
+    raise HTTPException(
+        status_code=400, detail=f"Unsupported TTS contract for provider {provider_id}"
+    )
 
 
 class ProviderModelSelectionRequest(BaseModel):
@@ -1807,7 +1878,7 @@ async def provider_unload(provider_id: str):
 
     client = _get_http_client()
     try:
-        response = await client.post(f"{provider['internal_url']}/unload", timeout=30.0)
+        response = await client.post(f"{provider['internal_url']}/unload", timeout=_timeout(30.0))
     except httpx.RequestError as exc:
         raise _build_upstream_request_error(provider.get("display_name", provider_id), exc) from exc
 
@@ -2054,7 +2125,7 @@ async def frontend_stt(request: Request):
 
     client = _get_http_client()
     try:
-        response = await client.post(f"{provider['internal_url']}{backend_path}", data=data, files=files, timeout=300.0)
+        response = await client.post(f"{provider['internal_url']}{backend_path}", data=data, files=files, timeout=_timeout(300.0))
     except httpx.RequestError as exc:
         raise _build_upstream_request_error(provider.get("display_name", provider_id), exc) from exc
 
@@ -2073,42 +2144,22 @@ async def frontend_stt(request: Request):
 async def frontend_tts(request: FrontendTTSRequest):
     """Synthesize speech through a normalized frontend TTS adapter."""
     provider = _get_provider(request.provider, kind="tts")
-    contract = provider.get("contracts", {}).get("tts")
 
     if not request.text.strip():
         raise HTTPException(status_code=400, detail="Text not provided")
 
-    if contract == "simple-json-tts-v1" and request.provider == "piper":
-        payload = {
-            "text": request.text,
-            "output_format": request.output_format,
-            "speed": request.speed if request.speed is not None else 1.0,
-        }
-        if request.voice:
-            payload["voice"] = request.voice
-        if request.language and request.language != "auto":
-            payload["language"] = request.language
-        if request.quality:
-            payload["quality"] = request.quality
-        if request.gender:
-            payload["gender"] = request.gender
-        read_timeout = 120.0
-    elif contract == "simple-json-tts-v1" and request.provider == "chatterbox":
-        payload = {
-            "text": request.text,
-            "language": request.language or "auto",
-        }
-        read_timeout = 300.0
-    elif contract == "simple-json-tts-v1" and request.provider == "qwen3":
-        payload = {
-            "text": request.text,
-            "lang": _normalize_qwen3_language(request.language),
-            "speaker": request.voice or "Vivian",
-            "instruct": request.instructions or "",
-        }
-        read_timeout = 120.0
-    else:
-        raise HTTPException(status_code=400, detail=f"Unsupported TTS contract for provider {request.provider}")
+    payload, read_timeout = _build_tts_payload(
+        request.provider,
+        provider,
+        text=request.text,
+        voice=request.voice,
+        language=request.language,
+        quality=request.quality,
+        gender=request.gender,
+        speed=request.speed,
+        instructions=request.instructions,
+        output_format=request.output_format,
+    )
 
     # Prefer the provider's chunked streaming endpoint when it declares one:
     # time-to-first-audio then tracks the first sentence instead of the whole
@@ -2211,6 +2262,7 @@ app.include_router(
         post_form=_provider_form_post_raw,
         post_json=_provider_json_post,
         provider_health=provider_health,
+        build_tts_payload=_build_tts_payload,
     )
 )
 

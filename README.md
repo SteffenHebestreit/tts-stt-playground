@@ -543,6 +543,13 @@ For always-on versus training-window service recommendations, use
 > headroom for training. Avoid running training concurrently with all three
 > inference services if you hit OOM.
 
+Those are peak figures, and none of them is permanent: each GPU service releases
+its weights after `MODEL_TTL` seconds idle (300 by default) and reloads on the
+next request, so what has to fit is closer to the models actually in use than to
+the sum of the column. Override per service with `STT_MODEL_TTL`,
+`ASR_MODEL_TTL` or `TTS_MODEL_TTL` — `-1` pins a model resident and trades the
+VRAM for never paying a reload.
+
 ### Launch
 
 ```bash

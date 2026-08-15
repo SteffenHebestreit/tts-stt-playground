@@ -52,6 +52,13 @@ SPEECH_MEDIA_TYPES = {"mp3": "audio/mpeg", "wav": "audio/wav"}
 # Spec: CreateSpeechRequest.input has maxLength 4096.
 MAX_SPEECH_INPUT = 4096
 
+# OpenAI's own voice names. They mean nothing to any backend here, so forwarding
+# one makes the provider fail to resolve a voice instead of using its default.
+OPENAI_PLACEHOLDER_VOICES = {
+    "alloy", "echo", "fable", "onyx", "nova", "shimmer",
+    "ash", "ballad", "coral", "sage", "verse", "marin", "cedar",
+}
+
 
 def openai_error(status: int, message: str, *, param: Optional[str] = None,
                  code: Optional[str] = None) -> JSONResponse:
@@ -107,6 +114,7 @@ def build_router(
     post_form: Callable,
     post_json: Callable,
     provider_health: Callable,
+    build_tts_payload: Callable,
 ) -> APIRouter:
     """Create the `/v1` router.
 
@@ -261,16 +269,32 @@ def build_router(
         # VoiceIdsShared enum disagree, and the schema accepts any string — so an
         # unknown voice falls back to the deployment default rather than 404.
         voice = str(body.get("voice") or "").strip()
-        payload: dict[str, Any] = {"text": text, "speed": speed}
-        if voice and voice.lower() not in {"alloy", "echo", "fable", "onyx", "nova", "shimmer",
-                                           "ash", "ballad", "coral", "sage", "verse", "marin", "cedar"}:
-            # Not one of OpenAI's placeholder names, so treat it as one of ours.
-            payload["voice"] = voice
-        if body.get("language"):
-            payload["language"] = str(body["language"])
+        if voice.lower() in OPENAI_PLACEHOLDER_VOICES:
+            # One of OpenAI's own names, which resolves to nothing here.
+            voice = ""
+
+        # Built by the gateway's shared translator, not inline. Each backend
+        # names these fields differently (`lang`/`speaker` on qwen3 against
+        # `language`/`voice` on piper), and Pydantic drops unknown keys without
+        # complaint — so a hand-rolled body here returned the wrong language in
+        # the wrong voice with HTTP 200 on any deployment whose default TTS
+        # provider was not piper.
+        try:
+            payload, read_timeout = build_tts_payload(
+                provider_id,
+                provider,
+                text=text,
+                voice=voice or None,
+                language=str(body.get("language") or "auto"),
+                speed=speed,
+            )
+        except HTTPException as exc:
+            return openai_error(
+                503, f"Text-to-speech provider '{provider_id}' cannot serve this request: {exc.detail}")
 
         try:
-            upstream = await post_json(provider_id, "/tts", payload, timeout=600.0)
+            upstream = await post_json(provider_id, "/tts", payload,
+                                       timeout=max(read_timeout, 600.0))
         except HTTPException as exc:
             return openai_error(502, f"Speech backend failed: {exc.detail}")
 

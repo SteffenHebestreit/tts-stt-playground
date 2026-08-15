@@ -67,6 +67,24 @@ def _valid_wav(n_samples: int = 160) -> bytes:
     return header + data
 
 
+class _StreamableResponse(httpx.Response):
+    """An httpx.Response that also answers the streaming-proxy interface.
+
+    `/api/tts` proxies audio with `send(..., stream=True)` and forwards
+    `aiter_raw()`; the content here is already materialised, so it goes over in
+    one chunk.
+    """
+
+    async def aiter_raw(self, chunk_size=None):
+        yield self.content
+
+    async def aread(self):
+        return self.content
+
+    async def aclose(self):
+        return None
+
+
 class _StubClient:
     """Stands in for httpx.AsyncClient, answering both backend contracts.
 
@@ -85,6 +103,25 @@ class _StubClient:
 
     async def __aexit__(self, *a):
         return False
+
+    def build_request(self, method, url, **kwargs):
+        kwargs.pop("timeout", None)
+        return {"method": method, "url": url, "kwargs": kwargs}
+
+    async def send(self, request, stream=False):
+        """The `/api/tts` streaming path goes through build_request + send.
+
+        Routed back through post() so a single stub answers both call styles and
+        `last_post` records either one — which is what lets a test compare the
+        body /v1 puts on the wire against the body /api/tts puts on the wire.
+        """
+        response = await self.post(request["url"], **request["kwargs"])
+        return _StreamableResponse(
+            status_code=response.status_code,
+            headers=response.headers,
+            content=response.content,
+            request=response.request,
+        )
 
     async def post(self, url, **kwargs):
         type(self).last_post = {"url": url, **kwargs}
@@ -364,6 +401,102 @@ def test_our_own_voice_name_is_forwarded(whisper_app, monkeypatch):
                 json={"model": "tts-1", "voice": "de_DE-thorsten-medium",
                       "input": "hi", "response_format": "wav"})
     assert _StubClient.last_post["json"]["voice"] == "de_DE-thorsten-medium"
+
+
+# --- speech across TTS providers ---------------------------------------------
+#
+# The module's whole premise is that a client must not care which backend it is
+# talking to. That held for STT and quietly failed for TTS: /v1/audio/speech
+# built Piper's body regardless of the deployment's default provider, and every
+# other backend names the same fields differently. Pydantic drops unknown keys
+# silently, so on a qwen3 or chatterbox deployment the request succeeded with
+# HTTP 200 and returned the default speaker reading the text in the wrong
+# language. Nothing in the response said so.
+
+
+@pytest.fixture(scope="module")
+def qwen3_tts_app():
+    """Deployment whose default TTS is Qwen3 — `lang` / `speaker`, not `language` / `voice`."""
+    return _load_app({"DEFAULT_TTS_PROVIDER": "qwen3"})
+
+
+@pytest.fixture(scope="module")
+def chatterbox_tts_app():
+    """Deployment whose default TTS is Chatterbox — the German-capable MIT option."""
+    return _load_app({
+        "DEFAULT_TTS_PROVIDER": "chatterbox",
+        "ENABLE_CHATTERBOX_TTS": "true",
+    })
+
+
+def test_speech_reaches_qwen3_in_its_own_field_names(qwen3_tts_app, monkeypatch):
+    client = _client(qwen3_tts_app, monkeypatch)
+    _StubClient.last_post = {}
+    r = client.post("/v1/audio/speech", json={
+        "model": "tts-1", "input": "Guten Tag", "voice": "Ethan",
+        "language": "de", "response_format": "wav",
+    })
+    assert r.status_code == 200
+    sent = _StubClient.last_post["json"]
+    assert sent["lang"] == "German", (
+        "language=de was dropped: qwen3 reads `lang` with English labels, so the "
+        "request silently synthesised German text with the English decoder"
+    )
+    assert sent["speaker"] == "Ethan", "voice was dropped; qwen3 reads `speaker`"
+    assert "language" not in sent and "voice" not in sent
+
+
+def test_openai_placeholder_voice_does_not_become_a_qwen3_speaker(qwen3_tts_app, monkeypatch):
+    """'alloy' is OpenAI's name for nothing we have; it must not override the default."""
+    client = _client(qwen3_tts_app, monkeypatch)
+    _StubClient.last_post = {}
+    client.post("/v1/audio/speech", json={
+        "model": "tts-1", "input": "hi", "voice": "alloy", "response_format": "wav"})
+    assert _StubClient.last_post["json"]["speaker"] == "Vivian"
+
+
+def test_speech_reaches_chatterbox_with_its_language_field(chatterbox_tts_app, monkeypatch):
+    client = _client(chatterbox_tts_app, monkeypatch)
+    _StubClient.last_post = {}
+    r = client.post("/v1/audio/speech", json={
+        "model": "tts-1", "input": "Guten Tag", "language": "de",
+        "response_format": "wav"})
+    assert r.status_code == 200
+    sent = _StubClient.last_post["json"]
+    assert sent == {"text": "Guten Tag", "language": "de"}, (
+        "chatterbox takes text+language only; forwarding piper's speed/voice/"
+        "output_format relies on Pydantic silently discarding them"
+    )
+
+
+def test_speech_body_matches_the_api_tts_body_for_the_same_request(qwen3_tts_app, monkeypatch):
+    """/v1 and /api/tts must translate identically — one shared builder, one truth."""
+    client = _client(qwen3_tts_app, monkeypatch)
+
+    _StubClient.last_post = {}
+    client.post("/v1/audio/speech", json={
+        "model": "tts-1", "input": "Guten Tag", "voice": "Ethan",
+        "language": "de", "response_format": "wav"})
+    via_v1 = _StubClient.last_post["json"]
+
+    _StubClient.last_post = {}
+    client.post("/api/tts", json={
+        "provider": "qwen3", "text": "Guten Tag", "voice": "Ethan", "language": "de"})
+    via_api = _StubClient.last_post["json"]
+
+    assert via_v1 == via_api
+
+
+def test_speech_refuses_a_provider_with_no_tts_contract(whisper_app, monkeypatch):
+    """A misconfigured DEFAULT_TTS_PROVIDER must say so, not 500."""
+    module = whisper_app
+    monkeypatch.setitem(module.PROVIDER_REGISTRY["ui"], "default_tts_provider", "piper")
+    monkeypatch.setitem(
+        module.PROVIDER_REGISTRY["providers"]["piper"], "contracts", {})
+    r = _client(module, monkeypatch).post(
+        "/v1/audio/speech", json={"model": "tts-1", "input": "hi", "response_format": "wav"})
+    assert r.status_code == 503
+    assert r.json()["error"]["type"] == "server_error"
 
 
 # --- backwards compatibility ------------------------------------------------

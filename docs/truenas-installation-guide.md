@@ -293,6 +293,18 @@ Everything past the four defaults is opt-in, because VRAM is the binding constra
 | `parakeet-asr-service` | ~3 GB | 25 EU languages |
 | `piper-training-service` | 2–4 GB | On demand only |
 
+These are *resident* figures, and none of them is permanent. Every GPU service
+releases its weights after `MODEL_TTL` seconds idle (300 by default) and reloads
+transparently on the next request, so the number that has to fit on the card is
+closer to the largest concurrently-active model than to the sum of the column
+above. Per-service overrides: `STT_MODEL_TTL`, `ASR_MODEL_TTL`, `TTS_MODEL_TTL`
+— `>0` seconds, `0` to release the moment a service falls idle, `-1` to pin it
+resident and never pay a reload.
+
+Unloading is reference counted, so a request in flight is never freed underneath
+itself. `POST /api/providers/{id}/unload` forces it early and answers `409` if
+the model is busy.
+
 ### Suggested configurations
 
 **16 GB card, everyday use** *(the default)*
@@ -332,6 +344,7 @@ Defaults are already tuned for realtime. These are the knobs that matter, set on
 | `WS_MIN_NEW_AUDIO_S` | `0.5` | Floor on how often a partial transcript can be emitted |
 | `WS_MAX_SESSIONS` | `4` | Concurrent live microphone sessions before new ones are refused |
 | `WHISPER_NUM_WORKERS` | `2` | Gives live and batch traffic independent slots |
+| `STT_MODEL_TTL` | `300` | Seconds idle before the Whisper weights are released. `-1` pins them resident, which trades ~1.6–3.1 GB for never paying a reload on a cold request. |
 
 The live panel prints `decode NNN ms` under the transcript. **Tune against that number, not
 against feel.** If decode time approaches `WS_MIN_NEW_AUDIO_S × 1000`, move to a smaller model

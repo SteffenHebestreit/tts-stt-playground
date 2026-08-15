@@ -147,6 +147,13 @@ services:
       WS_NO_SPEECH_THRESHOLD: ${WS_NO_SPEECH_THRESHOLD:-0.6}
       WS_MIN_AVG_LOGPROB: ${WS_MIN_AVG_LOGPROB:--1.0}
       WHISPER_NUM_WORKERS: ${WHISPER_NUM_WORKERS:-2}
+      # Release the 1.6-3 GB of CT2 weights after this many idle seconds.
+      # Whisper is the always-on consumer here, so leaving it pinned made the
+      # other services' TTLs free memory that this one immediately re-occupied.
+      # >0 seconds | 0 = unload when idle | -1 = never unload.
+      STT_MODEL_TTL: ${STT_MODEL_TTL:-300}
+      # Global fallback the code reads when the specific TTL is unset.
+      MODEL_TTL: ${MODEL_TTL:-300}
       # CT2 spawns WHISPER_NUM_WORKERS model replicas, each running
       # cpu_threads threads. Without an explicit cap the BLAS layer also
       # spawns one thread per core on top, oversubscribing the CPU.

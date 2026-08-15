@@ -1188,3 +1188,89 @@ def test_native_contract_still_omits_auto(frontend_module):
 
     _path, data, _files = _build(frontend_module, "stt-form-v1", language="de")
     assert data.get("language") == "de"
+
+
+# --- upstream timeouts -------------------------------------------------------
+#
+# `_timeout()` splits the budget per phase because a bare float applies the
+# WHOLE budget to every phase, connect included. The helper existed and was used
+# on the streaming path, while nine other call sites still passed the raw float
+# — so with the qwen3 container stopped, /voice-clone and saved-voice TTS sat on
+# a dead socket for their full 600 s read budget before reporting "unavailable",
+# instead of failing at the 3 s connect. Static, because a real 600 s wait is
+# not something a test can sit through.
+
+
+GATEWAY_APP = Path(__file__).resolve().parents[1] / "frontend-service" / "app.py"
+
+
+def _httpx_timeout_arguments() -> list[str]:
+    """Every `timeout=` keyword passed to a client call in the gateway."""
+    import ast
+
+    tree = ast.parse(GATEWAY_APP.read_text(encoding="utf-8"))
+
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        # client.get/post/delete/build_request(...), or a dict literal handed to
+        # one of them as **request_kwargs.
+        if not (isinstance(func, ast.Attribute)
+                and func.attr in {"get", "post", "delete", "put", "build_request", "send"}):
+            continue
+        for kw in node.keywords:
+            if kw.arg == "timeout":
+                found.append(f"line {node.lineno}: timeout={ast.unparse(kw.value)}")
+    return found
+
+
+def test_every_upstream_call_uses_per_phase_timeouts():
+    """No call site may hand httpx a bare number."""
+    offenders = [
+        entry for entry in _httpx_timeout_arguments()
+        if "_timeout(" not in entry and "None" not in entry
+    ]
+    assert not offenders, (
+        "these upstream calls pass a scalar timeout, which httpx applies to the "
+        "connect phase too — a stopped backend then blocks for the full read "
+        f"budget instead of failing fast:\n  " + "\n  ".join(offenders)
+        + "\nWrap the value in _timeout()."
+    )
+
+
+def test_request_kwargs_dicts_also_use_per_phase_timeouts():
+    """The multipart helpers build `{"data": ..., "timeout": ...}` and splat it,
+    so the check above cannot see them."""
+    import ast
+
+    offenders: list[str] = []
+    for node in ast.walk(ast.parse(GATEWAY_APP.read_text(encoding="utf-8"))):
+        if not isinstance(node, ast.Dict):
+            continue
+        for key, value in zip(node.keys, node.values):
+            if not (isinstance(key, ast.Constant) and key.value == "timeout"):
+                continue
+            rendered = ast.unparse(value)
+            if "_timeout(" not in rendered:
+                offenders.append(f"line {node.lineno}: 'timeout': {rendered}")
+
+    assert not offenders, (
+        "these request-kwargs dicts carry a scalar timeout:\n  "
+        + "\n  ".join(offenders) + "\nWrap the value in _timeout()."
+    )
+
+
+def test_connect_phase_stays_short():
+    """The point of the split: a dead upstream is detected in seconds."""
+    import re
+
+    match = re.search(
+        r"httpx\.Timeout\(connect=([0-9.]+)", GATEWAY_APP.read_text(encoding="utf-8"))
+    assert match, "_timeout() no longer builds an httpx.Timeout with an explicit connect"
+    assert float(match.group(1)) <= 10.0, (
+        "the connect budget has grown past 10 s; container-to-container connects "
+        "on a bridge network resolve in milliseconds, and a long one here is "
+        "indistinguishable from the bare-float bug this replaced"
+    )

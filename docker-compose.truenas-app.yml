@@ -146,12 +146,18 @@ services:
       WS_NO_SPEECH_THRESHOLD: ${WS_NO_SPEECH_THRESHOLD:-0.6}
       WS_MIN_AVG_LOGPROB: ${WS_MIN_AVG_LOGPROB:--1.0}
       OMP_NUM_THREADS: ${OMP_NUM_THREADS:-4}
+      # Release the CT2 weights after this many idle seconds, so the other
+      # services' TTLs are not freeing memory Whisper immediately re-occupies.
+      # >0 seconds | 0 = unload when idle | -1 = never unload.
+      STT_MODEL_TTL: ${STT_MODEL_TTL:-300}
+      MODEL_TTL: ${MODEL_TTL:-300}
     volumes:
       - "${APP_DATA_DIR:-/mnt/pool/apps/tts-stt}/models:/app/models"
       - "${APP_DATA_DIR:-/mnt/pool/apps/tts-stt}/.cache:/root/.cache"
     restart: unless-stopped
     healthcheck:
-      # Returns 503 until the model is actually loaded, so "healthy" means ready.
+      # 503 only when every load attempt failed. A model released by the idle
+      # TTL still reports 200 — it is not down, the next request reloads it.
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s

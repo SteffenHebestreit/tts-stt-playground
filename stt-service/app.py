@@ -26,6 +26,7 @@ from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 
 from json_utils import clean_json_inf_nan, ENGLISH_ONLY_MODELS
+from residency import IdleUnloader, ttl_from_env
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -35,10 +36,25 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     """Load the Whisper model on startup; release the executors on shutdown."""
-    load_model()
-    warm_up_model()
+    if MODEL_TTL == 0:
+        # "Release the moment nothing is using it" — preloading here would load
+        # ~2 GB, warm it, and immediately throw both away. The first request
+        # loads it instead, which is what this setting asks for.
+        logger.info("Whisper preload skipped: STT_MODEL_TTL=0 unloads on every idle")
+    else:
+        load_model()
+        warm_up_model()
+
+    if MODEL_TTL < 0:
+        logger.info("Whisper idle unloading disabled (STT_MODEL_TTL=-1)")
+    elif MODEL_TTL > 0:
+        logger.info(f"Whisper idle unloading after {MODEL_TTL:.0f}s idle")
+        # Nothing holds a reference yet, so start the clock: a container that is
+        # booted and never used should not sit on the VRAM either.
+        _idle_unloader.arm()
     yield
     logger.info("Shutting down thread pool executors...")
+    _idle_unloader.cancel()
     rt_executor.shutdown(wait=False)
     executor.shutdown(wait=False)
 
@@ -250,6 +266,14 @@ startup_error = None
 _model_refs = 0
 _model_ref_lock = threading.Lock()
 
+# Idle unloading. Whisper is the one always-on GPU consumer in the stack, so
+# without this `MODEL_TTL` frees the ~2-4 GB held by qwen3-asr and chatterbox
+# and then stalls against 1.6-3 GB of resident CT2 weights that nothing ever
+# releases. Reference counted rather than timestamped: cancelling the coroutine
+# that awaits a decode does not stop the worker thread running it.
+MODEL_TTL = ttl_from_env(os.getenv, "STT_MODEL_TTL", "MODEL_TTL", default=300.0)
+_idle_unloader = IdleUnloader(MODEL_TTL, lambda: unload_model(), name="Whisper model")
+
 
 def acquire_model():
     """Take a reference to the Whisper model, loading it on demand.
@@ -263,6 +287,10 @@ def acquire_model():
     """
     global _model_refs
 
+    # Outside the reference lock: cancel() takes the unloader's own lock, and
+    # _fire() -> unload_model() takes the reference lock, so taking them in the
+    # other order here would invert the pair.
+    _idle_unloader.cancel()
     with _model_ref_lock:
         model = whisper_model
         if model is None:
@@ -276,11 +304,17 @@ def acquire_model():
 
 
 def release_model():
-    """Drop one reference taken by acquire_model()."""
+    """Drop one reference taken by acquire_model(); arm the idle timer at zero."""
     global _model_refs
     with _model_ref_lock:
         if _model_refs > 0:
             _model_refs -= 1
+        now_idle = _model_refs == 0
+    # Armed outside the lock. With TTL=0 arm() unloads synchronously, and
+    # unload_model() takes the same lock — doing this inside the block would
+    # self-deadlock on a non-reentrant lock.
+    if now_idle:
+        _idle_unloader.arm()
 
 
 @contextmanager
@@ -301,6 +335,12 @@ def unload_model() -> dict:
     freeing memory that a running decode is still reading from.
     """
     global whisper_model, model_loaded, model_warmed
+
+    # Before the lock, never inside it: this is the only place both locks are in
+    # play at once, and taking them in this order is what keeps the pair from
+    # inverting against acquire_model(). Dropping a timer here is safe even when
+    # the unload turns out to be refused — release_model() re-arms at zero refs.
+    _idle_unloader.cancel()
 
     with _model_ref_lock:
         if _model_refs > 0:
@@ -665,9 +705,6 @@ async def transcribe_audio_stream(
     no_speech_threshold: float = Form(0.6),
 ):
     """Stream transcription results via Server-Sent Events as segments are decoded."""
-    if not model_loaded:
-        raise HTTPException(status_code=503, detail="Whisper model not loaded")
-
     _reject_unsupported_translate(task)
 
     # Match /transcribe semantics: "auto" (or empty) means auto-detect.
@@ -689,14 +726,32 @@ async def transcribe_audio_stream(
         logger.error(f"[{req_id}] Failed to save temp file: {e}")
         raise HTTPException(status_code=500, detail="Failed to process uploaded file.")
 
+    # Take the reference HERE, not inside the generator.
+    #
+    # Two things depend on it. First, this route used to gate on `model_loaded`,
+    # which is False after an idle unload or POST /unload — so it answered 503
+    # for a model that would have reloaded on demand, unlike every other decode
+    # path. Second, once an SSE body starts the status line is already 200, so a
+    # load failure discovered inside the generator can only be reported as an
+    # in-band event many clients never look at. Acquiring up front turns both
+    # into an honest HTTP status before a single byte is streamed.
+    try:
+        model = acquire_model()
+    except HTTPException:
+        try:
+            os.unlink(tmp_file_path)
+        except OSError:
+            pass
+        raise
+
     async def generate_transcription():
         """SSE generator that yields transcription segments as JSON events."""
         effective_target_lang = target_language  # capture outer scope value
-        # Reference held across the whole stream, not just the transcribe() call:
-        # the segment generator is lazy and is pulled one item at a time by the
-        # loop below, so the model must stay resident until the last yield.
-        # Released in the finally, including when the client disconnects early.
-        model = None
+        # The reference taken by the handler is held across the whole stream, not
+        # just the transcribe() call: the segment generator is lazy and is pulled
+        # one item at a time by the loop below, so the model must stay resident
+        # until the last yield. Released in the finally, including when the
+        # client disconnects early (Starlette closes the generator, which runs it).
         try:
             logger.info(f"[{req_id}] /transcribe-stream request received: filename={audio.filename}, content_type={audio.content_type}, language={language}, task={task}")
             logger.info(f"[{req_id}] Uploaded audio size: {len(audio_content)} bytes")
@@ -709,8 +764,6 @@ async def transcribe_audio_stream(
             # Start transcription
             yield f"data: {json.dumps({'status': 'processing', 'task': task})}\n\n"
             logger.info(f"[{req_id}] Starting streaming transcription...")
-            
-            model = acquire_model()
 
             # Run transcription in executor to avoid blocking
             def run_transcription():
@@ -790,8 +843,7 @@ async def transcribe_audio_stream(
             error_data = {"error": f"Transcription failed: {str(e)}", "status": "error"}
             yield f"data: {json.dumps(error_data)}\n\n"
         finally:
-            if model is not None:
-                release_model()
+            release_model()
             # Cleanup temporary file
             if os.path.exists(tmp_file_path):
                 try:
@@ -1177,6 +1229,8 @@ async def health_check():
         "live_sessions": _live_sessions,
         # Outstanding references. POST /unload refuses while this is non-zero.
         "model_refs": _model_refs,
+        # Seconds idle before the model is released (0 = immediately, -1 = never).
+        "model_ttl_seconds": MODEL_TTL,
         "torch_version": torch.__version__,
         "cuda_available": torch.cuda.is_available()
     }
@@ -1302,12 +1356,9 @@ async def detect_language(
     duration_limit: float = 30.0,
 ):
     """Quickly detect the spoken language and return a sample transcript."""
-    if not model_loaded or whisper_model is None:
-        logger.error("Model not loaded, attempting to load...")
-        load_model()
-        if not model_loaded or whisper_model is None:
-            raise HTTPException(status_code=503, detail="Model not available")
-
+    # No `model_loaded` pre-check: after an idle unload it is False for a model
+    # that reloads on demand. `model_in_use()` inside _detect() does the load
+    # under the reference lock and raises 503 only if it genuinely cannot.
     safe_filename = os.path.basename(file.filename or "audio.wav")
     suffix = os.path.splitext(safe_filename)[1] or ".wav"
     tmp_fd, temp_audio_path = tempfile.mkstemp(suffix=suffix)
@@ -1390,6 +1441,10 @@ async def detect_language(
             "audio_duration": info.duration
         }
         
+    except HTTPException:
+        # A 503 from model_in_use() must stay a 503; the blanket handler below
+        # would relabel "no model available" as an internal error.
+        raise
     except Exception as e:
         logger.error(f"Language detection failed: {e}")
         raise HTTPException(status_code=500, detail=f"Language detection failed: {str(e)}")
