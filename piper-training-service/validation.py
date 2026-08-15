@@ -32,6 +32,31 @@ def safe_name(value: str, field: str = "name") -> str:
     return name
 
 
+# The UI offers 100-5000, but the API enforced nothing. `epochs=0` produces a
+# job that reports 0/0 and divides by zero the moment anything computes a
+# percentage; a very large value is not wrong so much as unbounded, and the
+# operator has no way to tell it apart from a typo until hours later.
+MIN_EPOCHS = 1
+MAX_EPOCHS = 100_000
+
+
+def validate_epochs(value: int, field: str = "epochs") -> int:
+    """Bound a requested epoch count, rejecting values that cannot mean anything."""
+    try:
+        epochs = int(value)
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError is the one that is easy to miss: int(float("inf"))
+        # raises it rather than ValueError, so an infinite value escaped as a
+        # 500 instead of the 400 every other bad input gets.
+        raise HTTPException(status_code=400, detail=f"Invalid {field}: {value!r}")
+    if not (MIN_EPOCHS <= epochs <= MAX_EPOCHS):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field} must be between {MIN_EPOCHS} and {MAX_EPOCHS} (got {epochs})",
+        )
+    return epochs
+
+
 def coerce_resume_int(value, default: int) -> int:
     """Coerce persisted checkpoint state values to positive integers."""
     try:

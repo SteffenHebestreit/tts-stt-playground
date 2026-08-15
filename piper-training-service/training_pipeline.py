@@ -22,6 +22,16 @@ from dataset import TTSDataset, collate_fn
 from training_utils import get_optimizer, get_scheduler
 
 
+class TrainingCancelled(Exception):
+    """Raised by ``train_sync`` when the caller cancelled the job mid-run.
+
+    Distinct from a failure on purpose. The callers export and deploy whatever
+    ``train_sync`` returns, so cancellation had to become something they cannot
+    fall through — and it must not be reported as "failed" either, since the
+    checkpoints are intact and the job can be resumed.
+    """
+
+
 class OptimizedTrainingPipeline:
     """Manage dataset loading, checkpointing, and stable VITS training execution."""
 
@@ -177,11 +187,13 @@ class OptimizedTrainingPipeline:
 
         model.train()
 
+        cancelled_at_epoch = None
         for epoch in range(start_epoch, epochs):
             if callback:
                 current_status = callback({'check_status': True})
                 if current_status is not None and getattr(current_status, 'status', None) == 'cancelled':
                     logger.info(f"Training cancelled at epoch {epoch}")
+                    cancelled_at_epoch = epoch
                     break
 
             logger.info(f"=== EPOCH {epoch+1}/{epochs} ===")
@@ -319,6 +331,44 @@ class OptimizedTrainingPipeline:
                     json.dump(job_state, f, indent=2)
                 logger.info(f"Job state saved: {state_path}")
 
+        def _mark_state(status: str) -> None:
+            """Record the terminal status in job_state.json, if one was written."""
+            state_path = checkpoint_dir / "job_state.json"
+            if not state_path.exists():
+                return
+            try:
+                with open(state_path) as f:
+                    job_state = json.load(f)
+                job_state['status'] = status
+                with open(state_path, 'w') as f:
+                    json.dump(job_state, f, indent=2)
+            except Exception:
+                pass
+
+        def _free_memory() -> None:
+            del model, optimizer, scheduler, dataset, dataloader
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            logger.info("Training memory freed")
+
+        # Cancellation used to `break` and then fall straight into the block
+        # below, which saves final_model.pt, stamps the job state 'completed' and
+        # calls back with status='completed' — overwriting the 'cancelled' the
+        # user had just set. The caller then exported and DEPLOYED the
+        # half-trained model. So DELETE /job/{id} appeared to work, and the voice
+        # it was meant to stop went live anyway.
+        #
+        # Periodic checkpoints are already on disk, so the job stays resumable;
+        # only the "this is a finished model" artefacts are withheld.
+        if cancelled_at_epoch is not None:
+            _mark_state('cancelled')
+            _free_memory()
+            raise TrainingCancelled(
+                f"Training cancelled at epoch {cancelled_at_epoch + 1}/{epochs}"
+            )
+
         final_path = checkpoint_dir / "final_model.pt"
         torch.save({
             'model_state_dict': model.state_dict(),
@@ -327,23 +377,8 @@ class OptimizedTrainingPipeline:
         }, final_path)
         logger.info(f"Training complete — model saved: {final_path}")
 
-        state_path = checkpoint_dir / "job_state.json"
-        if state_path.exists():
-            try:
-                with open(state_path) as f:
-                    job_state = json.load(f)
-                job_state['status'] = 'completed'
-                with open(state_path, 'w') as f:
-                    json.dump(job_state, f, indent=2)
-            except Exception:
-                pass
-
-        del model, optimizer, scheduler, dataset, dataloader
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-        logger.info("Training memory freed")
+        _mark_state('completed')
+        _free_memory()
 
         if callback:
             callback({'status': 'completed', 'message': 'Training completed successfully'})

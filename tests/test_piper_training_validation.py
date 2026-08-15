@@ -96,3 +96,49 @@ def test_phoneme_map_specials_only_when_empty():
 def test_phoneme_map_ignores_non_dict_entries():
     result = validation.phoneme_id_map_from_entries(["not-a-dict", None, {"phonemes": "z"}])
     assert "z" in result
+
+
+# --- validate_epochs ---
+#
+# The UI offers 100-5000; the API enforced nothing. `epochs=0` produced a job
+# reporting 0/0, which divides by zero the moment anything computes a percentage
+# — including the gateway's own job normaliser and the resume path's
+# `round(saved_epoch / total_epochs * 100, 1)`.
+
+
+@pytest.mark.parametrize("value", [1, 100, 1000, 5000, 100_000])
+def test_validate_epochs_accepts_the_usable_range(value):
+    assert validation.validate_epochs(value) == value
+
+
+def test_validate_epochs_accepts_a_numeric_string():
+    """Form fields arrive as strings when a client posts them by hand."""
+    assert validation.validate_epochs("250") == 250
+
+
+@pytest.mark.parametrize("value", [0, -1, -1000, 100_001])
+def test_validate_epochs_rejects_values_outside_the_range(value):
+    with pytest.raises(HTTPException) as exc:
+        validation.validate_epochs(value)
+    assert exc.value.status_code == 400
+    assert "epochs" in str(exc.value.detail)
+
+
+def test_validate_epochs_rejects_zero_specifically():
+    """The one that produced a divide-by-zero rather than an obviously bad job."""
+    with pytest.raises(HTTPException):
+        validation.validate_epochs(0)
+
+
+@pytest.mark.parametrize("value", ["lots", None, "", 3.7e400])
+def test_validate_epochs_rejects_non_integers(value):
+    with pytest.raises(HTTPException) as exc:
+        validation.validate_epochs(value)
+    assert exc.value.status_code == 400
+
+
+def test_validate_epochs_names_the_field_it_rejected():
+    """`extra_epochs` on /resume-training shares this validator."""
+    with pytest.raises(HTTPException) as exc:
+        validation.validate_epochs(0, "extra_epochs")
+    assert "extra_epochs" in str(exc.value.detail)

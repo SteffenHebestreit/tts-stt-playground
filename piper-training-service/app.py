@@ -28,13 +28,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 
-from training_pipeline import OptimizedTrainingPipeline
+from training_pipeline import OptimizedTrainingPipeline, TrainingCancelled
 from data_processor import DataProcessor
 from model_exporter import ModelExporter
 from validation import (
     safe_name as _safe_name,
     coerce_resume_int as _coerce_resume_int,
     coerce_resume_path as _coerce_resume_path,
+    validate_epochs as _validate_epochs,
 )
 
 # Configure logging so all logger.info() calls actually output to stdout
@@ -336,6 +337,48 @@ async def remove_model_from_deployment_target(model_name: str, target_id: Option
 
     logger.info(f"No removal implementation for deployment target {resolved_target_id}")
 
+def _model_name_from_disk(job_id: str) -> Optional[str]:
+    """Read a job's model name from its checkpoint state file.
+
+    The in-memory registry only survives until a restart, and completed jobs are
+    deliberately not restored — so after any restart `delete_trained_model` could
+    not tell which dataset belonged to the job it was deleting, and quietly left
+    both the dataset and the deployed voice behind.
+    """
+    state_path = Path("checkpoints") / job_id / "job_state.json"
+    try:
+        with open(state_path) as f:
+            return json.load(f).get("model_name")
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _other_jobs_using_model(model_name: str, excluding_job_id: str) -> list[str]:
+    """Job ids other than *excluding_job_id* that trained the same model name.
+
+    Retraining a voice is the normal workflow, so several jobs routinely share
+    one `data/<model_name>` directory and one deployed voice. Deleting any of
+    them used to take the dataset and the live voice with it.
+    """
+    others: list[str] = []
+    for state_file in Path("checkpoints").glob("*/job_state.json"):
+        if state_file.parent.name == excluding_job_id:
+            continue
+        try:
+            with open(state_file) as f:
+                state = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if state.get("model_name") == model_name:
+            others.append(state.get("job_id") or state_file.parent.name)
+
+    for other_id, job in training_jobs.items():
+        if other_id != excluding_job_id and job.model_name == model_name:
+            if other_id not in others:
+                others.append(other_id)
+    return others
+
+
 async def restore_interrupted_jobs():
     """Scan checkpoints/ for jobs interrupted by a container restart and restore them."""
     checkpoints_root = Path("checkpoints")
@@ -516,6 +559,7 @@ async def train_model(
     job_id = str(uuid.uuid4())
 
     model_name = _safe_name(model_name, "model_name")
+    epochs = _validate_epochs(epochs)
     resolved_target_id, _ = resolve_deployment_target(deployment_target or None)
     stt_service_url = resolve_stt_service_url(stt_service_url)
 
@@ -767,7 +811,14 @@ async def run_stt_based_training(job_id: str,
             )
 
         logger.info(f"STT-based training completed for job {job_id}")
-        
+
+    except TrainingCancelled as cancelled:
+        # Not a failure: the checkpoints are intact and the job is resumable.
+        # Falling through to export here is what used to deploy the voice the
+        # user had just cancelled.
+        logger.info(f"Training cancelled for job {job_id}: {cancelled}")
+        training_jobs[job_id].status = "cancelled"
+        training_jobs[job_id].message = f"{cancelled}. Resume from the last checkpoint to continue."
     except Exception as e:
         logger.error(f"STT-based training failed for job {job_id}: {e}")
         training_jobs[job_id].status = "failed"
@@ -796,6 +847,8 @@ async def resume_training(
     Finds the newest checkpoint_epoch_N.pt for the job and continues from there.
     """
     model_name = _safe_name(model_name, "model_name")
+    if extra_epochs:
+        _validate_epochs(extra_epochs, "extra_epochs")
     if job_id.strip():
         job_id = _safe_name(job_id, "job_id")
     resolved_target_id, _ = resolve_deployment_target(deployment_target or None)
@@ -879,13 +932,30 @@ async def resume_training(
 
     async def _resume():
         """Resume training in a background thread, then export the updated model."""
-        await asyncio.to_thread(
-            training_pipeline.train_sync,
-            job_id=resumed_job_id,
-            request=training_request,
-            callback=lambda update: update_training_status(resumed_job_id, update),
-            resume_from=str(latest_ckpt_path),
-        )
+        # Guarded, unlike before: this runs as a BackgroundTask, so an exception
+        # escaping here was swallowed by the event loop and the job sat at
+        # "training" forever with no error anywhere the caller could see.
+        try:
+            await asyncio.to_thread(
+                training_pipeline.train_sync,
+                job_id=resumed_job_id,
+                request=training_request,
+                callback=lambda update: update_training_status(resumed_job_id, update),
+                resume_from=str(latest_ckpt_path),
+            )
+        except TrainingCancelled as cancelled:
+            logger.info(f"Resumed training cancelled for {resumed_job_id}: {cancelled}")
+            training_jobs[resumed_job_id].status = "cancelled"
+            training_jobs[resumed_job_id].message = (
+                f"{cancelled}. Resume from the last checkpoint to continue."
+            )
+            return
+        except Exception as train_error:
+            logger.error(f"Resumed training failed for {resumed_job_id}: {train_error}")
+            training_jobs[resumed_job_id].status = "failed"
+            training_jobs[resumed_job_id].message = f"Resumed training failed: {train_error}"
+            return
+
         # Export after training completes
         try:
             training_jobs[resumed_job_id].status = "exporting"
@@ -926,6 +996,7 @@ async def train_from_dataset(
     Skips upload and STT — goes straight to VITS training.
     """
     model_name = _safe_name(model_name, "model_name")
+    epochs = _validate_epochs(epochs)
     train_json = Path(f"data/{model_name}/train.json")
     val_json = Path(f"data/{model_name}/val.json")
 
@@ -992,6 +1063,7 @@ async def retrain_from_segments(
     then calls generate_training_metadata() and train_sync().
     """
     model_name = _safe_name(model_name, "model_name")
+    epochs = _validate_epochs(epochs)
     stt_service_url = resolve_stt_service_url(stt_service_url)
     dataset_path = Path(f"data/{model_name}")
     audio_dir = dataset_path / "audio"
@@ -1164,6 +1236,10 @@ async def _run_retrain_from_segments(
         )
         logger.info(f"[{job_id}] Retrain from segments completed for '{model_name}'")
 
+    except TrainingCancelled as cancelled:
+        logger.info(f"[{job_id}] Retrain cancelled: {cancelled}")
+        training_jobs[job_id].status = "cancelled"
+        training_jobs[job_id].message = f"{cancelled}. Resume from the last checkpoint to continue."
     except Exception as e:
         logger.error(f"[{job_id}] Retrain from segments failed: {e}")
         training_jobs[job_id].status = "failed"
@@ -1220,36 +1296,49 @@ async def delete_trained_model(job_id: str):
             shutil.rmtree(model_dir)
             logger.info(f"Deleted model directory: {model_dir}")
         
-        # Look up model name from training job record
-        model_name = None
+        # Look up model name from the job record, falling back to disk so this
+        # still works for a completed job after a restart (those are not
+        # restored into memory on purpose).
+        model_name = _model_name_from_disk(job_id)
         deployment_target = None
         if job_id in training_jobs:
-            model_name = training_jobs[job_id].model_name
+            model_name = training_jobs[job_id].model_name or model_name
             deployment_target = training_jobs[job_id].deployment_target
             del training_jobs[job_id]
             logger.info(f"Removed job {job_id} from active jobs")
 
-        # Remove dataset directory
-        if model_name:
+        deleted_items = ["checkpoint directory", "model directory", "training job record"]
+
+        # The dataset and the deployed voice are keyed on the MODEL NAME, not on
+        # the job id, and retraining a voice produces several jobs that share
+        # both. Deleting one job used to take the dataset the others still need
+        # and undeploy a voice a newer job had just published.
+        siblings = _other_jobs_using_model(model_name, job_id) if model_name else []
+        if model_name and siblings:
+            logger.info(
+                f"Keeping dataset and deployed voice for '{model_name}': still used "
+                f"by job(s) {', '.join(siblings)}"
+            )
+        elif model_name:
             dataset_dir = Path(f"data/{model_name}")
             if dataset_dir.exists():
                 shutil.rmtree(dataset_dir)
                 logger.info(f"Deleted dataset directory: {dataset_dir}")
+                deleted_items.append("dataset directory")
 
-        if model_name:
             try:
                 await remove_model_from_deployment_target(model_name, deployment_target)
+                deleted_items.append("deployed voice")
             except Exception as tts_error:
                 logger.warning(f"Could not remove from deployment target: {tts_error}")
-        
+
         return {
             "message": f"Model {job_id} deleted successfully",
-            "deleted_items": [
-                "checkpoint directory",
-                "model directory", 
-                "dataset directory",
-                "training job record"
-            ]
+            "model_name": model_name,
+            "deleted_items": deleted_items,
+            # Named so the caller can see why the dataset survived, rather than
+            # concluding the delete silently half-failed.
+            "retained_for_jobs": siblings,
         }
         
     except Exception as e:
@@ -1341,6 +1430,10 @@ async def run_training(job_id: str, request: TrainingRequest):
             training_jobs[job_id].progress = 100.0
             training_jobs[job_id].message = f"Training completed, but model export failed: {str(export_error)}"
         
+    except TrainingCancelled as cancelled:
+        logger.info(f"Training cancelled for {job_id}: {cancelled}")
+        training_jobs[job_id].status = "cancelled"
+        training_jobs[job_id].message = f"{cancelled}. Resume from the last checkpoint to continue."
     except Exception as e:
         training_jobs[job_id].status = "failed"
         training_jobs[job_id].message = f"Training failed: {str(e)}"

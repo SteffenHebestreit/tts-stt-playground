@@ -2492,17 +2492,20 @@ async function refreshTrainingJobs() {
             const statusClass = job.status === 'completed' ? 'status-badge-success' :
                               job.status === 'failed' ? 'status-badge-error' :
                               job.status === 'training' || job.status === 'running' ? 'status-badge-active' :
-                              job.status === 'interrupted' ? 'status-badge-warning' : 'status-badge-default';
+                              job.status === 'interrupted' || job.status === 'cancelled' ? 'status-badge-warning' : 'status-badge-default';
 
             const voiceName = job.voice_name || job.model_name || job.job_id;
             const deploymentLabel = job.deployment_target_label || getTrainingDeploymentLabel(job.deployment_target);
             const createdAtLabel = job.created_at_display || formatTimestamp(job.created_at);
             let actionButtons = `<button class="btn-secondary btn-sm" data-action="details"
                     data-job-id="${escapeHtml(job.job_id)}">${messages.details_action || 'Details'}</button>`;
-            if (job.status === 'interrupted') {
+            // 'cancelled' is resumable now that cancelling actually stops the run
+            // and leaves the checkpoints in place — and it is terminal, so it
+            // must not keep offering a Cancel button the API answers with 400.
+            if (job.status === 'interrupted' || job.status === 'cancelled') {
                 actionButtons += ` <button class="btn-secondary btn-sm" data-action="resume"
                     data-voice-name="${escapeHtml(voiceName)}">${messages.resume_action || 'Resume'}</button>`;
-            } else if (job.status !== 'completed' && job.status !== 'failed') {
+            } else if (!['completed', 'failed', 'cancelled'].includes(job.status)) {
                 actionButtons += ` <button class="btn-secondary btn-sm btn-danger" data-action="cancel"
                     data-job-id="${escapeHtml(job.job_id)}">${messages.cancel_action || 'Cancel'}</button>`;
             }

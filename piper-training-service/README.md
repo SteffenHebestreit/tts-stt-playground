@@ -14,7 +14,7 @@ VITS training pipeline for creating ONNX voice bundles. The service can upload r
 | POST | `/retrain-from-segments` | Re-transcribe existing clips and retrain |
 | GET | `/status/{job_id}` | Retrieve progress and current status |
 | GET | `/jobs` | List known jobs |
-| DELETE | `/job/{job_id}` | Cancel a running job |
+| DELETE | `/job/{job_id}` | Cancel a running job. Takes effect at the next epoch boundary. |
 
 ### Data Preparation
 
@@ -41,6 +41,25 @@ VITS training pipeline for creating ONNX voice bundles. The service can upload r
 3. Resume with `/resume-training` if a container restart interrupts work.
 4. Export with `/export/{job_id}` or let the automatic post-training export complete.
 5. Deploy automatically to the configured target, or choose manual download only.
+
+### Cancelling
+
+`DELETE /job/{job_id}` is checked once per epoch, so it takes effect at the next
+epoch boundary rather than immediately. A cancelled job:
+
+- does **not** produce `final_model.pt`, and is **not** exported or deployed —
+  the point of cancelling is that the voice does not go live;
+- keeps every periodic checkpoint, so `/resume-training` continues from where it
+  stopped;
+- ends in status `cancelled`, which is distinct from `failed`.
+
+### Deleting
+
+`DELETE /model/{job_id}` always removes that job's checkpoints and exported
+model. The dataset under `data/<model_name>` and the deployed voice are keyed on
+the model *name*, which several jobs share whenever a voice is retrained — so
+those are removed only when no other job trained the same name. The response
+lists any job ids that kept them alive in `retained_for_jobs`.
 
 ## Configuration
 
