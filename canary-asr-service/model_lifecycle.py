@@ -64,15 +64,28 @@ class ModelSlot:
 
     # --- state ---------------------------------------------------------------
 
+    # Both read WITHOUT the lock, deliberately.
+    #
+    # `_acquire` holds `self._lock` for the entire duration of `self._loader()`,
+    # which for a NeMo checkpoint is tens of seconds to minutes. These two are
+    # read by /health, which Docker polls with `timeout: 10s, retries: 3` — so
+    # taking the lock here means three consecutive probe timeouts during any
+    # reload and a container marked unhealthy, quite possibly restarted, in the
+    # middle of loading its model. Idle unloading is what makes a reload happen
+    # outside `start_period` at all, so this is not hypothetical.
+    #
+    # A single attribute read is atomic under the GIL. The answer can be one
+    # instant stale, which is the right trade for a status field and no trade at
+    # all for the safety property: nothing decides whether to free memory from
+    # these — `try_unload` and `_expire` re-check `_refs` under the lock.
+
     @property
     def resident(self) -> bool:
-        with self._lock:
-            return self._model is not None
+        return self._model is not None
 
     @property
     def refs(self) -> int:
-        with self._lock:
-            return self._refs
+        return self._refs
 
     # --- use -----------------------------------------------------------------
 

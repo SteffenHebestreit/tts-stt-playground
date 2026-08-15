@@ -220,3 +220,64 @@ def test_ttl_from_env_accepts_sentinels():
 def test_ttl_from_env_ignores_garbage():
     env = {"MODEL_TTL": "soon"}
     assert ml.ttl_from_env(lambda k, d="": env.get(k, d), "MODEL_TTL", default=42.0) == 42.0
+
+
+# --- /health must never block on a model load --------------------------------
+#
+# _acquire holds the lock for the whole of loader(), which for a NeMo checkpoint
+# is tens of seconds to minutes. Docker polls /health with timeout 10s and
+# retries 3, and /health reads `resident` and `refs` — so if those took the lock,
+# any reload would produce three consecutive probe timeouts and a container
+# marked unhealthy mid-load. Idle unloading is what makes a reload happen
+# outside start_period at all, so this is reachable in normal operation.
+
+
+def test_status_properties_do_not_block_while_the_model_is_loading():
+    """The property that keeps the healthcheck honest during a slow load."""
+    release = threading.Event()
+    loading = threading.Event()
+
+    def slow_loader():
+        loading.set()
+        release.wait(timeout=5)
+        return _FakeModel()
+
+    slot = ml.ModelSlot(slow_loader, ttl_seconds=-1, name="slow")
+
+    worker = threading.Thread(target=lambda: slot.acquire().__enter__(), daemon=True)
+    worker.start()
+    assert loading.wait(timeout=5), "loader never started"
+
+    # The lock is held by the in-flight load right now. Both reads must answer
+    # anyway, and quickly.
+    done = threading.Event()
+    seen = {}
+
+    def probe():
+        seen["resident"] = slot.resident
+        seen["refs"] = slot.refs
+        done.set()
+
+    threading.Thread(target=probe, daemon=True).start()
+    assert done.wait(timeout=2), (
+        "reading slot.resident/.refs blocked while a load held the lock — "
+        "/health would time out and the container would be marked unhealthy"
+    )
+    assert seen["resident"] is False  # not yet assigned
+    assert seen["refs"] == 0
+
+    release.set()
+    worker.join(timeout=5)
+
+
+def test_the_unload_decision_still_takes_the_lock():
+    """Lock-free reads are for reporting only. Anything that FREES memory must
+    still decide under the lock, or it can race a request that just arrived."""
+    import inspect
+
+    for name in ("try_unload", "_expire"):
+        source = inspect.getsource(getattr(ml.ModelSlot, name))
+        assert "self._lock" in source, (
+            f"ModelSlot.{name} no longer decides under the lock; a status read "
+            f"being lock-free must not spread to the safety path"
+        )
