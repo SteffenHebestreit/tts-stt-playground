@@ -346,6 +346,16 @@ class OptimizedTrainingPipeline:
                 pass
 
         def _free_memory() -> None:
+            # `nonlocal` is load-bearing, not decoration. Without it, `del name`
+            # inside a nested function marks that name LOCAL to the function, so
+            # the delete hits an unbound local and raises UnboundLocalError —
+            # valid syntax, so py_compile and every static check pass, and it
+            # only fires at the very end of a real training run. It also has to
+            # be `del` on the enclosing binding rather than on parameters: the
+            # point is to drop the last reference so gc.collect() can actually
+            # reclaim the GPU tensors, and a parameter copy would leave the
+            # outer binding holding them.
+            nonlocal model, optimizer, scheduler, dataset, dataloader
             del model, optimizer, scheduler, dataset, dataloader
             gc.collect()
             if torch.cuda.is_available():
