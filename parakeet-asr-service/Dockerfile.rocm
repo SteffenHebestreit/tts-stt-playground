@@ -27,6 +27,7 @@ RUN pip3 install --no-cache-dir torch torchaudio --index-url https://download.py
 
 COPY app.py .
 COPY transcription.py .
+COPY model_lifecycle.py .
 
 # Mirrors the CUDA Dockerfile: torch's TorchScript compiler segfaults scripting
 # NeMo's online_clustering.py at import. Latent here only because this image

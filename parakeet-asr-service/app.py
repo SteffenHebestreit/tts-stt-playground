@@ -28,16 +28,22 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
+from model_lifecycle import ModelSlot, ttl_from_env
 from transcription import parse_hypothesis as _parse_hypothesis
 
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     """Pre-load the model on startup so the first request is fast."""
-    try:
-        get_model()
-    except Exception as e:
-        logger.warning(f"Could not preload model: {e}")
+    if MODEL_TTL == 0:
+        # "Release it the moment nothing is using it" — preloading ~3 GB only to
+        # drop it on the first release is work with no beneficiary.
+        logger.info("Preload skipped: ASR_MODEL_TTL=0 unloads on every idle")
+    else:
+        try:
+            get_model()
+        except Exception as e:
+            logger.warning(f"Could not preload model: {e}")
     yield
 
 
@@ -87,30 +93,76 @@ _ASR_SEM = asyncio.Semaphore(max(1, int(os.getenv("ASR_MAX_CONCURRENCY", "1"))))
 
 
 async def _asr(fn, *args, **kwargs):
-    """Run a blocking model call off the event loop, bounded by _ASR_SEM."""
-    async with _ASR_SEM:
-        return await asyncio.to_thread(fn, *args, **kwargs)
+    """Run a blocking model call off the event loop, bounded by _ASR_SEM.
 
+    The reference is held across the ``await``, not just around the call that
+    takes it: `asyncio.to_thread` runs the NeMo forward pass on a worker thread,
+    and releasing early would let the idle reaper free weights the pass is still
+    reading.
+    """
+    async with _model_slot.acquire_async() as model, _ASR_SEM:
+        return await asyncio.to_thread(fn, model, *args, **kwargs)
+
+
+def _load_parakeet():
+    """Load the Parakeet model onto the active device."""
+    global asr_model, model_loaded
+    logger.info(f"Loading Parakeet model '{MODEL_NAME}' on {device}...")
+    try:
+        import nemo.collections.asr as nemo_asr
+
+        model = nemo_asr.models.ASRModel.from_pretrained(model_name=MODEL_NAME)
+        model.eval()
+        if device == "cuda":
+            model = model.to("cuda")
+        asr_model = model
+        model_loaded = True
+        logger.info(f"Parakeet model '{MODEL_NAME}' loaded on {device}")
+        return model
+    except Exception as e:
+        logger.error(f"Failed to load Parakeet model: {e}", exc_info=True)
+        raise
+
+
+def _release_parakeet(model) -> None:
+    """Clear the module aliases and get the weights off the GPU.
+
+    Moving to CPU before dropping the object is deliberate. `empty_cache()` only
+    returns blocks that are already unreferenced, so it frees nothing while any
+    reference to the module survives — and NeMo registers every instantiated
+    model in its own `AppState`, which is not ours to reason about. `.cpu()`
+    releases the device allocation regardless of who still points at the object,
+    which is the property this endpoint has to guarantee.
+    """
+    global asr_model, model_loaded
+    asr_model = None
+    model_loaded = False
+    try:
+        model.cpu()
+    except Exception as e:
+        logger.warning(f"Could not move Parakeet off the GPU before unload: {e}")
+
+
+# ~3 GB resident. This service is opt-in and bursty — it is selected for a batch
+# of files and then sits idle — so holding the card between bursts is the worst
+# possible trade on a box where VRAM is the binding constraint.
+#   >0 = seconds idle before unloading | 0 = unload immediately | -1 = never
+MODEL_TTL = ttl_from_env(os.getenv, "ASR_MODEL_TTL", "MODEL_TTL", default=300.0)
+_model_slot = ModelSlot(
+    _load_parakeet, ttl_seconds=MODEL_TTL, name="Parakeet-TDT",
+    on_unload=_release_parakeet,
+)
 
 
 def get_model():
-    """Load or return the cached Parakeet model (lazy singleton)."""
-    global asr_model, model_loaded
-    if asr_model is None:
-        logger.info(f"Loading Parakeet model '{MODEL_NAME}' on {device}...")
-        try:
-            import nemo.collections.asr as nemo_asr
+    """Load or return the cached Parakeet model.
 
-            asr_model = nemo_asr.models.ASRModel.from_pretrained(model_name=MODEL_NAME)
-            asr_model.eval()
-            if device == "cuda":
-                asr_model = asr_model.to("cuda")
-            model_loaded = True
-            logger.info(f"Parakeet model '{MODEL_NAME}' loaded on {device}")
-        except Exception as e:
-            logger.error(f"Failed to load Parakeet model: {e}", exc_info=True)
-            raise
-    return asr_model
+    Only for the startup preload. Request handlers go through ``_asr()``, which
+    pins the model for the duration of the call; this does not, so the reference
+    is gone by the time it returns.
+    """
+    with _model_slot.acquire() as model:
+        return model
 
 
 async def _save_upload(upload: UploadFile) -> tuple[str, bytes]:
@@ -165,23 +217,56 @@ def _prepare_audio(src_path: str) -> str:
     return src_path
 
 
-def _run_transcription(audio_path: str) -> tuple[str, list]:
+def _run_transcription(model, audio_path: str) -> tuple[str, list]:
     """Run Parakeet on a single prepared audio file; return ``(text, segments)``."""
-    output = get_model().transcribe([audio_path], timestamps=True, **_NEMO_RUNTIME_KWARGS)
+    output = model.transcribe([audio_path], timestamps=True, **_NEMO_RUNTIME_KWARGS)
     return _parse_hypothesis(output[0]) if output else ("", [])
 
 
-def _run_transcription_batch(audio_paths: list) -> list:
+def _run_transcription_batch(model, audio_paths: list) -> list:
     """Run Parakeet on several prepared files in one batched call (NeMo batches internally)."""
     kwargs = {**_NEMO_RUNTIME_KWARGS, "batch_size": min(len(audio_paths), _NEMO_MAX_BATCH)}
-    outputs = get_model().transcribe(audio_paths, timestamps=True, **kwargs)
+    outputs = model.transcribe(audio_paths, timestamps=True, **kwargs)
     return [_parse_hypothesis(hyp) for hyp in (outputs or [])]
 
 
 @app.get("/health")
 async def health():
-    """Basic liveness / readiness probe."""
-    return {"status": "ok", "model_loaded": model_loaded, "device": device}
+    """Liveness probe.
+
+    `model_resident: false` is not an error: the idle TTL released the weights
+    and the next request reloads them. Returning non-200 for that would make an
+    idle container report unhealthy under Docker's `curl -f`.
+    """
+    return {
+        "status": "ok",
+        "model_loaded": model_loaded,
+        "model_resident": _model_slot.resident,
+        "model_ttl_seconds": MODEL_TTL,
+        "active_requests": _model_slot.refs,
+        "device": device,
+    }
+
+
+@app.post("/unload")
+async def unload():
+    """Release the model and its VRAM now, without stopping the container.
+
+    The idle TTL covers the common case; this is the deliberate one — you are
+    about to run something else on the same GPU and want the memory back now.
+    The next request reloads transparently.
+
+    200 when released or already unloaded; **409 while a request is in flight**,
+    since freeing memory a running forward pass still reads would crash the
+    worker. Retry once `active_requests` reaches zero.
+    """
+    result = _model_slot.try_unload()
+    if result["reason"] == "busy":
+        return JSONResponse(
+            status_code=409,
+            content={"detail": "Model is in use; retry when idle", **result},
+        )
+    return {"model_resident": _model_slot.resident, **result}
 
 
 @app.get("/status")
@@ -193,6 +278,9 @@ async def status():
         "device": device,
         "cuda_available": torch.cuda.is_available(),
         "model_loaded": model_loaded,
+        "model_resident": _model_slot.resident,
+        "model_ttl_seconds": MODEL_TTL,
+        "active_requests": _model_slot.refs,
         "current_model": MODEL_NAME,
     }
     if torch.cuda.is_available():

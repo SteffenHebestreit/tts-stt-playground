@@ -250,6 +250,13 @@ services:
       # expandable_segments avoids the fragmentation that per-request
       # empty_cache() calls used to (badly) paper over.
       PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+      # Release the model after this many idle seconds. This service is bursty —
+      # selected for a batch of files, then idle — so holding the card between
+      # bursts is the worst trade available on a VRAM-bound host.
+      # >0 seconds | 0 = unload when idle | -1 = never unload.
+      ASR_MODEL_TTL: ${ASR_MODEL_TTL:-300}
+      # Global fallback the code reads when the specific TTL is unset.
+      MODEL_TTL: ${MODEL_TTL:-300}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
@@ -295,6 +302,13 @@ services:
       # expandable_segments avoids the fragmentation that per-request
       # empty_cache() calls used to (badly) paper over.
       PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+      # Release the model after this many idle seconds. This service is bursty —
+      # selected for a batch of files, then idle — so holding the card between
+      # bursts is the worst trade available on a VRAM-bound host.
+      # >0 seconds | 0 = unload when idle | -1 = never unload.
+      ASR_MODEL_TTL: ${ASR_MODEL_TTL:-300}
+      # Global fallback the code reads when the specific TTL is unset.
+      MODEL_TTL: ${MODEL_TTL:-300}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:

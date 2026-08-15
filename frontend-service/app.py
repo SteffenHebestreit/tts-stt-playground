@@ -714,7 +714,7 @@ def _build_provider_registry() -> dict:
             # /detect_language exists but is a stub that always returns null,
             # so the capability is NOT declared. Parakeet auto-detects
             # internally during transcription but does not report it.
-            "capabilities": ["transcribe", "segments"],
+            "capabilities": ["transcribe", "segments", "model_unload"],
             "language_detect": False,
             "contracts": {
                 "transcribe": "stt-form-v1",
@@ -750,7 +750,7 @@ def _build_provider_registry() -> dict:
             "short_name": "Canary ASR",
             "internal_url": CANARY_ASR_SERVICE_URL,
             "health_endpoint": "/health",
-            "capabilities": ["transcribe", "segments"],
+            "capabilities": ["transcribe", "segments", "model_unload"],
             # Canary has no language identification at all — its /detect_language
             # route transcribes with the default language and returns null. The
             # contract is therefore NOT declared: a client must not be told it

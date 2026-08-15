@@ -213,9 +213,9 @@ response carries the outstanding count (`model_refs`, or `inflight` on qwen3-tts
 whether a retry is worthwhile.
 
 Supported where the provider lists the `model_unload` capability — currently `whisper`,
-`qwen3-asr`, `qwen3` (TTS) and `chatterbox`. Asking any other provider returns 400. Piper is
-CPU-only ONNX with no VRAM to reclaim, and the NeMo services hold their models for the process
-lifetime.
+`qwen3-asr`, `qwen3` (TTS), `chatterbox`, `parakeet` and `canary`. Asking any other provider
+returns 400. The two that cannot: `piper` is CPU-only ONNX with no VRAM to reclaim, and
+`whisper-cpp` is the upstream whisper-server binary with no Python layer to add a route to.
 
 ```bash
 curl -X POST http://your-host:3000/api/providers/whisper/unload

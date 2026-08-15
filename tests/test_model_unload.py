@@ -32,6 +32,8 @@ UNLOAD_SERVICES = {
     "qwen3-asr": "qwen3-asr-service",
     "qwen3": "qwen3-tts-service",
     "chatterbox": "chatterbox-tts-service",
+    "parakeet": "parakeet-asr-service",
+    "canary": "canary-asr-service",
 }
 UNLOAD_CAPABILITY = "model_unload"
 
@@ -127,9 +129,15 @@ def test_registry_declares_unload_exactly_where_it_exists(declared_capabilities)
 
 
 def test_stub_providers_do_not_claim_unload(declared_capabilities):
-    """Providers with no residency management must not advertise unloading."""
+    """Providers with no residency management must not advertise unloading.
+
+    `whisper-cpp` is the upstream whisper-server binary with no Python layer to
+    add a route to, and `piper` is CPU-only ONNX with no VRAM to reclaim. Both
+    are permanent members of this list, unlike parakeet and canary, which used
+    to be here and now manage residency through `ModelSlot`.
+    """
     declared = declared_capabilities
-    for pid in ("parakeet", "canary", "whisper-cpp", "piper"):
+    for pid in ("whisper-cpp", "piper"):
         if pid not in declared:
             continue
         assert UNLOAD_CAPABILITY not in declared[pid], (
