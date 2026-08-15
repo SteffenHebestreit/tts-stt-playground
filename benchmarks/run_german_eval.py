@@ -197,7 +197,7 @@ def run(args: argparse.Namespace) -> int:
           f"(model={args.model}, language={args.language})", file=sys.stderr)
 
     results = []
-    total_audio_seconds = 0.0
+    total_wall_seconds = 0.0
     with httpx.Client() as client:
         for index, (audio, reference) in enumerate(manifest, 1):
             try:
@@ -211,7 +211,7 @@ def run(args: argparse.Namespace) -> int:
                     return 1
                 continue
 
-            total_audio_seconds += elapsed
+            total_wall_seconds += elapsed
             wer = word_errors(reference, hypothesis, fold_umlauts=args.fold_umlauts)
             cer = character_errors(reference, hypothesis, fold_umlauts=args.fold_umlauts)
             results.append({
@@ -248,7 +248,9 @@ def run(args: argparse.Namespace) -> int:
         "cer": cer_total.rate,
         "wer_counts": asdict(wer_total),
         "cer_counts": asdict(cer_total),
-        "wall_seconds": total_audio_seconds,
+        # Sum of per-request latencies. Not audio duration — this harness never
+        # measures that, so it deliberately reports no real-time factor.
+        "wall_seconds": total_wall_seconds,
         "results": results,
     }
 

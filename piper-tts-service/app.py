@@ -313,6 +313,10 @@ def select_best_voice(language: str, quality: str, gender: Optional[str] = None)
     """Pick the best voice across all registered voices (see naming.select_best_voice)."""
     return _select_best_voice({**DEFAULT_VOICES, **CUSTOM_VOICES}, language, quality, gender)
 
+# ffprobe reads a header; it should answer immediately.
+FFPROBE_TIMEOUT_S = 30
+
+
 async def analyze_audio_with_ffmpeg(file_path: str) -> Dict:
     """Run ``ffprobe`` on *file_path* and return codec/duration/quality metadata."""
     try:
@@ -327,9 +331,18 @@ async def analyze_audio_with_ffmpeg(file_path: str) -> Dict:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        
-        stdout, stderr = await process.communicate()
-        
+
+        # Bounded: ffprobe only reads a header, so it should answer at once. A
+        # wedged one would otherwise keep the request and the child process
+        # alive for as long as the client is willing to wait.
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=FFPROBE_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            return {"error": f"ffprobe timed out after {FFPROBE_TIMEOUT_S}s"}
+
         if process.returncode != 0:
             return {"error": f"FFmpeg analysis failed: {stderr.decode()}"}
         

@@ -513,6 +513,10 @@ async def prepare_dataset(dataset: DatasetUpload):
             "dataset_path": str(dataset_path),
             "num_samples": len(dataset.segments)
         }
+    except HTTPException:
+        # A 400 from the split validator ("too few segments") is the caller's
+        # problem to fix and must not be relabelled as an internal error.
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

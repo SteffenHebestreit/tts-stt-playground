@@ -11,6 +11,8 @@ import librosa
 import numpy as np
 from pathlib import Path
 from typing import List, Dict
+
+from validation import split_train_val
 import soundfile as sf
 from phonemizer import phonemize
 import asyncio
@@ -20,6 +22,10 @@ import subprocess
 import logging
 
 logger = logging.getLogger(__name__)
+
+# ffprobe reads a header; it should answer immediately. A bound stops a wedged
+# process from hanging the caller indefinitely.
+FFPROBE_TIMEOUT_S = 30
 
 class DataProcessor:
     """Prepare audio/text examples and mel features for VITS training."""
@@ -165,16 +171,15 @@ class DataProcessor:
         return mel_spec
     
     async def _create_splits(self, metadata: List[Dict], dataset_dir: Path):
-        """Write train.json / val.json with a 90/10 random split."""
-        n_samples = len(metadata)
-        n_val = max(1, int(n_samples * 0.1))  # 10% validation
-        
-        indices = np.random.permutation(n_samples)
-        val_indices = indices[:n_val]
-        train_indices = indices[n_val:]
-        
-        train_metadata = [metadata[i] for i in train_indices]
-        val_metadata = [metadata[i] for i in val_indices]
+        """Write train.json / val.json with a reproducible 90/10 split.
+
+        Shares ``split_train_val`` with the segmenter rather than repeating the
+        unseeded ``np.random.permutation`` that used to be here: an unseeded
+        split means two runs over the same data validate against different sets
+        and their loss curves cannot be compared. It also refuses a dataset too
+        small to divide, instead of handing back an empty training set.
+        """
+        train_metadata, val_metadata = split_train_val(metadata)
         
         async with aiofiles.open(dataset_dir / "train.json", 'w') as f:
             await f.write(json.dumps(train_metadata, indent=2))
@@ -213,7 +218,8 @@ class DataProcessor:
                 "-show_format", "-show_streams", audio_path
             ]
             
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, check=True, timeout=FFPROBE_TIMEOUT_S)
             info = json.loads(result.stdout)
             
             # Extract audio stream information
@@ -268,8 +274,10 @@ class DataProcessor:
             if sr != target_sample_rate:
                 audio = librosa.resample(audio, orig_sr=sr, target_sr=target_sample_rate)
             
-            # Normalize audio
-            audio = audio / np.max(np.abs(audio))
+            # Normalize audio. The +1e-6 matters: a fully silent file makes
+            # np.max(np.abs(audio)) zero, and the division then writes a WAV of
+            # NaN. prepare_dataset() guards this the same way.
+            audio = audio / (np.max(np.abs(audio)) + 1e-6)
             
             # Save preprocessed audio
             filename = Path(audio_path).stem + ".wav"
