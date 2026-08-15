@@ -6,6 +6,7 @@ or the rest of the training stack.
 """
 
 import os
+import random
 from pathlib import Path
 from typing import Optional
 
@@ -55,6 +56,57 @@ def validate_epochs(value: int, field: str = "epochs") -> int:
             detail=f"{field} must be between {MIN_EPOCHS} and {MAX_EPOCHS} (got {epochs})",
         )
     return epochs
+
+
+VAL_FRACTION = 0.1
+SPLIT_SEED = 1234
+
+
+def split_train_val(entries: list, val_fraction: float = VAL_FRACTION,
+                    seed: int = SPLIT_SEED) -> tuple[list, list]:
+    """Split dataset entries into (train, val), reproducibly.
+
+    Two things the previous inline version got wrong.
+
+    ``np.random.permutation`` with no seed reshuffled on every call, so
+    retraining the same voice compared a new model against a validation set it
+    had partly trained on last time — and the loss curves of two runs were not
+    comparable at all. Sorting first and seeding makes the split a pure function
+    of the segment set, which also matters because ``_run_retrain_from_segments``
+    collects its segments concurrently and hands them over in arrival order.
+
+    ``max(1, int(n * 0.1))`` also guaranteed at least one validation entry even
+    when there was only one entry in total, which left the training set empty
+    and surfaced hours later as a bare "Dataset is empty".
+    """
+    total = len(entries)
+    if total < 2:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Need at least 2 usable segments to build a train/validation "
+                f"split, got {total}. Upload more audio, or lower the quality "
+                f"filters if segments are being discarded."
+            ),
+        )
+
+    # Sort by a stable key so concurrent collection order cannot change the split.
+    def _key(entry):
+        if isinstance(entry, dict):
+            return str(entry.get("audio_path") or entry.get("text") or "")
+        return str(entry)
+
+    ordered = sorted(entries, key=_key)
+
+    n_val = min(max(1, int(total * val_fraction)), total - 1)
+    rng = random.Random(seed)
+    indices = list(range(total))
+    rng.shuffle(indices)
+
+    val_idx = set(indices[:n_val])
+    val = [ordered[i] for i in indices[:n_val]]
+    train = [ordered[i] for i in range(total) if i not in val_idx]
+    return train, val
 
 
 def coerce_resume_int(value, default: int) -> int:

@@ -199,3 +199,71 @@ def test_epoch_counts_are_bounded_at_every_entry_point(endpoint: str):
     assert "_validate_epochs" in ast.unparse(node), (
         f"{endpoint} accepts an unbounded epoch count"
     )
+
+
+# --- ffmpeg invocation -------------------------------------------------------
+#
+# `-ss` after `-i` is *output* seeking: ffmpeg decodes the file from the start
+# and discards everything before the cut point. Cutting one recording into N
+# segments therefore cost N full decodes, so segmenting a long upload was
+# quadratic in the number of segments. Before `-i` it seeks the input directly,
+# and has been accurate as well as fast since ffmpeg 2.1.
+
+FFMPEG_CALLERS = [
+    (SERVICE_DIR / "audio_segmenter.py", "extract_audio_segment"),
+    (REPO_ROOT / "qwen3-tts-service" / "app.py", "_trim_audio_segment"),
+]
+
+
+def _ffmpeg_argv(path: Path, func_name: str) -> list[str]:
+    """The literal argv list built inside *func_name*."""
+    node = _function(path, func_name)
+    assert node is not None, f"{func_name} not found in {path.name}"
+    for sub in ast.walk(node):
+        if not isinstance(sub, ast.Assign):
+            continue
+        target = sub.targets[0]
+        if getattr(target, "id", None) != "cmd":
+            continue
+        assert isinstance(sub.value, ast.List), f"{func_name}: cmd is not a list literal"
+        return [ast.unparse(el) for el in sub.value.elts]
+    pytest.fail(f"{func_name} no longer builds a `cmd` list")
+
+
+@pytest.mark.parametrize("path,func", FFMPEG_CALLERS, ids=lambda v: getattr(v, "name", v))
+def test_ffmpeg_seeks_the_input_not_the_output(path: Path, func: str):
+    argv = _ffmpeg_argv(path, func)
+    assert "'-ss'" in argv, f"{func}: no -ss in the ffmpeg argv"
+    assert "'-i'" in argv, f"{func}: no -i in the ffmpeg argv"
+    assert argv.index("'-ss'") < argv.index("'-i'"), (
+        f"{func} places -ss after -i, which makes ffmpeg decode the whole file "
+        f"up to the cut point every time. Move it before -i."
+    )
+
+
+@pytest.mark.parametrize("path,func", FFMPEG_CALLERS, ids=lambda v: getattr(v, "name", v))
+def test_ffmpeg_calls_are_bounded_by_a_timeout(path: Path, func: str):
+    """A wedged ffmpeg must not stall segmentation or a request forever."""
+    body = ast.unparse(_function(path, func))
+    assert "timeout" in body, f"{func} runs ffmpeg with no timeout"
+
+
+def test_segment_extraction_does_not_block_the_event_loop():
+    """It runs inside a BackgroundTask, so a synchronous subprocess.run here
+    froze /health and /status for the whole of segmentation."""
+    body = ast.unparse(_function(SERVICE_DIR / "audio_segmenter.py", "extract_audio_segment"))
+    assert "to_thread" in body, (
+        "extract_audio_segment calls subprocess.run directly on the event loop"
+    )
+
+
+def test_the_train_val_split_goes_through_the_shared_helper():
+    """Reproducibility lives in validation.split_train_val, which is unit-tested;
+    an inline np.random.permutation here would bypass all of it."""
+    body = ast.unparse(
+        _function(SERVICE_DIR / "audio_segmenter.py", "generate_training_metadata"))
+    assert "split_train_val" in body
+    assert "np.random.permutation" not in body, (
+        "the unseeded permutation is back — the split would stop being "
+        "reproducible across retrains"
+    )

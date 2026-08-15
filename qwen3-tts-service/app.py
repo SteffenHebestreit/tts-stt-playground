@@ -555,8 +555,12 @@ def _trim_audio_segment(input_path: str, start: float, end: float, output_path: 
     try:
         duration = end - start
         cmd = [
-            "ffmpeg", "-y", "-i", input_path,
-            "-ss", f"{start:.3f}", "-t", f"{duration:.3f}",
+            # -ss before -i: input seeking, which jumps to the position instead
+            # of decoding the whole file up to it and discarding the result.
+            # Accurate as well as fast on ffmpeg >= 2.1.
+            "ffmpeg", "-y",
+            "-ss", f"{start:.3f}", "-i", input_path,
+            "-t", f"{duration:.3f}",
             "-ar", "24000", "-ac", "1",
             output_path,
         ]
@@ -800,7 +804,11 @@ async def save_voice(
         best = _pick_best_segment(segments)
         if best and best.get("start") is not None:
             trimmed_path = tmp_path + "_trimmed.wav"
-            if _trim_audio_segment(tmp_path, best["start"], best["end"], trimmed_path):
+            # Off the event loop: subprocess.run here blocks every other request
+            # for as long as ffmpeg takes, up to its own 30 s timeout.
+            trimmed = await asyncio.to_thread(
+                _trim_audio_segment, tmp_path, best["start"], best["end"], trimmed_path)
+            if trimmed:
                 audio_path = trimmed_path
                 segment_text = best.get("text", ref_text)
                 dur = best["end"] - best["start"]

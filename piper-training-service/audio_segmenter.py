@@ -12,8 +12,13 @@ import tempfile
 from dataclasses import dataclass
 
 from stt_processor import STTProcessor, SegmentInfo
+from validation import split_train_val
 
 logger = logging.getLogger(__name__)
+
+# Ceiling on a single ffmpeg cut. Generous — these are seconds of audio — but a
+# wedged process must not stall the whole segmentation run indefinitely.
+FFMPEG_TIMEOUT_S = 120
 
 
 @dataclass
@@ -70,8 +75,16 @@ class AudioSegmenter:
             output_path.parent.mkdir(parents=True, exist_ok=True)
             cmd = [
                 self.ffmpeg_path,
-                '-i', str(input_path),
+                # -ss BEFORE -i is input seeking: ffmpeg jumps to the position and
+                # decodes only the requested slice. After -i it is *output*
+                # seeking, which decodes the file from the beginning every time
+                # and throws away everything before start_time. Cutting one
+                # recording into N segments therefore cost N full decodes -- for
+                # a one-hour file at a few hundred segments that is hours of CPU
+                # doing nothing. Modern ffmpeg (>= 2.1) makes input seeking
+                # accurate as well as fast, so nothing is traded away here.
                 '-ss', str(start_time),
+                '-i', str(input_path),
                 '-t', str(end_time - start_time),
                 '-ar', str(sample_rate),
                 '-ac', str(channels),
@@ -79,7 +92,14 @@ class AudioSegmenter:
                 '-y',
                 str(output_path)
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            # Off the event loop, and bounded. This runs inside a BackgroundTask,
+            # so a synchronous call here froze /health and /status for the whole
+            # of segmentation -- long enough for Docker to mark the container
+            # unhealthy -- and a wedged ffmpeg would have hung it for good.
+            result = await asyncio.to_thread(
+                subprocess.run, cmd,
+                capture_output=True, text=True, check=False, timeout=FFMPEG_TIMEOUT_S,
+            )
             if result.returncode != 0:
                 logger.error(f"ffmpeg error for {output_path.name}: {result.stderr}")
                 return False
@@ -87,6 +107,9 @@ class AudioSegmenter:
                 logger.error(f"No output file created: {output_path}")
                 return False
             return True
+        except subprocess.TimeoutExpired:
+            logger.error(f"ffmpeg timed out after {FFMPEG_TIMEOUT_S}s for {output_path.name}")
+            return False
         except Exception as e:
             logger.error(f"Error extracting segment {output_path.name}: {e}")
             return False
@@ -307,11 +330,7 @@ class AudioSegmenter:
                 "confidence": segment.confidence
             })
 
-        # 90/10 train/val split
-        n_val = max(1, int(len(metadata) * 0.1))
-        indices = np.random.permutation(len(metadata))
-        train_metadata = [metadata[i] for i in indices[n_val:]]
-        val_metadata = [metadata[i] for i in indices[:n_val]]
+        train_metadata, val_metadata = split_train_val(metadata)
 
         train_path = output_dir / "train.json"
         with open(train_path, 'w', encoding='utf-8') as f:
