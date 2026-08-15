@@ -726,17 +726,25 @@ async def transcribe_audio_stream(
         logger.error(f"[{req_id}] Failed to save temp file: {e}")
         raise HTTPException(status_code=500, detail="Failed to process uploaded file.")
 
-    # Take the reference HERE, not inside the generator.
+    # PROBE here; the reference itself is taken inside the generator.
     #
-    # Two things depend on it. First, this route used to gate on `model_loaded`,
-    # which is False after an idle unload or POST /unload — so it answered 503
-    # for a model that would have reloaded on demand, unlike every other decode
-    # path. Second, once an SSE body starts the status line is already 200, so a
-    # load failure discovered inside the generator can only be reported as an
-    # in-band event many clients never look at. Acquiring up front turns both
-    # into an honest HTTP status before a single byte is streamed.
+    # This route used to gate on `model_loaded`, which is False after an idle
+    # unload or POST /unload — so it answered 503 for a model that would have
+    # reloaded on demand, unlike every other decode path. It still must not
+    # simply move the check inside the generator: once an SSE body starts the
+    # status line is already 200, and a load failure could then only be reported
+    # as an in-band event many clients never read.
+    #
+    # But acquiring here and releasing in the generator is asymmetric, and the
+    # asymmetry leaks. An async generator that is never started never runs its
+    # `finally`, so if anything prevents Starlette from iterating this one the
+    # reference is held for the life of the process: POST /unload answers 409
+    # forever and the idle TTL can never fire again. Acquire and release
+    # therefore live together in the generator, and this is only a probe —
+    # exactly what the WebSocket handshake below does for the same reason.
     try:
-        model = acquire_model()
+        acquire_model()
+        release_model()
     except HTTPException:
         try:
             os.unlink(tmp_file_path)
@@ -747,12 +755,16 @@ async def transcribe_audio_stream(
     async def generate_transcription():
         """SSE generator that yields transcription segments as JSON events."""
         effective_target_lang = target_language  # capture outer scope value
-        # The reference taken by the handler is held across the whole stream, not
-        # just the transcribe() call: the segment generator is lazy and is pulled
-        # one item at a time by the loop below, so the model must stay resident
-        # until the last yield. Released in the finally, including when the
-        # client disconnects early (Starlette closes the generator, which runs it).
+        # Held across the whole stream, not just the transcribe() call: the
+        # segment generator is lazy and is pulled one item at a time by the loop
+        # below, so the model must stay resident until the last yield. Taken
+        # here rather than in the handler so that a generator which never starts
+        # cannot leak it, and released in the finally — including when the
+        # client disconnects early, where Starlette closes the generator and the
+        # finally does run.
+        model = None
         try:
+            model = acquire_model()
             logger.info(f"[{req_id}] /transcribe-stream request received: filename={audio.filename}, content_type={audio.content_type}, language={language}, task={task}")
             logger.info(f"[{req_id}] Uploaded audio size: {len(audio_content)} bytes")
             
@@ -843,7 +855,12 @@ async def transcribe_audio_stream(
             error_data = {"error": f"Transcription failed: {str(e)}", "status": "error"}
             yield f"data: {json.dumps(error_data)}\n\n"
         finally:
-            release_model()
+            # Only if the acquire above actually succeeded. An unconditional
+            # release here would, when acquire_model() raised, hand back a
+            # reference this request never held — decrementing some other
+            # request's count and letting its model be unloaded mid-decode.
+            if model is not None:
+                release_model()
             # Cleanup temporary file
             if os.path.exists(tmp_file_path):
                 try:
