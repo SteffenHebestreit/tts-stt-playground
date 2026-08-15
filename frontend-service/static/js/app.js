@@ -20,7 +20,7 @@ function removeOptionalProvider(providerId) {
 
     const sttSelect = document.getElementById('stt-engine-select');
     if (sttSelect) {
-        const option = sttSelect.querySelector(`option[value="${providerId}"]`);
+        const option = sttSelect.querySelector(`option[value="${CSS.escape(providerId)}"]`);
         if (option) {
             option.remove();
         }
@@ -577,7 +577,12 @@ function showTab(tabId) {
     const tabEl = document.getElementById(tabId);
     if (tabEl) tabEl.classList.add('active');
 
-    const btn = document.querySelector(`.tab-button[onclick*="${tabId}"]`);
+    // By id, not by substring-matching the button's own onclick text. Every tab
+    // button in index.html is `<tabId>-button`, and the old selector matched any
+    // handler *containing* the id — so a future tab whose name ends in an
+    // existing one would highlight whichever button happened to come first in
+    // document order.
+    const btn = document.getElementById(`${tabId}-button`);
     if (btn) btn.classList.add('active');
 
     // Tab-specific initialization
@@ -723,10 +728,53 @@ function updateServiceStatus() {
 }
 
 // Helper functions
-/** Render a status message into the given result/status container. */
+/**
+ * Render a status message into the given result/status container.
+ *
+ * Text, never markup. Every caller passes a plain string, and most of the error
+ * paths pass a backend `detail` — which can carry an uploaded filename or a
+ * voice name straight through from the user. Building this with innerHTML meant
+ * a message containing `<` either vanished or executed, depending on what
+ * followed it.
+ */
 function showStatus(elementId, type, message) {
     const element = document.getElementById(elementId);
-    if (element) element.innerHTML = `<div class="${type}">${message}</div>`;
+    if (!element) return;
+    const box = document.createElement('div');
+    box.className = type;
+    box.textContent = String(message ?? '');
+    element.replaceChildren(box);
+}
+
+/**
+ * Render a small inline status box into an arbitrary container as text.
+ *
+ * Same reasoning as showStatus, for the places that render a status into an
+ * element they already hold rather than one they look up by id.
+ */
+function setStatusBox(container, type, message, style = 'padding: 8px; font-size: 0.9rem;') {
+    if (!container) return;
+    const box = document.createElement('div');
+    box.className = type;
+    box.style.cssText = style;
+    box.textContent = String(message ?? '');
+    container.replaceChildren(box);
+}
+
+/**
+ * Bind click handlers to `data-action` elements inside `root`.
+ *
+ * Replaces inline `onclick="fn('${value}')"`, which cannot be made safe by
+ * escaping: the HTML parser decodes entities in an attribute value *before* the
+ * result is parsed as JavaScript, so an escaped apostrophe still closes the
+ * argument string. Routing values through `data-*` attributes keeps them data.
+ */
+function bindActions(root, handlers) {
+    if (!root) return;
+    root.querySelectorAll('[data-action]').forEach((element) => {
+        const handler = handlers[element.dataset.action];
+        if (handler) element.addEventListener('click', () => handler(element));
+    });
 }
 
 /** Escape a value for safe interpolation into innerHTML. */
@@ -906,26 +954,33 @@ async function refreshCustomVoices() {
 
         let html = '<div class="voices-grid">';
         customVoices.forEach(voice => {
+            const baseLanguage = (voice.language || 'en').split('_')[0];
             html += `
                 <div class="voice-card">
                     <div class="voice-header">
-                        <h4>${voice.name || voice.id}</h4>
-                        <span class="voice-id">${voice.id}</span>
+                        <h4>${escapeHtml(voice.name || voice.id)}</h4>
+                        <span class="voice-id">${escapeHtml(voice.id)}</span>
                     </div>
                     <div class="voice-info">
-                        ${voice.language ? `<p>Language: ${voice.language}</p>` : ''}
-                        ${voice.quality ? `<p>Quality: ${voice.quality}</p>` : ''}
+                        ${voice.language ? `<p>Language: ${escapeHtml(voice.language)}</p>` : ''}
+                        ${voice.quality ? `<p>Quality: ${escapeHtml(voice.quality)}</p>` : ''}
                     </div>
                     <div class="voice-actions">
-                        <button class="btn-secondary" onclick="testVoice('${voice.id}', '${(voice.language || 'en').split('_')[0]}')">${messages.action_test || 'Test'}</button>
-                        <button class="btn-secondary" onclick="deleteCustomVoice('${voice.id}')" style="color: var(--error);">${messages.action_delete || 'Delete'}</button>
+                        <button class="btn-secondary" data-action="test-voice"
+                                data-voice-id="${escapeHtml(voice.id)}" data-lang="${escapeHtml(baseLanguage)}">${messages.action_test || 'Test'}</button>
+                        <button class="btn-secondary" data-action="delete-voice"
+                                data-voice-id="${escapeHtml(voice.id)}" style="color: var(--error);">${messages.action_delete || 'Delete'}</button>
                     </div>
-                    <div id="voice-test-${voice.id}" class="audio-player"></div>
+                    <div class="audio-player" data-voice-test="${escapeHtml(voice.id)}"></div>
                 </div>
             `;
         });
         html += '</div>';
         container.innerHTML = html;
+        bindActions(container, {
+            'test-voice': (el) => testVoice(el.dataset.voiceId, el.dataset.lang),
+            'delete-voice': (el) => deleteCustomVoice(el.dataset.voiceId),
+        });
     } catch (error) {
         console.error('Error refreshing custom voices:', error);
         container.innerHTML = `<p style="color: var(--error);">${messages.unavailable || 'Failed to load voices. Is the PiperTTS service running?'}</p>`;
@@ -934,12 +989,15 @@ async function refreshCustomVoices() {
 
 /** Generate a short preview clip for a specific custom Piper voice. */
 async function testVoice(voiceId, lang = 'en') {
-    const playerDiv = document.getElementById(`voice-test-${voiceId}`);
+    // Attribute selector rather than an id: a voice id is whatever the trainer
+    // named it, and CSS.escape is the only thing that makes that safe to put in
+    // a selector.
+    const playerDiv = document.querySelector(`[data-voice-test="${CSS.escape(voiceId)}"]`);
     const messages = getProviderMessages('piper')?.custom_voice_library || {};
     if (!playerDiv) return;
 
     try {
-        playerDiv.innerHTML = `<div class="info" style="padding: 8px; font-size: 0.9rem;">${messages.test_start || 'Generating test audio...'}</div>`;
+        setStatusBox(playerDiv, 'info', messages.test_start || 'Generating test audio...');
 
         const testTexts = {
             'de': 'Hallo, das ist ein Test dieser Stimme.',
@@ -959,7 +1017,10 @@ async function testVoice(voiceId, lang = 'en') {
 
         setAudioPlayer(playerDiv, await response.blob(), ' margin-top: 8px;');
     } catch (error) {
-        playerDiv.innerHTML = `<div class="error" style="padding: 8px; font-size: 0.9rem;">${formatMessage(messages.test_error, { error: error.message }) || `Test failed: ${error.message}`}</div>`;
+        setStatusBox(
+            playerDiv, 'error',
+            formatMessage(messages.test_error, { error: error.message }) || `Test failed: ${error.message}`
+        );
     }
 }
 
@@ -969,7 +1030,8 @@ async function deleteCustomVoice(voiceId) {
     if (!confirm(formatMessage(messages.delete_confirm, { voice_id: voiceId }) || `Delete custom voice "${voiceId}"? This cannot be undone.`)) return;
 
     try {
-        const response = await fetch(getProviderApiPath('piper', `/custom-voices/${voiceId}`), { method: 'DELETE' });
+        const response = await fetch(
+            getProviderApiPath('piper', `/custom-voices/${encodeURIComponent(voiceId)}`), { method: 'DELETE' });
         if (!response.ok) throw new Error('Delete failed');
 
         showNotification(formatMessage(messages.delete_success, { voice_id: voiceId }) || `Voice "${voiceId}" deleted`, 'success');
@@ -2061,12 +2123,12 @@ async function toggleLiveTranscription() {
             showStatus(
                 'live-stt-status',
                 'success',
-                `Final transcript ready (${escapeHtml(message.language || 'unknown')}, ${message.duration}s of audio)${dropped}.`
+                `Final transcript ready (${message.language || 'unknown'}, ${message.duration}s of audio)${dropped}.`
             );
         } else if (message.type === 'warning') {
-            showStatus('live-stt-status', 'info', escapeHtml(message.message || 'Warning'));
+            showStatus('live-stt-status', 'info', message.message || 'Warning');
         } else if (message.type === 'error') {
-            showStatus('live-stt-status', 'error', escapeHtml(message.error || 'Streaming error'));
+            showStatus('live-stt-status', 'error', message.error || 'Streaming error');
         }
     };
 
@@ -2237,11 +2299,11 @@ async function startTraining() {
 
         progressDiv.innerHTML = `
             <div class="training-info">
-                <p><strong>Job ID:</strong> ${result.job_id}</p>
-                <p><strong>Voice Name:</strong> ${voiceName}</p>
-                <p><strong>Language:</strong> ${language}</p>
-                <p><strong>Epochs:</strong> ${epochs}</p>
-                <p><strong>Deployment Target:</strong> ${getTrainingDeploymentLabel(deploymentTarget)}</p>
+                <p><strong>Job ID:</strong> ${escapeHtml(result.job_id)}</p>
+                <p><strong>Voice Name:</strong> ${escapeHtml(voiceName)}</p>
+                <p><strong>Language:</strong> ${escapeHtml(language)}</p>
+                <p><strong>Epochs:</strong> ${escapeHtml(epochs)}</p>
+                <p><strong>Deployment Target:</strong> ${escapeHtml(getTrainingDeploymentLabel(deploymentTarget))}</p>
             </div>
         `;
 
@@ -2375,14 +2437,17 @@ async function refreshModels() {
             const createdAtLabel = job.created_at_display || formatTimestamp(job.created_at);
             html += `
                 <tr>
-                    <td>${voiceName}</td>
-                    <td><code>${job.job_id}</code></td>
-                    <td>${deploymentLabel}</td>
-                    <td>${createdAtLabel}</td>
+                    <td>${escapeHtml(voiceName)}</td>
+                    <td><code>${escapeHtml(job.job_id)}</code></td>
+                    <td>${escapeHtml(deploymentLabel)}</td>
+                    <td>${escapeHtml(createdAtLabel)}</td>
                     <td class="action-buttons">
-                        <button class="btn-secondary btn-sm" onclick="deployExportedModel('${job.job_id}', '${voiceName}')">${messages.deploy_action || 'Deploy'}</button>
-                        <button class="btn-secondary btn-sm" onclick="downloadModel('${job.job_id}')">${messages.download_action || 'Download'}</button>
-                        <button class="btn-secondary btn-sm btn-danger" onclick="deleteModel('${job.job_id}')">${messages.delete_action || 'Delete'}</button>
+                        <button class="btn-secondary btn-sm" data-action="deploy"
+                                data-job-id="${escapeHtml(job.job_id)}" data-voice-name="${escapeHtml(voiceName)}">${messages.deploy_action || 'Deploy'}</button>
+                        <button class="btn-secondary btn-sm" data-action="download"
+                                data-job-id="${escapeHtml(job.job_id)}">${messages.download_action || 'Download'}</button>
+                        <button class="btn-secondary btn-sm btn-danger" data-action="delete"
+                                data-job-id="${escapeHtml(job.job_id)}">${messages.delete_action || 'Delete'}</button>
                     </td>
                 </tr>
             `;
@@ -2390,6 +2455,11 @@ async function refreshModels() {
 
         html += '</tbody></table>';
         modelsList.innerHTML = html;
+        bindActions(modelsList, {
+            deploy: (el) => deployExportedModel(el.dataset.jobId, el.dataset.voiceName),
+            download: (el) => downloadModel(el.dataset.jobId),
+            delete: (el) => deleteModel(el.dataset.jobId),
+        });
     } catch (error) {
         console.error('Failed to refresh models:', error);
         modelsList.innerHTML = `<p style="color: var(--error);">${messages.error || 'Failed to load models. Is the training service running?'}</p>`;
@@ -2427,20 +2497,23 @@ async function refreshTrainingJobs() {
             const voiceName = job.voice_name || job.model_name || job.job_id;
             const deploymentLabel = job.deployment_target_label || getTrainingDeploymentLabel(job.deployment_target);
             const createdAtLabel = job.created_at_display || formatTimestamp(job.created_at);
-            let actionButtons = `<button class="btn-secondary btn-sm" onclick="viewJobDetails('${job.job_id}')">${messages.details_action || 'Details'}</button>`;
+            let actionButtons = `<button class="btn-secondary btn-sm" data-action="details"
+                    data-job-id="${escapeHtml(job.job_id)}">${messages.details_action || 'Details'}</button>`;
             if (job.status === 'interrupted') {
-                actionButtons += ` <button class="btn-secondary btn-sm" onclick="resumeTraining('${voiceName}')">${messages.resume_action || 'Resume'}</button>`;
+                actionButtons += ` <button class="btn-secondary btn-sm" data-action="resume"
+                    data-voice-name="${escapeHtml(voiceName)}">${messages.resume_action || 'Resume'}</button>`;
             } else if (job.status !== 'completed' && job.status !== 'failed') {
-                actionButtons += ` <button class="btn-secondary btn-sm btn-danger" onclick="cancelJob('${job.job_id}')">${messages.cancel_action || 'Cancel'}</button>`;
+                actionButtons += ` <button class="btn-secondary btn-sm btn-danger" data-action="cancel"
+                    data-job-id="${escapeHtml(job.job_id)}">${messages.cancel_action || 'Cancel'}</button>`;
             }
 
             html += `
                 <tr>
-                    <td>${voiceName}</td>
-                    <td><span class="status-badge ${statusClass}">${job.status}</span></td>
-                    <td>${deploymentLabel}</td>
+                    <td>${escapeHtml(voiceName)}</td>
+                    <td><span class="status-badge ${statusClass}">${escapeHtml(job.status)}</span></td>
+                    <td>${escapeHtml(deploymentLabel)}</td>
                     <td>${(job.progress || 0).toFixed(1)}%</td>
-                    <td>${createdAtLabel}</td>
+                    <td>${escapeHtml(createdAtLabel)}</td>
                     <td class="action-buttons">${actionButtons}</td>
                 </tr>
             `;
@@ -2448,6 +2521,11 @@ async function refreshTrainingJobs() {
 
         html += '</tbody></table>';
         jobsList.innerHTML = html;
+        bindActions(jobsList, {
+            details: (el) => viewJobDetails(el.dataset.jobId),
+            resume: (el) => resumeTraining(el.dataset.voiceName),
+            cancel: (el) => cancelJob(el.dataset.jobId),
+        });
     } catch (error) {
         console.error('Failed to refresh training jobs:', error);
         jobsList.innerHTML = `<p style="color: var(--error);">${messages.error || 'Failed to load training jobs.'}</p>`;
