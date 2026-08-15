@@ -26,6 +26,10 @@ from pathlib import Path
 
 import pytest
 
+# Only the dev-overlay checks need a YAML parser; the rest of this file is
+# deliberately dependency-free so it runs anywhere.
+yaml = pytest.importorskip("yaml", reason="PyYAML needed to parse the dev overlay")
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # `COPY --from=<stage>` moves build artefacts between stages rather than source
@@ -145,6 +149,58 @@ def test_dockerfile_ships_every_local_import(service_dir: Path, dockerfile: Path
         f"startup with ModuleNotFoundError.\n"
         f"Fix: add `COPY {missing[0]}.py .` to {dockerfile.name}.\n"
         f"COPY sources found: {copied}"
+    )
+
+
+# --- the dev overlay ---------------------------------------------------------
+#
+# Same rule as the Dockerfile, different mechanism. docker-compose.dev.yml
+# live-mounts source over the built image FILE BY FILE, naming each local module
+# explicitly. A module that is imported but not listed silently keeps the copy
+# baked into the image: edits to it appear to do nothing, and against an image
+# built before that module existed the container dies at import with
+# ModuleNotFoundError — the exact failure the COPY check above exists to stop,
+# reached by the other route.
+
+
+def _dev_overlay_mounts() -> dict[str, set[str]]:
+    """{service: {basenames it mounts into the image}}."""
+    document = yaml.safe_load(
+        (REPO_ROOT / "docker-compose.dev.yml").read_text(encoding="utf-8"))
+    out: dict[str, set[str]] = {}
+    for name, service in (document.get("services") or {}).items():
+        names: set[str] = set()
+        for volume in (service or {}).get("volumes") or []:
+            if isinstance(volume, str) and ":" in volume:
+                names.add(volume.split(":")[1].rstrip("/").rsplit("/", 1)[-1])
+        out[name] = names
+    return out
+
+
+@pytest.mark.parametrize("service_dir", _service_dirs(), ids=lambda p: p.name)
+def test_dev_overlay_mounts_every_local_import(service_dir: Path):
+    """If the overlay mounts a service at all, it must mount its whole closure."""
+    mounts = _dev_overlay_mounts().get(service_dir.name)
+    if mounts is None:
+        pytest.skip(f"{service_dir.name} is not in the dev overlay")
+
+    required = _local_import_closure(service_dir)
+    missing = sorted(f"{m}.py" for m in required if f"{m}.py" not in mounts)
+
+    assert not missing, (
+        f"docker-compose.dev.yml mounts {service_dir.name}/app.py but not "
+        f"{', '.join(missing)}, which it imports. Edits to those files would be "
+        f"ignored, and against an image built before they existed the container "
+        f"dies at import.\nAdd: - \"./{service_dir.name}/{missing[0]}:/app/{missing[0]}\""
+    )
+
+
+def test_the_dev_overlay_scan_is_not_vacuous():
+    """A rename in the overlay must not turn every case above into a skip."""
+    covered = [d for d in _service_dirs() if d.name in _dev_overlay_mounts()]
+    assert len(covered) >= 6, (
+        f"only {len(covered)} services matched the dev overlay by name; the "
+        f"parametrisation is mostly skipping"
     )
 
 

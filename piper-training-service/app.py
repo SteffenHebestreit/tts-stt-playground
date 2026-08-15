@@ -1288,21 +1288,14 @@ async def delete_trained_model(job_id: str):
     try:
         import shutil
 
-        # Remove checkpoint directory
-        checkpoint_dir = Path(f"checkpoints/{job_id}")
-        if checkpoint_dir.exists():
-            shutil.rmtree(checkpoint_dir)
-            logger.info(f"Deleted checkpoint directory: {checkpoint_dir}")
-        
-        # Remove exported model directory
-        model_dir = Path(f"models/{job_id}")
-        if model_dir.exists():
-            shutil.rmtree(model_dir)
-            logger.info(f"Deleted model directory: {model_dir}")
-        
-        # Look up model name from the job record, falling back to disk so this
-        # still works for a completed job after a restart (those are not
-        # restored into memory on purpose).
+        # EVERYTHING THAT READS DISK HAPPENS FIRST.
+        #
+        # _model_name_from_disk reads checkpoints/<job_id>/job_state.json, and
+        # the checkpoint directory is about to be deleted below. Resolving the
+        # name after that rmtree meant the disk fallback always returned None —
+        # which is precisely the after-a-restart case it was added for, since
+        # completed jobs are not restored into memory. The dataset and the
+        # deployed voice were then silently left behind, exactly as before.
         model_name = _model_name_from_disk(job_id)
         deployment_target = None
         if job_id in training_jobs:
@@ -1311,13 +1304,29 @@ async def delete_trained_model(job_id: str):
             del training_jobs[job_id]
             logger.info(f"Removed job {job_id} from active jobs")
 
+        # Also resolved before the deletes. This one scans OTHER jobs' state
+        # files so it would survive, but keeping the whole read phase together
+        # is what stops the next edit from reintroducing the same ordering bug.
+        siblings = _other_jobs_using_model(model_name, job_id) if model_name else []
+
+        # Remove checkpoint directory
+        checkpoint_dir = Path(f"checkpoints/{job_id}")
+        if checkpoint_dir.exists():
+            shutil.rmtree(checkpoint_dir)
+            logger.info(f"Deleted checkpoint directory: {checkpoint_dir}")
+
+        # Remove exported model directory
+        model_dir = Path(f"models/{job_id}")
+        if model_dir.exists():
+            shutil.rmtree(model_dir)
+            logger.info(f"Deleted model directory: {model_dir}")
+
         deleted_items = ["checkpoint directory", "model directory", "training job record"]
 
         # The dataset and the deployed voice are keyed on the MODEL NAME, not on
         # the job id, and retraining a voice produces several jobs that share
         # both. Deleting one job used to take the dataset the others still need
         # and undeploy a voice a newer job had just published.
-        siblings = _other_jobs_using_model(model_name, job_id) if model_name else []
         if model_name and siblings:
             logger.info(
                 f"Keeping dataset and deployed voice for '{model_name}': still used "

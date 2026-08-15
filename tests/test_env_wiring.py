@@ -40,8 +40,10 @@ EXEMPT: dict[str, str] = {
     "IMAGE_TAG": "host-side interpolation only",
     "ENVIRONMENT": "host-side marker, not read by service code",
     # Set by the ROCm overlay's x-rocm-env, not by the CUDA base file.
+    # ROCR_VISIBLE_DEVICES is deliberately NOT here: nothing sets it, because
+    # the ROCr and HIP filters nest and forwarding both breaks any index above
+    # 0. .env.example documents it only as something not to set.
     "HIP_VISIBLE_DEVICES": "set by docker-compose.rocm.yml",
-    "ROCR_VISIBLE_DEVICES": "set by docker-compose.rocm.yml",
     "HSA_OVERRIDE_GFX_VERSION": "set by docker-compose.rocm.yml",
     # Port mappings: consumed by the ports: section, not by the app.
     **{f"{name}_PORT": "compose ports mapping" for name in (
@@ -160,7 +162,6 @@ NOT_READ_BY_PYTHON = {
     "OMP_NUM_THREADS": "read by OpenMP / BLAS",
     "PYTHONUNBUFFERED": "read by CPython",
     "HIP_VISIBLE_DEVICES": "read by the ROCm runtime",
-    "ROCR_VISIBLE_DEVICES": "read by the ROCm runtime",
     "HSA_OVERRIDE_GFX_VERSION": "read by the ROCm runtime",
     "WS_MAX_QUEUE": "read by stt-service/start.sh",
     "KEEPALIVE_TIMEOUT": "read by stt-service/start.sh",

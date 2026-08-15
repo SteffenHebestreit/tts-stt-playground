@@ -32,16 +32,25 @@ services:
     volumes:
       - "./stt-service/app.py:/app/app.py"
       - "./stt-service/json_utils.py:/app/json_utils.py"
+      - "./stt-service/residency.py:/app/residency.py"
       - "./stt-service/requirements.txt:/app/requirements.txt"
 
   qwen3-asr-service:
     volumes:
       - "./qwen3-asr-service/app.py:/app/app.py"
+      - "./qwen3-asr-service/model_lifecycle.py:/app/model_lifecycle.py"
 
   parakeet-asr-service:
     volumes:
       - "./parakeet-asr-service/app.py:/app/app.py"
       - "./parakeet-asr-service/transcription.py:/app/transcription.py"
+      - "./parakeet-asr-service/model_lifecycle.py:/app/model_lifecycle.py"
+
+  canary-asr-service:
+    volumes:
+      - "./canary-asr-service/app.py:/app/app.py"
+      - "./canary-asr-service/transcription.py:/app/transcription.py"
+      - "./canary-asr-service/model_lifecycle.py:/app/model_lifecycle.py"
 
   qwen3-tts-service:
     volumes:
@@ -50,5 +59,6 @@ services:
   frontend-service:
     volumes:
       - "./frontend-service/app.py:/app/app.py"
+      - "./frontend-service/openai_router.py:/app/openai_router.py"
       - "./frontend-service/static:/app/static"
       - "./frontend-service/templates:/app/templates"
