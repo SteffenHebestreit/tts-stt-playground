@@ -167,18 +167,67 @@ def test_escapehtml_still_covers_the_attribute_delimiters(source: str):
         )
 
 
-def test_bindactions_exists_and_is_used_by_every_rebuilt_list(source: str):
+# The renderers that replace a container's innerHTML and must re-bind after.
+# Names are asserted to exist rather than skipped: an earlier version of this
+# list said "refreshTrainedModels", which is not what the function is called, so
+# the check quietly passed over the models table entirely.
+LIST_RENDERERS = ("refreshCustomVoices", "refreshModels", "refreshTrainingJobs")
+
+
+@pytest.mark.parametrize("renderer", LIST_RENDERERS)
+def test_bindactions_is_used_by_every_rebuilt_list(source: str, renderer: str):
     """Rebuilding a list with innerHTML detaches its listeners; each renderer
     that does so must re-bind, or its buttons silently stop working."""
     assert "function bindActions(" in source, "bindActions() helper is missing"
-    for renderer in ("refreshCustomVoices", "refreshTrainedModels", "refreshTrainingJobs"):
-        match = re.search(rf"async function {renderer}\(\)\s*\{{(.*?)\n\}}", source, re.S)
-        if not match:
-            continue
-        assert "bindActions(" in match.group(1), (
-            f"{renderer}() rebuilds its container with innerHTML but never calls "
-            f"bindActions(), so its action buttons do nothing"
-        )
+
+    start = source.find(f"async function {renderer}()")
+    assert start != -1, (
+        f"{renderer}() not found in app.js — if it was renamed, rename it here "
+        f"too rather than letting this check skip it"
+    )
+    # To the start of the next top-level function, so the body is not truncated
+    # at the first dedented brace inside it.
+    nxt = source.find("\nasync function ", start + 1)
+    other = source.find("\nfunction ", start + 1)
+    end = min(x for x in (nxt, other, len(source)) if x != -1)
+    body = source[start:end]
+
+    assert "innerHTML" in body, f"{renderer}() no longer rebuilds its container?"
+    assert "bindActions(" in body, (
+        f"{renderer}() rebuilds its container with innerHTML but never calls "
+        f"bindActions(), so its action buttons do nothing"
+    )
+    # Against the assignment that writes the built list, not merely the last
+    # innerHTML in the function — that one is the catch block's error message,
+    # which comes after bindActions in source order and needs no handlers.
+    built = body.find(".innerHTML = html")
+    assert built != -1, (
+        f"{renderer}() no longer assigns its built markup via `.innerHTML = html`; "
+        f"update this check to match how it renders now"
+    )
+    assert body.index("bindActions(") > built, (
+        f"{renderer}() calls bindActions() before writing the list, so the "
+        f"handlers attach to elements that are then replaced"
+    )
+
+
+def test_every_data_action_has_a_handler(source: str):
+    """A data-action with no matching bindActions key is a dead button — it
+    looks live, does nothing, and reports no error."""
+    emitted = set(re.findall(r'data-action="([a-z-]+)"', source))
+    bound: set[str] = set()
+    for block in re.finditer(r"bindActions\([^,]+,\s*\{(.*?)\}\s*\)", source, re.S):
+        bound.update(re.findall(r"^\s*'?([a-zA-Z-]+)'?\s*:", block.group(1), re.M))
+
+    assert emitted, "no data-action attributes found — did the renderers change?"
+    assert not (emitted - bound), (
+        f"these data-action values are emitted but have no handler: "
+        f"{sorted(emitted - bound)}"
+    )
+    assert not (bound - emitted), (
+        f"these handlers are registered but nothing emits them: "
+        f"{sorted(bound - emitted)}"
+    )
 
 
 def test_template_does_not_reintroduce_interpolated_inline_handlers():
