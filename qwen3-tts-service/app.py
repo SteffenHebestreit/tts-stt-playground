@@ -91,6 +91,9 @@ _desired_model_name = None
 # default thread pool (min(32, cpu+4) workers) all enter the model at once and
 # multiply peak VRAM while making every individual request slower.
 _GEN_SEM = asyncio.Semaphore(max(1, int(os.getenv("TTS_MAX_CONCURRENCY", "1"))))
+# Sentences generated in one forward pass. Peak VRAM scales with this, so it has
+# to be bounded by configuration rather than by how long a caller's text is.
+TTS_MAX_BATCH = max(1, int(os.getenv("TTS_MAX_BATCH", "8")))
 # Serialises model switching against itself; generation is kept out by _GEN_SEM.
 _LOAD_LOCK = asyncio.Lock()
 
@@ -190,6 +193,29 @@ async def _gen(fn, *args, **kwargs):
             with _inflight_lock:
                 _inflight -= 1
             _touch_model()
+
+
+def _require_capability(model_name: str, capability: str, switch_to: str) -> None:
+    """Refuse a request the loaded model variant cannot serve.
+
+    Declared capabilities, never ``hasattr``. The variants share one class, so
+    the method is present on all of them and raises at call time on the ones
+    that cannot do the work — `/tts` documents this for
+    ``generate_custom_voice`` and routes on ``AVAILABLE_MODELS`` accordingly.
+    ``/voice_design`` still probed with ``hasattr`` and ``/clone-with-ref-text``
+    checked nothing at all, so both turned "wrong model loaded" into a raw 500
+    instead of the actionable 400 every sibling endpoint returns.
+    """
+    model_info = AVAILABLE_MODELS.get(model_name, {})
+    if capability in model_info.get("capabilities", []):
+        return
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"Current model '{model_info.get('name', model_name or 'unknown')}' does not "
+            f"support {capability.replace('_', ' ')}. Please switch to {switch_to}."
+        ),
+    )
 
 
 def _safe_header(value: str) -> str:
@@ -681,34 +707,49 @@ def _split_sentences(text: str) -> list[str]:
 
 
 def _generate_chunks(model, sentences: list[str], language: str, voice_clone_prompt, sample_rate: int = 24000) -> tuple[np.ndarray, int]:
-    """Generate audio for sentences using batch mode for speed, then concatenate with gaps."""
-    # Batch mode: generate all sentences at once (2x+ faster than sequential)
+    """Generate audio for sentences in bounded batches, then concatenate with gaps.
+
+    Batch mode is 2x+ faster than sequential, but the batch used to be *every*
+    sentence in the request — so peak VRAM scaled with the length of the text a
+    caller happened to send, on a card the whole stack shares. A paragraph was
+    fine; a chapter was an OOM with no knob to turn. TTS_MAX_BATCH bounds it,
+    mirroring ASR_MAX_BATCH on the NeMo services.
+    """
     prompt_item = voice_clone_prompt[0] if voice_clone_prompt else None
-    prompts = [prompt_item] * len(sentences)
-    langs = [language] * len(sentences)
 
-    logger.info(f"  Generating {len(sentences)} sentences in batch mode...")
-    start = time.time()
-    wavs, sr = model.generate_voice_clone(
-        text=sentences,
-        language=langs,
-        voice_clone_prompt=prompts,
-    )
-    elapsed = time.time() - start
-    logger.info(f"  Batch generation done in {elapsed:.2f}s")
-
-    # Concatenate with gaps. The gap is sized from the rate the model actually
-    # returned, not the 24000 default — a model at any other rate produced
-    # audibly wrong pauses.
-    gap = np.zeros(int((sr or sample_rate) * 0.15), dtype=np.float32)  # 150ms
     all_audio = []
-    for i, wav in enumerate(wavs):
-        all_audio.append(np.array(wav))
-        if i < len(wavs) - 1:
-            all_audio.append(gap)
-    del wavs
+    sr = None
+    start = time.time()
+    for offset in range(0, len(sentences), TTS_MAX_BATCH):
+        batch = sentences[offset:offset + TTS_MAX_BATCH]
+        logger.info(
+            f"  Generating sentences {offset + 1}-{offset + len(batch)} of "
+            f"{len(sentences)} (batch of {len(batch)})..."
+        )
+        wavs, batch_sr = model.generate_voice_clone(
+            text=batch,
+            language=[language] * len(batch),
+            voice_clone_prompt=[prompt_item] * len(batch),
+        )
+        sr = batch_sr or sr
+        for wav in wavs:
+            all_audio.append(np.array(wav))
+        del wavs
 
-    return np.concatenate(all_audio), sr
+    logger.info(f"  Generation done in {time.time() - start:.2f}s")
+
+    sr = sr or sample_rate
+    # Interleave gaps once, across the whole sequence. Sizing the gap from the
+    # rate the model actually returned matters — at any other rate the 24000
+    # default produced audibly wrong pauses.
+    gap = np.zeros(int(sr * 0.15), dtype=np.float32)  # 150ms
+    spaced = []
+    for i, chunk in enumerate(all_audio):
+        spaced.append(chunk)
+        if i < len(all_audio) - 1:
+            spaced.append(gap)
+
+    return np.concatenate(spaced), sr
 
 
 @app.get("/voices")
@@ -735,9 +776,7 @@ async def save_voice(
         # Ensure the model is loaded before checking capabilities, otherwise a
         # cold start (failed preload) reports a misleading capability error.
         model, model_name = await _acquire_model()
-        model_info = AVAILABLE_MODELS.get(model_name, {})
-        if "voice_clone" not in model_info.get("capabilities", []):
-            raise HTTPException(status_code=400, detail="Current model does not support voice cloning. Switch to a Base model.")
+        _require_capability(model_name, "voice_clone", "a Base model (1.7B Base or 0.6B Base)")
         start_time = time.time()
 
         # Save uploaded file
@@ -835,9 +874,7 @@ async def tts_with_saved_voice(
         # Load the model before the capability check so a cold start
         # (failed preload) doesn't report a misleading capability error.
         model, model_name = await _acquire_model()
-        model_info = AVAILABLE_MODELS.get(model_name, {})
-        if "voice_clone" not in model_info.get("capabilities", []):
-            raise HTTPException(status_code=400, detail="Current model does not support voice cloning. Switch to a Base model.")
+        _require_capability(model_name, "voice_clone", "a Base model (1.7B Base or 0.6B Base)")
         start_time = time.time()
 
         sentences = _split_sentences(text)
@@ -988,14 +1025,7 @@ async def clone_voice(
     try:
         model, model_name = await _acquire_model()
 
-        model_info = AVAILABLE_MODELS.get(model_name, {})
-        capabilities = model_info.get("capabilities", [])
-        if "voice_clone" not in capabilities:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Current model '{model_info.get('name', current_model_name)}' does not support voice cloning. "
-                       f"Please switch to a Base model (1.7B Base or 0.6B Base)."
-            )
+        _require_capability(model_name, "voice_clone", "a Base model (1.7B Base or 0.6B Base)")
         start_time = time.time()
 
         # Save uploaded reference audio
@@ -1112,6 +1142,9 @@ async def clone_voice_with_ref_text(
     tmp_path = None
     try:
         model, model_name = await _acquire_model()
+        # The sibling /clone endpoint checks this; this one did not, so calling
+        # it on a CustomVoice or VoiceDesign model produced a raw 500.
+        _require_capability(model_name, "voice_clone", "a Base model (1.7B Base or 0.6B Base)")
         start_time = time.time()
 
         suffix = Path(file.filename).suffix if file.filename else ".wav"
@@ -1180,20 +1213,15 @@ async def voice_design(request: VoiceDesignRequest):
 
     try:
         model, model_name = await _acquire_model()
+        _require_capability(model_name, "voice_design", "the VoiceDesign model")
         start_time = time.time()
 
-        if hasattr(model, 'generate_voice_design'):
-            wavs, sr = await _gen(
-                model.generate_voice_design,
-                text=request.text,
-                language=request.lang,
-                instruct=request.voice_description,
-            )
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail="Current model does not support voice design. Please switch to the VoiceDesign model."
-            )
+        wavs, sr = await _gen(
+            model.generate_voice_design,
+            text=request.text,
+            language=request.lang,
+            instruct=request.voice_description,
+        )
 
         generation_time = time.time() - start_time
         logger.info(f"Voice design generated in {generation_time:.2f}s")

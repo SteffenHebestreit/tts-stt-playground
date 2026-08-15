@@ -404,6 +404,10 @@ services:
       # One shared model on one GPU: bound concurrent generation rather than
       # letting the default thread pool multiply peak VRAM.
       TTS_MAX_CONCURRENCY: ${TTS_MAX_CONCURRENCY:-1}
+      # Sentences generated in one forward pass when a long text is chunked.
+      # Peak VRAM scales with this, so it must be bounded by config rather than
+      # by how long the caller's text happens to be.
+      TTS_MAX_BATCH: ${TTS_MAX_BATCH:-8}
       # Release the model after this many idle seconds. Reloads whatever was
       # last selected via /load_model, not the env default.
       TTS_MODEL_TTL: ${TTS_MODEL_TTL:-300}

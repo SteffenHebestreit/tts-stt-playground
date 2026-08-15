@@ -221,6 +221,10 @@ services:
       QWEN3_TTS_MODEL: ${QWEN3_TTS_MODEL:-Qwen/Qwen3-TTS-12Hz-0.6B-Base}
       QWEN3_ASR_SERVICE_URL: http://qwen3-asr-service:5002
       TTS_MAX_CONCURRENCY: ${TTS_MAX_CONCURRENCY:-1}
+      # Sentences generated in one forward pass when a long text is chunked.
+      # Peak VRAM scales with this, so it must be bounded by config rather than
+      # by how long the caller's text happens to be.
+      TTS_MAX_BATCH: ${TTS_MAX_BATCH:-8}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
       # Parity with docker-compose.yml — see tests/test_env_wiring.py.

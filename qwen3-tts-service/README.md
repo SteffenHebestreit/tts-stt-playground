@@ -57,8 +57,27 @@ curl -X POST "http://localhost:5004/clone" \
 | `QWEN3_TTS_MODEL` | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | Initial model variant |
 | `QWEN3_ASR_SERVICE_URL` | `http://qwen3-asr-service:5002` | ASR service used for auto-transcribing reference audio |
 | `VOICES_DIR` | `/app/voices` | Persistent directory for saved voice profiles |
+| `TTS_MODEL_TTL` / `MODEL_TTL` | `300` | Seconds idle before the weights are released. `-1` pins them resident. A reload restores whichever model was last selected via `/load_model`, not the env default. |
+| `TTS_MAX_CONCURRENCY` | `1` | Concurrent generations against the shared model |
+| `TTS_MAX_BATCH` | `8` | Sentences generated in one forward pass when a long text is chunked. Peak VRAM scales with it, so it bounds the cost of a long request rather than letting the caller's text length decide. |
 | `ALLOWED_ORIGINS` | `*` | Comma-separated CORS origins |
 | `ALLOW_CREDENTIALS` | `false` | Enables CORS credentials when origins are explicit |
+
+## Model variants and capabilities
+
+The four variants share one class, so every generation method exists on all of
+them and only raises when called on a variant that cannot do the work. The
+service therefore routes on the declared capability table rather than probing
+with `hasattr`, and answers **400 naming the model to switch to** when the
+loaded variant cannot serve a request:
+
+| Endpoint | Requires | Served by |
+|---|---|---|
+| `/tts` | `custom_voice` | CustomVoice |
+| `/clone`, `/clone-with-ref-text`, `/voices/save`, `/voices/{id}/tts` | `voice_clone` | 1.7B Base, 0.6B Base |
+| `/voice_design` | `voice_design` | VoiceDesign |
+
+Switch with `POST /load_model`. The choice survives an idle unload.
 
 ## Requirements
 
