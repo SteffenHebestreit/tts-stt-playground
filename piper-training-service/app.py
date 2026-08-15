@@ -75,6 +75,40 @@ model_exporter = ModelExporter()
 PIPER_TTS_SERVICE_URL = os.getenv("PIPER_TTS_SERVICE_URL", "http://piper-tts-service:5000")
 SHARED_MODELS_DIR = os.getenv("SHARED_MODELS_DIR", "/app/shared_models")
 
+# Where this service sends audio for transcription.
+#
+# compose has always set STT_SERVICE_URL here and this module never read it, so
+# the documented knob did nothing. The URL came from a form field on /train and
+# /retrain-from-segments instead — which is the wrong source twice over. It is
+# deployment configuration, not per-request input; and honouring it means any
+# caller can point the service at a host of their choosing, have it POST the
+# upload there, and read the resulting connection error back out of the job
+# status. That is a working probe of whatever network the container sits on.
+#
+# The env is now the source of truth. A caller may still pass the field, but
+# only with the value the deployment is already configured for, so existing
+# clients that echo the default keep working.
+STT_SERVICE_URL = os.getenv("STT_SERVICE_URL", "http://stt-service:8000")
+ALLOW_CLIENT_STT_URL = os.getenv("ALLOW_CLIENT_STT_URL", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def resolve_stt_service_url(requested: Optional[str]) -> str:
+    """Return the STT URL to use, rejecting an unexpected client override."""
+    candidate = (requested or "").strip().rstrip("/")
+    if not candidate or candidate == STT_SERVICE_URL.rstrip("/"):
+        return STT_SERVICE_URL
+    if ALLOW_CLIENT_STT_URL:
+        logger.warning("Using client-supplied STT URL %r (ALLOW_CLIENT_STT_URL=true)", candidate)
+        return candidate
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "stt_service_url must match this deployment's configured STT service "
+            f"({STT_SERVICE_URL}). Set it with the STT_SERVICE_URL environment "
+            "variable, or set ALLOW_CLIENT_STT_URL=true to accept per-request URLs."
+        ),
+    )
+
 
 def _build_deployment_target_registry() -> dict:
     """Describe where trained model bundles can be deployed after export."""
@@ -132,7 +166,8 @@ class TrainingRequest(BaseModel):
     sample_rate: int = 22050
     quality: str = "medium"  # low, medium, high
     speaker_name: Optional[str] = None
-    stt_service_url: str = "http://stt-service:8000"
+    # Resolved from STT_SERVICE_URL at request time; never taken from a client.
+    stt_service_url: Optional[str] = None
     audio_files: Optional[List[str]] = None # To pass file info internally
     epochs: int = 1000
     batch_size: int = 32
@@ -462,7 +497,7 @@ async def train_model(
     language: str = Form("de"),
     sample_rate: int = Form(22050),
     quality: str = Form("medium"),
-    stt_service_url: str = Form("http://stt-service:8000"),
+    stt_service_url: str = Form(""),
     epochs: int = Form(1000),
     batch_size: int = Form(32),
     deployment_target: str = Form(""),
@@ -482,6 +517,7 @@ async def train_model(
 
     model_name = _safe_name(model_name, "model_name")
     resolved_target_id, _ = resolve_deployment_target(deployment_target or None)
+    stt_service_url = resolve_stt_service_url(stt_service_url)
 
     try:
         logger.info(f"Starting STT-based training for model: {model_name}")
@@ -945,7 +981,7 @@ async def retrain_from_segments(
     epochs: int = Form(10000),
     batch_size: int = Form(32),
     prefix_filter: str = Form(""),
-    stt_service_url: str = Form("http://stt-service:8000"),
+    stt_service_url: str = Form(""),
     deployment_target: str = Form(""),
 ):
     """
@@ -956,6 +992,7 @@ async def retrain_from_segments(
     then calls generate_training_metadata() and train_sync().
     """
     model_name = _safe_name(model_name, "model_name")
+    stt_service_url = resolve_stt_service_url(stt_service_url)
     dataset_path = Path(f"data/{model_name}")
     audio_dir = dataset_path / "audio"
 

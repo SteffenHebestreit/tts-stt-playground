@@ -57,6 +57,12 @@ x-rocm-env: &rocm-env
   NVIDIA_VISIBLE_DEVICES: ""
   NVIDIA_DRIVER_CAPABILITIES: ""
   HIP_VISIBLE_DEVICES: ${HIP_VISIBLE_DEVICES:-0}
+  # Both, deliberately. .env.example tells you to set the two to the same index
+  # on a multi-GPU AMD host because some libraries read the ROCr name rather
+  # than the HIP one — but this file only ever forwarded HIP, so following that
+  # instruction changed nothing. The ASR services also probe this name to detect
+  # ROCm at all (`os.getenv("ROCR_VISIBLE_DEVICES") or os.getenv("HIP_...")`).
+  ROCR_VISIBLE_DEVICES: ${ROCR_VISIBLE_DEVICES:-0}
   # 11.0.0 = run gfx1100 kernels. Required only because the Dockerfile.rocm
   # images pin the rocm6.2 wheel index, which has no gfx1151 kernels.
   # Note the `-` (not `:-`): with `:-`, setting this to empty in .env would

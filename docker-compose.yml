@@ -70,6 +70,9 @@ services:
       SHARED_MODELS_DIR: ${SHARED_MODELS_DIR:-/app/shared_models}
       DEFAULT_DEPLOYMENT_TARGET: ${DEFAULT_DEPLOYMENT_TARGET:-piper-volume}
       MAX_TRAIN_BATCH_SIZE: ${MAX_TRAIN_BATCH_SIZE:-4}
+      # Honour a per-request stt_service_url instead of STT_SERVICE_URL.
+      # Off by default: it lets any caller redirect the service's uploads.
+      ALLOW_CLIENT_STT_URL: ${ALLOW_CLIENT_STT_URL:-false}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
@@ -132,7 +135,12 @@ services:
       WHISPER_COMPUTE_TYPE: ${WHISPER_COMPUTE_TYPE:-}
       # Last resort before a 503 when the chosen model will not fit in VRAM.
       WHISPER_OOM_FALLBACK: ${WHISPER_OOM_FALLBACK:-small}
-      WORKERS: 1
+      # Read by start.sh, not by app.py. WS_MAX_QUEUE bounds how much audio the
+      # server buffers per live socket before dropping the connection; the
+      # keep-alive timeout must stay >= the gateway's UPSTREAM_KEEPALIVE_EXPIRY
+      # or the server FINs first and pooled sockets come back dead.
+      WS_MAX_QUEUE: ${WS_MAX_QUEUE:-128}
+      KEEPALIVE_TIMEOUT: ${KEEPALIVE_TIMEOUT:-120}
       # Live-transcription tuning. WS_WINDOW_S bounds how much trailing audio
       # each interim decode re-transcribes. Whisper pads the mel to a fixed 30 s
       # before the encoder, so this does NOT change encoder cost — it bounds the

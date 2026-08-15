@@ -141,7 +141,9 @@ services:
       # Parity with docker-compose.yml — see tests/test_env_wiring.py.
       WHISPER_COMPUTE_TYPE: ${WHISPER_COMPUTE_TYPE:-}
       WHISPER_OOM_FALLBACK: ${WHISPER_OOM_FALLBACK:-small}
-      WORKERS: 1
+      # Read by start.sh, not by app.py — see docker-compose.yml.
+      WS_MAX_QUEUE: ${WS_MAX_QUEUE:-128}
+      KEEPALIVE_TIMEOUT: ${KEEPALIVE_TIMEOUT:-120}
       WS_MAX_BUFFER_S: ${WS_MAX_BUFFER_S:-600.0}
       WS_NO_SPEECH_THRESHOLD: ${WS_NO_SPEECH_THRESHOLD:-0.6}
       WS_MIN_AVG_LOGPROB: ${WS_MIN_AVG_LOGPROB:--1.0}

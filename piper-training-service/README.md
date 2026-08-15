@@ -47,7 +47,8 @@ VITS training pipeline for creating ONNX voice bundles. The service can upload r
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CUDA_VISIBLE_DEVICES` | `0` | GPU device index |
-| `STT_SERVICE_URL` | `http://stt-service:8000` | STT backend used for segmentation and transcription |
+| `STT_SERVICE_URL` | `http://stt-service:8000` | STT backend used for segmentation and transcription. The only source for that address — `/train` and `/retrain-from-segments` accept an `stt_service_url` field but reject any value that does not match this one. |
+| `ALLOW_CLIENT_STT_URL` | `false` | Honour a per-request `stt_service_url` instead. Leave off: it lets any caller redirect the service's uploads to a host of their choosing and read the resulting error out of the job status. |
 | `PIPER_TTS_SERVICE_URL` | `http://piper-tts-service:5000` | Piper runtime URL used by Piper deployment targets |
 | `SHARED_MODELS_DIR` | `/app/shared_models` | Shared model directory used by the `piper-volume` target |
 | `DEFAULT_DEPLOYMENT_TARGET` | `piper-volume` | Default deployment target used after export |

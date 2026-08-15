@@ -134,6 +134,131 @@ def test_compute_type_is_wired_because_the_benchmark_depends_on_it():
     )
 
 
+# --- the other direction ---------------------------------------------------
+#
+# The test above catches "documented and read, but never forwarded". It cannot
+# see the mirror image: a variable compose *does* forward that nothing reads.
+# That reads as a working knob in every deployment file and does nothing at all.
+#
+# Three were live when this was added. `STT_SERVICE_URL` on the training service
+# was the worst of them: compose set it, the service ignored it, and took the
+# address from a form field on /train instead — so the documented setting was
+# inert and the value came from the request. `PIPER_DATA_DIR` was set next to
+# `PIPER_OUTPUT_DIR`, but only the output half was read; every model path was the
+# literal /app/models. `WORKERS: 1` looked like a uvicorn worker count while
+# start.sh hardcodes `--workers 1`, so raising it would have done nothing (which
+# was lucky — four workers means four copies of the model in VRAM).
+
+# Consumed by something other than the service's own Python: the CUDA runtime,
+# the PyTorch allocator, OpenMP, or the container entrypoint script.
+NOT_READ_BY_PYTHON = {
+    "CUDA_VISIBLE_DEVICES": "read by the CUDA runtime",
+    "NVIDIA_VISIBLE_DEVICES": "read by the NVIDIA container toolkit",
+    "NVIDIA_DRIVER_CAPABILITIES": "read by the NVIDIA container toolkit",
+    "PYTORCH_CUDA_ALLOC_CONF": "read by the PyTorch caching allocator",
+    "PYTORCH_JIT": "read by torch at import",
+    "OMP_NUM_THREADS": "read by OpenMP / BLAS",
+    "PYTHONUNBUFFERED": "read by CPython",
+    "HIP_VISIBLE_DEVICES": "read by the ROCm runtime",
+    "ROCR_VISIBLE_DEVICES": "read by the ROCm runtime",
+    "HSA_OVERRIDE_GFX_VERSION": "read by the ROCm runtime",
+    "WS_MAX_QUEUE": "read by stt-service/start.sh",
+    "KEEPALIVE_TIMEOUT": "read by stt-service/start.sh",
+    "WHISPER_MODEL": "read by whisper-cpp's entrypoint",
+    "EXTRA_ARGS": "read by whisper-cpp's entrypoint",
+}
+
+
+def _shell_read_variables() -> set[str]:
+    """Variables referenced by any service's entrypoint script."""
+    names: set[str] = set()
+    for script in REPO_ROOT.glob("*-service/*.sh"):
+        names.update(re.findall(
+            r"\$\{([A-Z0-9_]+)[:}]", script.read_text(encoding="utf-8")))
+    return names
+
+
+def test_no_service_is_handed_a_variable_nothing_reads():
+    """Every key in a service's `environment:` must reach some consumer."""
+    compose_env = _compose_environment()
+    consumed = _consumed_by_service()
+    shell_read = _shell_read_variables()
+
+    dead: list[str] = []
+    for service, keys in sorted(compose_env.items()):
+        if not (REPO_ROOT / service / "app.py").exists():
+            continue  # third-party image; its own entrypoint decides
+        for key in sorted(keys):
+            if key in NOT_READ_BY_PYTHON or key in shell_read:
+                continue
+            if key not in consumed.get(service, set()):
+                dead.append(f"{service}: {key}")
+
+    assert not dead, (
+        "compose passes these to a container whose code never reads them, so "
+        "setting them changes nothing:\n  " + "\n  ".join(dead)
+        + "\nEither read the variable, delete it from the environment: block, or "
+          "add it to NOT_READ_BY_PYTHON with the consumer that does read it."
+    )
+
+
+def test_not_read_by_python_entries_are_all_still_in_use():
+    """An exemption for a variable nothing sets any more is dead weight.
+
+    Scans every compose variant, not just the base file: the ROCm overlay is
+    where the HIP/HSA knobs live, and `PYTORCH_JIT` is a Dockerfile ENV.
+    """
+    # Compose's own tags (`devices: !reset []` in the ROCm overlay) are not YAML
+    # the SafeLoader knows. Only the environment mappings matter here, so unknown
+    # tags resolve to their untagged value rather than failing the parse.
+    class _ComposeLoader(yaml.SafeLoader):
+        pass
+
+    _ComposeLoader.add_multi_constructor(
+        "", lambda loader, suffix, node: loader.construct_object(
+            node.__class__(loader.DEFAULT_MAPPING_TAG if isinstance(node, yaml.MappingNode)
+                           else loader.DEFAULT_SEQUENCE_TAG if isinstance(node, yaml.SequenceNode)
+                           else loader.DEFAULT_SCALAR_TAG, node.value), deep=True)
+    )
+
+    all_keys: set[str] = set()
+    for compose in REPO_ROOT.glob("docker-compose*.yml"):
+        document = yaml.load(compose.read_text(encoding="utf-8"), Loader=_ComposeLoader) or {}
+        for service in (document.get("services") or {}).values():
+            env = (service or {}).get("environment") or {}
+            all_keys |= set(env) if isinstance(env, dict) else {
+                entry.split("=", 1)[0] for entry in env}
+        # x-* extension blocks carry the ROCm overlay's shared env mapping.
+        for key, value in document.items():
+            if key.startswith("x-") and isinstance(value, dict):
+                all_keys |= set(value)
+    for dockerfile in REPO_ROOT.glob("*-service/Dockerfile*"):
+        text = dockerfile.read_text(encoding="utf-8").replace("\\\n", " ")
+        all_keys |= set(re.findall(r"^\s*ENV\s+([A-Z0-9_]+)=", text, flags=re.M))
+
+    stale = sorted(name for name in NOT_READ_BY_PYTHON if name not in all_keys)
+    assert not stale, (
+        f"NOT_READ_BY_PYTHON lists variables nothing sets any more: {stale}"
+    )
+
+
+def test_the_training_service_reads_its_stt_url_from_the_environment():
+    """Named explicitly: this one was inert while a form field decided instead.
+
+    A caller could point the service at any host, have it POST the upload there,
+    and read the connection error back out of the job status.
+    """
+    source = (REPO_ROOT / "piper-training-service" / "app.py").read_text(encoding="utf-8")
+    assert 'os.getenv("STT_SERVICE_URL"' in source, (
+        "piper-training-service does not read STT_SERVICE_URL, so the address "
+        "compose configures is ignored"
+    )
+    assert "def resolve_stt_service_url" in source, (
+        "the per-request stt_service_url field is no longer validated against "
+        "the configured URL"
+    )
+
+
 def test_exempt_entries_are_still_documented():
     """An exemption for a variable nobody documents is dead weight."""
     documented = _documented()

@@ -90,6 +90,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Where voice models live. compose has always set PIPER_DATA_DIR next to
+# PIPER_OUTPUT_DIR, but only the output half was ever read — every model path
+# below was the literal "/app/models", so pointing the data dir somewhere else
+# silently changed nothing and the service kept reading the old location.
+MODELS_DIR = Path(os.getenv("PIPER_DATA_DIR", "/app/models"))
+DEFAULT_MODELS_DIR = MODELS_DIR / "default"
+CUSTOM_MODELS_DIR = MODELS_DIR / "custom"
+
 # Generated default-voice WAVs land in OUTPUT_DIR and would otherwise accumulate
 # indefinitely. Files older than the retention window are pruned best-effort.
 OUTPUT_DIR = os.getenv("PIPER_OUTPUT_DIR", "/app/output")
@@ -226,7 +234,7 @@ DEFAULT_VOICES = {
     )
 }
 
-# Custom voices loaded at startup from /app/models/custom/
+# Custom voices loaded at startup from CUSTOM_MODELS_DIR
 CUSTOM_VOICES: Dict[str, VoiceInfo] = {}
 
 # Cache of loaded ONNX inference sessions keyed by model path. Each entry stores
@@ -429,7 +437,7 @@ def _custom_onnx_infer(model_path: str, text: str, voice_name: str, speed: float
 
     # Fallback: phoneme_vocab.json saved alongside the model
     if not phoneme_to_id:
-        vocab_path = Path(f"/app/models/custom/{voice_name}/phoneme_vocab.json")
+        vocab_path = CUSTOM_MODELS_DIR / voice_name / "phoneme_vocab.json"
         if vocab_path.exists():
             phoneme_to_id = json.loads(vocab_path.read_text())
 
@@ -556,9 +564,9 @@ async def text_to_speech(request: TTSRequest):
 
         # Determine model path
         if voice_info.model_type == "default":
-            model_path = f"/app/models/default/{request.voice}.onnx"
+            model_path = str(DEFAULT_MODELS_DIR / f"{request.voice}.onnx")
         else:
-            model_path = f"/app/models/custom/{request.voice}/{request.voice}.onnx"
+            model_path = str(CUSTOM_MODELS_DIR / request.voice / f"{request.voice}.onnx")
         
         if not os.path.exists(model_path):
             raise HTTPException(status_code=404, detail=f"Model file not found for voice '{request.voice}'")
@@ -646,7 +654,7 @@ async def synthesize_with_custom_voice(request: VoiceCloneRequest):
     if voice_name not in CUSTOM_VOICES:
         raise HTTPException(status_code=404, detail=f"Custom voice '{voice_name}' not found")
 
-    model_path = f"/app/models/custom/{voice_name}/{voice_name}.onnx"
+    model_path = str(CUSTOM_MODELS_DIR / voice_name / f"{voice_name}.onnx")
     if not os.path.exists(model_path):
         raise HTTPException(status_code=404, detail=f"Custom model file not found for '{voice_name}'")
 
@@ -675,7 +683,7 @@ async def upload_custom_model(
     try:
         final_voice_name = _sanitize_voice_name(model_name or voice_name)
 
-        voice_dir = Path(f"/app/models/custom/{final_voice_name}")
+        voice_dir = CUSTOM_MODELS_DIR / final_voice_name
         voice_dir.mkdir(parents=True, exist_ok=True)
         
         # Save model file
@@ -757,7 +765,7 @@ async def delete_custom_voice(voice_name: str):
         if voice_name not in CUSTOM_VOICES:
             raise HTTPException(status_code=404, detail=f"Custom voice '{voice_name}' not found")
 
-        voice_dir = Path(f"/app/models/custom/{voice_name}")
+        voice_dir = CUSTOM_MODELS_DIR / voice_name
         if voice_dir.exists():
             shutil.rmtree(voice_dir)
 
@@ -784,8 +792,8 @@ async def get_voice_info(voice_name: str):
     return all_voices[voice_name]
 
 async def load_custom_voices():
-    """Scan ``/app/models/custom/`` and register each valid voice into ``CUSTOM_VOICES``."""
-    custom_models_dir = Path("/app/models/custom")
+    """Scan ``CUSTOM_MODELS_DIR`` and register each valid voice into ``CUSTOM_VOICES``."""
+    custom_models_dir = CUSTOM_MODELS_DIR
     if not custom_models_dir.exists():
         return
     
