@@ -81,6 +81,27 @@ def _bound_names(func: ast.AST) -> set[str]:
     return bound
 
 
+def _own_deletes(func: ast.AST):
+    """`Delete` nodes belonging to this function's OWN scope.
+
+    Must stop at nested def/class boundaries for the same reason `_bound_names`
+    does. A plain `ast.walk` descends into them, so a nested helper's perfectly
+    legal `del` of its own local would be checked against the ENCLOSING
+    function's bindings and reported as an offender — a false positive that
+    would be "fixed" by adding a `nonlocal` that changes what the code means.
+    Each nested function is visited on its own pass anyway.
+    """
+    def visit(node: ast.AST):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            if isinstance(child, ast.Delete):
+                yield child
+            yield from visit(child)
+
+    return visit(func)
+
+
 def _offenders(tree: ast.AST) -> list[tuple[int, str, str]]:
     """(line, function, name) for each undeletable `del` target."""
     found: list[tuple[int, str, str]] = []
@@ -88,9 +109,7 @@ def _offenders(tree: ast.AST) -> list[tuple[int, str, str]]:
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         bound = _bound_names(node)
-        for sub in ast.walk(node):
-            if not isinstance(sub, ast.Delete):
-                continue
+        for sub in _own_deletes(node):
             # Only bare names are scope-sensitive; `del d[k]` and `del o.attr`
             # are attribute/subscript deletes and are always fine.
             for target in sub.targets:
@@ -144,6 +163,50 @@ def test_the_check_catches_the_shape_that_slipped_through():
 def test_deleting_a_name_the_function_binds_itself_is_allowed():
     ok = ast.parse("def f():\n    tmp = 1\n    del tmp\n")
     assert _offenders(ok) == []
+
+
+def test_a_nested_helper_may_delete_its_own_local():
+    """The false positive this detector shipped with.
+
+    `ast.walk` from the outer function descends into nested defs, so the inner
+    `del tmp` was checked against `outer`'s bindings — which of course do not
+    include the inner function's local — and reported as an offender. Legal code
+    would have failed the guard for its whole file, and the obvious way to
+    silence it (adding `nonlocal`) changes what the code does.
+    """
+    ok = ast.parse(
+        "def outer():\n"
+        "    def inner():\n"
+        "        tmp = 1\n"
+        "        del tmp\n"
+        "    inner()\n"
+    )
+    assert _offenders(ok) == []
+
+
+def test_a_nested_helper_deleting_an_ENCLOSING_name_is_still_caught():
+    """The fix must not blind the detector to the case it exists for."""
+    bad = ast.parse(
+        "def outer():\n"
+        "    model = 1\n"
+        "    def inner():\n"
+        "        del model\n"
+        "    inner()\n"
+    )
+    assert _offenders(bad) == [(4, "inner", "model")]
+
+
+def test_each_function_is_judged_only_on_its_own_deletes():
+    """One function's offence must not be attributed to its parent as well."""
+    bad = ast.parse(
+        "def outer():\n"
+        "    keep = 1\n"
+        "    del keep\n"
+        "    def inner():\n"
+        "        del missing\n"
+        "    inner()\n"
+    )
+    assert _offenders(bad) == [(5, "inner", "missing")]
 
 
 def test_subscript_and_attribute_deletes_are_not_flagged():
