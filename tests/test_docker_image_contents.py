@@ -278,11 +278,35 @@ def _module_level_nodes(tree: ast.Module):
             stack.append(child)
 
 
+def _local_class_inits(service_dir: Path) -> dict[str, ast.FunctionDef]:
+    """{ClassName: its __init__} across the service's own modules."""
+    found: dict[str, ast.FunctionDef] = {}
+    for source_file in sorted(service_dir.glob("*.py")):
+        tree = ast.parse(source_file.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            for item in node.body:
+                if isinstance(item, ast.FunctionDef) and item.name == "__init__":
+                    found[node.name] = item
+    return found
+
+
 @pytest.mark.parametrize("service_dir", _service_dirs(), ids=lambda p: p.name)
 def test_no_filesystem_writes_at_import(service_dir: Path):
-    """No service may create files or directories just by being imported."""
+    """No service may create files or directories just by being imported.
+
+    Constructors count. `app.py` instantiates its helpers at module scope, so a
+    `mkdir` inside one of their `__init__`s runs at import exactly as if it were
+    written inline — but sits one frame away, which is how
+    `ModelExporter.__init__` creating `models/` slipped past the first version of
+    this check. That is the same shape as the qwen3-tts `VOICES_DIR.mkdir()` in
+    the docstring above: fine as root in a container, PermissionError anywhere
+    else.
+    """
     source = (service_dir / "app.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
+    class_inits = _local_class_inits(service_dir)
 
     offenders = []
     for node in _module_level_nodes(tree):
@@ -292,6 +316,23 @@ def test_no_filesystem_writes_at_import(service_dir: Path):
         name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
         if name in _WRITE_CALLS:
             offenders.append(f"line {node.lineno}: {ast.unparse(node)[:80]}")
+            continue
+
+        # A module-level `Thing()` where Thing is defined in this service.
+        init = class_inits.get(name) if name else None
+        if init is None:
+            continue
+        for sub in ast.walk(init):
+            if not isinstance(sub, ast.Call):
+                continue
+            inner = sub.func
+            inner_name = (inner.attr if isinstance(inner, ast.Attribute)
+                          else getattr(inner, "id", None))
+            if inner_name in _WRITE_CALLS:
+                offenders.append(
+                    f"line {node.lineno}: {name}() -> {name}.__init__ "
+                    f"line {sub.lineno}: {ast.unparse(sub)[:60]}"
+                )
 
     assert not offenders, (
         f"{service_dir.name}/app.py writes to the filesystem at import time:\n  "

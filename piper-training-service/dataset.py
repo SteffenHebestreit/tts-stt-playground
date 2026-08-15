@@ -32,9 +32,24 @@ class TTSDataset(Dataset):
         
         # Create phoneme vocabulary
         self.phoneme_to_id = self._create_phoneme_vocab()
-        
+
+        # The text embedding is sized from config['n_vocab'] (256), while the
+        # vocabulary is whatever distinct symbols the phonemizer produced. Any
+        # id at or above n_vocab is an out-of-range embedding lookup, which on
+        # GPU is a device-side assert — an opaque crash, hours into a run, with
+        # a traceback pointing at an unrelated kernel. Checked here instead, in
+        # the first seconds of the job, where the message can say what to fix.
+        n_vocab = self.config.get('n_vocab', 256)
+        if len(self.phoneme_to_id) > n_vocab:
+            raise ValueError(
+                f"Dataset needs {len(self.phoneme_to_id)} phoneme symbols but the "
+                f"model is configured for n_vocab={n_vocab}. Raise n_vocab, or "
+                f"check the transcripts for text the phonemizer passed through "
+                f"unconverted (mixed scripts and stray symbols are the usual cause)."
+            )
+
         logger.info(f"Loaded {len(self.metadata)} samples for {split} split")
-        logger.info(f"Phoneme vocabulary size: {len(self.phoneme_to_id)}")
+        logger.info(f"Phoneme vocabulary size: {len(self.phoneme_to_id)}/{n_vocab}")
         
     def __len__(self):
         """Return the number of examples in the current split."""

@@ -14,9 +14,16 @@ class ModelExporter:
     """Export trained checkpoints to ONNX bundles without deploying them."""
 
     def __init__(self):
-        """Create the export directory used for generated model artifacts."""
+        """Record where exports go. Deliberately creates nothing.
+
+        This class is instantiated at module scope in ``app.py``, so a ``mkdir``
+        here ran at *import* time — the same failure ``VOICES_DIR.mkdir()`` had
+        in qwen3-tts: PermissionError for any caller without write access to the
+        working directory, and a hard stop on a read-only rootfs. The directory
+        is created in ``export_to_onnx``, where it is used and where a failure
+        can be reported against a request.
+        """
         self.export_dir = Path("models")
-        self.export_dir.mkdir(exist_ok=True)
     
     async def export_to_onnx(self, job_id: str) -> Path:
         """Export a training checkpoint to ONNX and write its companion config bundle."""
@@ -30,7 +37,7 @@ class ModelExporter:
         
         # Create export directory
         export_path = self.export_dir / job_id
-        export_path.mkdir(exist_ok=True)
+        export_path.mkdir(parents=True, exist_ok=True)
         
         # Load configuration from checkpoint (preferred) or fallback
         config = checkpoint.get('config', self._load_config(job_id))
@@ -40,29 +47,54 @@ class ModelExporter:
         # Export to ONNX
         onnx_path = export_path / f"{job_id}.onnx"
         
+        # Build the model and load its weights OUTSIDE the try below. That
+        # handler relabels everything as "ONNX export failed ... may need more
+        # epochs", which is the wrong diagnosis for a checkpoint/architecture
+        # mismatch and would bury the only message that says what to fix.
+        from vits_model import VITS, VITSConfig
+
+        vits_config = VITSConfig(**config)
+        logger.info(f"VITS Config - hidden_channels: {vits_config.hidden_channels}")
+        logger.info(f"VITS Config - inter_channels: {vits_config.inter_channels}")
+        logger.info(f"VITS Config - n_layers: {vits_config.n_layers}")
+
+        model = VITS(vits_config)
+
+        # strict=False, but the result is inspected rather than discarded.
+        #
+        # Training and export build the same VITS class, so a MISSING key means
+        # the checkpoint has no weights for that layer and the export would carry
+        # its random initialisation instead — an ONNX that loads, runs, and emits
+        # noise, reported as a successful export. That is the failure this module
+        # already refuses elsewhere ("raise rather than write an invalid
+        # placeholder ONNX").
+        #
+        # UNEXPECTED keys are the benign direction: the checkpoint carries more
+        # than inference needs. Logged, not fatal.
+        result = model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        if result.unexpected_keys:
+            logger.info(
+                "Checkpoint has %d tensor(s) the inference model does not use "
+                "(e.g. %s)", len(result.unexpected_keys), result.unexpected_keys[0]
+            )
+        if result.missing_keys:
+            raise RuntimeError(
+                f"Checkpoint is missing weights for {len(result.missing_keys)} "
+                f"tensor(s), so the export would contain untrained random values "
+                f"for them and produce noise. First few: "
+                f"{result.missing_keys[:5]}. This usually means the training "
+                f"config and the checkpoint disagree on the architecture."
+            )
+        model.eval()
+
+        # Create dummy input for tracing
+        batch_size = 1
+        max_seq_len = 100
+
+        dummy_text = torch.randint(0, config.get('n_vocab', 256), (batch_size, max_seq_len), dtype=torch.long)
+        dummy_text_lengths = torch.tensor([max_seq_len], dtype=torch.long)
+
         try:
-            # Create simplified inference model with exact training config
-            from vits_model import VITS, VITSConfig
-            
-            # Create VITSConfig object with exact training parameters
-            vits_config = VITSConfig(**config)
-            logger.info(f"VITS Config - hidden_channels: {vits_config.hidden_channels}")
-            logger.info(f"VITS Config - inter_channels: {vits_config.inter_channels}")
-            logger.info(f"VITS Config - n_layers: {vits_config.n_layers}")
-            
-            model = VITS(vits_config)
-            
-            # Load state dict with strict=False to handle any missing keys gracefully
-            model.load_state_dict(checkpoint['model_state_dict'], strict=False)
-            model.eval()
-            
-            # Create dummy input for tracing
-            batch_size = 1
-            max_seq_len = 100
-            
-            dummy_text = torch.randint(0, config.get('n_vocab', 256), (batch_size, max_seq_len), dtype=torch.long)
-            dummy_text_lengths = torch.tensor([max_seq_len], dtype=torch.long)
-            
             # Export with simplified inputs
             with torch.no_grad():
                 torch.onnx.export(

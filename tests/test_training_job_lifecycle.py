@@ -267,3 +267,60 @@ def test_the_train_val_split_goes_through_the_shared_helper():
         "the unseeded permutation is back — the split would stop being "
         "reproducible across retrains"
     )
+
+
+# --- export integrity ---------------------------------------------------------
+#
+# `load_state_dict(..., strict=False)` with the result discarded. Training and
+# export build the same VITS class, so a missing key means the checkpoint has no
+# weights for that layer and the exported ONNX carries its random
+# initialisation — a model that loads, runs, and emits noise, reported as a
+# successful export and then deployed as a voice.
+
+EXPORTER = SERVICE_DIR / "model_exporter.py"
+
+
+def test_export_refuses_a_checkpoint_with_missing_weights():
+    body = ast.unparse(_function(EXPORTER, "export_to_onnx"))
+    assert "load_state_dict" in body, "export no longer loads a state dict?"
+    assert "missing_keys" in body, (
+        "export_to_onnx calls load_state_dict(strict=False) and ignores the "
+        "result, so a checkpoint/architecture mismatch produces an ONNX full of "
+        "untrained random values instead of an error"
+    )
+    assert "raise" in body.split("missing_keys", 1)[1][:400], (
+        "missing_keys is inspected but not fatal"
+    )
+
+
+def test_export_tolerates_extra_tensors_in_the_checkpoint():
+    """The benign direction: a checkpoint carrying more than inference needs."""
+    body = ast.unparse(_function(EXPORTER, "export_to_onnx"))
+    assert "unexpected_keys" in body, (
+        "unexpected_keys is not distinguished from missing_keys; making both "
+        "fatal would reject checkpoints that are perfectly usable"
+    )
+
+
+def test_the_weight_check_is_not_relabelled_as_an_onnx_failure():
+    """The generic handler says 'may need more epochs', which is the wrong
+    advice for an architecture mismatch and buries the real message."""
+    body = ast.unparse(_function(EXPORTER, "export_to_onnx"))
+    load_at = body.index("load_state_dict")
+    export_at = body.index("torch.onnx.export")
+    try_at = body.index("try:")
+    assert load_at < try_at < export_at, (
+        "the weight check sits inside the try whose handler rewrites every "
+        "exception as an ONNX export failure"
+    )
+
+
+def test_the_dataset_checks_its_vocabulary_against_the_embedding_size():
+    """An id at or above n_vocab is an out-of-range embedding lookup, which on
+    GPU is a device-side assert hours into a run with an unrelated traceback."""
+    body = ast.unparse(_function(SERVICE_DIR / "dataset.py", "__init__"))
+    assert "n_vocab" in body, (
+        "TTSDataset builds a phoneme vocabulary without comparing it to the "
+        "configured embedding size"
+    )
+    assert "raise" in body.split("n_vocab", 1)[1][:600]
