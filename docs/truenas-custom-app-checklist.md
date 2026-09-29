@@ -31,6 +31,7 @@ One page to tick off. The steps and the reasons are in
 
 ## Decisions
 
-- Remote browser access: leave `ALLOWED_ORIGINS` empty; behind a proxy that rewrites `Host`, set `TRUSTED_ORIGINS`.
+- Remote browser access: leave `ALLOWED_ORIGINS` empty. An IP address, `*.local` or a plain name (`truenas`) needs nothing; a real domain or reverse proxy needs `TRUSTED_HOSTS` (else `403 host_not_allowed`), and `TRUSTED_ORIGINS` too if the proxy rewrites `Host`.
+- `API_KEY` (optional): protects `/v1/*`, mutating `/api/*` and `/ws/stt`; the web UI asks for it once per tab, there is no exemption for it.
 - Training: free `qwen3-tts-service`'s VRAM first on a small card (`POST /api/providers/qwen3/unload`).
 - Lowest memory: run `frontend`, `piper-tts` and `stt` only.
