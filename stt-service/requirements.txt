@@ -13,7 +13,7 @@ python-multipart==0.0.32
 faster-whisper==1.2.1
 # ctranslate2 >=4.5 requires cuDNN 9 — provided by the cuda:12.8.1-cudnn base image
 ctranslate2>=4.5,<5
-tokenizers>=0.13.0
+tokenizers>=0.23.2
 # huggingface-hub 1.x replaced `requests` with httpx. faster-whisper 1.2.1 no
 # longer imports requests itself, but its model download has only been exercised
 # against hub 0.x, so the cap stays until that is checked against 1.x.
