@@ -10,7 +10,8 @@ torch 2.14 the export did not run at all (``onnxscript`` missing; then
 
 These tests build a tiny model (no GPU, no downloads), export it through the real
 ``ModelExporter`` and run the ONNX file in onnxruntime. They skip where torch,
-onnx or onnxruntime are not installed (CI installs tests/requirements.txt only).
+onnx or onnxruntime are not installed (the unit job installs tests/requirements.txt
+only), and fail there when REQUIRE_TORCH_TESTS=1, which the CI training job sets.
 
 ``PIPER_TRAINING_SERVICE_DIR`` points them at another checkout of the service,
 which is how they were run against the pre-fix code to show they fail there.
@@ -27,11 +28,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from optional_deps import importorskip_unless_required as _need
 
-torch = pytest.importorskip("torch")
-ort = pytest.importorskip("onnxruntime")
-pytest.importorskip("onnx")
-np = pytest.importorskip("numpy")
+# Skips where a dependency is missing, except with REQUIRE_TORCH_TESTS=1 (the CI
+# training job), where a missing one is an error: see tests/optional_deps.py.
+torch = _need("torch")
+ort = _need("onnxruntime")
+_need("onnx")
+np = _need("numpy")
 
 REPO = Path(__file__).resolve().parents[1]
 SERVICE_DIR = Path(os.environ.get("PIPER_TRAINING_SERVICE_DIR") or REPO / "piper-training-service")
