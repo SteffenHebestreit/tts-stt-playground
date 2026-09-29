@@ -238,7 +238,8 @@ questions:
     label: Allowed cross-origin callers
     description: >-
       Leave empty. The web UI is same-origin, also over http://<ip>:3000. List origins (comma
-      separated) only for scripts running in other web pages.
+      separated) only for scripts running in other web pages; a foreign page is otherwise
+      refused with 403.
     group: Access
     schema:
       type: string
@@ -248,7 +249,20 @@ questions:
     label: Reverse proxy public URL
     description: >-
       Behind an HTTPS reverse proxy that does not pass the original Host header, enter its URL
-      (https://voice.example.com). Without it every button answers 403.
+      (https://voice.example.com; its host name is trusted too). Without it every button
+      answers 403. A proxy that does pass Host needs the name under "Host names" below instead.
+    group: Access
+    schema:
+      type: string
+      default: ""
+
+  - variable: trusted_hosts
+    label: Host names of the web UI (only if not an IP address or *.local)
+    description: >-
+      Comma-separated. An IP address (192.168.1.20), localhost, *.local, *.lan, *.internal and
+      a plain name such as truenas work without an entry. A real domain in front of a reverse
+      proxy (voice.example.com) or a Tailscale name (*.tail1234.ts.net) must be listed here,
+      or every request answers 403 host_not_allowed.
     group: Access
     schema:
       type: string
@@ -257,8 +271,9 @@ questions:
   - variable: api_key
     label: API key (optional)
     description: >-
-      If set, /v1/* and mutating /api/* calls from scripts need "Authorization: Bearer <key>".
-      Same-origin browser requests do not. This is not user authentication.
+      If set, /v1/*, mutating /api/* calls and the live-transcription socket need
+      "Authorization: Bearer <key>". The web UI has no exemption: it asks for the key once per
+      browser tab. This is not user authentication.
     group: Access
     schema:
       type: string

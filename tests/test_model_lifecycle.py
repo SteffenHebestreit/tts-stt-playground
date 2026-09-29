@@ -662,6 +662,46 @@ def test_release_async_survives_its_own_cancellation():
     assert model is not None
 
 
+def test_a_release_still_queued_behind_a_busy_pool_survives_its_caller_being_cancelled():
+    """The case `asyncio.shield` in `release_async` decides.
+
+    The test above cancels a release whose job is already *running* (parked on the slot
+    lock), and a running job cannot be cancelled either way. A job that has not started
+    can: `asyncio.wrap_future` passes the cancellation on to the pool's future, and
+    `Future.cancel()` withdraws a queued job. So without the shield, a handler cancelled
+    (client gone) while the control pool is busy loses its release, and the reference it
+    holds pins the model for good: the idle TTL never arms and /unload answers 409.
+    """
+    slot, _ = _slot(-1)
+    slot._acquire()  # one reference, taken by hand
+    assert slot.refs == 1
+    submitted = []
+    real_submit = slot._control_pool.submit
+    slot._control_pool.submit = lambda fn, *a, **k: (submitted.append(fn), real_submit(fn, *a, **k))[1]
+    occupied, free_it = threading.Event(), threading.Event()
+
+    def occupy_the_only_worker():
+        occupied.set()
+        free_it.wait(WAIT)
+
+    async def main():
+        slot._control_pool.submit(occupy_the_only_worker)
+        assert await asyncio.to_thread(occupied.wait, WAIT)
+        task = asyncio.create_task(slot.release_async())
+        assert await _await_until(lambda: len(submitted) == 2), "the release was never submitted"
+        assert slot.refs == 1, "the release must still be queued, not run: that is the case under test"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        free_it.set()
+        # One worker, first in first out: once this returns, the queued release has
+        # run, or has been withdrawn.
+        await asyncio.wrap_future(real_submit(lambda: None))
+
+    asyncio.run(main())
+    assert slot.refs == 0, "a release cancelled while queued was withdrawn: the reference leaked"
+
+
 # --- L2: nothing on the event loop may wait for the slot lock -----------------
 
 

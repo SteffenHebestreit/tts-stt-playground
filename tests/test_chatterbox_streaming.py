@@ -216,7 +216,13 @@ def test_cancelling_a_stream_mid_chunk_keeps_slot_and_model_until_the_worker_is_
         # A new request must wait for the slot instead of starting a second generation.
         calls_before = len(model.calls)
         second = asyncio.ensure_future(app.text_to_speech(_request(app, text="Zweite Anfrage.")))
-        await wait_until_async(lambda: model.running > 1, timeout=0.4)
+        # Either the second request parks for the slot (right) or it starts generating
+        # next to the orphan (the bug). Wait for whichever happens first instead of for a
+        # fixed 0.4 s, which also "passes" when the machine is too busy to start a second
+        # generation in that time.
+        assert await wait_until_async(lambda: app._waiting == 1 or model.running > 1), (
+            "the second request neither queued for the slot nor started")
+        queued = app._waiting == 1
         overlapped = model.max_running
         started_early = len(model.calls) > calls_before
 
@@ -224,10 +230,11 @@ def test_cancelling_a_stream_mid_chunk_keeps_slot_and_model_until_the_worker_is_
         await second
         # Release runs on the loop when the worker ends; do not let the loop close first.
         await wait_until_async(lambda: _all_released(app))
-        return overlapped, started_early
+        return overlapped, started_early, queued
 
-    overlapped, started_early = asyncio.run(main())
+    overlapped, started_early, queued = asyncio.run(main())
 
+    assert queued, "the second request did not wait for the slot the orphaned worker still holds"
     assert overlapped == 1 and not started_early, "a second generation ran next to the orphaned one"
     assert _all_released(app), "the reference or the slot leaked after the worker finished"
 

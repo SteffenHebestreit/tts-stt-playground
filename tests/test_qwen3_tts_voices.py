@@ -72,6 +72,35 @@ class Asr:
         return True
 
 
+def test_a_reference_segment_is_trimmed_by_seeking_the_input_under_a_timeout(monkeypatch, tmp_path):
+    """`-ss` after `-i` is output seeking: the whole file is decoded up to the cut point every time.
+    A wedged ffmpeg must also not hold the request for ever."""
+    m = load_app(str(tmp_path / "voices"))
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen.update(cmd=list(cmd), kwargs=kwargs)
+        Path(cmd[-1]).write_bytes(b"TRIMMED")
+        return type("Done", (), {"returncode": 0})()
+
+    monkeypatch.setattr(m.subprocess, "run", fake_run)
+    out = tmp_path / "ref.wav"
+
+    assert m._trim_audio_segment(str(tmp_path / "in.wav"), 3.0, 8.5, str(out)) is True
+
+    cmd = seen["cmd"]
+    assert cmd.index("-ss") < cmd.index("-i"), f"-ss after -i decodes the whole file for every cut: {cmd}"
+    assert cmd[cmd.index("-ss") + 1] == "3.000" and cmd[cmd.index("-t") + 1] == "5.500"
+    assert seen["kwargs"]["timeout"] > 0, "ffmpeg runs with no timeout"
+
+    def hung(cmd, **kwargs):
+        raise m.subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+    monkeypatch.setattr(m.subprocess, "run", hung)
+    out.unlink()
+    assert m._trim_audio_segment(str(tmp_path / "in.wav"), 3.0, 8.5, str(out)) is False
+
+
 def _meta(voices, voice_id):
     return json.loads((voices / voice_id / "metadata.json").read_text())
 
@@ -263,7 +292,7 @@ def test_an_x_vector_voice_is_still_played_back_as_x_vector(lib, monkeypatch):
 
 def test_a_voice_saved_before_icl_existed_loads_exactly_as_it_did(lib):
     m, model, voices = lib
-    import torch
+    torch = m.torch  # the service's own binding: no torch is installed (or imported) in the unit job
     legacy = voices / "old"
     legacy.mkdir(parents=True)
     torch.save(make_tensor([0.5, 0.25]), legacy / "ref_spk_embedding.pt")
@@ -280,7 +309,7 @@ def test_a_voice_saved_before_icl_existed_loads_exactly_as_it_did(lib):
 
 def test_stale_reference_codes_do_not_turn_an_x_vector_voice_into_an_icl_one(lib):
     m, model, voices = lib
-    import torch
+    torch = m.torch
     d = voices / "mixed"
     d.mkdir(parents=True)
     torch.save(make_tensor([0.5]), d / "ref_spk_embedding.pt")

@@ -7,66 +7,25 @@ either a 500 or a silent reversion to full-text latency.
 The model stack is stubbed; these are pure-function tests.
 """
 
-import sys
 import time
-import types
-from importlib.util import module_from_spec, spec_from_file_location
-from pathlib import Path
 
 import pytest
 
 pytest.importorskip("numpy", reason="chatterbox app.py requires numpy")
 
-SERVICE_DIR = Path(__file__).resolve().parents[1] / "chatterbox-tts-service"
-
 MAX = 180
 MIN = 60
 FIRST = 40
 
-
-def _install_stubs():
-    """Stub the heavy audio/ML imports so app.py can be imported offline."""
-    if "torch" not in sys.modules:
-        torch = types.ModuleType("torch")
-        torch.__version__ = "0.0.0-stub"
-        torch.cuda = types.SimpleNamespace(
-            is_available=lambda: False,
-            get_device_name=lambda i: "stub",
-            memory_allocated=lambda: 0,
-            get_device_properties=lambda i: types.SimpleNamespace(total_memory=0),
-            empty_cache=lambda: None,
-        )
-        torch.is_tensor = lambda x: False
-        sys.modules["torch"] = torch
-
-    if "soundfile" not in sys.modules:
-        sf = types.ModuleType("soundfile")
-        sf.write = lambda *a, **k: None
-        sf.info = lambda p: types.SimpleNamespace(format="WAV", samplerate=16000, channels=1, frames=0)
-        sys.modules["soundfile"] = sf
-
-    if "uvicorn" not in sys.modules:
-        uv = types.ModuleType("uvicorn")
-        uv.run = lambda *a, **k: None
-        sys.modules["uvicorn"] = uv
+from chatterbox_loader import load_app  # noqa: E402  (after the numpy importorskip above)
 
 
 @pytest.fixture(scope="module")
 def split():
-    _install_stubs()
-    # app.py does `from model_lifecycle import ...`, a sibling module, so the
-    # service directory has to be importable — loading app.py by path alone is
-    # not enough.
-    sys.path.insert(0, str(SERVICE_DIR))
-    try:
-        spec = spec_from_file_location("chatterbox_app_under_test", SERVICE_DIR / "app.py")
-        module = module_from_spec(spec)
-        assert spec.loader is not None
-        sys.modules["chatterbox_app_under_test"] = module
-        spec.loader.exec_module(module)
-        return module._split_sentences
-    finally:
-        sys.path.remove(str(SERVICE_DIR))
+    # The shared loader imports a fresh copy of the service under torch / soundfile /
+    # uvicorn stand-ins that exist only while it imports (they used to be installed into
+    # sys.modules here and left there for the rest of the run).
+    return load_app()._split_sentences
 
 
 # --- Inputs that must never hang or crash ----------------------------------

@@ -124,7 +124,19 @@ services:
       MAX_TEXT_CHARS: ${PIPER_MAX_TEXT_CHARS:-20000}
       MAX_UPLOAD_MB: ${PIPER_MAX_UPLOAD_MB:-100}
       MAX_ANALYZE_UPLOAD_MB: ${PIPER_MAX_ANALYZE_UPLOAD_MB:-25}
+      # /analyze_audio refuses a recording that decodes to more seconds than this
+      # (413), whatever its file size.
+      PIPER_ANALYZE_MAX_SECONDS: ${PIPER_ANALYZE_MAX_SECONDS:-600}
+      # Uploaded voices are models that run inside the service. At most this many
+      # (409 beyond it; 0 = no new upload is accepted) and this many MB of them in
+      # total (413), and a candidate gets this many seconds to load and answer a
+      # test request in a throw-away process before it is published.
+      PIPER_MAX_CUSTOM_VOICES: ${PIPER_MAX_CUSTOM_VOICES:-20}
+      PIPER_MAX_CUSTOM_MB: ${PIPER_MAX_CUSTOM_MB:-2048}
+      PIPER_ONNX_VALIDATE_TIMEOUT_S: ${PIPER_ONNX_VALIDATE_TIMEOUT_S:-30}
       # The backends are not browser-facing (the gateway is), see BACKEND_BIND_ADDR.
+      # Empty = closed: no CORS headers, and a state-changing request with a
+      # foreign Origin header gets 403.
       ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
@@ -391,6 +403,12 @@ services:
       # One shared model on one GPU: bound concurrent inference rather than
       # letting the default thread pool multiply peak VRAM.
       ASR_MAX_CONCURRENCY: ${ASR_MAX_CONCURRENCY:-1}
+      # Requests that may wait for a free inference slot. Empty = 4 x
+      # ASR_MAX_CONCURRENCY; 0 = nobody waits. A request beyond that, or one that
+      # waited ASR_QUEUE_TIMEOUT_S seconds without getting its turn, is answered
+      # 503 + Retry-After instead of hanging.
+      ASR_MAX_QUEUE: ${ASR_MAX_QUEUE:-}
+      ASR_QUEUE_TIMEOUT_S: ${ASR_QUEUE_TIMEOUT_S:-60}
       # expandable_segments avoids the fragmentation that per-request
       # empty_cache() calls used to (badly) paper over.
       PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
@@ -462,6 +480,12 @@ services:
       # One shared model on one GPU: bound concurrent inference rather than
       # letting the default thread pool multiply peak VRAM.
       ASR_MAX_CONCURRENCY: ${ASR_MAX_CONCURRENCY:-1}
+      # Requests that may wait for a free inference slot. Empty = 4 x
+      # ASR_MAX_CONCURRENCY; 0 = nobody waits. A request beyond that, or one that
+      # waited ASR_QUEUE_TIMEOUT_S seconds without getting its turn, is answered
+      # 503 + Retry-After instead of hanging.
+      ASR_MAX_QUEUE: ${ASR_MAX_QUEUE:-}
+      ASR_QUEUE_TIMEOUT_S: ${ASR_QUEUE_TIMEOUT_S:-60}
       # expandable_segments avoids the fragmentation that per-request
       # empty_cache() calls used to (badly) paper over.
       PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
@@ -525,6 +549,12 @@ services:
       # One shared model on one GPU: bound concurrent inference rather than
       # letting the default thread pool multiply peak VRAM.
       ASR_MAX_CONCURRENCY: ${ASR_MAX_CONCURRENCY:-1}
+      # Requests that may wait for a free inference slot. Empty = 4 x
+      # ASR_MAX_CONCURRENCY; 0 = nobody waits. A request beyond that, or one that
+      # waited ASR_QUEUE_TIMEOUT_S seconds without getting its turn, is answered
+      # 503 + Retry-After instead of hanging.
+      ASR_MAX_QUEUE: ${ASR_MAX_QUEUE:-}
+      ASR_QUEUE_TIMEOUT_S: ${ASR_QUEUE_TIMEOUT_S:-60}
       # expandable_segments avoids the fragmentation that per-request
       # empty_cache() calls used to (badly) paper over.
       PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
@@ -608,6 +638,12 @@ services:
       # letting the default thread pool multiply peak VRAM. (The model itself
       # cannot run two generations at once: values above 1 only queue.)
       TTS_MAX_CONCURRENCY: ${TTS_MAX_CONCURRENCY:-1}
+      # Requests that may wait for a generation slot. Empty = 4 x
+      # TTS_MAX_CONCURRENCY; 0 = nobody waits. A request beyond that, or one that
+      # waited TTS_QUEUE_TIMEOUT_S seconds without getting its turn, is answered
+      # 503 + Retry-After instead of hanging.
+      TTS_MAX_QUEUE: ${TTS_MAX_QUEUE:-}
+      TTS_QUEUE_TIMEOUT_S: ${TTS_QUEUE_TIMEOUT_S:-60}
       # expandable_segments avoids the fragmentation that per-request
       # empty_cache() calls used to (badly) paper over.
       PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
@@ -662,9 +698,18 @@ services:
       QWEN3_TTS_ATTN_IMPLEMENTATION: ${QWEN3_TTS_ATTN_IMPLEMENTATION:-auto}
       MAX_TEXT_CHARS: ${QWEN3_TTS_MAX_TEXT_CHARS:-5000}
       MAX_UPLOAD_MB: ${QWEN3_TTS_MAX_UPLOAD_MB:-20}
+      # A reference clip that decodes to more seconds than this is refused (413),
+      # whatever its file size. A voice needs 3-10 s.
+      QWEN3_TTS_REF_MAX_SECONDS: ${QWEN3_TTS_REF_MAX_SECONDS:-60}
       # One shared model on one GPU: bound concurrent generation rather than
       # letting the default thread pool multiply peak VRAM.
       TTS_MAX_CONCURRENCY: ${TTS_MAX_CONCURRENCY:-1}
+      # Requests that may wait for a generation slot. Empty = 4 x
+      # TTS_MAX_CONCURRENCY; 0 = nobody waits. A request beyond that, or one that
+      # waited TTS_QUEUE_TIMEOUT_S seconds without getting its turn, is answered
+      # 503 + Retry-After instead of hanging.
+      TTS_MAX_QUEUE: ${TTS_MAX_QUEUE:-}
+      TTS_QUEUE_TIMEOUT_S: ${TTS_QUEUE_TIMEOUT_S:-60}
       # Sentences generated in one forward pass when a long text is chunked.
       # Peak VRAM scales with this, so it must be bounded by config rather than
       # by how long the caller's text happens to be.
@@ -787,14 +832,30 @@ services:
       # 403 on every button. And whether to believe X-Forwarded-Host.
       TRUSTED_ORIGINS: ${TRUSTED_ORIGINS:-}
       TRUST_PROXY_HEADERS: ${TRUST_PROXY_HEADERS:-false}
+      # The Host header must name this service (DNS-rebinding guard), else 403
+      # host_not_allowed. Accepted without setup: IP addresses, localhost, *.local,
+      # *.lan, *.internal, *.home.arpa and single-label names. Anything else (a real
+      # domain in front of a reverse proxy, a Tailscale MagicDNS name) goes into
+      # TRUSTED_HOSTS: comma separated, e.g. tts.example.com,*.tail1234.ts.net.
+      # ALLOWED_HOSTS reads only `*` (check off; not recommended).
+      TRUSTED_HOSTS: ${TRUSTED_HOSTS:-}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:-}
       # Optional shared secret. Empty = open (fine on a trusted LAN). When set:
-      # Bearer token required on /v1/* and on mutating /api/* calls, except
-      # same-origin browser requests. Not user authentication.
+      # Bearer token required on /v1/*, on mutating /api/* calls and on the
+      # /ws/stt upgrade, with no exemption for the bundled UI (it asks for the
+      # key once and keeps it in sessionStorage). Not user authentication.
       API_KEY: ${API_KEY:-}
       # Largest request body (MB) for uploads (training audio, voice samples,
-      # STT files) and the longest text (characters) for TTS.
+      # STT files) and the longest text (characters) for TTS. Keep MAX_TTS_CHARS
+      # <= the smallest backend limit in use (chatterbox and qwen3-tts: 5000).
       MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-512}
-      MAX_TTS_CHARS: ${MAX_TTS_CHARS:-20000}
+      MAX_TTS_CHARS: ${MAX_TTS_CHARS:-5000}
+      # Per worker process: uploads forwarded at the same time (the next one
+      # gets 503 + Retry-After before its body is read) and ffmpeg conversions
+      # for /v1/audio/speech (mp3, resampled pcm). Upload memory is at most
+      # FRONTEND_WORKERS x MAX_CONCURRENT_UPLOADS x MAX_UPLOAD_MB.
+      MAX_CONCURRENT_UPLOADS: ${MAX_CONCURRENT_UPLOADS:-4}
+      MAX_CONCURRENT_FFMPEG: ${MAX_CONCURRENT_FFMPEG:-4}
       # Seconds a GET /api/health result is reused (0 = always probe).
       HEALTH_CACHE_TTL: ${HEALTH_CACHE_TTL:-2}
       # uvicorn workers, read by entrypoint.sh. Each is a full copy of the

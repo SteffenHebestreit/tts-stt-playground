@@ -276,12 +276,22 @@ def load_audio_pipeline():
 # --- fake ffmpeg -------------------------------------------------------------------
 
 FAKE_FFMPEG = f"""#!{sys.executable}
-import json, os, struct, sys, time, wave
-import numpy as np
+import os, sys, time
 
 args = sys.argv[1:]
 root = os.environ["FAKE_FFMPEG_DIR"]
 mode = open(root + "/mode").read().strip()
+if mode == "hang":
+    # Published before the slow imports below (numpy alone takes longer than a short
+    # test timeout on a loaded machine), and as temp file + rename so that a poller
+    # never sees `pid` created but still empty.
+    with open(root + "/pid.tmp", "w") as fh:
+        fh.write(str(os.getpid()))
+    os.replace(root + "/pid.tmp", root + "/pid")
+
+import json, struct, wave
+import numpy as np
+
 src = args[args.index("-i") + 1]
 limit = float(args[args.index("-t") + 1]) if "-t" in args else None
 record = {{"args": args, "src": src}}
@@ -294,7 +304,6 @@ if mode == "fail":
     log()
     sys.exit(1)
 if mode == "hang":
-    open(root + "/pid", "w").write(str(os.getpid()))
     log()
     time.sleep(60)
 
@@ -347,8 +356,12 @@ class FakeFfmpeg:
         return [json.loads(line) for line in log.read_text().splitlines()]
 
     def hung_pid(self) -> int | None:
-        pid = self.dir / "pid"
-        return int(pid.read_text()) if pid.exists() else None
+        """The hung fake's pid; None until it has published it (a missing or empty file is "not yet")."""
+        try:
+            text = (self.dir / "pid").read_text().strip()
+        except OSError:
+            return None
+        return int(text) if text.isdigit() else None
 
 
 def process_alive(pid: int) -> bool:

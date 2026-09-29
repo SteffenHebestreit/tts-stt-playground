@@ -22,7 +22,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from compose_helpers import env_mapping, load_compose
+from compose_helpers import env_mapping, interpolate, load_compose
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = REPO_ROOT / "docker-compose.yml"
@@ -340,3 +340,218 @@ def test_truenas_app_matches_the_base_stack():
         "stack sets, so a TrueNAS install behaves differently from a compose "
         "install of the same commit:\n  " + "\n  ".join(gaps)
     )
+
+
+# --- the same default everywhere ---------------------------------------------
+#
+# Forwarding a variable is half of it. `MAX_TTS_CHARS` was 20000 in three
+# deployment files and 5000 in the code that reads it, for as long as nobody
+# looked: every install "used the default" and got a value the documentation
+# and the service disagreed about. The rules below make the file, not a person,
+# notice.
+
+# Keys whose value is meant to differ between the base stack and the standalone
+# TrueNAS file, with the reason. GPU pinning is PARITY_IGNORE above.
+DEFAULT_DIFFERS = {
+    ("stt-service", "STT_DEFAULT_LANGUAGE"): "the TrueNAS file is German-first; the base file detects",
+    ("stt-service", "WHISPER_COMPUTE_TYPE"): "the TrueNAS file targets one NVIDIA card (float16); the base file picks per device",
+}
+
+_NUMBER = r"(-?\d+(?:\.\d+)?)"
+# A numeric default written next to the name at the read: `env_number("X", 4)`,
+# `_number(os.getenv("X"), "X", 60.0, ...)`, `os.getenv("X", "512")`.
+_DEFAULT_READ = (
+    re.compile(r"\b[A-Za-z_]*env[A-Za-z_]*\(\s*[\"']([A-Z][A-Z0-9_]*)[\"']\s*,\s*" + _NUMBER + r"\s*[,)]"),
+    re.compile(
+        r"_number\(\s*os\.(?:getenv|environ\.get)\(\s*[\"']([A-Z][A-Z0-9_]*)[\"']\)\s*,\s*"
+        r"[\"'][A-Z0-9_]+[\"']\s*,\s*" + _NUMBER + r"\s*[,)]"),
+    re.compile(r"os\.(?:getenv|environ\.get)\(\s*[\"']([A-Z][A-Z0-9_]*)[\"']\s*,\s*[\"']" + _NUMBER + r"[\"']\s*\)"),
+)
+
+
+def _code_defaults() -> dict[str, dict[str, set[float]]]:
+    """{service_dir: {variable: numeric defaults its Python gives it}}."""
+    out: dict[str, dict[str, set[float]]] = {}
+    for path in REPO_ROOT.glob("*-service/*.py"):
+        source = path.read_text(encoding="utf-8", errors="ignore")
+        for pattern in _DEFAULT_READ:
+            for name, value in pattern.findall(source):
+                out.setdefault(path.parent.name, {}).setdefault(name, set()).add(float(value))
+    return out
+
+
+def _numeric_default(value) -> float | None:
+    """The number a compose value resolves to with nothing set, or None (empty, or not a number)."""
+    text = interpolate(str(value)).strip()
+    return float(text) if re.fullmatch(_NUMBER, text) else None
+
+
+def test_a_compose_default_is_the_default_the_code_would_use_anyway():
+    """`${MAX_TTS_CHARS:-20000}` next to `_env_number("MAX_TTS_CHARS", 5000, int)` is a lie.
+
+    An empty default is fine (it means "the code decides", which is how derived
+    defaults such as 4 x ASR_MAX_CONCURRENCY are spelled). A number must be the
+    number the code falls back to, in the base file and in the standalone one.
+    """
+    code = _code_defaults()
+    wrong: list[str] = []
+    checked = 0
+    for compose in (COMPOSE, TRUENAS_APP):
+        services = load_compose(compose).get("services") or {}
+        for service, definition in sorted(services.items()):
+            for key, value in sorted(env_mapping(definition or {}).items()):
+                defaults = code.get(service, {}).get(key)
+                number = _numeric_default(value)
+                if not defaults or number is None:
+                    continue
+                checked += 1
+                if number not in defaults:
+                    wrong.append(
+                        f"{compose.name}: {service}.{key} defaults to {number:g}, "
+                        f"the code to {sorted(defaults)}")
+    assert not wrong, "compose disagrees with the service about a default:\n  " + "\n  ".join(wrong)
+    # The scan itself must keep finding things, or it guards nothing.
+    assert checked >= 40, f"only {checked} defaults were comparable; did the read helpers change shape?"
+
+
+def test_the_limit_knobs_are_forwarded_with_the_code_default_everywhere():
+    """The knobs the hardening added, by name, in every file that deploys the service."""
+    expected = {
+        "frontend-service": {
+            "TRUSTED_HOSTS": "", "ALLOWED_HOSTS": "", "MAX_TTS_CHARS": "5000",
+            "MAX_CONCURRENT_UPLOADS": "4", "MAX_CONCURRENT_FFMPEG": "4",
+        },
+        "piper-tts-service": {
+            "PIPER_ANALYZE_MAX_SECONDS": "600", "PIPER_MAX_CUSTOM_VOICES": "20",
+            "PIPER_MAX_CUSTOM_MB": "2048", "PIPER_ONNX_VALIDATE_TIMEOUT_S": "30",
+        },
+        "qwen3-asr-service": {"ASR_MAX_QUEUE": "", "ASR_QUEUE_TIMEOUT_S": "60"},
+        "parakeet-asr-service": {"ASR_MAX_QUEUE": "", "ASR_QUEUE_TIMEOUT_S": "60"},
+        "canary-asr-service": {"ASR_MAX_QUEUE": "", "ASR_QUEUE_TIMEOUT_S": "60"},
+        "qwen3-tts-service": {
+            "QWEN3_TTS_REF_MAX_SECONDS": "60", "TTS_MAX_QUEUE": "", "TTS_QUEUE_TIMEOUT_S": "60",
+        },
+        "chatterbox-tts-service": {"TTS_MAX_QUEUE": "", "TTS_QUEUE_TIMEOUT_S": "60"},
+    }
+    problems: list[str] = []
+    for compose in (COMPOSE, TRUENAS_APP):
+        services = load_compose(compose).get("services") or {}
+        for service, knobs in expected.items():
+            environment = env_mapping(services.get(service) or {})
+            for key, default in knobs.items():
+                if key not in environment:
+                    problems.append(f"{compose.name}: {service} does not forward {key}")
+                elif interpolate(str(environment[key])) != default:
+                    problems.append(
+                        f"{compose.name}: {service}.{key} defaults to "
+                        f"{interpolate(str(environment[key]))!r}, expected {default!r}")
+    assert not problems, "\n  ".join(problems)
+
+
+def test_canary_is_not_handed_a_batch_size_it_does_not_read():
+    """Canary decodes one file per pass; ASR_MAX_BATCH belongs to Parakeet alone."""
+    for compose in sorted(REPO_ROOT.glob("docker-compose*.yml")):
+        services = load_compose(compose).get("services") or {}
+        assert "ASR_MAX_BATCH" not in env_mapping(services.get("canary-asr-service") or {}), compose.name
+    template = (REPO_ROOT / "truenas/tts-stt/templates/docker-compose.yaml").read_text(encoding="utf-8")
+    block = template.split("canary-asr-service:", 1)[1].split("\n\n", 1)[0]
+    assert "ASR_MAX_BATCH" not in block
+
+
+def test_truenas_app_defaults_match_the_base_stack():
+    """The same key must resolve to the same default in both files, unless the difference is listed."""
+    base = load_compose(COMPOSE).get("services") or {}
+    standalone = load_compose(TRUENAS_APP).get("services") or {}
+    differing: list[str] = []
+    for service in sorted(standalone):
+        if service not in base:
+            continue
+        a, b = env_mapping(base[service]), env_mapping(standalone[service])
+        for key in sorted((set(a) & set(b)) - PARITY_IGNORE):
+            if (service, key) in DEFAULT_DIFFERS:
+                continue
+            if interpolate(str(a[key])) != interpolate(str(b[key])):
+                differing.append(
+                    f"{service}.{key}: base {interpolate(str(a[key]))!r}, "
+                    f"standalone {interpolate(str(b[key]))!r}")
+    assert not differing, (
+        "docker-compose.truenas-app.yml and docker-compose.yml resolve the same variable to different "
+        "defaults, so a TrueNAS install and a compose install of one commit disagree:\n  "
+        + "\n  ".join(differing)
+        + "\nFix the file that is wrong, or list the pair in DEFAULT_DIFFERS with the reason."
+    )
+
+
+# --- the documentation has to say what the services do -----------------------
+
+# The limits the hardening added. Each must be in .env.example (test above), in
+# docs/api.md's limits tables and in the TrueNAS Custom App file.
+DOCUMENTED_KNOBS = (
+    "TRUSTED_HOSTS", "ALLOWED_HOSTS", "MAX_CONCURRENT_UPLOADS", "MAX_CONCURRENT_FFMPEG",
+    "ASR_MAX_QUEUE", "ASR_QUEUE_TIMEOUT_S", "TTS_MAX_QUEUE", "TTS_QUEUE_TIMEOUT_S",
+    "PIPER_ANALYZE_MAX_SECONDS", "PIPER_MAX_CUSTOM_VOICES", "PIPER_MAX_CUSTOM_MB",
+    "PIPER_ONNX_VALIDATE_TIMEOUT_S", "QWEN3_TTS_REF_MAX_SECONDS",
+)
+
+
+def test_every_limit_knob_is_in_the_env_file_the_api_docs_and_the_truenas_form_files():
+    api = (REPO_ROOT / "docs" / "api.md").read_text(encoding="utf-8")
+    truenas_app = TRUENAS_APP.read_text(encoding="utf-8")
+    template = (REPO_ROOT / "truenas/tts-stt/templates/docker-compose.yaml").read_text(encoding="utf-8")
+    documented = _documented()
+    missing = []
+    for knob in DOCUMENTED_KNOBS:
+        if knob not in documented:
+            missing.append(f".env.example: {knob}")
+        if knob not in api:
+            missing.append(f"docs/api.md: {knob}")
+        if knob not in truenas_app:
+            missing.append(f"docker-compose.truenas-app.yml: {knob}")
+        if knob not in template:
+            missing.append(f"truenas template: {knob}")
+    assert not missing, "a limit knob is not written down everywhere it has to be:\n  " + "\n  ".join(missing)
+
+
+def test_a_hostname_that_needs_trusted_hosts_is_asked_for_in_the_truenas_form():
+    """A reverse proxy or a real domain is 403 host_not_allowed without it; an operator must be able to set it."""
+    import yaml
+
+    form = yaml.safe_load((REPO_ROOT / "truenas/tts-stt/questions.yaml").read_text(encoding="utf-8"))
+    names = {question["variable"] for question in form["questions"]}
+    assert "trusted_hosts" in names
+    guide = (REPO_ROOT / "docs" / "truenas-installation-guide.md").read_text(encoding="utf-8")
+    assert "host_not_allowed" in guide and "TRUSTED_HOSTS" in guide
+
+
+# Statements that were true before the gateway validated Host, stopped exempting
+# its own UI from API_KEY, resampled pcm to 24 kHz and lowered MAX_TTS_CHARS.
+STALE_STATEMENTS = (
+    "same-origin browser calls are exempt",
+    "same-origin browser requests do not",
+    "except same-origin browser requests",
+    "except requests the bundled UI itself makes",
+    "same-origin browser request). Reads",
+    "at the backend's **native",
+    "It is not resampled here",
+    "it does not guard `/ws/stt`",
+    "and `API_KEY` does not",
+    "`512`, `20000`",
+    "MAX_TTS_CHARS:-20000",
+    "MAX_TTS_CHARS=20000",
+    "(default 20000, 422 beyond it)",
+)
+
+
+def test_no_document_or_deployment_file_repeats_a_retired_statement():
+    paths = [
+        *REPO_ROOT.glob("docker-compose*.yml"), *REPO_ROOT.glob(".env*example"),
+        REPO_ROOT / "README.md", *(REPO_ROOT / "docs").glob("*.md"),
+        *(REPO_ROOT / "truenas").rglob("*.md"), *(REPO_ROOT / "truenas").rglob("*.yaml"),
+    ]
+    found = []
+    for path in paths:
+        text = path.read_text(encoding="utf-8")
+        for statement in STALE_STATEMENTS:
+            if statement in text:
+                found.append(f"{path.relative_to(REPO_ROOT)}: {statement!r}")
+    assert not found, "these statements are no longer true:\n  " + "\n  ".join(found)

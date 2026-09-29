@@ -13,8 +13,11 @@ properties checked here are the ones whose failure is silent:
   handler is about to run inference on;
 - a transcription runner whose first parameter is not the model has silently
   gone back to reading the global, with the same consequence;
-- `.cpu()` in the unload hook, without which `empty_cache()` frees nothing at
-  all if anything still references the module.
+
+The unload hook's `.cpu()` and `model_loaded` reset, what `/health` reports about
+residency, and skipping the preload at TTL 0 are exercised through the real
+endpoints instead (test_nemo_services_uploads.py, test_nemo_services_runtime.py):
+they used to be greps of the source here, which pass when the code is wrong.
 
 `tests/test_model_lifecycle.py` covers ModelSlot's own behaviour, and
 `tests/test_model_unload.py` covers the registry claim. This file covers the
@@ -125,31 +128,6 @@ def test_no_route_handler_resolves_its_own_model(service: str):
 
 
 @pytest.mark.parametrize("service", NEMO_SERVICES)
-def test_unload_hook_moves_the_weights_off_the_gpu(service: str):
-    """Without this the endpoint can report success and free nothing.
-
-    `empty_cache()` only returns blocks that are already unreferenced. NeMo
-    registers instantiated models in its own AppState, so `del` is not proof the
-    tensors became unreachable — but `.cpu()` releases the device allocation
-    regardless of who still holds the object.
-    """
-    tree = _tree(service)
-    hook = next(
-        (f for f in _functions(tree) if f.name.startswith("_release_")), None)
-    assert hook is not None, f"{service}: no on_unload hook found"
-
-    body = ast.unparse(hook)
-    assert ".cpu()" in body, (
-        f"{service}: {hook.name} drops the reference without moving the module "
-        f"off the GPU, so the VRAM may never come back"
-    )
-    assert "model_loaded = False" in body, (
-        f"{service}: {hook.name} leaves the module-level `model_loaded` flag set, "
-        f"so /health and /status keep reporting a model that is gone"
-    )
-
-
-@pytest.mark.parametrize("service", NEMO_SERVICES)
 def test_slot_is_wired_with_the_documented_ttl_names(service: str):
     source = (REPO_ROOT / service / "app.py").read_text(encoding="utf-8")
     assert 'ttl_from_env(os.getenv, "ASR_MODEL_TTL", "MODEL_TTL"' in source, (
@@ -157,32 +135,6 @@ def test_slot_is_wired_with_the_documented_ttl_names(service: str):
         f"service without its own knob; both names must be honoured"
     )
     assert "on_unload=" in source, f"{service}: ModelSlot built without an unload hook"
-
-
-@pytest.mark.parametrize("service", NEMO_SERVICES)
-def test_health_reports_residency_not_just_loadedness(service: str):
-    """`model_loaded` alone cannot distinguish "idle" from "broken"."""
-    health = next(
-        (f for f in _functions(_tree(service))
-         if f.name == "health" and _is_route(f)), None)
-    assert health is not None, f"{service}: no /health handler"
-    body = ast.unparse(health)
-    for key in ("model_resident", "model_ttl_seconds", "active_requests"):
-        assert key in body, (
-            f"{service}: /health omits {key}; the gateway's status row cannot "
-            f"then tell an idle-unloaded model from a down service"
-        )
-
-
-@pytest.mark.parametrize("service", NEMO_SERVICES)
-def test_ttl_zero_skips_the_startup_preload(service: str):
-    """Loading GBs at boot purely to drop them on the first release is waste."""
-    lifespan = _named(_tree(service), "_lifespan")
-    assert lifespan is not None, f"{service}: no lifespan"
-    assert "MODEL_TTL == 0" in ast.unparse(lifespan), (
-        f"{service}: _lifespan preloads unconditionally; with ASR_MODEL_TTL=0 "
-        f"that loads the model at boot only to discard it"
-    )
 
 
 def test_the_lifecycle_module_is_not_forked_per_service():

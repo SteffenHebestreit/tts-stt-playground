@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 
 from chatterbox_loader import (
     CLONE_VOICE, DEFAULT_VOICE, decode_audio, decode_pcm16, install_chatterbox, load_app,
-    make_upload, patch_decoder, reference_clip, voices_in, wait_until_async,
+    WatchedLock, make_upload, patch_decoder, reference_clip, voices_in, wait_until_async,
 )
 
 LONG_TEXT = " ".join(
@@ -160,6 +160,8 @@ def test_generations_never_overlap_on_the_shared_model_even_with_concurrency_abo
     model = package.model
     model.gate = threading.Event()
     model.entered.clear()
+    model_lock = WatchedLock()
+    monkeypatch.setattr(app, "_MODEL_LOCK", model_lock)
 
     async def main():
         tts = asyncio.create_task(app.text_to_speech(app.TTSRequest(text="Hallo Welt.", language="de")))
@@ -167,14 +169,19 @@ def test_generations_never_overlap_on_the_shared_model_even_with_concurrency_abo
         clone = asyncio.create_task(app.clone_voice(
             text="Klon.", lang="de", file=make_upload(), exaggeration=None, cfg_weight=None
         ))
-        # Give a (buggy) second generation the chance to start next to the first.
-        await wait_until_async(lambda: model.running > 1, timeout=0.4)
+        # Either the clone's worker parks on the model lock (right) or a (buggy) second
+        # generation starts next to the first. Wait for whichever comes first, not for a
+        # fixed 0.4 s that also passes when the machine is too busy to start one.
+        assert await wait_until_async(lambda: model_lock.contended.is_set() or model.running > 1), (
+            "the clone neither waited for the model nor started")
         overlapped = model.max_running
+        parked = model_lock.contended.is_set()
         model.gate.set()
-        return overlapped, await tts, await clone
+        return overlapped, parked, await tts, await clone
 
-    overlapped, tts_response, clone_response = asyncio.run(main())
+    overlapped, parked, tts_response, clone_response = asyncio.run(main())
 
+    assert parked, "the clone did not wait for the model lock the running generation holds"
     assert overlapped == 1, "two generate() calls ran on the shared model at the same time"
     assert voices_in(decode_audio(_first_body(tts_response))) == {DEFAULT_VOICE}
     assert voices_in(decode_audio(_first_body(clone_response))) == {CLONE_VOICE}

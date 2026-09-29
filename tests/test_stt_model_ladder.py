@@ -286,6 +286,29 @@ def test_a_request_during_the_preload_waits_for_it_instead_of_loading_a_second_c
             self.default = []
 
     app = load_stt_app({}, name="stt_app_ladder_race", model_cls=Slow)
+    queued = threading.Event()
+
+    class WatchedLock:
+        """The reference lock, reporting the moment a caller has to wait for it.
+
+        The preload holds it for the whole (gated) load, so the first caller that finds
+        it taken is the request, parked behind that load. That is the state the test is
+        about, and this is how it is known, instead of sleeping and hoping.
+        """
+
+        def __init__(self):
+            self._lock = threading.Lock()
+
+        def __enter__(self):
+            if not self._lock.acquire(blocking=False):
+                queued.set()
+                self._lock.acquire()
+            return self
+
+        def __exit__(self, *exc):
+            self._lock.release()
+
+    app._model_ref_lock = WatchedLock()
     with TestClient(app.app) as client:
         assert entered.wait(5)
         answers = {}
@@ -295,9 +318,14 @@ def test_a_request_during_the_preload_waits_for_it_instead_of_loading_a_second_c
             daemon=True,
         )
         requester.start()
-        threading.Event().wait(0.3)          # the request is now queued behind the load
+        assert queued.wait(5), "the request never reached the reference lock the preload holds"
+        assert constructed == [1], "a request that arrived during the load started a second one"
         gate.set()
         requester.join(10)
+        assert not requester.is_alive(), "the request never finished"
         wait_for_preload(app)
     assert constructed == [1], f"the model was loaded {len(constructed)} times"
-    assert answers["r"].status_code in (200, 422)
+    # The audio is not valid, but the decode is a scripted stand-in: what matters is that
+    # the request was served by the model the preload loaded, so the outcome is exact.
+    assert answers["r"].status_code == 200, answers["r"].text
+    assert answers["r"].json()["text"] == ""

@@ -28,28 +28,78 @@ never needs them, because the gateway proxies every call, the live microphone We
 over the internal Docker network. Set `BACKEND_BIND_ADDR=0.0.0.0` only on a network you trust.
 Services never reach each other through published ports.
 
-**Browsers.** `ALLOWED_ORIGINS` is **empty by default**: the gateway answers its own origin only,
-sends no CORS headers, and refuses a state-changing request (`POST`, `PUT`, `PATCH`, `DELETE`)
-that carries a foreign `Origin` with **403** (`cross_origin_blocked`). Opening the UI by another
-hostname needs nothing. List origins to let other pages call the API; `*` opens it to any page and
-is logged as a warning. Behind a reverse proxy that rewrites the `Host` header, add the public
-URL to `TRUSTED_ORIGINS` (the symptom of forgetting it is a 403 on every button); set
-`TRUST_PROXY_HEADERS=true` only if the proxy overwrites `X-Forwarded-Host`. Requests without an
-`Origin` header (curl, SDKs) are unaffected.
+**Backends are closed to browsers too.** Their `ALLOWED_ORIGINS` (compose: `BACKEND_ALLOWED_ORIGINS`)
+is **empty by default = closed**: no CORS headers, and a state-changing request (`POST`, `PUT`,
+`PATCH`, `DELETE`, and a WebSocket handshake) that carries an `Origin` header naming a different
+host than the one it was addressed to gets **403**. Callers that send no `Origin` (the gateway,
+`curl`, the benchmarks, other containers) are unaffected. It used to default to `*`, which let any
+web page open in a browser that could reach a published backend port start a training job or unload
+a model. Only if you call a published backend port from a browser page, list its origins there; `*`
+must be written down and every service logs a warning for it. This is a check against
+browser-borne requests, not authentication: anything that can reach the port and sends no `Origin`
+is served.
 
-**API key.** Optional. With `API_KEY` set, `/v1/*` needs `Authorization: Bearer <key>` and so
-does every state-changing `/api/*` call, except requests the bundled UI itself makes (a
-same-origin browser request). Reads (`GET /api/...`), CORS preflights, `/health` and the pages
-stay open; a wrong or missing key is **401** with `WWW-Authenticate: Bearer`. The check is
-constant-time. This protects an exposed API port; it is not user authentication, because a
-script can forge a browser's headers, and it does not guard `/ws/stt` (browsers cannot send an
-`Authorization` header on a WebSocket; the origin rule applies there instead).
+**Browsers (gateway).** `ALLOWED_ORIGINS` is **empty by default**: the gateway answers its own
+origin only, sends no CORS headers, and refuses a state-changing request (`POST`, `PUT`, `PATCH`,
+`DELETE`) that carries a foreign `Origin` with **403** (`cross_origin_blocked`). "Own origin" means
+the `Origin` matches the `Host` the request was addressed to. List origins to let other pages call
+the API; `*` opens it to any page and is logged as a warning. Behind a reverse proxy that rewrites
+the `Host` header, add the public URL to `TRUSTED_ORIGINS` (the symptom of forgetting it is a 403
+on every button); set `TRUST_PROXY_HEADERS=true` only if the proxy overwrites `X-Forwarded-Host`.
+Requests without an `Origin` header (curl, SDKs) are unaffected.
+
+**Host header (DNS rebinding).** A web page that re-points its own DNS name at the gateway sends
+`Host: evil.example` and `Origin: http://evil.example`, which agree, so the origin rule alone
+cannot stop it. Every request must therefore address a name that belongs to the gateway or it is
+refused with **403** (`host_not_allowed`) before any handler runs; the `/ws/stt` handshake is
+refused the same way, before the upgrade completes (a bare 403 with no body, which a browser reports
+as a failed connection). Accepted without
+configuration: any IP address (`192.168.1.20`, `[::1]`, a Tailscale `100.x`), `localhost`,
+`*.local`, `*.localdomain`, `*.lan`, `*.internal`, `*.home.arpa` and single-label names (`truenas`,
+`frontend-service`). Any other name, such as a real domain in front of a reverse proxy or a
+Tailscale MagicDNS name, goes into **`TRUSTED_HOSTS`** (comma separated, `*.` for a whole domain:
+`TRUSTED_HOSTS=tts.example.com,*.tail1234.ts.net`; the hostnames of `TRUSTED_ORIGINS` count too).
+`ALLOWED_HOSTS=*` switches the check off and reads nothing else. With
+`TRUST_PROXY_HEADERS=true` the name in `X-Forwarded-Host` is the one validated.
+
+**API key.** Optional. With `API_KEY` set, `/v1/*` needs `Authorization: Bearer <key>` and so does
+every state-changing `/api/*` call and the `/ws/stt` upgrade. **There is no exemption for the
+bundled UI**: `Origin`, `Host` and `Sec-Fetch-Site` are exactly what a rebinding page controls, so
+none of them proves who is calling. The UI asks for the key once (a browser prompt) on the first
+`401`, keeps it in `sessionStorage` (this tab only) and sends it on every later request; a refused
+key is dropped and asked for again. Reads (`GET /api/...`), CORS preflights, `/health`, `/providers`
+and the pages stay open; a wrong or missing key is **401** with `WWW-Authenticate: Bearer` (in the
+OpenAI envelope on `/v1`, code `invalid_api_key`). The check is constant-time. `POST /api/auth/check`
+answers `204` when the caller may use the state-changing API and `401` otherwise; the UI calls it
+before opening the live-transcription socket.
+
+Browsers cannot set headers on a WebSocket handshake, so `/ws/stt` takes the key as a subprotocol
+next to the real one: `new WebSocket(url, ["tts-stt.v1", "bearer." + base64url(key)])` (base64url,
+no padding, UTF-8). The gateway echoes back only `tts-stt.v1`, never the credential; a script may
+send `Authorization: Bearer <key>` on the upgrade request instead. A socket without a valid key is
+accepted and immediately closed with code `1008` and reason `A valid API key is required`, so a page
+can tell that from a dead server. The key is a shared secret, not user authentication: everyone who
+has it can do everything, and over plain `http://` it crosses the network unencrypted. Put real
+authentication and TLS in front of a port that untrusted people can reach.
 
 **Limits.** Request bodies larger than `MAX_UPLOAD_MB` (default 512, sized for the UI's
 multi-file training upload) get **413**, as do JSON bodies over 1 MiB; `/v1/audio/transcriptions`
 takes at most 25 MB per file. Text fields for TTS and voice design are capped at `MAX_TTS_CHARS`
-(default 20000, 422 beyond it). Each backend also enforces its own, usually smaller, limit; see
-[Limits per service](#limits-per-service).
+(default **5000**, 422 beyond it): keep it at or below the smallest text limit of the TTS backends
+in use, since Qwen3-TTS and Chatterbox accept 5000 and a larger value only turns the early `422`
+into a `413` from the backend; a Piper-only deployment (backend limit 20000) can raise it. Each
+backend also enforces its own limit; see [Limits per service](#limits-per-service).
+
+**Busy answers (503 + `Retry-After`).** Nothing queues without bound. Per gateway worker process,
+`MAX_CONCURRENT_UPLOADS` (default 4) uploads are forwarded at once, and the next one is refused
+with **503**, `Retry-After: 5` and `error.code: "server_busy"` on `/v1`, before its body is read;
+JSON calls (at most 1 MiB) do not count. `MAX_CONCURRENT_FFMPEG` (default 4) bounds the `ffmpeg`
+conversions behind `/v1/audio/speech` (`mp3`, resampled `pcm`); the next request gets **503** with
+`Retry-After: 2`. The OpenAI SDKs retry a 503 on their own. The model backends bound their queue the
+same way (see [Limits per service](#limits-per-service)): a request that finds no room, or waits
+`ASR_QUEUE_TIMEOUT_S` / `TTS_QUEUE_TIMEOUT_S` (60 s) for its turn, is answered **503** with a
+`Retry-After` instead of hanging. The gateway relays a backend's 503 as a 503 but does not forward the
+backend's own `Retry-After` header, so back off on your own.
 
 ---
 
@@ -164,10 +214,16 @@ deployment default; anything else is passed through as one of *your* voices, e.g
 ffmpeg (asynchronously, killed after 120 s). If ffmpeg is missing the endpoint returns **501**
 naming `wav` as the alternative rather than silently returning a WAV labelled as MP3.
 
-**On `pcm`:** the WAV header is stripped and stereo is mixed down to mono at the backend's **native
-sample rate**, reported in `X-Sample-Rate` (Piper is 22050 Hz). OpenAI's PCM is 24 kHz; a client that
-hard-codes that must read the header, or resample. It is not resampled here so the format does not
-depend on ffmpeg being installed.
+**On `pcm`:** raw 16-bit little-endian mono at **24 kHz**, which is what OpenAI documents and what
+stock clients hard-code. Qwen3-TTS and Chatterbox already produce 24 kHz, so only the WAV header is
+dropped (and stereo mixed down); Piper voices (22050 or 16000 Hz) are resampled with `ffmpeg`, and
+without it the endpoint answers **501** naming `wav`, as it does for `mp3`. `X-Sample-Rate` is
+always `24000`. `wav` keeps the backend's own rate, which its header states.
+
+**Concurrency.** `mp3` and resampled `pcm` each run one `ffmpeg` process; at most
+`MAX_CONCURRENT_FFMPEG` (default 4) per gateway worker run at the same time, and the next request
+gets **503** with `Retry-After: 2` and `error.code: "server_busy"`. `wav` and 24 kHz `pcm` need no
+`ffmpeg` and are not limited by it.
 
 ---
 
@@ -201,15 +257,41 @@ which FastAPI would otherwise answer with `{"detail": …}`:
 |---|---|---|
 | 400, 404, 413, 415, 422 | `invalid_request_error` | `invalid_value`, `unsupported_value`, `file_too_large`, `request_too_large`, `string_above_max_length`, `model_not_found` |
 | 401 | `authentication_error` | `invalid_api_key` (with `WWW-Authenticate: Bearer`) |
-| 403 | `permission_error` | `cross_origin_blocked` |
+| 403 | `permission_error` | `cross_origin_blocked`, `host_not_allowed` |
 | 429 | `rate_limit_error` | — |
-| 5xx | `server_error` | — |
+| 5xx | `server_error` | `server_busy` (503, with `Retry-After`) |
 
 `/api/*` keeps FastAPI's `{"detail": …}`. A backend that fails is reported by name:
 **503** when it cannot be reached, **502** when it answers 200 with something that is not the JSON
-it promised, and any status a backend answers with (400, 409, 413, 422, 503, …) is relayed with its
-own `detail`. Path ids (`job_id`, `voice_id`) are restricted to `[A-Za-z0-9_-]{1,128}`; anything
-else is 422 and never reaches a backend.
+it promised, and any status a backend answers with (400, 409, 413, 422, 503, …) is relayed. Path ids
+(`job_id`, `voice_id`) are restricted to `[A-Za-z0-9_-]{1,128}`; anything else is 422 and never
+reaches a backend.
+
+**Errors do not leak internals, and carry a request id.** A backend's error body and connection
+errors contain file paths, tracebacks and internal URLs, so a client gets a status-appropriate
+sentence plus a request id, and the detail goes to the gateway log under that id:
+
+```jsonc
+{ "detail": "The backend service failed to handle the request (HTTP 500). Request id: 3f9a1c2b7d4e." }
+```
+
+Quote the id to the operator (`docker compose logs frontend-service | grep 3f9a1c2b7d4e`). A backend
+answer in the 4xx range that is one short line of prose (a validation message such as `text is 5001
+characters; the limit is 5000`) still passes through, because the UI shows it; one that contains a
+traceback, a filesystem path or a URL is treated like a 5xx. The backends themselves answer an
+unexpected failure with a generic message and a request id too; the Piper, Qwen3-TTS and Chatterbox
+services also put it in an `X-Request-ID` response header, and the exception text is in their log
+under the same id.
+
+**Statuses worth handling** (from the gateway, or relayed from a backend):
+
+| Status | When |
+|---|---|
+| **401** | `API_KEY` is set and the request did not send it (`WWW-Authenticate: Bearer`) |
+| **403** | a foreign `Origin` on a state-changing request (`cross_origin_blocked`), or a `Host` the gateway does not accept (`host_not_allowed`, fix with `TRUSTED_HOSTS`); on a backend port, a foreign `Origin` |
+| **409** | Piper: an upload named like a built-in voice, or past `PIPER_MAX_CUSTOM_VOICES`; every model service: `/unload` while a request is in flight |
+| **413** | a body, text or upload over a limit (see [Limits per service](#limits-per-service)), including a custom-voice total past `PIPER_MAX_CUSTOM_MB`, a recording longer than `PIPER_ANALYZE_MAX_SECONDS` and a reference clip longer than `QWEN3_TTS_REF_MAX_SECONDS` |
+| **503** | no room: too many uploads or conversions at the gateway, a full or timed-out queue at a model backend, a second Piper voice upload while one is running; always with `Retry-After` when the service itself answers |
 
 ---
 
@@ -346,18 +428,41 @@ gives each its own host variable:
 
 | Service | Upload | Length or text | Host variables |
 |---|---|---|---|
-| gateway | 512 MB body, 1 MiB JSON, 25 MB per `/v1` file | 20000 characters of TTS text | `MAX_UPLOAD_MB`, `MAX_TTS_CHARS` |
+| gateway | 512 MB body, 1 MiB JSON, 25 MB per `/v1` file | 5000 characters of TTS text (`422`) | `MAX_UPLOAD_MB`, `MAX_TTS_CHARS` |
 | stt-service, qwen3-asr, parakeet, canary | 200 MB per file | 7200 s (stt, qwen3-asr) or 1500 s (NeMo) per recording | `ASR_MAX_UPLOAD_MB`, `ASR_MAX_AUDIO_SECONDS`, `NEMO_MAX_AUDIO_S` |
-| piper-tts | 100 MB model upload, 25 MB analysed audio | 20000 characters | `PIPER_MAX_UPLOAD_MB`, `PIPER_MAX_ANALYZE_UPLOAD_MB`, `PIPER_MAX_TEXT_CHARS` |
-| qwen3-tts | 20 MB reference audio | 5000 characters | `QWEN3_TTS_MAX_UPLOAD_MB`, `QWEN3_TTS_MAX_TEXT_CHARS` |
+| piper-tts | 100 MB model upload, 25 MB analysed audio | 20000 characters; 600 s of analysed audio | `PIPER_MAX_UPLOAD_MB`, `PIPER_MAX_ANALYZE_UPLOAD_MB`, `PIPER_MAX_TEXT_CHARS`, `PIPER_ANALYZE_MAX_SECONDS` |
+| piper-tts, uploaded voices | 20 voices, 2048 MB in total | a new voice has 30 s to load and answer a test request | `PIPER_MAX_CUSTOM_VOICES` (0 = no upload), `PIPER_MAX_CUSTOM_MB`, `PIPER_ONNX_VALIDATE_TIMEOUT_S` |
+| qwen3-tts | 20 MB reference audio | 5000 characters; 60 s reference clip | `QWEN3_TTS_MAX_UPLOAD_MB`, `QWEN3_TTS_MAX_TEXT_CHARS`, `QWEN3_TTS_REF_MAX_SECONDS` |
 | chatterbox | 20 MB reference audio | 5000 characters | `CHATTERBOX_MAX_UPLOAD_MB`, `CHATTERBOX_MAX_TEXT_CHARS` |
 | piper-training | 500 MB per `/train` request | 1000 characters per segment | `TRAINING_MAX_UPLOAD_MB`, `TRAINING_MAX_TEXT_CHARS` |
 
-The gateway accepts more text than Qwen3-TTS and Chatterbox, so a long text can pass the gateway
-and be refused by the backend; its 413 is relayed with the backend's own message. Chatterbox used
-to cut such audio off at about 40 s without saying so. The upload limits bound what a service
-copies to disk and decodes; a multipart body is already spooled by the framework before a handler
-runs, so put a reverse-proxy limit in front if wire bytes matter.
+The gateway's `MAX_TTS_CHARS` now defaults to the 5000 of Qwen3-TTS and Chatterbox, so a text that
+is too long for them is refused early and clearly (`422`) instead of after a round trip; with
+Piper alone (20000) it can be raised, and if it is raised past a backend's own limit the backend's
+`413` is relayed with its message. Chatterbox used to cut such audio off at about 40 s without
+saying so. The upload limits bound what a service copies to disk and decodes: they are counted on
+the bytes that actually arrive (a chunked upload or a lying `Content-Length` does not get past
+them), and a duration limit is checked on the decoded audio, because a few MB of silent FLAC or
+low-bitrate Opus decode to hours. Put a reverse-proxy limit in front if wire bytes matter.
+
+### Concurrency and queues
+
+A model is shared by every caller, so each service runs a fixed number of requests at once, lets a
+bounded number wait, and turns the rest away with **503** and `Retry-After` rather than piling
+them up until every client times out:
+
+| Service | Runs at once | May wait | Waits at most | Host variables |
+|---|---|---|---|---|
+| gateway (per worker process) | 4 uploads, 4 `ffmpeg` conversions | nobody | not at all | `MAX_CONCURRENT_UPLOADS`, `MAX_CONCURRENT_FFMPEG` |
+| qwen3-asr, parakeet, canary | 1 | 4 x the concurrency (`0` = nobody waits) | 60 s | `ASR_MAX_CONCURRENCY`, `ASR_MAX_QUEUE`, `ASR_QUEUE_TIMEOUT_S` |
+| qwen3-tts, chatterbox | 1 | 4 x the concurrency (`0` = nobody waits) | 60 s | `TTS_MAX_CONCURRENCY`, `TTS_MAX_QUEUE`, `TTS_QUEUE_TIMEOUT_S` |
+| piper-tts | half the CPU cores | any number, for `PIPER_TIMEOUT_S` | 60 s | `PIPER_MAX_CONCURRENCY`, `PIPER_TIMEOUT_S` |
+
+For the ASR and TTS services at most `MAX_CONCURRENCY + MAX_QUEUE` requests are admitted; the next one
+is refused at once, before any work is done, and one that waited its timeout without getting its turn
+is refused the same way. The `*_MAX_QUEUE` variables are empty by default, which means four times the
+concurrency (4 with the default of 1). A synthesis that itself runs longer than `PIPER_TIMEOUT_S` is
+killed and answered `504`.
 
 ---
 

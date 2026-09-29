@@ -156,7 +156,9 @@ case "$mode" in
     printf 'partial' > "$out"
     exit 3 ;;
   hang)
-    echo $$ > "$FAKE_PIPER_DIR/pid"
+    # Temp file + rename: a poller must never see `pid` created but still empty.
+    echo $$ > "$FAKE_PIPER_DIR/pid.tmp"
+    mv -f "$FAKE_PIPER_DIR/pid.tmp" "$FAKE_PIPER_DIR/pid"
     printf 'partial' > "$out"
     exec sleep 60 ;;
   slow)
@@ -202,8 +204,12 @@ class FakePiper:
         return [tuple(line.split("\t", 1)) for line in log.read_text().splitlines()]
 
     def pid(self) -> int | None:
-        pid_file = self.dir / "pid"
-        return int(pid_file.read_text()) if pid_file.exists() else None
+        """The hung fake's pid; None until it has published it (a missing or empty file is "not yet")."""
+        try:
+            text = (self.dir / "pid").read_text().strip()
+        except OSError:
+            return None
+        return int(text) if text.isdigit() else None
 
     def peak_concurrency(self) -> int:
         log = self.dir / "concurrency.log"

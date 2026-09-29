@@ -203,12 +203,15 @@ def test_free_text_answers_survive_yaml_and_compose_interpolation():
     """An API key may hold quotes, backslashes, # and $: YAML must not mangle it, Compose must not expand it."""
     key = 'p"a\\ss$word#with: {braces} and $HOME and ${X}'
     origins = "https://voice.example.com,https://other.example.com"
-    config = compose_config(rc.render(answers(api_key=key, trusted_origins=origins, allowed_origins=origins),
+    hosts = "voice.example.com,*.tail1234.ts.net"
+    config = compose_config(rc.render(answers(api_key=key, trusted_origins=origins, allowed_origins=origins,
+                                              trusted_hosts=hosts),
                                       questions=questions()))
     env = config["services"]["frontend-service"]["environment"]
     # `docker compose config` prints a literal $ as $$ so that its output can be fed back in.
     assert env["API_KEY"].replace("$$", "$") == key
     assert env["TRUSTED_ORIGINS"] == origins and env["ALLOWED_ORIGINS"] == origins
+    assert env["TRUSTED_HOSTS"] == hosts
 
 
 def test_free_text_survives_without_the_docker_cli_too():
@@ -390,6 +393,7 @@ def test_the_custom_app_file_settings_and_the_form_agree_on_the_defaults_they_sh
     assert str(by_name["model_ttl"]) == stt["MODEL_TTL"] == stt["STT_MODEL_TTL"]
     assert by_name["allowed_origins"] == frontend["ALLOWED_ORIGINS"]
     assert by_name["trusted_origins"] == frontend["TRUSTED_ORIGINS"]
+    assert by_name["trusted_hosts"] == frontend["TRUSTED_HOSTS"]
     assert by_name["api_key"] == frontend["API_KEY"]
     assert by_name["image_registry"] == "ghcr.io/steffenhebestreit"
     assert by_name["frontend_port"] == 3000
