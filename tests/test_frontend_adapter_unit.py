@@ -9,6 +9,8 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from frontend_loader import install_stub, load_frontend_app, wav_bytes
+
 
 @pytest.fixture(scope="session")
 def frontend_module():
@@ -1274,3 +1276,347 @@ def test_connect_phase_stays_short():
         "on a bridge network resolve in milliseconds, and a long one here is "
         "indistinguishable from the bare-float bug this replaced"
     )
+
+
+# --- path parameters ----------------------------------------------------------
+#
+# job_id / voice_id are interpolated into the upstream URL after Starlette has
+# percent-DECODED them: `a%3Fb=1` reached the training service as the query
+# string of `/model/a`, `x%23y` as a fragment, and `%2e%2e` as `..` (DELETE
+# /model/.. is DELETE /). Nothing a backend generates contains those characters.
+
+RESOURCE_ROUTES = [
+    ("DELETE", "/api/training/model/{}"),
+    ("DELETE", "/api/training/job/{}"),
+    ("GET", "/api/training/status/{}"),
+    ("GET", "/api/training/download/{}"),
+    ("POST", "/api/training/export/{}"),
+    ("DELETE", "/api/providers/piper/custom-voices/{}"),
+    ("DELETE", "/api/providers/qwen3/saved-voices/{}"),
+    ("POST", "/api/providers/qwen3/saved-voices/{}/tts"),
+]
+
+
+def _echo_backend(method, url, kwargs):
+    return {"status": "success"}
+
+
+@pytest.mark.parametrize("method,template", RESOURCE_ROUTES)
+@pytest.mark.parametrize("bad", [
+    "a%3Fb=1", "x%23y", "%2e%2e", "..", ".", "a%20b", "a%2Fb", "a%5Cb", "a;b",
+    "a%00b", "a%0d%0ab", "a" * 129,
+])
+def test_hostile_resource_ids_never_reach_a_backend(monkeypatch, method, template, bad):
+    module = load_frontend_app()
+    stub = install_stub(monkeypatch, module, _echo_backend)
+    r = TestClient(module.app).request(method, template.format(bad))
+    # 422 for an id the route matches and rejects; 404/405 where the client has
+    # already normalised the path (`.` / `..` segments) onto some other route.
+    assert r.status_code in (404, 405, 422), (r.status_code, r.text)
+    assert stub.calls == [], f"{method} {template.format(bad)} was forwarded: {stub.calls}"
+
+
+@pytest.mark.parametrize("method,template", RESOURCE_ROUTES)
+@pytest.mark.parametrize("good", [
+    "job-1", "de_DE-thorsten-medium", "3f2b8c1e-5d4a-4f0e-9b7a-1c2d3e4f5a6b", "A" * 128,
+])
+def test_ids_the_backends_generate_still_pass(monkeypatch, method, template, good):
+    module = load_frontend_app()
+
+    def backend(m, url, kwargs):
+        if url.endswith("/tts"):
+            return httpx.Response(200, content=wav_bytes(), headers={"content-type": "audio/wav"})
+        return {"status": "success", "deployment": {}}
+
+    stub = install_stub(monkeypatch, module, backend)
+    if template.endswith("/tts"):
+        r = TestClient(module.app).post(template.format(good), data={"text": "hi"})
+    else:
+        r = TestClient(module.app).request(method, template.format(good))
+    assert r.status_code == 200, (r.status_code, r.text)
+    assert len(stub.calls) == 1
+    assert good in stub.calls[0][1]
+
+
+# --- a 200 that is not the JSON the gateway expects ----------------------------
+#
+# ~20 endpoints called `response.json()` on a successful upstream reply with
+# nothing around it, so a proxy's HTML error page, a truncated body or a bare
+# string became an unhandled JSONDecodeError: a 500 that does not even name the
+# service at fault.
+
+JSON_ENDPOINTS = [
+    # (method, path, request kwargs, needs a JSON object from the backend)
+    ("GET", "/api/providers/piper/voices", {}, True),
+    ("GET", "/api/providers/qwen3/voices", {}, True),
+    ("GET", "/api/providers/qwen3/models", {}, True),
+    ("POST", "/api/providers/qwen3/models/select", {"json": {"model": "m"}}, True),
+    ("GET", "/api/providers/qwen3/status", {}, True),
+    ("GET", "/api/providers/qwen3/saved-voices", {}, True),
+    ("GET", "/api/providers/piper/custom-voices", {}, True),
+    ("POST", "/api/providers/qwen3/saved-voices", {"data": {"name": "x"}}, False),
+    ("DELETE", "/api/providers/qwen3/saved-voices/v-1", {}, False),
+    ("DELETE", "/api/providers/piper/custom-voices/v-1", {}, False),
+    ("POST", "/api/stt", {"data": {"provider": "whisper"},
+                          "files": {"audio": ("a.wav", b"RIFF", "audio/wav")}}, True),
+    ("GET", "/api/training/deployment-targets", {}, False),
+    ("GET", "/api/training/jobs", {}, False),
+    ("GET", "/api/training/status/job-1", {}, True),
+    ("POST", "/api/training/train", {"data": {"model_name": "demo"}}, False),
+    ("POST", "/api/training/train-from-dataset", {"data": {"model_name": "demo"}}, False),
+    ("POST", "/api/training/resume", {"data": {"model_name": "demo"}}, False),
+    ("POST", "/api/training/export/job-1", {"data": {"model_name": "demo"}}, True),
+    ("DELETE", "/api/training/model/job-1", {}, False),
+    ("DELETE", "/api/training/job/job-1", {}, False),
+]
+
+
+@pytest.mark.parametrize("method,path,kwargs,_needs_object", JSON_ENDPOINTS,
+                         ids=[f"{m} {p}" for m, p, _, _ in JSON_ENDPOINTS])
+def test_non_json_upstream_success_is_a_502_naming_the_service(
+        monkeypatch, method, path, kwargs, _needs_object):
+    module = load_frontend_app()
+    install_stub(monkeypatch, module, lambda m, u, k: httpx.Response(
+        200, content=b"<html>502 from the proxy</html>", headers={"content-type": "text/html"}))
+    r = TestClient(module.app, raise_server_exceptions=False).request(method, path, **kwargs)
+    assert r.status_code == 502, (r.status_code, r.text)
+    assert "not JSON" in r.json()["detail"]
+
+
+@pytest.mark.parametrize("method,path,kwargs,needs_object",
+                         [entry for entry in JSON_ENDPOINTS if entry[3]],
+                         ids=[f"{m} {p}" for m, p, _, n in JSON_ENDPOINTS if n])
+def test_json_of_the_wrong_shape_is_a_502_not_a_crash(monkeypatch, method, path, kwargs, needs_object):
+    module = load_frontend_app()
+    install_stub(monkeypatch, module, lambda m, u, k: ["not", "an", "object"])
+    r = TestClient(module.app, raise_server_exceptions=False).request(method, path, **kwargs)
+    assert r.status_code == 502, (r.status_code, r.text)
+    assert "unexpected response" in r.json()["detail"]
+
+
+def test_upstream_errors_still_pass_through_with_their_own_status(monkeypatch):
+    """The new parse step must not swallow the existing >=400 handling."""
+    module = load_frontend_app()
+    install_stub(monkeypatch, module, lambda m, u, k: httpx.Response(404, json={"detail": "no such job"}))
+    r = TestClient(module.app).delete("/api/training/job/job-1")
+    assert r.status_code == 404 and r.json() == {"detail": "no such job"}
+
+
+@pytest.mark.parametrize("body,expected_detail", [
+    (["ok"], ["ok"]),
+    ("done", "done"),
+    (42, 42),
+])
+def test_unload_tolerates_a_non_object_json_reply(monkeypatch, body, expected_detail):
+    """`{"provider": ..., **body}` raised TypeError for anything but an object, so
+    a backend that answered with a bare value turned a successful unload into a 500."""
+    module = load_frontend_app()
+    install_stub(monkeypatch, module, lambda m, u, k: httpx.Response(200, json=body))
+    r = TestClient(module.app, raise_server_exceptions=False).post("/api/providers/qwen3/unload")
+    assert r.status_code == 200
+    assert r.json() == {"provider": "qwen3", "detail": expected_detail}
+
+
+def test_unload_keeps_the_upstream_status_and_object_body(monkeypatch):
+    module = load_frontend_app()
+    install_stub(monkeypatch, module, lambda m, u, k: httpx.Response(
+        409, json={"unloaded": False, "reason": "busy", "in_flight": 2}))
+    r = TestClient(module.app).post("/api/providers/qwen3/unload")
+    assert r.status_code == 409
+    assert r.json() == {"provider": "qwen3", "unloaded": False, "reason": "busy", "in_flight": 2}
+
+
+def test_unload_with_a_plain_text_reply(monkeypatch):
+    module = load_frontend_app()
+    install_stub(monkeypatch, module, lambda m, u, k: httpx.Response(200, content=b"ok"))
+    r = TestClient(module.app).post("/api/providers/qwen3/unload")
+    assert r.status_code == 200 and r.json() == {"provider": "qwen3", "detail": "ok"}
+
+
+def test_stt_adapter_survives_junk_in_numeric_fields(monkeypatch):
+    module = load_frontend_app()
+    payload = {"text": "hi", "duration": "n/a",
+               "segments": [{"start": "x", "end": "2.5", "text": "hi"}, "not a segment"]}
+    install_stub(monkeypatch, module, lambda m, u, k: payload)
+    r = TestClient(module.app).post(
+        "/api/stt", data={"provider": "whisper"},
+        files={"audio": ("a.wav", b"RIFF", "audio/wav")})
+    assert r.status_code == 200
+    assert r.json()["duration"] is None
+    assert r.json()["segments"] == [{"start": 0.0, "end": 2.5, "text": "hi"}]
+
+
+def test_catalog_normalizers_tolerate_the_wrong_inner_shape(frontend_module):
+    assert frontend_module._normalize_piper_voice_catalog({"voices": []}) == []
+    assert frontend_module._normalize_piper_voice_catalog({"voices": {"a": "junk"}}) == []
+    assert frontend_module._normalize_qwen3_voice_catalog({"speakers": "Vivian"}) == []
+    assert frontend_module._normalize_qwen3_model_catalog({"models": {"m": None}}) == []
+
+
+# --- Piper "auto" -------------------------------------------------------------
+#
+# "auto" means the service decides the language. The gateway must not fill one in
+# itself (the piper service owns PIPER_DEFAULT_LANGUAGE), and /api/tts and
+# /v1/audio/speech must agree on every spelling of it.
+
+
+def _piper_bodies(monkeypatch, language):
+    module = load_frontend_app()
+    stub = install_stub(monkeypatch, module, lambda m, u, k: httpx.Response(
+        200, content=wav_bytes(), headers={"content-type": "audio/wav"}))
+    client = TestClient(module.app)
+
+    stub.calls.clear()
+    client.post("/api/tts", json={"provider": "piper", "text": "Guten Tag", "language": language})
+    via_api = stub.calls[-1][2]["json"]
+
+    stub.calls.clear()
+    client.post("/v1/audio/speech", json={
+        "input": "Guten Tag", "response_format": "wav", "language": language})
+    via_v1 = stub.calls[-1][2]["json"]
+    return via_api, via_v1
+
+
+@pytest.mark.parametrize("language", ["auto", "AUTO", " Auto ", ""])
+def test_piper_auto_is_not_replaced_by_a_gateway_default(monkeypatch, language):
+    via_api, via_v1 = _piper_bodies(monkeypatch, language)
+    for body in (via_api, via_v1):
+        assert "language" not in body, f"gateway sent language={body.get('language')!r} for auto"
+    assert via_api == via_v1
+
+
+@pytest.mark.parametrize("language", ["de", "de_DE", "en_US"])
+def test_explicit_piper_language_is_forwarded_the_same_by_both_routes(monkeypatch, language):
+    via_api, via_v1 = _piper_bodies(monkeypatch, language)
+    assert via_api["language"] == via_v1["language"] == language
+    assert via_api == via_v1
+
+
+def test_absent_language_on_v1_is_auto_too(monkeypatch):
+    module = load_frontend_app()
+    stub = install_stub(monkeypatch, module, lambda m, u, k: httpx.Response(
+        200, content=wav_bytes(), headers={"content-type": "audio/wav"}))
+    TestClient(module.app).post("/v1/audio/speech", json={"input": "Hallo", "response_format": "wav"})
+    assert "language" not in stub.calls[-1][2]["json"]
+
+
+# --- the page's registry element ------------------------------------------------
+
+
+def _registry_element(html):
+    import re
+    match = re.search(
+        r'<script type="application/json" id="provider-registry-data">(.*?)</script>', html, re.S)
+    assert match, "the registry element is missing from the page"
+    return match.group(1)
+
+
+def test_registry_in_the_page_matches_the_providers_endpoint_in_order(monkeypatch):
+    import json
+    module = load_frontend_app({"ENABLE_WHISPER_CPP": "true", "ENABLE_PARAKEET_ASR": "true"})
+    client = TestClient(module.app)
+    embedded = json.loads(_registry_element(client.get("/").text))
+    served = client.get("/providers").json()
+    assert embedded == served
+    # The UI builds its selectors from Object.entries(): order is behaviour.
+    assert list(embedded["providers"]) == list(served["providers"]) == list(
+        module.PROVIDER_REGISTRY["providers"])
+
+
+def test_registry_strings_cannot_close_the_script_element(monkeypatch):
+    """PROVIDER_REGISTRY_JSON is operator input; `json.dumps(...) | safe` let a
+    `</script>` in any string inject markup into the page."""
+    import json
+    evil = "</script><script>alert(document.domain)</script>"
+    module = load_frontend_app({
+        "PROVIDER_REGISTRY_JSON": json.dumps({
+            "providers": {"evil": {"kind": "stt", "display_name": evil}},
+            "ui": {"copy": {"app_subtitle": evil}},
+        }),
+        "APP_VERSION": 'v1"</script><script>alert(1)</script>',
+    })
+    client = TestClient(module.app)
+    page = client.get("/").text
+    baseline = TestClient(load_frontend_app().app).get("/").text
+
+    assert "<script>alert" not in page
+    assert page.count("<script") == baseline.count("<script")
+    assert page.count("</script>") == baseline.count("</script>")
+
+    embedded = json.loads(_registry_element(page))
+    assert embedded["providers"]["evil"]["display_name"] == evil, "the value must round-trip intact"
+    assert embedded["ui"]["copy"]["app_subtitle"] == evil
+
+
+# --- entrypoint -----------------------------------------------------------------
+
+
+def _run_entrypoint(tmp_path, workers, *extra):
+    import subprocess
+
+    out = tmp_path / "argv"
+    fake = tmp_path / "bin"
+    fake.mkdir(exist_ok=True)
+    python = fake / "python"
+    python.write_text('#!/bin/sh\necho "$$" > "$OUT.pid"\nfor a in "$@"; do echo "$a"; done > "$OUT"\n')
+    python.chmod(0o755)
+    env = {"PATH": f"{fake}:/usr/bin:/bin", "OUT": str(out)}
+    if workers is not None:
+        env["FRONTEND_WORKERS"] = workers
+    script = Path(__file__).resolve().parents[1] / "frontend-service" / "entrypoint.sh"
+    proc = subprocess.Popen(["sh", str(script), *extra], env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    _stdout, stderr = proc.communicate(timeout=20)
+    argv = out.read_text().split()
+    return proc.pid, int((tmp_path / "argv.pid").read_text()), argv, stderr
+
+
+def _workers_of(argv):
+    return argv[argv.index("--workers") + 1]
+
+
+def test_entrypoint_defaults_to_two_workers(tmp_path):
+    _, _, argv, stderr = _run_entrypoint(tmp_path, None)
+    assert _workers_of(argv) == "2" and stderr == ""
+    assert argv[:3] == ["-m", "uvicorn", "app:app"]
+    assert "--proxy-headers" in argv and "--no-access-log" in argv
+
+
+def test_entrypoint_honours_frontend_workers(tmp_path):
+    _, _, argv, _ = _run_entrypoint(tmp_path, "1")
+    assert _workers_of(argv) == "1"
+    _, _, argv, _ = _run_entrypoint(tmp_path, "5")
+    assert _workers_of(argv) == "5"
+
+
+@pytest.mark.parametrize("bad", ["", "0", "-2", "many", "1.5", "00"])
+def test_entrypoint_falls_back_on_a_bad_worker_count(tmp_path, bad):
+    _, _, argv, stderr = _run_entrypoint(tmp_path, bad)
+    if bad == "":
+        assert _workers_of(argv) == "2"
+    else:
+        assert _workers_of(argv) == "2"
+        assert "FRONTEND_WORKERS" in stderr
+
+
+def test_entrypoint_execs_so_signals_reach_uvicorn(tmp_path):
+    shell_pid, python_pid, _, _ = _run_entrypoint(tmp_path, "2")
+    assert python_pid == shell_pid, "the server runs as a child of the shell, so SIGTERM stops only the shell"
+
+
+def test_entrypoint_passes_extra_arguments_through(tmp_path):
+    _, _, argv, _ = _run_entrypoint(tmp_path, "2", "--log-level", "debug")
+    assert argv[-2:] == ["--log-level", "debug"]
+
+
+def test_dockerfile_ships_and_runs_the_entrypoint():
+    import re
+
+    service = Path(__file__).resolve().parents[1] / "frontend-service"
+    dockerfile = (service / "Dockerfile").read_text(encoding="utf-8")
+    assert re.search(r"^FROM python:3\.12-slim\b", dockerfile, re.M)
+    copied = re.findall(r"^COPY\s+(\S+)\s", dockerfile, re.M)
+    assert "entrypoint.sh" in copied
+    for source in copied:
+        assert (service / source).exists(), f"COPY {source}: not in the build context"
+    assert re.search(r'^CMD \["sh", "/app/entrypoint\.sh"\]', dockerfile, re.M)

@@ -4,7 +4,8 @@ Drives a real Chromium via Playwright with fake-media-device flags so
 getUserMedia yields a looping German WAV instead of hardware audio, clicks
 the Live Transcription button, and asserts that partial/final transcripts
 appear. Requires a running frontend + whisper stack and the FAKE_MIC_WAV
-file; skips otherwise.
+file; skips otherwise. (The page-level behaviour of the live UI against a
+scripted socket, which needs no stack, is in test_frontend_ui_browser.py.)
 
 Run:
     FRONTEND_URL=http://localhost:3000 FAKE_MIC_WAV=/path/german.wav \
@@ -39,15 +40,18 @@ def test_live_mic_transcription_in_browser():
     console_errors: list[str] = []
 
     with playwright_sync.sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--use-fake-ui-for-media-stream",
-                "--use-fake-device-for-media-stream",
-                f"--use-file-for-fake-audio-capture={FAKE_MIC_WAV}",
-                "--autoplay-policy=no-user-gesture-required",
-            ],
-        )
+        try:
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--use-fake-ui-for-media-stream",
+                    "--use-fake-device-for-media-stream",
+                    f"--use-file-for-fake-audio-capture={FAKE_MIC_WAV}",
+                    "--autoplay-policy=no-user-gesture-required",
+                ],
+            )
+        except Exception as exc:  # browser binary missing or not launchable here
+            pytest.skip(f"chromium is not available: {exc}")
         page = browser.new_page()
         page.on("pageerror", lambda err: console_errors.append(str(err)))
         page.on(

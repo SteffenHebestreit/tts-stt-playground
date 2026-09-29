@@ -8,7 +8,9 @@ is that check; the rest guard the contract details that clients branch on.
 Field names and defaults are from the OpenAI OpenAPI spec (info.version 2.3.0).
 """
 
+import asyncio
 import json
+import os
 import struct
 import sys
 from importlib.util import module_from_spec, spec_from_file_location
@@ -17,6 +19,8 @@ from pathlib import Path
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+
+from frontend_loader import asgi_client, install_stub, load_frontend_app, wav_bytes
 
 REPO = Path(__file__).resolve().parents[1]
 SERVICE_DIR = REPO / "frontend-service"
@@ -512,19 +516,36 @@ def test_api_namespace_is_untouched(whisper_app, monkeypatch):
 def test_speech_mp3_is_the_default_format(whisper_app, monkeypatch):
     """mp3 is the spec default, so a client sending no response_format gets it.
 
-    Skipped where ffmpeg is absent: there the endpoint correctly returns a
-    documented 501 pointing at wav, which is asserted separately below.
+    The transcoder is replaced rather than skipped when ffmpeg is absent: this
+    used to branch on `shutil.which("ffmpeg")`, so on a CI image without it the
+    success path never ran at all, and on one with it the test needed a real
+    encoder and a decodable WAV.
     """
-    import shutil
+    received = []
+
+    async def fake_transcoder(wav):
+        received.append(wav)
+        return b"ID3-transcoded"
+
+    monkeypatch.setattr(whisper_app.openai_router, "_wav_to_mp3", fake_transcoder)
     r = _client(whisper_app, monkeypatch).post(
         "/v1/audio/speech",
         json={"model": "tts-1", "voice": "alloy", "input": "Guten Tag"})
-    if shutil.which("ffmpeg"):
-        assert r.status_code == 200
-        assert r.headers["content-type"] == "audio/mpeg"
-    else:
-        assert r.status_code == 501
-        assert r.json()["error"]["param"] == "response_format"
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "audio/mpeg"
+    assert r.content == b"ID3-transcoded"
+    assert received and received[0].startswith(b"RIFF"), "the backend's WAV is what gets transcoded"
+
+
+def test_speech_mp3_without_a_transcoder_is_a_documented_501(whisper_app, monkeypatch):
+    async def unavailable(wav):
+        return None
+
+    monkeypatch.setattr(whisper_app.openai_router, "_wav_to_mp3", unavailable)
+    r = _client(whisper_app, monkeypatch).post(
+        "/v1/audio/speech", json={"model": "tts-1", "input": "Guten Tag"})
+    assert r.status_code == 501
+    assert r.json()["error"]["param"] == "response_format"
 
 
 # --- registry truthfulness ---------------------------------------------------
@@ -582,3 +603,288 @@ def test_known_stub_providers_do_not_claim_detection(full_registry_app):
             assert providers[pid]["language_detect"] is False, (
                 f"{pid}'s /detect_language returns null; it must not claim detection"
             )
+
+
+# --- ffmpeg: asynchronous, bounded, and absent-tolerant ------------------------
+#
+# `_wav_to_mp3` used `subprocess.run` inside an `async def`. mp3 is the DEFAULT
+# format, so every default request froze the whole worker for the length of the
+# encode: /health, the /ws/stt relay and every other request queued behind it.
+# These use a stand-in `ffmpeg` on PATH so the real subprocess path runs.
+
+
+def _fake_ffmpeg(directory, body: str):
+    script = directory / "ffmpeg"
+    script.write_text("#!/bin/sh\n" + body + "\n")
+    script.chmod(0o755)
+    return script
+
+
+def _path_with(monkeypatch, directory):
+    monkeypatch.setenv("PATH", f"{directory}{os.pathsep}{os.environ.get('PATH', '')}")
+
+
+def test_mp3_transcode_does_not_block_the_event_loop(tmp_path, monkeypatch):
+    _fake_ffmpeg(tmp_path, "cat >/dev/null; sleep 0.5; printf 'ID3-real-subprocess'")
+    _path_with(monkeypatch, tmp_path)
+    module = load_frontend_app()
+    install_stub(monkeypatch, module, lambda m, u, k: httpx.Response(
+        200, content=wav_bytes(), headers={"content-type": "audio/wav"}))
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        worst_gap = 0.0
+
+        async def heartbeat():
+            nonlocal worst_gap
+            last = loop.time()
+            while True:
+                await asyncio.sleep(0.01)
+                now = loop.time()
+                worst_gap = max(worst_gap, now - last)
+                last = now
+
+        beat = asyncio.create_task(heartbeat())
+        await asyncio.sleep(0.05)              # let it take its first reading
+        async with asgi_client(module) as client:
+            response = await client.post("/v1/audio/speech", json={"input": "Guten Tag"})
+        # One more reading after the request: a stall shows up as the gap that ends
+        # at the first tick following it, so the heartbeat must get to take one.
+        await asyncio.sleep(0.05)
+        beat.cancel()
+        return response, worst_gap
+
+    response, worst_gap = asyncio.run(run())
+    assert response.status_code == 200
+    assert response.content == b"ID3-real-subprocess"
+    assert worst_gap < 0.25, (
+        f"the event loop was frozen for {worst_gap:.2f}s while ffmpeg ran; "
+        "nothing else on the worker can be served in that time"
+    )
+
+
+def test_missing_ffmpeg_returns_none_instead_of_raising(tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", str(tmp_path))          # an empty directory
+    module = load_frontend_app()
+    assert asyncio.run(module.openai_router._wav_to_mp3(wav_bytes())) is None
+
+
+def test_failing_ffmpeg_returns_none(tmp_path, monkeypatch):
+    _fake_ffmpeg(tmp_path, "cat >/dev/null; echo 'invalid data' >&2; exit 1")
+    _path_with(monkeypatch, tmp_path)
+    module = load_frontend_app()
+    assert asyncio.run(module.openai_router._wav_to_mp3(wav_bytes())) is None
+
+
+def test_hung_ffmpeg_is_killed_at_the_timeout(tmp_path, monkeypatch):
+    _fake_ffmpeg(tmp_path, "cat >/dev/null; exec sleep 3")
+    _path_with(monkeypatch, tmp_path)
+    module = load_frontend_app()
+    monkeypatch.setattr(module.openai_router, "FFMPEG_TIMEOUT_S", 0.3)
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        result = await module.openai_router._wav_to_mp3(wav_bytes())
+        return result, loop.time() - started
+
+    result, elapsed = asyncio.run(run())
+    assert result is None
+    assert elapsed < 2.0, "the timeout did not fire"
+
+
+# --- speech: pcm ---------------------------------------------------------------
+
+
+def _speech_app(monkeypatch, wav):
+    module = load_frontend_app()
+    install_stub(monkeypatch, module, lambda m, u, k: httpx.Response(
+        200, content=wav, headers={"content-type": "audio/wav"}))
+    return TestClient(module.app)
+
+
+def test_pcm_is_the_wav_without_its_header(monkeypatch):
+    samples = struct.pack("<hhh", 1, -2, 300)
+    client = _speech_app(monkeypatch, wav_bytes(samples, rate=22050))
+    r = client.post("/v1/audio/speech", json={"input": "hi", "response_format": "pcm"})
+    assert r.status_code == 200
+    assert r.content == samples
+    assert r.headers["content-type"] == "audio/pcm"
+    # raw samples carry no rate; it is not resampled, so the caller has to be told
+    assert r.headers["x-sample-rate"] == "22050"
+    assert r.headers["x-provider"] == "piper"
+
+
+def test_pcm_downmixes_to_mono(monkeypatch):
+    stereo = struct.pack("<hhhh", 100, 300, -50, 50)          # two frames
+    client = _speech_app(monkeypatch, wav_bytes(stereo, rate=24000, channels=2))
+    r = client.post("/v1/audio/speech", json={"input": "hi", "response_format": "pcm"})
+    assert r.status_code == 200
+    assert struct.unpack("<hh", r.content) == (200, 0)
+    assert r.headers["x-sample-rate"] == "24000"
+
+
+@pytest.mark.parametrize("wav", [
+    wav_bytes(b"\x00" * 6, width=3),          # 24-bit
+    b"definitely not a wav file",
+])
+def test_pcm_from_audio_that_is_not_16_bit_wav_is_a_502_envelope(monkeypatch, wav):
+    client = _speech_app(monkeypatch, wav)
+    r = client.post("/v1/audio/speech", json={"input": "hi", "response_format": "pcm"})
+    assert r.status_code == 502
+    assert set(r.json()["error"]) == {"message", "type", "param", "code"}
+
+
+def test_other_speech_formats_are_still_refused(monkeypatch):
+    client = _speech_app(monkeypatch, wav_bytes())
+    for fmt in ("opus", "aac", "flac"):
+        r = client.post("/v1/audio/speech", json={"input": "hi", "response_format": fmt})
+        assert r.status_code == 400 and r.json()["error"]["code"] == "unsupported_value", fmt
+
+
+# --- transcription: verbose_json, srt, vtt -------------------------------------
+
+NATIVE_PAYLOAD = {
+    "text": "Guten Tag zusammen",
+    "language": "de",
+    "duration": 3.5,
+    "segments": [
+        {"start": 0.0, "end": 1.5, "text": "Guten Tag", "avg_logprob": -0.25, "no_speech_prob": 0.01},
+        {"start": 1.5, "end": 3.5, "text": " zusammen"},
+    ],
+}
+
+
+def _stt_client(monkeypatch, payload, env=None, capture=None):
+    module = load_frontend_app(env)
+
+    def handler(method, url, kwargs):
+        if capture is not None:
+            capture.append((url, kwargs))
+        return payload
+
+    install_stub(monkeypatch, module, handler)
+    return TestClient(module.app)
+
+
+def _transcribe_fmt(client, fmt, **data):
+    return client.post("/v1/audio/transcriptions",
+                       data={"model": "whisper-1", "response_format": fmt, **data},
+                       files={"file": ("a.wav", wav_bytes(), "audio/wav")})
+
+
+def test_verbose_json_matches_the_specs_required_fields(monkeypatch):
+    r = _transcribe_fmt(_stt_client(monkeypatch, NATIVE_PAYLOAD), "verbose_json", temperature="0.2")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("application/json")
+    body = r.json()
+    # CreateTranscriptionResponseVerboseJson.required
+    assert body["language"] == "de"
+    assert body["duration"] == 3.5
+    assert body["text"] == "Guten Tag zusammen"
+    assert body["task"] == "transcribe"
+    # TranscriptionSegment.required - openai-python validates every one of these
+    required = {"id", "seek", "start", "end", "text", "tokens", "temperature",
+                "avg_logprob", "compression_ratio", "no_speech_prob"}
+    assert [seg["id"] for seg in body["segments"]] == [0, 1]
+    for seg in body["segments"]:
+        assert set(seg) == required
+    first, second = body["segments"]
+    assert (first["start"], first["end"], first["text"]) == (0.0, 1.5, "Guten Tag")
+    assert first["avg_logprob"] == -0.25 and first["no_speech_prob"] == 0.01
+    assert second["text"] == "zusammen", "leading whitespace is trimmed"
+    assert first["temperature"] == 0.2
+
+
+def test_srt_output_is_exact(monkeypatch):
+    r = _transcribe_fmt(_stt_client(monkeypatch, NATIVE_PAYLOAD), "srt")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/plain")
+    assert r.text == (
+        "1\n00:00:00,000 --> 00:00:01,500\nGuten Tag\n"
+        "\n"
+        "2\n00:00:01,500 --> 00:00:03,500\nzusammen\n"
+    )
+
+
+def test_vtt_output_is_exact(monkeypatch):
+    r = _transcribe_fmt(_stt_client(monkeypatch, NATIVE_PAYLOAD), "vtt")
+    assert r.status_code == 200
+    assert r.text == (
+        "WEBVTT\n\n"
+        "00:00:00.000 --> 00:00:01.500\nGuten Tag\n"
+        "\n"
+        "00:00:01.500 --> 00:00:03.500\nzusammen\n"
+    )
+
+
+def test_a_backend_without_segments_gets_one_spanning_segment(monkeypatch):
+    payload = {"text": "hallo welt", "duration": 2.25}
+    client = _stt_client(monkeypatch, payload)
+    body = _transcribe_fmt(client, "verbose_json").json()
+    assert len(body["segments"]) == 1
+    assert (body["segments"][0]["start"], body["segments"][0]["end"]) == (0.0, 2.25)
+    assert body["segments"][0]["text"] == "hallo welt"
+    assert _transcribe_fmt(client, "srt").text == "1\n00:00:00,000 --> 00:00:02,250\nhallo welt\n"
+
+
+def test_an_empty_transcript_renders_empty_documents(monkeypatch):
+    client = _stt_client(monkeypatch, {"text": "", "segments": []})
+    assert _transcribe_fmt(client, "srt").text == ""
+    assert _transcribe_fmt(client, "vtt").text == "WEBVTT\n\n"
+    body = _transcribe_fmt(client, "verbose_json").json()
+    assert body["segments"] == [] and body["text"] == "" and body["duration"] == 0.0
+
+
+def test_timestamps_use_the_right_separator_and_carry_hours(monkeypatch):
+    payload = {"text": "spaet", "segments": [{"start": 3661.5, "end": 3662.0004, "text": "spaet"}]}
+    client = _stt_client(monkeypatch, payload)
+    assert "01:01:01,500 --> 01:01:02,000" in _transcribe_fmt(client, "srt").text
+    assert "01:01:01.500 --> 01:01:02.000" in _transcribe_fmt(client, "vtt").text
+
+
+def test_junk_in_a_backends_numeric_fields_does_not_fail_the_request(monkeypatch):
+    # NaN is what whisper.cpp emits for a segment with no tokens; Python's JSON
+    # parser accepts the bare token, so it has to be sent as raw text here.
+    payload = httpx.Response(200, content=(
+        b'{"text": "hi", "duration": "n/a", "segments": ['
+        b'{"start": "abc", "end": null, "text": "hi", "avg_logprob": NaN}]}'),
+        headers={"content-type": "application/json"})
+    r = _transcribe_fmt(_stt_client(monkeypatch, payload), "verbose_json")
+    assert r.status_code == 200
+    seg = r.json()["segments"][0]
+    assert (seg["start"], seg["end"], seg["avg_logprob"]) == (0.0, 0.0, 0.0)
+
+
+def test_whisper_cpp_is_asked_for_timings_only_when_they_are_needed(monkeypatch):
+    env = {"DEFAULT_STT_PROVIDER": "whisper-cpp", "ENABLE_WHISPER_CPP": "true"}
+    cpp_payload = {
+        "task": "transcribe", "language": "german", "duration": 2.0, "text": " Guten Tag",
+        "segments": [{"id": 0, "text": " Guten Tag", "start": 0.0, "end": 2.0}],
+    }
+    sent = []
+    client = _stt_client(monkeypatch, cpp_payload, env, capture=sent)
+
+    body = _transcribe_fmt(client, "verbose_json").json()
+    assert sent[-1][1]["data"]["response_format"] == "verbose_json"
+    assert body["language"] == "german"
+    assert body["segments"][0]["text"] == "Guten Tag"
+
+    _transcribe_fmt(client, "srt")
+    assert sent[-1][1]["data"]["response_format"] == "verbose_json"
+
+    _transcribe_fmt(client, "json")
+    assert sent[-1][1]["data"]["response_format"] == "json"
+    _transcribe_fmt(client, "text")
+    assert sent[-1][1]["data"]["response_format"] == "json"
+
+
+def test_diarized_json_is_still_refused(monkeypatch):
+    r = _transcribe_fmt(_stt_client(monkeypatch, NATIVE_PAYLOAD), "diarized_json")
+    assert r.status_code == 400 and r.json()["error"]["code"] == "unsupported_value"
+
+
+def test_non_object_backend_reply_is_a_502_envelope(monkeypatch):
+    r = _transcribe_fmt(_stt_client(monkeypatch, ["not", "an", "object"]), "json")
+    assert r.status_code == 502
+    assert set(r.json()["error"]) == {"message", "type", "param", "code"}

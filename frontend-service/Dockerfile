@@ -1,5 +1,6 @@
 # Frontend Service Dockerfile
-FROM python:3.10-slim
+# 3.10 reaches end of life in 2026-10; 3.12 is what the test suite also runs on.
+FROM python:3.12-slim
 
 WORKDIR /app
 
@@ -20,6 +21,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application files
 COPY app.py .
 COPY openai_router.py .
+COPY entrypoint.sh .
 COPY templates/ templates/
 COPY static/ static/
 
@@ -33,15 +35,6 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:3000/health || exit 1
 
-# Start command.
-#   --workers 2       the gateway is I/O-bound with no per-process model state.
-#                     Asset cache-busting is derived from a hash of static/, so
-#                     every worker computes the same value without pinning it.
-#   --timeout-keep-alive  >= the httpx keepalive_expiry used for upstream calls,
-#                     so the server does not FIN first and hand back dead sockets.
-CMD ["python", "-m", "uvicorn", "app:app", \
-     "--host", "0.0.0.0", "--port", "3000", \
-     "--workers", "2", \
-     "--proxy-headers", \
-     "--timeout-keep-alive", "120", \
-     "--no-access-log"]
+# Start command. Worker count comes from FRONTEND_WORKERS (default 2); see
+# entrypoint.sh for why this is a script rather than an inline CMD.
+CMD ["sh", "/app/entrypoint.sh"]

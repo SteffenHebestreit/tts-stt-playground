@@ -10,11 +10,13 @@ Browser-facing UI and API hub for the TTS-STT platform. Built with FastAPI, Jinj
 | GET | `/api-docs` | Static API documentation page |
 | GET | `/health` | Service health plus configured backend URLs |
 | GET | `/providers` | Provider registry with capabilities and contract metadata |
+| GET | `/api/health` | Health of every backend, probed concurrently and cached for `HEALTH_CACHE_TTL` seconds (default 2) |
 | GET | `/api/providers/{provider_id}/voices` | Normalized voice or speaker catalog for a TTS provider |
 | GET | `/api/providers/{provider_id}/custom-voices` | Managed custom voice catalog for providers that support custom model deletion |
 | GET | `/api/providers/{provider_id}/models` | Normalized model catalog for providers that support model switching |
 | POST | `/api/providers/{provider_id}/models/select` | Switch the active provider model variant |
 | GET | `/api/providers/{provider_id}/status` | Provider runtime status for advanced TTS backends |
+| POST | `/api/providers/{provider_id}/unload` | Ask a backend to release its model now (upstream status and body are passed through) |
 | GET | `/api/providers/{provider_id}/saved-voices` | List saved provider voice profiles |
 | POST | `/api/providers/{provider_id}/saved-voices` | Save a reusable provider voice profile |
 | DELETE | `/api/providers/{provider_id}/custom-voices/{voice_id}` | Delete a managed custom provider voice |
@@ -34,6 +36,20 @@ Browser-facing UI and API hub for the TTS-STT platform. Built with FastAPI, Jinj
 | GET | `/api/training/download/{job_id}` | Download exported model through the frontend adapter |
 | DELETE | `/api/training/model/{job_id}` | Delete a trained model through the frontend adapter |
 | DELETE | `/api/training/job/{job_id}` | Cancel a job through the frontend adapter |
+| WS | `/ws/stt?provider=whisper` | Live-transcription relay to the STT service (same-origin or `ALLOWED_ORIGINS` only) |
+| POST | `/v1/audio/transcriptions` | OpenAI-compatible transcription (`json`, `text`, `verbose_json`, `srt`, `vtt`); max 25 MB |
+| POST | `/v1/audio/speech` | OpenAI-compatible speech (`mp3` default, `wav`, `pcm`) |
+| GET | `/v1/models`, `/v1/models/{id}` | OpenAI-compatible model list |
+
+`job_id` and `voice_id` path parameters must match `[A-Za-z0-9_-]{1,128}` (uuid4 job ids and the voice names the backends generate); anything else is a 422 and never reaches a backend.
+
+### The `/v1` surface
+
+Every `/v1` failure - including the ones FastAPI raises itself (missing form field, unknown route, wrong method, oversize body, a crash) - uses the OpenAI error envelope `{"error": {"message", "type", "param", "code"}}`. `/api/*` keeps FastAPI's `{"detail": ...}`.
+
+- **`response_format` for transcriptions**: `json`, `text`, `verbose_json`, `srt`, `vtt`. `diarized_json` is refused (`400 unsupported_value`). Backends that report no segments get one segment spanning the whole file. `verbose_json` fills the fields a backend cannot measure with neutral values (`tokens: []`, `compression_ratio: 0`) so that openai-python's validation passes; `language` is whatever the backend reports (an ISO code from faster-whisper, a full name from whisper.cpp).
+- **`response_format` for speech**: `mp3` (default; needs `ffmpeg`, otherwise `501`), `wav`, `pcm`. `pcm` is raw 16-bit little-endian mono at the backend's **native** sample rate (Piper 22050 Hz, Qwen3 and Chatterbox 24000 Hz) - nothing is resampled, and the rate is returned in the `X-Sample-Rate` header. OpenAI documents 24 kHz, so a client that hard-codes it must read the header for Piper voices.
+- **Default STT fallback**: `/v1/audio/transcriptions` always uses `DEFAULT_STT_PROVIDER`. If that provider cannot be *reached* (connection refused, DNS, timeout - not an error answer) and exactly one other STT provider is healthy, the request is served by that one and the response carries `X-Provider: <used>` and `X-Provider-Fallback: <default>-><used>`; a warning is logged. With no healthy alternative, or more than one, the request fails as before. Explicit selections (`/api/stt` with a `provider` field) never fall back. This is what keeps a whisper.cpp-only device (`rk3588`, `strixhalo`) working when `DEFAULT_STT_PROVIDER` was left at `whisper`; set it to `whisper-cpp` there anyway.
 
 ## Features
 
@@ -73,12 +89,36 @@ Browser-facing UI and API hub for the TTS-STT platform. Built with FastAPI, Jinj
 | `BROWSER_QWEN3_TTS_URL` | `http://localhost:5004` | Browser-visible Qwen3-TTS URL |
 | `BROWSER_QWEN3_ASR_URL` | `http://localhost:5002` | Browser-visible Qwen3-ASR URL |
 | `BROWSER_WHISPER_CPP_URL` | `http://localhost:5003` | Browser-visible whisper.cpp URL |
-| `DEFAULT_TTS_PROVIDER` | `piper` | Default TTS provider ID selected by the UI |
-| `DEFAULT_STT_PROVIDER` | `whisper` | Default STT provider ID selected by the UI |
+| `DEFAULT_TTS_PROVIDER` | `piper` | Default TTS provider ID: preselected by the UI and used by `/v1/audio/speech` |
+| `DEFAULT_STT_PROVIDER` | `whisper` | Default STT provider ID: preselected by the UI and used by `/v1/audio/transcriptions` (falls back to the one healthy alternative if unreachable, see above) |
 | `TRAINING_PROVIDER` | `piper-training` | Provider ID used for training workflows |
 | `PROVIDER_REGISTRY_JSON` | unset | Optional JSON override for provider metadata, per-service settings, and defaults |
-| `ALLOWED_ORIGINS` | `*` | Comma-separated CORS origins |
+| `ALLOWED_ORIGINS` | *(empty)* | Comma-separated origins allowed to call the API from a browser. **Empty or unset: same-origin only, no CORS headers.** `*` allows every origin and must be set explicitly |
 | `ALLOW_CREDENTIALS` | `false` | Enables CORS credentials when origins are explicit |
+| `TRUSTED_ORIGINS` | *(empty)* | Origins that are *this UI under another name* (a reverse proxy that does not forward `Host`). They pass the state-changing origin check but get no CORS headers |
+| `TRUST_PROXY_HEADERS` | `false` | Believe `X-Forwarded-Host` when comparing an `Origin` with the host. Only enable behind a proxy that sets it |
+| `API_KEY` | *(empty)* | Optional shared secret, see Security below |
+| `MAX_UPLOAD_MB` | `512` | Largest request body for uploads (training audio, voice samples, STT files) - about 48 minutes of 44.1 kHz mono 16-bit WAV. Larger requests get `413`. Everything is held in memory while being forwarded, so this is also the worst-case memory cost of one request |
+| `MAX_TTS_CHARS` | `20000` | Longest `text` accepted by `/api/tts` and voice design (`422` beyond it) |
+| `HEALTH_CACHE_TTL` | `2` | Seconds `/api/health` results are reused; `0` disables the cache |
+| `PROVIDER_HEALTH_TIMEOUT` | `6` | Per-provider timeout for a health probe, in seconds |
+| `FRONTEND_WORKERS` | `2` | uvicorn worker processes (the container's `entrypoint.sh` reads it; a value that is not a positive integer falls back to 2). Use `1` on memory-constrained boards |
+
+JSON request bodies are capped at 1 MiB regardless of `MAX_UPLOAD_MB`, and `/v1/audio/transcriptions` at 25 MB (plus multipart framing), as OpenAI does. Other free-text fields (`voice` 256, `language` 64, `instructions` and `voice_description` 4000 characters) are bounded too.
+
+## Security
+
+The gateway is the only service a browser talks to, and it can delete trained models, unload backends and start training. Its defaults therefore assume a browser on the LAN is hostile:
+
+- **Same-origin by default.** No CORS headers are sent unless `ALLOWED_ORIGINS` lists an origin (or is `*`). Independently of CORS, a request that changes state (anything except `GET`/`HEAD`/`OPTIONS`) carrying an `Origin` header is refused with `403` unless the origin matches the `Host` the request was addressed to, is listed in `ALLOWED_ORIGINS`/`TRUSTED_ORIGINS`, or - with `TRUST_PROXY_HEADERS=true` - matches `X-Forwarded-Host`. Requests with no `Origin` (curl, OpenAI SDKs, other services) are not affected. The same rule guards `/ws/stt`, which browsers do not subject to the same-origin policy.
+- **Behind a reverse proxy** that does not pass `Host` through, add the public origin to `TRUSTED_ORIGINS` (for example `https://tts.example.com`), or forward `X-Forwarded-Host` and set `TRUST_PROXY_HEADERS=true`. The symptom of getting it wrong is `403 Cross-origin request ... refused` on every button in the UI.
+- **`API_KEY`** (unset = open, as before). When set, every `/v1/*` request must send `Authorization: Bearer <key>` (`401` in the OpenAI envelope otherwise), and so must every state-changing `/api/*` request unless it is a same-origin browser request (`Sec-Fetch-Site: same-origin`/`none`, or a matching `Origin`) - the bundled UI has no key to send. Reads such as `/health` and `/api/health` stay open. This keeps other web pages and non-browser scripts out; it is not user authentication, since a script can forge browser headers. If the port is reachable by people you do not trust, put real authentication in front of it.
+- Responses carry `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin` and `X-Frame-Options: SAMEORIGIN`. There is deliberately no `Content-Security-Policy`: the page still uses inline event handlers.
+- The provider registry is embedded in the page with the `tojson` filter, so a `</script>` inside `PROVIDER_REGISTRY_JSON` cannot break out of it.
+
+## Container
+
+The image is `python:3.12-slim` and starts through `entrypoint.sh`, which `exec`s uvicorn so `docker stop` reaches it. Worker count comes from `FRONTEND_WORKERS`.
 
 `whisper-cpp` remains optional even when its backend container is running. To surface it in the browser UI, set `ENABLE_WHISPER_CPP=true` for `frontend-service` and start the `whisper-cpp` compose profile.
 

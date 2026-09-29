@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-app-version="{{ app_version }}">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -19,7 +19,7 @@
                 <div class="radio-group">
                     {% for provider_id, provider in tts_provider_options %}
                     <label class="radio-label">
-                        <input type="radio" name="tts-engine" value="{{ provider_id }}" {% if provider_id == default_tts_provider %}checked{% endif %} onchange="switchTTSEngine(this.value)">
+                        <input type="radio" name="tts-engine" value="{{ provider_id }}" {% if provider_id == default_tts_provider %}checked{% endif %} data-action="switch-tts-engine" data-action-event="change">
                         <span class="radio-custom"></span>
                         {{ provider.display_name }}
                     </label>
@@ -28,7 +28,7 @@
             </div>
 
             <div class="header-actions">
-                <a href="/api-docs" target="_blank" class="api-docs-link">API Documentation</a>
+                <a href="/api-docs" target="_blank" rel="noopener" class="api-docs-link">API Documentation</a>
             </div>
             <div class="service-status">
                 {% for provider_id, provider in status_provider_options %}
@@ -38,12 +38,12 @@
         </div>
 
         <!-- Navigation Tabs -->
-        <div class="tabs">
-            <button class="tab-button active" id="stt-tab-button" onclick="showTab('stt-tab')">Speech-to-Text</button>
-            <button class="tab-button piper-only" id="training-tab-button" onclick="showTab('training-tab')">Voice Training</button>
-            <button class="tab-button piper-only" id="tts-tab-button" onclick="showTab('tts-tab')">Text-to-Speech</button>
-            <button class="tab-button qwen3-only" id="qwen3-tts-tab-button" onclick="showTab('qwen3-tts-tab')" style="display: none;">Qwen3 TTS</button>
-            <button class="tab-button qwen3-only" id="qwen3-cloning-tab-button" onclick="showTab('qwen3-cloning-tab')" style="display: none;">Voice Cloning</button>
+        <div class="tabs" role="navigation" aria-label="Sections">
+            <button class="tab-button active" id="stt-tab-button" data-action="show-tab" data-tab="stt-tab" aria-current="page">Speech-to-Text</button>
+            <button class="tab-button piper-only" id="training-tab-button" data-action="show-tab" data-tab="training-tab">Voice Training</button>
+            <button class="tab-button piper-only" id="tts-tab-button" data-action="show-tab" data-tab="tts-tab">Text-to-Speech</button>
+            <button class="tab-button qwen3-only" id="qwen3-tts-tab-button" data-action="show-tab" data-tab="qwen3-tts-tab" style="display: none;">Qwen3 TTS</button>
+            <button class="tab-button qwen3-only" id="qwen3-cloning-tab-button" data-action="show-tab" data-tab="qwen3-cloning-tab" style="display: none;">Voice Cloning</button>
         </div>
 
         <!-- STT Tab -->
@@ -64,7 +64,7 @@
                 <div class="form-group">
                     <label for="stt-file">Audio File:</label>
                     <div class="file-upload">
-                        <input type="file" id="stt-file" accept="audio/*" onchange="handleSTTFile(this)">
+                        <input type="file" id="stt-file" accept="audio/*">
                         <div class="file-drop-zone" id="stt-drop-zone">
                             <p>Drop audio file here or click to browse</p>
                             <small>Supported: WAV, MP3, M4A, FLAC, OGG</small>
@@ -89,7 +89,7 @@
                     </div>
                 </div>
 
-                <button class="btn-primary" onclick="processSTT()">Transcribe Audio</button>
+                <button class="btn-primary" id="process-stt-button" data-action="process-stt">Transcribe Audio</button>
 
                 <div id="stt-result-status" class="status-display"></div>
                 <div id="stt-results" class="results-display"></div>
@@ -98,10 +98,12 @@
             <div class="panel" id="live-stt-panel">
                 <h2>Live Transcription (Microphone)</h2>
                 <p class="description">Stream your microphone to the Whisper backend over WebSocket and watch the transcript build in real time. Uses the language selected above ("Auto-Detect" works).</p>
-                <button class="btn-primary" id="live-stt-button" onclick="toggleLiveTranscription()">Start Live Transcription</button>
+                <button class="btn-primary" id="live-stt-button" data-action="toggle-live-transcription">Start Live Transcription</button>
                 <div id="live-stt-status" class="status-display"></div>
+                <!-- Only the confirmed text is a live region: the tentative tail changes
+                     every decode and would be re-read each time. -->
                 <div id="live-stt-transcript" class="results-display" style="display:none; padding: 12px; line-height: 1.6;">
-                    <span id="live-stt-confirmed"></span>
+                    <span id="live-stt-confirmed" aria-live="polite" aria-relevant="additions text"></span>
                     <span id="live-stt-pending" style="opacity: 0.55; font-style: italic;"></span>
                 </div>
                 <div id="live-stt-latency" style="margin-top: 6px; font-size: 0.8em; opacity: 0.6; font-variant-numeric: tabular-nums;"></div>
@@ -138,7 +140,7 @@
                 <div class="form-group">
                     <label id="training-files-label" for="training-files">Training Audio Files:</label>
                     <div class="file-upload">
-                        <input type="file" id="training-files" accept="audio/*" multiple onchange="handleTrainingFiles(this)">
+                        <input type="file" id="training-files" accept="audio/*" multiple>
                         <div class="file-drop-zone" id="training-drop-zone">
                             <p id="training-files-drop-text">Drop multiple audio files here or click to browse</p>
                             <small id="training-files-hint">Upload guidance will load here.</small>
@@ -169,7 +171,7 @@
                     <small class="form-hint" id="training-deployment-target-description"></small>
                 </div>
 
-                <button class="btn-primary" id="start-training-button" onclick="startTraining()">Start Training</button>
+                <button class="btn-primary" id="start-training-button" data-action="start-training">Start Training</button>
 
                 <div id="training-progress-status" class="status-display"></div>
                 <div id="training-progress" class="progress-display"></div>
@@ -200,8 +202,8 @@
                 </div>
 
                 <div style="display: flex; gap: 10px; flex-wrap: wrap;">
-                    <button class="btn-secondary" id="resume-training-button" onclick="resumeTrainingManual()">Resume</button>
-                    <button class="btn-secondary" id="train-from-dataset-button" onclick="trainFromDataset()">Train from Dataset</button>
+                    <button class="btn-secondary" id="resume-training-button" data-action="resume-training-manual">Resume</button>
+                    <button class="btn-secondary" id="train-from-dataset-button" data-action="train-from-dataset">Train from Dataset</button>
                 </div>
 
                 <div id="continue-status" class="status-display" style="margin-top: 10px;"></div>
@@ -279,11 +281,11 @@
                         <select id="tts-voice-select">
                             <option value="auto">Auto-Select Best Voice</option>
                         </select>
-                        <button class="btn-secondary" onclick="refreshTTSVoices()">Refresh</button>
+                        <button class="btn-secondary" data-action="refresh-tts-voices">Refresh</button>
                     </div>
                 </div>
 
-                <button class="btn-primary" onclick="generateTTS()">Generate Speech</button>
+                <button class="btn-primary" id="generate-tts-button" data-action="generate-tts">Generate Speech</button>
 
                 <div id="tts-result-status" class="status-display"></div>
                 <div id="tts-audio-player" class="audio-player"></div>
@@ -293,7 +295,7 @@
             <div class="panel" style="margin-top: 20px;">
                 <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;">
                     <h3 id="custom-voices-title" style="margin: 0;">Custom Voices</h3>
-                    <button class="btn-secondary" onclick="refreshCustomVoices()">Refresh</button>
+                    <button class="btn-secondary" data-action="refresh-custom-voices">Refresh</button>
                 </div>
                 <p class="description" id="custom-voices-description">Manage custom trained voices loaded in PiperTTS. Delete voices you no longer need.</p>
                 <div id="custom-voices-list">
@@ -312,7 +314,7 @@
                 <div class="form-group">
                     <label for="qwen3-model-select">Model:</label>
                     <div class="voice-select-row">
-                        <select id="qwen3-model-select" onchange="switchQwen3Model(this.value)">
+                        <select id="qwen3-model-select" data-action="switch-qwen3-model" data-action-event="change">
                             <option value="">Loading models...</option>
                         </select>
                         <span id="qwen3-model-loading" style="display: none; color: var(--warning); font-size: 0.9rem;">Switching model...</span>
@@ -354,7 +356,7 @@
                     <small class="form-hint" id="qwen3-builtin-instruct-hint">Describe how the voice should sound. Leave empty for default style.</small>
                 </div>
 
-                <button class="btn-primary" id="qwen3-builtin-generate-button" onclick="generateQwen3BuiltinTTS()">Generate Speech</button>
+                <button class="btn-primary" id="qwen3-builtin-generate-button" data-action="generate-qwen3-builtin">Generate Speech</button>
 
                 <div id="qwen3-builtin-status" class="status-display"></div>
                 <div id="qwen3-builtin-audio-player" class="audio-player"></div>
@@ -371,7 +373,7 @@
                 <div class="form-group">
                     <label id="qwen3-clone-model-label" for="qwen3-clone-model-select">Model:</label>
                     <div class="voice-select-row">
-                        <select id="qwen3-clone-model-select" onchange="onCloneModelChange(this.value)">
+                        <select id="qwen3-clone-model-select" data-action="clone-model-change" data-action-event="change">
                             <option value="">Loading models...</option>
                         </select>
                         <span id="qwen3-clone-model-loading" style="display: none; color: var(--warning); font-size: 0.9rem;">Switching model...</span>
@@ -398,12 +400,12 @@
                     <label id="clone-voice-source-label">Voice Source:</label>
                     <div class="radio-group">
                         <label class="radio-label">
-                            <input type="radio" name="voice-source" value="saved" checked onchange="switchVoiceSource(this.value)">
+                            <input type="radio" name="voice-source" value="saved" checked data-action="switch-voice-source" data-action-event="change">
                             <span class="radio-custom"></span>
                             <span id="clone-saved-source-label">Saved Voices (fast)</span>
                         </label>
                         <label class="radio-label">
-                            <input type="radio" name="voice-source" value="upload" onchange="switchVoiceSource(this.value)">
+                            <input type="radio" name="voice-source" value="upload" data-action="switch-voice-source" data-action-event="change">
                             <span class="radio-custom"></span>
                             <span id="clone-upload-source-label">Upload New Sample</span>
                         </label>
@@ -418,8 +420,8 @@
                             <select id="qwen3-saved-voice-select">
                                 <option value="">Loading saved voices...</option>
                             </select>
-                            <button class="btn-secondary" id="saved-voices-refresh-button" onclick="loadSavedVoices()">Refresh</button>
-                            <button class="btn-secondary" id="saved-voices-delete-button" onclick="deleteSavedVoice()" title="Delete selected voice" style="background: var(--error); color: white; padding: 8px 12px;">Delete</button>
+                            <button class="btn-secondary" id="saved-voices-refresh-button" data-action="refresh-saved-voices">Refresh</button>
+                            <button class="btn-secondary" id="saved-voices-delete-button" data-action="delete-saved-voice" title="Delete selected voice" style="background: var(--error); color: white; padding: 8px 12px;">Delete</button>
                         </div>
                         <small class="form-hint" id="saved-voice-info"></small>
                     </div>
@@ -447,7 +449,7 @@
 
                     <div class="form-group">
                         <label>
-                            <input type="checkbox" id="enable-ref-text" onchange="toggleRefText()">
+                            <input type="checkbox" id="enable-ref-text" data-action="toggle-ref-text" data-action-event="change">
                             <span id="enable-ref-text-label">Provide reference text manually</span>
                         </label>
                     </div>
@@ -468,7 +470,7 @@
                     </div>
                 </div>
 
-                <button class="btn-primary" id="generate-qwen3-speech-btn" onclick="generateQwen3TTS()">Generate Speech</button>
+                <button class="btn-primary" id="generate-qwen3-speech-btn" data-action="generate-qwen3-tts">Generate Speech</button>
 
                 <div id="qwen3-generation-status" class="status-display"></div>
                 <div id="qwen3-audio-player" class="audio-player"></div>
@@ -477,10 +479,13 @@
     </div>
 
     <!-- Service Configuration -->
+    <!-- `tojson` escapes < > & ', so a registry string can never close this element.
+         `| safe` on a pre-dumped string did not, and PROVIDER_REGISTRY_JSON is operator input. -->
+    <script type="application/json" id="provider-registry-data">{{ provider_registry | tojson }}</script>
     <script>
-        window.PROVIDER_REGISTRY = {{ provider_registry_json | safe }};
+        window.PROVIDER_REGISTRY = JSON.parse(document.getElementById('provider-registry-data').textContent);
         // Used to cache-bust the audio worklet module, which app.js loads itself.
-        window.APP_VERSION = "{{ app_version }}";
+        window.APP_VERSION = {{ app_version | tojson }};
     </script>
 
     <script defer src="{{ url_for('static', path='/js/app.js') }}?v={{ app_version }}"></script>

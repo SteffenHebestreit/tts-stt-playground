@@ -1,8 +1,9 @@
 """Static invariants of the browser layer (`app.js` + `index.html`).
 
 Two groups: escaping rules, and the DOM contracts that couple the script to the
-template. There is no JS test runner in this repo — the only browser test is the
-Playwright live-mic one — so these read the source.
+template. These read the source; what the script *does* is exercised by
+`test_frontend_ui_logic.py` (under Node) and `test_frontend_ui_browser.py` (in
+Chromium).
 
 Escaping
 --------
@@ -36,6 +37,9 @@ does.
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
+from html.parser import HTMLParser
 from pathlib import Path
 
 import pytest
@@ -143,6 +147,23 @@ def test_untrusted_values_are_escaped_in_every_innerhtml_template(source: str):
     )
 
 
+def test_request_urls_encode_every_interpolated_segment(source: str):
+    """An id with `/`, `?` or `#` in it changes which route a request addresses.
+
+    Behaviour is covered in test_frontend_ui_logic.py; this is the tripwire for
+    the next fetch() someone adds.
+    """
+    offenders = []
+    for match in re.finditer(r"(?:fetch|getProviderApiPath|addModule)\(([^;]*?)`([^`]*)`", source):
+        template = match.group(2)
+        for expression in re.findall(r"\$\{([^}]*)\}", template):
+            # `path` is getProviderApiPath's own already-built suffix argument.
+            if expression.strip() != "path" and not expression.strip().startswith("encodeURIComponent("):
+                line = source[:match.start()].count("\n") + 1
+                offenders.append(f"line {line}: ${{{expression.strip()}}} in `{template[:60]}`")
+    assert not offenders, "unencoded URL segments:\n  " + "\n  ".join(offenders)
+
+
 def test_html_building_helpers_that_take_a_selector_escape_it(source: str):
     """A voice id is operator-chosen, so it is not a safe CSS selector."""
     for match in re.finditer(r"querySelector(?:All)?\(`([^`]*)`\)", source):
@@ -211,10 +232,15 @@ def test_bindactions_is_used_by_every_rebuilt_list(source: str, renderer: str):
     )
 
 
+def _template_actions() -> set[str]:
+    return set(re.findall(r'data-action="([a-z-]+)"', INDEX_HTML.read_text(encoding="utf-8")))
+
+
 def test_every_data_action_has_a_handler(source: str):
     """A data-action with no matching bindActions key is a dead button — it
-    looks live, does nothing, and reports no error."""
-    emitted = set(re.findall(r'data-action="([a-z-]+)"', source))
+    looks live, does nothing, and reports no error. Actions are emitted by the
+    list renderers in app.js and by the static controls in the template."""
+    emitted = set(re.findall(r'data-action="([a-z-]+)"', source)) | _template_actions()
     bound: set[str] = set()
     for block in re.finditer(r"bindActions\([^,]+,\s*\{(.*?)\}\s*\)", source, re.S):
         bound.update(re.findall(r"^\s*'?([a-zA-Z-]+)'?\s*:", block.group(1), re.M))
@@ -230,18 +256,75 @@ def test_every_data_action_has_a_handler(source: str):
     )
 
 
-def test_template_does_not_reintroduce_interpolated_inline_handlers():
-    """Jinja renders provider metadata into the page; same rule applies."""
+def test_data_action_events_name_a_real_event():
+    """`data-action-event` picks the DOM event a control listens for; a typo
+    there binds a listener that never fires."""
     html = INDEX_HTML.read_text(encoding="utf-8")
-    offenders = [
-        match.group(0)[:90]
-        for match in re.finditer(r'\bon[a-z]+\s*=\s*"([^"]*)"', html)
-        if "{{" in match.group(1) or "{%" in match.group(1)
-    ]
-    assert not offenders, (
-        "index.html interpolates template data into an inline handler:\n  "
-        + "\n  ".join(offenders)
-    )
+    events = set(re.findall(r'data-action-event="([^"]*)"', html))
+    assert events, "no data-action-event found — did the change-driven controls move?"
+    assert events <= {"change", "input", "click", "submit"}, events
+
+
+class _InlineHandlerFinder(HTMLParser):
+    """Collects every event-handler attribute (on*) the way a browser parses them."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.found: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        for name, value in attrs:
+            if name.lower().startswith("on"):
+                line = self.getpos()[0]
+                self.found.append(f"line {line}: <{tag} {name}=\"{(value or '')[:50]}\">")
+
+    handle_startendtag = handle_starttag
+
+
+def test_template_has_no_inline_event_handlers():
+    """No `onclick=`/`onchange=`/... anywhere in index.html.
+
+    Inline handlers are inline script as far as a Content-Security-Policy is
+    concerned, so any one left keeps `script-src 'unsafe-inline'` mandatory.
+    Controls carry `data-action` and are wired by bindStaticActions().
+    """
+    finder = _InlineHandlerFinder()
+    finder.feed(INDEX_HTML.read_text(encoding="utf-8"))
+    assert not finder.found, "inline event handlers in index.html:\n  " + "\n  ".join(finder.found)
+
+
+def test_markup_built_in_app_js_has_no_inline_handlers(source: str):
+    """The same rule for the HTML app.js writes into the page, interpolated or not."""
+    code = re.sub(r"(?m)^\s*//[^\n]*", "", _strip_block_comments(source))
+    finder = _InlineHandlerFinder()
+    for match in re.finditer(r"`([^`]*)`", code, re.S):
+        finder.feed(match.group(1).replace("${", "").replace("}", ""))
+    assert not finder.found, "inline event handlers in markup built by app.js:\n  " + "\n  ".join(finder.found)
+
+
+def test_app_js_parses(tmp_path):
+    """`node --check`: catches a syntax slip that the string-level tests above would miss."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    result = subprocess.run([node, "--check", str(APP_JS)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
+def test_static_ids_app_js_looks_up_exist_in_the_template(source: str):
+    """`getElementById('x')` on a missing id is a silent no-op for most helpers
+    (setElementText, showStatus, ...), so a renamed element just stops updating."""
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    template_ids = set(re.findall(r'\bid="([^"{}]+)"', html))
+    created_by_script = set(re.findall(r'id="([^"$]+)"', source)) | set(re.findall(r"\.id = '([^']+)'", source))
+    lookups = set()
+    for pattern in (
+        r"getElementById\(\s*'([^']+)'",
+        r"(?:setElementText|setElementFormattedText|setInputPlaceholder|setInputValue|showStatus|populateSelectOptions|applyInputNumberConfig|getSelectedTrainingDeploymentTarget)\(\s*'([^']+)'",
+    ):
+        lookups.update(re.findall(pattern, source))
+    missing = sorted(lookups - template_ids - created_by_script)
+    assert not missing, f"app.js looks up ids that index.html does not define: {missing}"
 
 
 # --- script/template DOM contracts -------------------------------------------
@@ -255,8 +338,8 @@ def test_every_tab_has_the_panel_and_button_id_showtab_looks_up():
     assert, invisible to catch by hand.
     """
     html = INDEX_HTML.read_text(encoding="utf-8")
-    tab_ids = sorted(set(re.findall(r"showTab\('([^']+)'\)", html)))
-    assert tab_ids, "no showTab() calls found in index.html — did the tabs move?"
+    tab_ids = sorted(set(re.findall(r'data-action="show-tab"\s+data-tab="([^"]+)"', html)))
+    assert tab_ids, "no show-tab controls found in index.html — did the tabs move?"
 
     ids = set(re.findall(r'\bid="([^"]+)"', html))
     missing = [
