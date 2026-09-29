@@ -1,0 +1,225 @@
+# Weekly, grouped update PRs. One PR per ecosystem-and-directory group instead of
+# one per package, so a week of releases is a handful of reviews, not dozens.
+#
+# What is deliberately NOT updated automatically:
+#   * torch / torchaudio / nemo_toolkit: pinned by build ARGs in the Dockerfiles,
+#     not by requirements files, and coupled to the CUDA base image and to the
+#     cu128 wheel index (sm_120 / Blackwell). See each service's README.
+#   * The GPU base images (nvidia/cuda, rocm/dev-ubuntu, ubuntu): bumping one
+#     changes the driver floor and the Python version together with it.
+#   * The Python base image's minor version (python:3.12-slim): requirements are
+#     resolved and tested on one minor at a time.
+# Those are decisions with a test plan, not routine bumps.
+#
+# GitHub Actions stay pinned by tag; this keeps the tags fresh.
+
+version: 2
+
+updates:
+  # --- GitHub Actions -------------------------------------------------------------
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
+
+  # --- Python requirements (one entry per service, plus the test environment) -------
+  - package-ecosystem: pip
+    directory: /tests
+    schedule: {interval: weekly, day: monday}
+    groups:
+      minor-and-patch: {patterns: ["*"], update-types: [minor, patch]}
+    commit-message: {prefix: "build(deps)"}
+    # tests/requirements.txt must keep fastapi, jinja2, python-multipart, httpx and
+    # uvicorn in lockstep with frontend-service (tests/test_docker_image_contents.py checks it),
+    # so those are bumped together, by hand, in the service's own PR.
+    ignore:
+      - {dependency-name: fastapi}
+      - {dependency-name: jinja2}
+      - {dependency-name: python-multipart}
+      - {dependency-name: httpx}
+      - {dependency-name: uvicorn}
+
+  - package-ecosystem: pip
+    directory: /frontend-service
+    schedule: {interval: weekly, day: monday}
+    groups:
+      minor-and-patch: {patterns: ["*"], update-types: [minor, patch]}
+    commit-message: {prefix: "build(deps)"}
+
+  - package-ecosystem: pip
+    directory: /stt-service
+    schedule: {interval: weekly, day: monday}
+    groups:
+      minor-and-patch: {patterns: ["*"], update-types: [minor, patch]}
+    commit-message: {prefix: "build(deps)"}
+
+  - package-ecosystem: pip
+    directory: /piper-tts-service
+    schedule: {interval: weekly, day: monday}
+    groups:
+      minor-and-patch: {patterns: ["*"], update-types: [minor, patch]}
+    commit-message: {prefix: "build(deps)"}
+
+  - package-ecosystem: pip
+    directory: /piper-training-service
+    schedule: {interval: weekly, day: monday}
+    groups:
+      minor-and-patch: {patterns: ["*"], update-types: [minor, patch]}
+    commit-message: {prefix: "build(deps)"}
+
+  - package-ecosystem: pip
+    directory: /qwen3-asr-service
+    schedule: {interval: weekly, day: monday}
+    groups:
+      minor-and-patch: {patterns: ["*"], update-types: [minor, patch]}
+    commit-message: {prefix: "build(deps)"}
+
+  - package-ecosystem: pip
+    directory: /qwen3-tts-service
+    schedule: {interval: weekly, day: monday}
+    groups:
+      minor-and-patch: {patterns: ["*"], update-types: [minor, patch]}
+    commit-message: {prefix: "build(deps)"}
+
+  - package-ecosystem: pip
+    directory: /parakeet-asr-service
+    schedule: {interval: weekly, day: monday}
+    groups:
+      minor-and-patch: {patterns: ["*"], update-types: [minor, patch]}
+    commit-message: {prefix: "build(deps)"}
+    # The NeMo line (3.0.x default, 2.7.x rollback) is chosen by a build ARG.
+    ignore:
+      - {dependency-name: nemo-toolkit}
+
+  - package-ecosystem: pip
+    directory: /canary-asr-service
+    schedule: {interval: weekly, day: monday}
+    groups:
+      minor-and-patch: {patterns: ["*"], update-types: [minor, patch]}
+    commit-message: {prefix: "build(deps)"}
+    ignore:
+      - {dependency-name: nemo-toolkit}
+
+  - package-ecosystem: pip
+    directory: /chatterbox-tts-service
+    schedule: {interval: weekly, day: monday}
+    groups:
+      minor-and-patch: {patterns: ["*"], update-types: [minor, patch]}
+    commit-message: {prefix: "build(deps)"}
+    # setuptools<82 is a deliberate cap: resemble-perth imports pkg_resources,
+    # which setuptools 82 removed.
+    ignore:
+      - {dependency-name: setuptools}
+
+  # --- Dockerfiles (one entry per directory that holds one) -------------------------------
+  # Only the Python and Debian/Ubuntu-flavoured bases that are safe to move are
+  # left in; see the header for what is ignored.
+  - package-ecosystem: docker
+    directory: /frontend-service
+    schedule: {interval: weekly, day: monday}
+    groups:
+      docker: {patterns: ["*"]}
+    commit-message: {prefix: "build(docker)"}
+    ignore:
+      - {dependency-name: python, update-types: [version-update:semver-major, version-update:semver-minor]}
+
+  - package-ecosystem: docker
+    directory: /piper-tts-service
+    schedule: {interval: weekly, day: monday}
+    groups:
+      docker: {patterns: ["*"]}
+    commit-message: {prefix: "build(docker)"}
+    ignore:
+      - {dependency-name: python, update-types: [version-update:semver-major, version-update:semver-minor]}
+
+  - package-ecosystem: docker
+    directory: /whisper-cpp-service
+    schedule: {interval: weekly, day: monday}
+    groups:
+      docker: {patterns: ["*"]}
+    commit-message: {prefix: "build(docker)"}
+    ignore:
+      - {dependency-name: ubuntu}
+
+  - package-ecosystem: docker
+    directory: /stt-service
+    schedule: {interval: weekly, day: monday}
+    groups:
+      docker: {patterns: ["*"]}
+    commit-message: {prefix: "build(docker)"}
+    ignore:
+      - {dependency-name: nvidia/cuda}
+      - {dependency-name: rocm/dev-ubuntu-22.04}
+
+  - package-ecosystem: docker
+    directory: /piper-training-service
+    schedule: {interval: weekly, day: monday}
+    groups:
+      docker: {patterns: ["*"]}
+    commit-message: {prefix: "build(docker)"}
+    ignore:
+      - {dependency-name: nvidia/cuda}
+      - {dependency-name: rocm/dev-ubuntu-22.04}
+
+  - package-ecosystem: docker
+    directory: /qwen3-asr-service
+    schedule: {interval: weekly, day: monday}
+    groups:
+      docker: {patterns: ["*"]}
+    commit-message: {prefix: "build(docker)"}
+    ignore:
+      - {dependency-name: nvidia/cuda}
+      - {dependency-name: rocm/dev-ubuntu-22.04}
+
+  - package-ecosystem: docker
+    directory: /qwen3-tts-service
+    schedule: {interval: weekly, day: monday}
+    groups:
+      docker: {patterns: ["*"]}
+    commit-message: {prefix: "build(docker)"}
+    ignore:
+      - {dependency-name: nvidia/cuda}
+      - {dependency-name: rocm/dev-ubuntu-22.04}
+
+  - package-ecosystem: docker
+    directory: /parakeet-asr-service
+    schedule: {interval: weekly, day: monday}
+    groups:
+      docker: {patterns: ["*"]}
+    commit-message: {prefix: "build(docker)"}
+    ignore:
+      - {dependency-name: nvidia/cuda}
+      - {dependency-name: rocm/dev-ubuntu-22.04}
+
+  - package-ecosystem: docker
+    directory: /canary-asr-service
+    schedule: {interval: weekly, day: monday}
+    groups:
+      docker: {patterns: ["*"]}
+    commit-message: {prefix: "build(docker)"}
+    ignore:
+      - {dependency-name: nvidia/cuda}
+
+  - package-ecosystem: docker
+    directory: /chatterbox-tts-service
+    schedule: {interval: weekly, day: monday}
+    groups:
+      docker: {patterns: ["*"]}
+    commit-message: {prefix: "build(docker)"}
+    ignore:
+      - {dependency-name: nvidia/cuda}
+
+  - package-ecosystem: docker
+    directory: /tests
+    schedule: {interval: weekly, day: monday}
+    groups:
+      docker: {patterns: ["*"]}
+    commit-message: {prefix: "build(docker)"}
+    ignore:
+      - {dependency-name: python, update-types: [version-update:semver-major, version-update:semver-minor]}

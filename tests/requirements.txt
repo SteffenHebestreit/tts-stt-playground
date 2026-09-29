@@ -15,6 +15,10 @@ fastapi==0.141.1
 jinja2==3.1.6
 python-multipart==0.0.32
 httpx==0.28.1
+# piper-tts-service/app.py imports uvicorn at module level. Without it those tests
+# only passed when an earlier test module had left a stand-in in sys.modules, so
+# running one of them alone (or in another order) failed on import.
+uvicorn==0.54.0
 
 # Needed by the offline stt-service WebSocket tests, which stub torch and
 # faster-whisper but exercise the real numpy buffer handling.
@@ -28,3 +32,8 @@ pyyaml>=6.0
 # stt-service WebSocket tests and the frontend /ws/stt relay client
 # (`additional_headers=` needs >=14).
 websockets>=14.0
+
+# Optional: benchmarks/asr_metrics.py uses it for long recordings, and
+# test_benchmarks_metrics.py compares it with the pure-Python edit distance. A
+# small pure wheel; without it that one comparison is skipped.
+rapidfuzz>=3.0

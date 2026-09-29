@@ -66,7 +66,7 @@ Master also lowers `repetition_penalty` from 2.0 to 1.2 and drops the last speec
 1. installs `torch`/`torchaudio` from the `cu128` index (`TORCH_VERSION`, `TORCHAUDIO_VERSION`, default 2.8.0),
 2. installs `requirements.txt` (chatterbox's runtime dependencies without torch, torchaudio and gradio) under a constraint that keeps that torch,
 3. installs chatterbox itself with `--no-deps`,
-4. fails the build if `torch.version.cuda` is not 12.8, `sm_120` is missing from `torch.cuda.get_arch_list()`, the watermarker cannot import, or the chosen ref has no `t3_model` support.
+4. fails the build if `torch.version.cuda` is not 12.8, `sm_120` is missing from the kernels compiled into torch, the watermarker cannot import, or the chosen ref has no `t3_model` support. The kernel list is read with `torch._C._cuda_getArchFlags()`: `torch.cuda.get_arch_list()` answers `[]` on a build host without a GPU, so a check built on it would fail every build.
 
 Two more pins come from the dependency set: `setuptools<82` (resemble-perth imports `pkg_resources`, removed in setuptools 82; a missing one shows up as `'NoneType' object is not callable` at the first model load) and `numpy<2`.
 

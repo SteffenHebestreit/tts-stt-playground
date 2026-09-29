@@ -26,9 +26,10 @@ from pathlib import Path
 
 import pytest
 
-# Only the dev-overlay checks need a YAML parser; the rest of this file is
-# deliberately dependency-free so it runs anywhere.
-yaml = pytest.importorskip("yaml", reason="PyYAML needed to parse the dev overlay")
+# Only the dev-overlay checks need a YAML parser, but a missing one must not turn
+# the whole module into a silent skip in CI: compose_helpers fails instead when
+# REQUIRE_DRIFT_SUITES=1 (set by the CI workflow) and skips only on a bare checkout.
+from compose_helpers import load_compose
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -165,8 +166,7 @@ def test_dockerfile_ships_every_local_import(service_dir: Path, dockerfile: Path
 
 def _dev_overlay_mounts() -> dict[str, set[str]]:
     """{service: {basenames it mounts into the image}}."""
-    document = yaml.safe_load(
-        (REPO_ROOT / "docker-compose.dev.yml").read_text(encoding="utf-8"))
+    document = load_compose(REPO_ROOT / "docker-compose.dev.yml")
     out: dict[str, set[str]] = {}
     for name, service in (document.get("services") or {}).items():
         names: set[str] = set()
@@ -271,7 +271,7 @@ def test_variants_keep_runtime_critical_env(service_dir: Path):
 # legacy TemplateResponse(name, context) signature — CI failed on a code path
 # that worked fine in the container. Same name, two different frameworks.
 
-SHARED_WITH_FRONTEND = ("fastapi", "jinja2", "python-multipart", "httpx")
+SHARED_WITH_FRONTEND = ("fastapi", "jinja2", "python-multipart", "httpx", "uvicorn")
 
 
 def _pins(requirements: Path) -> dict[str, str]:

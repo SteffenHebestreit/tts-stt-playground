@@ -22,9 +22,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-import pytest
-
-yaml = pytest.importorskip("yaml", reason="PyYAML needed to parse compose files")
+from compose_helpers import env_mapping, load_compose
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = REPO_ROOT / "docker-compose.yml"
@@ -62,6 +60,19 @@ def _documented() -> set[str]:
     return set(re.findall(r"^([A-Z0-9_]+)=", text, flags=re.M))
 
 
+# A read of an environment variable by name. Beyond the direct
+# `os.getenv("X")` / `os.environ.get("X")` this covers the small wrappers the
+# services use to parse numbers and flags (`env_number("X", ...)`,
+# `_env_number`, `env_int`, `env_flag`): any callable with "env" in its name whose
+# first argument is an upper-case string literal. Without them, every knob read
+# through a wrapper looked unread and the reverse check below could not tell a
+# dead variable from a live one.
+_ENV_READ = (
+    r"(?:os\.(?:getenv|environ\.get)|\b[A-Za-z_]*env[A-Za-z_]*)"
+    r"\(\s*[\"']([A-Z][A-Z0-9_]*)[\"']"
+)
+
+
 def _consumed_by_service() -> dict[str, set[str]]:
     """{service_dir_name: variables its Python reads}.
 
@@ -75,9 +86,7 @@ def _consumed_by_service() -> dict[str, set[str]]:
     out: dict[str, set[str]] = {}
     for path in REPO_ROOT.glob("*-service/*.py"):
         source = path.read_text(encoding="utf-8", errors="ignore")
-        names = set(re.findall(
-            r"os\.(?:getenv|environ\.get)\(\s*[\"']([A-Z0-9_]+)[\"']", source
-        ))
+        names = set(re.findall(_ENV_READ, source))
         for call in re.findall(
             r"ttl_from_env\(\s*os\.(?:getenv|environ\.get)\s*,([^)]*)\)", source
         ):
@@ -88,14 +97,10 @@ def _consumed_by_service() -> dict[str, set[str]]:
 
 def _compose_environment() -> dict[str, set[str]]:
     """{service_name: keys in its environment: mapping}."""
-    document = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
+    document = load_compose(COMPOSE)
     out: dict[str, set[str]] = {}
     for name, service in (document.get("services") or {}).items():
-        env = service.get("environment") or {}
-        if isinstance(env, dict):
-            out[name] = set(env.keys())
-        else:  # list form: ["KEY=value", ...]
-            out[name] = {entry.split("=", 1)[0] for entry in env}
+        out[name] = set(env_mapping(service))
     return out
 
 
@@ -210,25 +215,12 @@ def test_not_read_by_python_entries_are_all_still_in_use():
     where the HIP/HSA knobs live, and `PYTORCH_JIT` is a Dockerfile ENV.
     """
     # Compose's own tags (`devices: !reset []` in the ROCm overlay) are not YAML
-    # the SafeLoader knows. Only the environment mappings matter here, so unknown
-    # tags resolve to their untagged value rather than failing the parse.
-    class _ComposeLoader(yaml.SafeLoader):
-        pass
-
-    _ComposeLoader.add_multi_constructor(
-        "", lambda loader, suffix, node: loader.construct_object(
-            node.__class__(loader.DEFAULT_MAPPING_TAG if isinstance(node, yaml.MappingNode)
-                           else loader.DEFAULT_SEQUENCE_TAG if isinstance(node, yaml.SequenceNode)
-                           else loader.DEFAULT_SCALAR_TAG, node.value), deep=True)
-    )
-
+    # the SafeLoader knows; load_compose resolves them to their untagged value.
     all_keys: set[str] = set()
     for compose in REPO_ROOT.glob("docker-compose*.yml"):
-        document = yaml.load(compose.read_text(encoding="utf-8"), Loader=_ComposeLoader) or {}
+        document = load_compose(compose)
         for service in (document.get("services") or {}).values():
-            env = (service or {}).get("environment") or {}
-            all_keys |= set(env) if isinstance(env, dict) else {
-                entry.split("=", 1)[0] for entry in env}
+            all_keys |= set(env_mapping(service or {}))
         # x-* extension blocks carry the ROCm overlay's shared env mapping.
         for key, value in document.items():
             if key.startswith("x-") and isinstance(value, dict):
@@ -323,10 +315,7 @@ PARITY_IGNORE = {"CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES", "FORCE_ACCELE
 
 
 def _env_of(document: dict, service: str) -> set[str]:
-    env = ((document.get("services") or {}).get(service, {}) or {}).get("environment") or {}
-    if isinstance(env, dict):
-        return set(env)
-    return {entry.split("=", 1)[0] for entry in env}
+    return set(env_mapping((document.get("services") or {}).get(service, {}) or {}))
 
 
 def test_truenas_app_matches_the_base_stack():
@@ -335,8 +324,8 @@ def test_truenas_app_matches_the_base_stack():
     Extra keys there are fine — it pins a GPU the base leaves flexible. Missing
     keys are not: they silently split the fleet.
     """
-    base = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
-    standalone = yaml.safe_load(TRUENAS_APP.read_text(encoding="utf-8"))
+    base = load_compose(COMPOSE)
+    standalone = load_compose(TRUENAS_APP)
 
     gaps: list[str] = []
     for service in sorted((standalone.get("services") or {})):

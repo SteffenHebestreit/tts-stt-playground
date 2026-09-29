@@ -47,7 +47,33 @@ This repository now exposes a frontend provider registry that describes which se
 }
 ```
 
-Optional providers may be omitted from the registry entirely. In the current frontend implementation, `whisper-cpp` is only registered when `ENABLE_WHISPER_CPP=true` is set for `frontend-service`.
+### Providers shipped with the gateway
+
+| Provider id | Kind | Service | Registered when | Contracts (feature: contract) |
+|---|---|---|---|---|
+| `piper` | tts | `piper-tts-service` | always | `tts: simple-json-tts-v1`, `voice_catalog: voice-catalog-v1`, `managed_voices: custom-voice-library-v1` |
+| `qwen3` | tts | `qwen3-tts-service` | always | `tts: simple-json-tts-v1`, `voice_catalog: speaker-catalog-v1`, `model_catalog`, `model_selection`, `runtime_status`, `saved_voices: saved-voice-library-v1`, `voice_clone`, `voice_design` |
+| `chatterbox` | tts | `chatterbox-tts-service` | `ENABLE_CHATTERBOX_TTS=true` | `tts: simple-json-tts-v1`, `voice_clone: voice-clone-tts-v1`, `tts_stream: chunked-wav-stream-v1` |
+| `whisper` | stt | `stt-service` | always | `transcribe: stt-form-v1`, `detect_language: stt-detect-language-v1` (also live transcription over `/ws/stt`) |
+| `qwen3-asr` | stt | `qwen3-asr-service` | always | `transcribe: stt-form-v1`, `detect_language: stt-detect-language-v1` |
+| `parakeet` | stt | `parakeet-asr-service` | `ENABLE_PARAKEET_ASR=true` | `transcribe: stt-form-v1` |
+| `canary` | stt | `canary-asr-service` | `ENABLE_CANARY_ASR=true` | `transcribe: stt-form-v1` |
+| `whisper-cpp` | stt | `whisper-cpp` | `ENABLE_WHISPER_CPP=true` | `transcribe: openai-audio-transcriptions-v1` |
+| `piper-training` | training | `piper-training-service` | always | `training: voice-training-job-v1` |
+
+Optional providers are omitted from the registry entirely until their `ENABLE_*` flag is set on
+`frontend-service`; the flag and the compose profile that starts the service are separate switches
+and both are needed (a flag without its service is a permanently red status indicator, a service
+without its flag is invisible).
+
+Five gateway variables shape the registry: `DEFAULT_TTS_PROVIDER` and `DEFAULT_STT_PROVIDER` (which
+engine the UI preselects; must be a provider id from this endpoint and, for STT, one that is
+running: `whisper` is `stt-service`, which the ARM64 and Strix Halo presets do not start, so they
+set `DEFAULT_STT_PROVIDER=whisper-cpp`), `TRAINING_PROVIDER` (the provider id that owns training),
+`PROVIDER_HEALTH_TIMEOUT`, and `PROVIDER_REGISTRY_JSON`. The latter is JSON with `providers` and/or
+`ui` objects: an entry with the same id **replaces** the built-in one as a whole (there is no deep
+merge, so restate every field you keep), and malformed JSON stops the gateway from starting. All
+five are forwarded by `docker-compose.yml`.
 
 The `settings` object is intentionally provider-specific metadata for configurable UI defaults and allowed values. The frontend now uses it to drive service configuration controls such as language lists, quality levels, training defaults, and built-in speaker defaults.
 
@@ -264,8 +290,15 @@ Request:
 Response:
 
 - audio binary payload
-- passthrough `X-*` headers from backend provider when present
+- passthrough `X-*` headers from backend provider when present (`X-Language`, `X-Language-Requested`, `X-Language-Fallback`, `X-Chunk-Count`, …)
 - `X-Provider` header added by the adapter
+
+`language` is compared case-insensitively and trimmed: `auto`, `AUTO`, ` Auto ` and an empty value all
+mean "no language given", so `/api/tts` and `/v1/audio/speech` send a backend the same body. What
+a backend does with it is the backend's contract: Piper resolves it to `PIPER_DEFAULT_LANGUAGE`
+(German) after a text-based guess, Qwen3-TTS to `QWEN3_DEFAULT_LANGUAGE` (German). `text` is capped
+at `MAX_TTS_CHARS` (422); a backend's own limit answers 413 with its own message, and a provider
+declaring `tts_stream` (Chatterbox) is called on `/tts-stream`.
 
 ### `POST /api/stt`
 
@@ -286,6 +319,22 @@ Response:
   - `duration`: number or `null`
 - passthrough `X-*` headers from backend provider when present
 - `X-Provider` header added by the adapter
+
+The provider is exactly the one named in `provider`: this route never falls back to another
+backend (only the implicit default of `POST /v1/audio/transcriptions` does, and it says so in
+`X-Provider-Fallback`, see [`api.md`](./api.md)).
+
+### Live transcription: `WS /ws/stt`
+
+The gateway relays the browser's microphone stream to a provider that declares `live_transcribe`
+(today `whisper`, selected with `?provider=`); any other provider is refused with close code 1008 and a
+reason. The same origin rule as the REST API applies, and `API_KEY` does not (browsers cannot send an
+`Authorization` header on a WebSocket). The backend's frames pass through unchanged:
+`{"type": "partial", "confirmed": …, "pending": …}` where `confirmed` is the whole session's
+committed text so far (it only grows), `{"type": "final", …}`, and `{"type": "error", "code": …,
+"message": …, "error": …}`. A live socket that sends nothing for `WS_IDLE_TIMEOUT_S` (60) is closed
+with code 4408; a language code that is not valid is answered with an error frame and the previous
+language is kept.
 
 ### `/api/training/*`
 
@@ -332,6 +381,8 @@ Used by:
 
 - `whisper`
 - `qwen3-asr`
+- `parakeet`
+- `canary`
 
 Request:
 
@@ -344,7 +395,31 @@ Response:
 - `text`: string
 - `segments`: array of `{start, end, text, ...}` when available
 - `language`: optional string
-- `duration`: optional number
+- `duration`: optional number (it is what lets `benchmarks/run_german_eval.py` report a real-time factor)
+
+Status codes every implementation shares: **400** for an empty file or an unknown `language`/`task`,
+**413** when the upload exceeds the service's `MAX_UPLOAD_MB` or the recording its length limit,
+**422** for audio that cannot be decoded (and, on Canary, for a language its model cannot decode),
+**503** while the model cannot be loaded or the GPU is out of memory. `GET /ready` (see
+[`api.md`](./api.md#health-versus-ready-on-the-backends)) never blocks on a load.
+
+Per-service differences worth knowing:
+
+- `qwen3-asr` cuts a recording into pieces of `QWEN3_ASR_CHUNK_S` seconds and adds `chunks`,
+  `truncated` and `warnings` at the top level and `language` and `truncated` on each segment.
+  Segments carry no `confidence`, because the model has none. `/detect_language` analyses only the
+  first piece.
+- `parakeet` and `canary` add a per-file `status` to the error entries of `POST /transcribe-batch`.
+  `GET /status` reports the NeMo, torch and CUDA versions the image was built with under `runtime`.
+- `whisper` (`stt-service`) takes `language=null` to mean `STT_DEFAULT_LANGUAGE` (empty: detect) and
+  reports `preferred_device`, `preferred_compute_type` and `degraded` in `/health`.
+
+### `stt-detect-language-v1`
+
+Used by `whisper` and `qwen3-asr`: `POST /detect_language` with the same multipart `audio`, returning
+the detected `language` and its probability. Parakeet has the route but always returns `null`, and
+Canary has no language identification at all: the registry's `language_detect` field says which
+providers can actually do it.
 
 ### `openai-audio-transcriptions-v1`
 
@@ -374,6 +449,7 @@ Used by:
 
 - `piper`
 - `qwen3` for basic built-in speaker synthesis via frontend adapter mapping
+- `chatterbox`
 
 Request:
 
@@ -383,11 +459,36 @@ Request:
 
 Notes:
 
+- Every TTS backend exposes `GET /health` (liveness) and `GET /ready` (Piper: 503 without an installed voice; the model backends: 503 while the first load runs or after it failed).
 - Qwen3 does not natively expose this exact payload. The frontend adapter translates the shared fields into the provider's native `lang`, `speaker`, and `instruct` request schema for basic TTS.
 
 Response:
 
 - audio binary payload
+
+### `voice-catalog-v1`, `speaker-catalog-v1`
+
+`voice-catalog-v1` (Piper): `GET /voices` lists the **installed** voices grouped by language, plus
+`default_language`, `default_voice` and `catalog_only` (true when the image ships no voices);
+`POST /refresh_voices` rescans the models directory and also returns `default_voices`. The gateway's
+`GET /api/providers/piper/voices` normalises it. `speaker-catalog-v1` (Qwen3-TTS): `GET /speakers`,
+which is empty on the Base models (they clone voices; built-in speakers need a CustomVoice variant)
+and reports `speakers_source`.
+
+### `saved-voice-library-v1`
+
+Used by `qwen3`. A saved voice is created from reference audio (`name`, `lang`, `file`) with an
+optional `mode` (`xvector`, the default, stores the speaker embedding only; `icl` also keeps the
+reference text, given as `ref_text` or transcribed) and answers with `mode` and `ref_text_source`. `POST /voices/{voice_id}/tts` synthesises with it; a `/tts` request against a
+model that has no built-in speakers is **409**, not 400.
+
+### `chunked-wav-stream-v1`
+
+Used by `chatterbox` (`POST /tts-stream`): a WAV header followed by audio generated sentence by
+sentence, with `CHATTERBOX_CHUNK_GAP_MS` of silence between sentences. Text longer than
+`MAX_TEXT_CHARS` is 413 before any audio is sent; a model that fails to load is an HTTP 500 with a
+detail, not a truncated stream. `POST /tts` and `/clone` use the same chunking and report
+`X-Chunk-Count`.
 
 ### `model-catalog-v1`
 
@@ -462,6 +563,9 @@ Notes:
 - training now separates export from deployment target selection
 - deployment is governed by explicit target contracts such as `manual-artifact-v1`, `piper-shared-volume-v1`, and `piper-upload-api-v1`
 - the training runtime is still Piper-oriented in model bundle format, but no longer assumes Piper as the only active deployment path
+- one job runs at a time by default (`TRAINING_MAX_CONCURRENT`); a second `POST /train`, `/train-from-dataset`, `/retrain-from-segments` or `/resume-training` is **409** naming the running job
+- job status carries `trainer_kind` and `trainer_caveat`, and `GET /ready` reports `accepting_jobs`, `active_jobs`, storage and device checks
+- `/prepare-dataset` reads audio only from `data/` plus `TRAINING_ALLOWED_AUDIO_DIRS` and downloads only from `TRAINING_ALLOWED_URL_HOSTS`; without an allowed host a URL is refused
 
 ## Capability Guidelines
 

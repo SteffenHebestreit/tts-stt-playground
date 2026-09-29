@@ -4,10 +4,35 @@ name: Publish images to GHCR
 # stack can be deployed (e.g. on TrueNAS SCALE, or on an ARM SBC) without
 # building from source.
 #
-# Triggers:
-#   - git tag  vX.Y.Z   -> publishes :X.Y.Z and :latest
-#   - push to master    -> publishes :latest
-#   - manual dispatch   -> publishes :<inputs.tag> (default: latest)
+# ---------------------------------------------------------------------------
+# WHAT GETS PUBLISHED, AND WHEN  (decided in scripts/plan_publish.py, which
+# tests/test_publish_plan.py exercises; this file only carries out the plan)
+# ---------------------------------------------------------------------------
+#   push of tag vX.Y.Z         :X.Y.Z  :X.Y  :latest  :sha-<short>
+#   push of tag vX.Y.Z-rc.1    :X.Y.Z-rc.1  :sha-<short>   (a prerelease never moves latest)
+#   push to master             :latest  :master  :sha-<short>
+#   manual run, any branch     :sha-<short>  :<branch>  and the optional `extra-tag`
+#                              input. NEVER :latest and never a version number: a
+#                              run from a feature branch must not change what every
+#                              default deployment pulls, or a tag a TrueNAS install
+#                              has pinned.
+#
+# So `latest` moves only when a release is cut or master advances, and both run the
+# CI checks first (the `tests` job below). Reproducible deployments pin
+# IMAGE_TAG=X.Y.Z. A release also publishes rollback images for the two NeMo
+# services built against NeMo 2.x, as :X.Y.Z-nemo2 (NEMO_IMAGE_SUFFIX=-nemo2 in
+# docker-compose.yml selects them); a manual run builds them when `nemo2` is set.
+#
+# ---------------------------------------------------------------------------
+# ONE BROKEN IMAGE DOES NOT BLOCK THE OTHERS
+# ---------------------------------------------------------------------------
+# The heavy CUDA images fail for reasons of their own (a wheel index that is down,
+# a base image that moved). Publishing is therefore gated per image, not per run:
+# every image has its own manifest job, which runs even when other builds failed
+# (if: !cancelled()) and publishes only if ALL architectures of THAT image were
+# built. The frontend and Piper go out even if Chatterbox does not; a half-built
+# multi-arch image is never published. Re-run the failed jobs to publish the rest.
+# Nothing is built at all when the CI checks fail.
 #
 # ---------------------------------------------------------------------------
 # ARCHITECTURES
@@ -24,52 +49,98 @@ name: Publish images to GHCR
 # arm64 is built on NATIVE GitHub-hosted arm64 runners, not QEMU. whisper-cpp
 # compiles ggml from source; under QEMU that build takes hours.
 #
-# Each architecture is pushed BY DIGEST (no tag), and a final merge job assembles
-# the manifest list. Two jobs must never push the same tag — the second would
-# silently replace the first rather than adding to it.
+# Each architecture is pushed BY DIGEST (no tag), and a final manifest job
+# assembles the manifest list. Two jobs must never push the same tag — the second
+# would silently replace the first rather than adding to it.
+#
 # ---------------------------------------------------------------------------
+# BUILD ARGUMENTS
+# ---------------------------------------------------------------------------
+# The pins (torch and torchaudio for the CUDA images, the Chatterbox commit, the
+# NeMo release line, the Piper voices, the whisper.cpp release) are ARGs with
+# defaults in each Dockerfile. This workflow deliberately passes none of them, so
+# a published image and `docker compose build` produce the same thing
+# (tests/test_compose_hygiene.py keeps compose from restating a different
+# default). The CUDA images fail their own build if the resulting torch has no
+# sm_120 (Blackwell) kernels; the check reads torch._C._cuda_getArchFlags(),
+# because torch.cuda.get_arch_list() is empty on a runner without a GPU. The one
+# argument set here is NEMO_TOOLKIT_SPEC for the -nemo2 rollback images. The
+# -rocm and -vulkan variants are not published: docker-compose.rocm.yml and
+# docker-compose.vulkan.yml build them locally (pull_policy: build).
 
 on:
   push:
     branches: [master]
-    tags: ["v*"]
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Image tag to publish"
+      extra-tag:
+        description: "Optional extra image tag, e.g. my-test. Never 'latest' and never a version number."
         required: false
-        default: latest
+        default: ""
+        type: string
+      nemo2:
+        description: "Also build the NeMo 2.x rollback images (parakeet-asr and canary-asr, tagged -nemo2)"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
-  packages: write
 
-env:
-  REGISTRY_IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}/tts-stt-
+# Two publishes of one ref would race for the same tags; let the first finish.
+concurrency:
+  group: publish-images-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.plan.outputs.build }}
+      merge: ${{ steps.plan.outputs.merge }}
+      release: ${{ steps.plan.outputs.release }}
+      latest: ${{ steps.plan.outputs.latest }}
+      extra_tag: ${{ steps.plan.outputs.extra_tag }}
+      image_prefix: ${{ steps.plan.outputs.image_prefix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Inputs reach the script as environment variables, not as text spliced
+      # into the shell command, so a hostile tag or input cannot inject code.
+      - name: Plan
+        id: plan
+        env:
+          PUBLISH_EXTRA_TAG: ${{ inputs.extra-tag }}
+          PUBLISH_NEMO2: ${{ inputs.nemo2 }}
+        run: python3 scripts/plan_publish.py
+
+  # The same checks every branch gets (lint, unit tests on 3.11 and 3.12, compose
+  # validation, actionlint, JS syntax). The informational jobs are skipped: they
+  # never fail a run, so they would only delay the builds.
+  tests:
+    name: CI checks
+    # After the plan, so a refused trigger (a bad tag, `latest` as an extra tag) stops
+    # here instead of after several minutes of checks.
+    needs: [plan]
+    uses: ./.github/workflows/ci.yml
+    with:
+      image-builds: false
+      informational: false
+
   build:
-    name: build ${{ matrix.name }} (${{ matrix.arch }})
+    name: build ${{ matrix.key }} (${{ matrix.arch }})
+    needs: [plan, tests]
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          # --- multi-arch: the only services that can run on ARM64 -----------
-          - { name: frontend,       context: ./frontend-service,        arch: amd64, runner: ubuntu-latest }
-          - { name: frontend,       context: ./frontend-service,        arch: arm64, runner: ubuntu-24.04-arm }
-          - { name: piper-tts,      context: ./piper-tts-service,       arch: amd64, runner: ubuntu-latest }
-          - { name: piper-tts,      context: ./piper-tts-service,       arch: arm64, runner: ubuntu-24.04-arm }
-          - { name: whisper-cpp,    context: ./whisper-cpp-service,     arch: amd64, runner: ubuntu-latest }
-          - { name: whisper-cpp,    context: ./whisper-cpp-service,     arch: arm64, runner: ubuntu-24.04-arm }
-          # --- amd64 only: CUDA / NeMo / PyTorch-GPU services ----------------
-          - { name: stt,            context: ./stt-service,             arch: amd64, runner: ubuntu-latest }
-          - { name: qwen3-asr,      context: ./qwen3-asr-service,       arch: amd64, runner: ubuntu-latest }
-          - { name: qwen3-tts,      context: ./qwen3-tts-service,       arch: amd64, runner: ubuntu-latest }
-          - { name: parakeet-asr,   context: ./parakeet-asr-service,    arch: amd64, runner: ubuntu-latest }
-          - { name: canary-asr,     context: ./canary-asr-service,      arch: amd64, runner: ubuntu-latest }
-          - { name: chatterbox-tts, context: ./chatterbox-tts-service,  arch: amd64, runner: ubuntu-latest }
-          - { name: piper-training, context: ./piper-training-service,  arch: amd64, runner: ubuntu-latest }
+      matrix: ${{ fromJSON(needs.plan.outputs.build) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -90,8 +161,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Push by digest only. Tags are applied by the merge job, so the two
-      # per-arch builds of one service cannot overwrite each other's tag.
+      # Push by digest only. Tags are applied by the manifest job, so the per-arch
+      # builds of one image cannot overwrite each other's tag. `build-args` is empty
+      # except for the -nemo2 rollback images; `cache-to` is empty for those too.
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@v6
@@ -99,18 +171,19 @@ jobs:
           context: ${{ matrix.context }}
           file: ${{ matrix.context }}/Dockerfile
           platforms: linux/${{ matrix.arch }}
+          build-args: ${{ matrix.build_args }}
           push: true
-          outputs: type=image,name=${{ env.REGISTRY_IMAGE_PREFIX }}${{ matrix.name }},push-by-digest=true,name-canonical=true
+          outputs: type=image,name=${{ needs.plan.outputs.image_prefix }}${{ matrix.name }},push-by-digest=true,name-canonical=true
           # Scope must include the arch, or the two builds fight over one cache.
-          cache-from: type=gha,scope=${{ matrix.name }}-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.name }}-${{ matrix.arch }}
+          cache-from: ${{ matrix.cache_from }}
+          cache-to: ${{ matrix.cache_to }}
 
       - name: Export digest
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           mkdir -p /tmp/digests
-          # The digest is "sha256:<hex>"; the merge job re-adds the prefix, so
+          # The digest is "sha256:<hex>"; the manifest job re-adds the prefix, so
           # store just the hex as the filename. Strip in the shell — GitHub
           # Actions expressions have no parameter-expansion syntax.
           touch "/tmp/digests/${DIGEST#sha256:}"
@@ -118,36 +191,53 @@ jobs:
       - name: Upload digest
         uses: actions/upload-artifact@v4
         with:
-          name: digests-${{ matrix.name }}-${{ matrix.arch }}
+          name: ${{ matrix.artifact }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
 
+  # One job per image (and per -nemo2 variant). It must not depend on the WHOLE
+  # build job succeeding, or one failing CUDA leg would keep the frontend
+  # unpublished: `!cancelled()` lets it run after failures, and the first step
+  # decides from this image's own digests.
   merge:
-    name: manifest ${{ matrix.name }}
+    name: manifest ${{ matrix.key }}
+    needs: [plan, tests, build]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.tests.result == 'success' }}
     runs-on: ubuntu-latest
-    needs: [build]
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
-      matrix:
-        name:
-          - frontend
-          - piper-tts
-          - whisper-cpp
-          - stt
-          - qwen3-asr
-          - qwen3-tts
-          - parakeet-asr
-          - canary-asr
-          - chatterbox-tts
-          - piper-training
+      matrix: ${{ fromJSON(needs.plan.outputs.merge) }}
     steps:
+      # One sub-directory per architecture artifact (no merge-multiple), so the
+      # next step can tell which architecture is missing.
       - name: Download digests
         uses: actions/download-artifact@v4
         with:
-          pattern: digests-${{ matrix.name }}-*
-          merge-multiple: true
+          pattern: digests-${{ matrix.key }}_*
           path: /tmp/digests
+
+      - name: Check every architecture of this image was built
+        env:
+          KEY: ${{ matrix.key }}
+          EXPECTED: ${{ matrix.archs }}
+        run: |
+          read -ra archs <<< "$EXPECTED"
+          missing=()
+          for arch in "${archs[@]}"; do
+            dir="/tmp/digests/digests-${KEY}_${arch}"
+            if [ -z "$(ls -A "$dir" 2>/dev/null)" ]; then
+              missing+=("$arch")
+            fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error title=${KEY} not published::no image was built for: ${missing[*]}. Its build failed; the other images are unaffected. Fix it and re-run the failed jobs."
+            exit 1
+          fi
+          echo "digests present for: ${archs[*]}"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -159,30 +249,48 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # flavor latest=false switches metadata-action's own idea of `latest` off: the
+      # plan job decides, and only it (see the table at the top of this file).
+      # `suffix` is empty except for the -nemo2 rollback images.
       - name: Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY_IMAGE_PREFIX }}${{ matrix.name }}
+          images: ${{ needs.plan.outputs.image_prefix }}${{ matrix.name }}
+          flavor: |
+            latest=false
+            suffix=${{ matrix.suffix }}
           tags: |
-            # Tag vX.Y.Z publishes :X.Y.Z and :latest (TrueNAS pins versions without the "v")
-            type=semver,pattern={{version}}
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-            type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=semver,pattern={{version}},enable=${{ needs.plan.outputs.release }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ needs.plan.outputs.release }}
+            type=raw,value=latest,enable=${{ needs.plan.outputs.latest }}
+            type=ref,event=branch
+            type=raw,value=${{ needs.plan.outputs.extra_tag }},enable=${{ needs.plan.outputs.extra_tag != '' }}
             type=sha,format=short
 
-      # Assembles one manifest list per tag from whichever per-arch digests
-      # exist. Services with only an amd64 digest get a single-entry list, which
-      # is exactly the previous behaviour.
+      # Assembles one manifest list per tag from this image's per-arch digests.
+      # An image with only an amd64 digest gets a single-entry list. The tags come
+      # from DOCKER_METADATA_OUTPUT_JSON, which metadata-action exports: the JSON
+      # is never spliced into the script text.
       - name: Create and push manifest list
         working-directory: /tmp/digests
+        env:
+          IMAGE: ${{ needs.plan.outputs.image_prefix }}${{ matrix.name }}
         run: |
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< '${{ steps.meta.outputs.json }}') \
-            $(printf '${{ env.REGISTRY_IMAGE_PREFIX }}${{ matrix.name }}@sha256:%s ' *)
+          mapfile -t tag_args < <(jq -r '.tags[] | ("-t", .)' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          refs=()
+          for digest in */*; do
+            refs+=("${IMAGE}@sha256:${digest##*/}")
+          done
+          docker buildx imagetools create "${tag_args[@]}" "${refs[@]}"
 
       - name: Inspect published image
         run: |
-          docker buildx imagetools inspect \
-            "${{ env.REGISTRY_IMAGE_PREFIX }}${{ matrix.name }}:${{ steps.meta.outputs.version }}"
+          first=$(jq -r '.tags[0]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          docker buildx imagetools inspect "$first"
+          {
+            echo "### ${MATRIX_KEY}"
+            jq -r '.tags[] | "- `\(.)`"' <<< "$DOCKER_METADATA_OUTPUT_JSON"
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          MATRIX_KEY: ${{ matrix.key }}

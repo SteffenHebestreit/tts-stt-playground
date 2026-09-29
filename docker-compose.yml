@@ -9,17 +9,86 @@ name: ttstt
 #   TrueNAS / single-GPU host:       -f docker-compose.yml -f docker-compose.truenas.yml
 #
 # See docs/truenas-deployment.md for the full guide.
+#
+# --- Published ports ---------------------------------------------------------
+# Only the frontend gateway is meant to be reached over the network
+# (FRONTEND_BIND_ADDR, default 0.0.0.0). It proxies every backend call, the live
+# microphone WebSocket included, over the internal network. The backends have no
+# authentication, so their host ports are bound to BACKEND_BIND_ADDR (default
+# 127.0.0.1): reachable from the machine itself for curl and benchmarks, and
+# from nowhere else. Set BACKEND_BIND_ADDR=0.0.0.0 to call them from other
+# hosts. No service reaches another through a published port; they use the
+# service names below on tts-stt-network (tests/test_env_wiring.py enforces it).
+#
+# --- Image tags --------------------------------------------------------------
+# IMAGE_TAG=latest follows the newest release tag or master build (see
+# .github/workflows/publish-images.yml for exactly when :latest moves; a manual or
+# branch build never moves it). That is convenient and it means an update can
+# change behaviour: pin IMAGE_TAG=X.Y.Z when a deployment must stay reproducible. PULL_POLICY=always makes `up` fetch a moved tag; the
+# default (missing) reuses whatever is already on the host. The -rocm and
+# -vulkan overlays build locally and keep their own `pull_policy: build`.
+#
+# --- Health checks -----------------------------------------------------------
+# Container healthchecks use /health: liveness only, 200 while a model is
+# loading or idle-unloaded. Each service also has GET /ready (503 while the first
+# model load is running or after it failed) for setup scripts and operators.
+# Neither the healthchecks nor `depends_on` use /ready: a first model download
+# takes minutes, optional backends may be absent, and a gate would keep the
+# gateway (and with it the whole UI) down for as long as the slowest backend.
+# The gateway reports each backend's state itself (GET /api/health).
 
 services:
+  # Seeds the Piper voices that ship inside the image into the models directory.
+  # That directory is a bind mount, and a bind mount hides whatever the image
+  # holds at the mount point, so a fresh install had no voices at all until
+  # someone copied .onnx files in by hand. Copies only what is missing, never
+  # overwrites, exits. Voices you add later are left alone.
+  piper-voices-seed:
+    profiles: [piper-tts, all]
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-piper-tts:${IMAGE_TAG:-latest}
+    pull_policy: ${PULL_POLICY:-missing}
+    build:
+      context: ./piper-tts-service
+      dockerfile: Dockerfile
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -eu
+        src=/app/models/default
+        dst=/seed/default
+        mkdir -p "$$dst"
+        copied=0
+        for f in "$$src"/*; do
+          [ -e "$$f" ] || continue
+          name=$${f##*/}
+          if [ ! -e "$$dst/$$name" ]; then
+            cp "$$f" "$$dst/$$name.part"
+            mv "$$dst/$$name.part" "$$dst/$$name"
+            copied=$$((copied + 1))
+          fi
+        done
+        echo "piper-voices-seed: $$copied new voice file(s) copied into $$dst"
+    volumes:
+      - "${MODELS_DIR:-${APP_DATA_DIR:-.}/models}:/seed"
+    restart: "no"
+    network_mode: none
+
   # PiperTTS service with default and custom model support
   piper-tts-service:
     profiles: [piper-tts, all]
     image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-piper-tts:${IMAGE_TAG:-latest}
+    pull_policy: ${PULL_POLICY:-missing}
     build:
       context: ./piper-tts-service
       dockerfile: Dockerfile
+      # Optional overrides, unset by default (the Dockerfile ARG is the pin):
+      #   PIPER_VOICES="de_DE-thorsten-medium ..."  voices baked into the image
+      #   PIPER_VOICES_REVISION                      rhasspy/piper-voices revision
+      args:
+        - PIPER_VOICES
+        - PIPER_VOICES_REVISION
     ports:
-      - "${PIPER_TTS_PORT:-5000}:5000"
+      - "${BACKEND_BIND_ADDR:-127.0.0.1}:${PIPER_TTS_PORT:-5000}:5000"
     environment:
       PIPER_DATA_DIR: /app/models
       PIPER_OUTPUT_DIR: /app/output
@@ -32,12 +101,32 @@ services:
       # A German request with no German voice otherwise returns English audio
       # at HTTP 200. Always reported via X-Language-Fallback; set true to 400.
       PIPER_STRICT_LANGUAGE: ${PIPER_STRICT_LANGUAGE:-false}
-      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
+      # What a request that names no language ("auto", or the OpenAI route,
+      # which has no such field) is spoken in. German is the project's language;
+      # the service still guesses German vs English from the text first.
+      PIPER_DEFAULT_LANGUAGE: ${PIPER_DEFAULT_LANGUAGE:-de}
+      # Voice id preferred for its language when the request names none, e.g.
+      # de_DE-thorsten-medium. Empty = the first installed voice of the language.
+      PIPER_DEFAULT_VOICE: ${PIPER_DEFAULT_VOICE:-}
+      PIPER_AUTO_DETECT: ${PIPER_AUTO_DETECT:-true}
+      # A synthesis longer than this is killed (504); the same bound applies to
+      # waiting for a free slot (503).
+      PIPER_TIMEOUT_S: ${PIPER_TIMEOUT_S:-60}
+      # Empty = half the CPU cores (at least 1).
+      PIPER_MAX_CONCURRENCY: ${PIPER_MAX_CONCURRENCY:-}
+      # MAX_TEXT_CHARS / MAX_UPLOAD_MB mean different things per service, so each
+      # gets its own host variable and the container-side name stays the same.
+      MAX_TEXT_CHARS: ${PIPER_MAX_TEXT_CHARS:-20000}
+      MAX_UPLOAD_MB: ${PIPER_MAX_UPLOAD_MB:-100}
+      MAX_ANALYZE_UPLOAD_MB: ${PIPER_MAX_ANALYZE_UPLOAD_MB:-25}
+      # The backends are not browser-facing (the gateway is), see BACKEND_BIND_ADDR.
+      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${MODELS_DIR:-${APP_DATA_DIR:-.}/models}:/app/models"
       - "${OUTPUT_DIR:-${APP_DATA_DIR:-.}/output}:/app/output"
     restart: unless-stopped
+    stop_grace_period: 20s
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
       interval: 30s
@@ -46,6 +135,9 @@ services:
       retries: 3
     networks:
       - tts-stt-network
+    depends_on:
+      piper-voices-seed:
+        condition: service_completed_successfully
 
   # PiperTTS Training service for custom voice models
   # Deliberately NOT in the `all` profile: training is an episodic workload,
@@ -54,11 +146,12 @@ services:
   piper-training-service:
     profiles: [training]
     image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-piper-training:${IMAGE_TAG:-latest}
+    pull_policy: ${PULL_POLICY:-missing}
     build:
       context: ./piper-training-service
       dockerfile: Dockerfile
     ports:
-      - "${TRAINING_PORT:-8080}:8080"
+      - "${BACKEND_BIND_ADDR:-127.0.0.1}:${TRAINING_PORT:-8080}:8080"
     environment:
       CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-0}
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
@@ -69,11 +162,37 @@ services:
       PIPER_TTS_SERVICE_URL: ${PIPER_TTS_SERVICE_URL:-http://piper-tts-service:5000}
       SHARED_MODELS_DIR: ${SHARED_MODELS_DIR:-/app/shared_models}
       DEFAULT_DEPLOYMENT_TARGET: ${DEFAULT_DEPLOYMENT_TARGET:-piper-volume}
+      # Advanced, JSON: its "targets" replace the built-in targets that have the same
+      # id, the others stay. Malformed JSON stops the service from starting.
+      DEPLOYMENT_TARGETS_JSON: ${DEPLOYMENT_TARGETS_JSON:-}
       MAX_TRAIN_BATCH_SIZE: ${MAX_TRAIN_BATCH_SIZE:-4}
       # Honour a per-request stt_service_url instead of STT_SERVICE_URL.
       # Off by default: it lets any caller redirect the service's uploads.
       ALLOW_CLIENT_STT_URL: ${ALLOW_CLIENT_STT_URL:-false}
-      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
+      # Jobs that may run at once; a second one is refused with 409.
+      TRAINING_MAX_CONCURRENT: ${TRAINING_MAX_CONCURRENT:-1}
+      TRAINING_DEFAULT_LANGUAGE: ${TRAINING_DEFAULT_LANGUAGE:-de}
+      # /prepare-dataset may read audio only from data/ plus these in-container
+      # directories, and may download only from these hosts (comma separated).
+      TRAINING_ALLOWED_AUDIO_DIRS: ${TRAINING_ALLOWED_AUDIO_DIRS:-}
+      TRAINING_ALLOWED_URL_HOSTS: ${TRAINING_ALLOWED_URL_HOSTS:-}
+      # Transcript segments below exp(avg_logprob) of this are not trained on.
+      STT_MIN_CONFIDENCE: ${STT_MIN_CONFIDENCE:-0.6}
+      # Share of samples that may fail phonemisation before the build aborts.
+      PHONEMIZER_MAX_FAILURE_FRACTION: ${PHONEMIZER_MAX_FAILURE_FRACTION:-0.05}
+      # Consecutive failed batches before a job is declared failed, and how many
+      # periodic checkpoints (~200 MB each) are kept per job (0 = all).
+      TRAIN_MAX_CONSECUTIVE_FAILURES: ${TRAIN_MAX_CONSECUTIVE_FAILURES:-5}
+      KEEP_LAST_CHECKPOINTS: ${KEEP_LAST_CHECKPOINTS:-5}
+      TRAIN_NUM_WORKERS: ${TRAIN_NUM_WORKERS:-2}
+      # How long shutdown waits for running jobs to stop. stop_grace_period below
+      # must stay larger, or Docker kills the container mid-checkpoint
+      # (tests/test_env_wiring.py checks it).
+      TRAINING_SHUTDOWN_GRACE_S: ${TRAINING_SHUTDOWN_GRACE_S:-30}
+      UVICORN_TIMEOUT_KEEP_ALIVE: ${UVICORN_TIMEOUT_KEEP_ALIVE:-75}
+      MAX_UPLOAD_MB: ${TRAINING_MAX_UPLOAD_MB:-500}
+      MAX_TEXT_CHARS: ${TRAINING_MAX_TEXT_CHARS:-1000}
+      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${TRAINING_DATA_DIR:-${APP_DATA_DIR:-.}/piper-training-service/data}:/app/data"
@@ -82,7 +201,16 @@ services:
       - "${TRAINING_CONFIGS_DIR:-${APP_DATA_DIR:-.}/piper-training-service/configs}:/app/configs"
       - "${MODELS_DIR:-${APP_DATA_DIR:-.}/models}:/app/shared_models"
     shm_size: 2gb
+    # Optional caps so a runaway job cannot take the whole host down. 0 = unlimited
+    # (Compose drops a zero, so the default adds no limit at all). Examples:
+    # TRAINING_MEM_LIMIT=12g, TRAINING_CPUS=6.
+    mem_limit: ${TRAINING_MEM_LIMIT:-0}
+    cpus: ${TRAINING_CPUS:-0}
     restart: unless-stopped
+    # SIGTERM asks running jobs to stop at the next epoch boundary and lets them
+    # write job state; Docker's default 10 s would SIGKILL first, and the job
+    # would come back as `interrupted` after every image update.
+    stop_grace_period: 60s
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 30s
@@ -111,10 +239,11 @@ services:
   stt-service:
     profiles: [stt, all]
     image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-stt:${IMAGE_TAG:-latest}
+    pull_policy: ${PULL_POLICY:-missing}
     build:
       context: ./stt-service
     ports:
-      - "${STT_PORT:-5001}:8000"
+      - "${BACKEND_BIND_ADDR:-127.0.0.1}:${STT_PORT:-5001}:8000"
     environment:
       USE_CUDA: "true"
       # Only the value `rocm` changes behaviour; everything else falls through
@@ -125,7 +254,8 @@ services:
       # large-v3-turbo: 4 decoder layers vs large-v3's 32 at comparable accuracy.
       # Decoder depth dominates greedy realtime decoding, so this is the single
       # biggest live-latency lever. It cannot do task="translate" — set
-      # large-v3 here if you need translation.
+      # large-v3 here if you need translation. A Hugging Face repo id or a path
+      # to a CTranslate2 export (e.g. a German fine-tune) is accepted as well.
       WHISPER_MODEL_SIZE: ${WHISPER_MODEL_SIZE:-large-v3-turbo}
       # Empty = probe the device and pick the most memory-efficient supported
       # type. Passed through explicitly because benchmarks/run_german_eval.py
@@ -141,10 +271,11 @@ services:
       # or the server FINs first and pooled sockets come back dead.
       WS_MAX_QUEUE: ${WS_MAX_QUEUE:-128}
       KEEPALIVE_TIMEOUT: ${KEEPALIVE_TIMEOUT:-120}
-      # Live-transcription tuning. WS_WINDOW_S bounds how much trailing audio
-      # each interim decode re-transcribes. Whisper pads the mel to a fixed 30 s
-      # before the encoder, so this does NOT change encoder cost — it bounds the
-      # decoder tokens regenerated per tick. Real, but a moderate saving.
+      # Live-transcription tuning. WS_WINDOW_S is the target amount of trailing
+      # audio each interim decode re-transcribes; the window is cut at the last
+      # committed sentence end and never exceeds min(30, 2x this). Whisper pads
+      # the mel to a fixed 30 s before the encoder, so this does NOT change
+      # encoder cost — it bounds the decoder tokens regenerated per tick.
       WS_WINDOW_S: ${WS_WINDOW_S:-8.0}
       WS_MIN_NEW_AUDIO_S: ${WS_MIN_NEW_AUDIO_S:-0.5}
       WS_MAX_SESSIONS: ${WS_MAX_SESSIONS:-4}
@@ -154,7 +285,32 @@ services:
       WS_MAX_BUFFER_S: ${WS_MAX_BUFFER_S:-600.0}
       WS_NO_SPEECH_THRESHOLD: ${WS_NO_SPEECH_THRESHOLD:-0.6}
       WS_MIN_AVG_LOGPROB: ${WS_MIN_AVG_LOGPROB:--1.0}
+      # Live-session robustness: interim-decode failures in a row before the
+      # client gets an error frame, seconds of silence on the socket before it is
+      # closed (0 = never; the session also releases the model then), and the
+      # probability at which the first detected language is locked for the session.
+      WS_MAX_INTERIM_ERRORS: ${WS_MAX_INTERIM_ERRORS:-3}
+      WS_IDLE_TIMEOUT_S: ${WS_IDLE_TIMEOUT_S:-60}
+      WS_LANGUAGE_LOCK_PROB: ${WS_LANGUAGE_LOCK_PROB:-0.8}
+      # Language used when a request names none. Empty = auto-detect. An explicit
+      # `auto` from a client still detects.
+      STT_DEFAULT_LANGUAGE: ${STT_DEFAULT_LANGUAGE:-}
       WHISPER_NUM_WORKERS: ${WHISPER_NUM_WORKERS:-2}
+      # Files: largest upload (MB) and longest recording (s); both answer 413.
+      # One knob for all ASR backends; 0 disables the length cap.
+      MAX_UPLOAD_MB: ${ASR_MAX_UPLOAD_MB:-200}
+      MAX_AUDIO_SECONDS: ${ASR_MAX_AUDIO_SECONDS:-7200}
+      # Threads for file transcription; empty = min(4, CPU cores).
+      STT_BATCH_WORKERS: ${STT_BATCH_WORKERS:-}
+      # Opt in to faster-whisper's batched pipeline for /transcribe files only
+      # (needs the VAD filter, changes decoding, ~+1.5 GB VRAM at batch 8).
+      STT_BATCHED_INFERENCE: ${STT_BATCHED_INFERENCE:-false}
+      STT_BATCH_SIZE: ${STT_BATCH_SIZE:-8}
+      # Where model downloads go. Empty = the Hugging Face cache under
+      # /root/.cache (kept where existing installs already have their weights).
+      WHISPER_MODEL_DIR: ${WHISPER_MODEL_DIR:-}
+      # 1 = never contact the Hub once the model is cached (air-gapped hosts).
+      HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-0}
       # Release the 1.6-3 GB of CT2 weights after this many idle seconds.
       # Whisper is the always-on consumer here, so leaving it pinned made the
       # other services' TTLs free memory that this one immediately re-occupied.
@@ -167,13 +323,15 @@ services:
       # spawns one thread per core on top, oversubscribing the CPU.
       OMP_NUM_THREADS: ${OMP_NUM_THREADS:-4}
       PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
-      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
+      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${MODELS_DIR:-${APP_DATA_DIR:-.}/models}:/app/models"
       - "${CACHE_DIR:-${APP_DATA_DIR:-.}/.cache}:/root/.cache"
       - pip-cache:/root/.cache/pip
     restart: unless-stopped
+    # Time for an in-flight decode and live sessions to finish before SIGKILL.
+    stop_grace_period: 30s
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -194,15 +352,36 @@ services:
   qwen3-asr-service:
     profiles: [qwen3-asr, all]
     image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-qwen3-asr:${IMAGE_TAG:-latest}
+    pull_policy: ${PULL_POLICY:-missing}
     build:
       context: ./qwen3-asr-service
       dockerfile: Dockerfile
+      # The pins live in the Dockerfile. cu128 wheels exist for a limited set of
+      # torch releases and the build fails unless the result has sm_120 kernels,
+      # so override these only to a release that publishes a cu128 build.
+      args:
+        - TORCH_VERSION=${QWEN3_ASR_TORCH_VERSION:-2.8.0}
+        - TORCHAUDIO_VERSION=${QWEN3_ASR_TORCHAUDIO_VERSION:-2.8.0}
     ports:
-      - "${QWEN3_ASR_PORT:-5002}:5002"
+      - "${BACKEND_BIND_ADDR:-127.0.0.1}:${QWEN3_ASR_PORT:-5002}:5002"
     environment:
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
       NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
       QWEN3_ASR_MODEL: ${QWEN3_ASR_MODEL:-Qwen/Qwen3-ASR-1.7B}
+      # qwen-asr only cuts audio at 20 minutes and caps each piece at 512 new
+      # tokens, which silently truncated everything past ~2 minutes. The service
+      # cuts the audio itself into pieces of this many seconds (5-600), at the
+      # quietest point near the limit.
+      QWEN3_ASR_CHUNK_S: ${QWEN3_ASR_CHUNK_S:-30}
+      # Pieces per forward pass; bounds peak VRAM. Lower it on OOM.
+      QWEN3_ASR_BATCH_SIZE: ${QWEN3_ASR_BATCH_SIZE:-4}
+      # Empty = max(512, 20 x QWEN3_ASR_CHUNK_S). A piece that reaches it is
+      # flagged truncated in the response.
+      QWEN3_ASR_MAX_NEW_TOKENS: ${QWEN3_ASR_MAX_NEW_TOKENS:-}
+      # Empty = library default (SDPA). flash_attention_2 needs a custom image.
+      QWEN3_ASR_ATTN_IMPLEMENTATION: ${QWEN3_ASR_ATTN_IMPLEMENTATION:-}
+      MAX_UPLOAD_MB: ${ASR_MAX_UPLOAD_MB:-200}
+      MAX_AUDIO_SECONDS: ${ASR_MAX_AUDIO_SECONDS:-7200}
       # One shared model on one GPU: bound concurrent inference rather than
       # letting the default thread pool multiply peak VRAM.
       ASR_MAX_CONCURRENCY: ${ASR_MAX_CONCURRENCY:-1}
@@ -214,7 +393,7 @@ services:
       ASR_MODEL_TTL: ${ASR_MODEL_TTL:-300}
       # Global fallback the code reads when the specific TTL is unset.
       MODEL_TTL: ${MODEL_TTL:-300}
-      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
+      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${QWEN3_ASR_CACHE_DIR:-qwen3-asr-cache}:/root/.cache"
@@ -226,6 +405,7 @@ services:
               driver: nvidia
               count: 1
     restart: unless-stopped
+    stop_grace_period: 30s
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5002/health"]
       interval: 30s
@@ -240,18 +420,39 @@ services:
   # the browser UI with ENABLE_PARAKEET_ASR=true on the frontend.
   parakeet-asr-service:
     profiles: [parakeet-asr]
-    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-parakeet-asr:${IMAGE_TAG:-latest}
+    # NEMO_IMAGE_SUFFIX=-nemo2 selects the rollback image built against NeMo 2.x
+    # (see the NeMo notes in .env.example and parakeet-asr-service/README.md).
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-parakeet-asr:${IMAGE_TAG:-latest}${NEMO_IMAGE_SUFFIX:-}
+    pull_policy: ${PULL_POLICY:-missing}
     build:
       context: ./parakeet-asr-service
       dockerfile: Dockerfile
+      # NeMo 3.0.x on torch 2.11 (cu128) is the default. Roll back with
+      # NEMO_TOOLKIT_SPEC='>=2.7.3,<3' docker compose build parakeet-asr-service
+      # (both specs are kept working; torch has cu128 wheels for 2.7 - 2.11 only).
+      args:
+        - NEMO_TOOLKIT_SPEC=${NEMO_TOOLKIT_SPEC:->=3.0.0,<3.1}
+        - TORCH_VERSION=${NEMO_TORCH_VERSION:-2.11.0}
+        - TORCHAUDIO_VERSION=${NEMO_TORCHAUDIO_VERSION:-2.11.0}
     ports:
-      - "${PARAKEET_ASR_PORT:-5005}:5005"
+      - "${BACKEND_BIND_ADDR:-127.0.0.1}:${PARAKEET_ASR_PORT:-5005}:5005"
     environment:
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
       NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+      # A Hugging Face id, an NGC name, or the path of a .nemo file on a mounted
+      # volume (e.g. a German fine-tune such as parakeet-primeline).
       PARAKEET_ASR_MODEL: ${PARAKEET_ASR_MODEL:-nvidia/parakeet-tdt-0.6b-v3}
       # Peak VRAM scales with this; lower it before lowering model size.
       ASR_MAX_BATCH: ${ASR_MAX_BATCH:-8}
+      # Largest upload (MB), and longest recording (s, 0 = unlimited). NeMo encodes
+      # a file in one pass; parakeet-tdt-0.6b-v3 is limited to about 24 minutes.
+      MAX_UPLOAD_MB: ${ASR_MAX_UPLOAD_MB:-200}
+      NEMO_MAX_AUDIO_S: ${NEMO_MAX_AUDIO_S:-1500}
+      # torch.set_float32_matmul_precision at load: highest | high | medium.
+      NEMO_MATMUL_PRECISION: ${NEMO_MATMUL_PRECISION:-high}
+      # Opt-in bfloat16 inference, NVIDIA compute capability 8.0+ only. German
+      # WER has not been re-measured with it: benchmark before enabling.
+      NEMO_BF16: ${NEMO_BF16:-false}
       # One shared model on one GPU: bound concurrent inference rather than
       # letting the default thread pool multiply peak VRAM.
       ASR_MAX_CONCURRENCY: ${ASR_MAX_CONCURRENCY:-1}
@@ -265,7 +466,7 @@ services:
       ASR_MODEL_TTL: ${ASR_MODEL_TTL:-300}
       # Global fallback the code reads when the specific TTL is unset.
       MODEL_TTL: ${MODEL_TTL:-300}
-      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
+      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${PARAKEET_ASR_CACHE_DIR:-parakeet-asr-cache}:/root/.cache"
@@ -277,6 +478,7 @@ services:
               driver: nvidia
               count: 1
     restart: unless-stopped
+    stop_grace_period: 30s
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5005/health"]
       interval: 30s
@@ -291,19 +493,33 @@ services:
   # browser UI with ENABLE_CANARY_ASR=true on the frontend.
   canary-asr-service:
     profiles: [canary-asr]
-    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-canary-asr:${IMAGE_TAG:-latest}
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-canary-asr:${IMAGE_TAG:-latest}${NEMO_IMAGE_SUFFIX:-}
+    pull_policy: ${PULL_POLICY:-missing}
     build:
       context: ./canary-asr-service
       dockerfile: Dockerfile
+      args:
+        - NEMO_TOOLKIT_SPEC=${NEMO_TOOLKIT_SPEC:->=3.0.0,<3.1}
+        - TORCH_VERSION=${NEMO_TORCH_VERSION:-2.11.0}
+        - TORCHAUDIO_VERSION=${NEMO_TORCHAUDIO_VERSION:-2.11.0}
     ports:
-      - "${CANARY_ASR_PORT:-5006}:5006"
+      - "${BACKEND_BIND_ADDR:-127.0.0.1}:${CANARY_ASR_PORT:-5006}:5006"
     environment:
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
       NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
       CANARY_ASR_MODEL: ${CANARY_ASR_MODEL:-nvidia/canary-180m-flash}
       # Peak VRAM scales with this; lower it before lowering model size.
+      # (Canary decodes one file per pass and no longer reads it: it stays only
+      # until canary-asr-service/app.py drops its leftover read.)
       ASR_MAX_BATCH: ${ASR_MAX_BATCH:-8}
       CANARY_DEFAULT_LANGUAGE: ${CANARY_DEFAULT_LANGUAGE:-de}
+      # Comma/space separated codes to accept instead of the table derived from
+      # CANARY_ASR_MODEL (en,de,es,fr for the flash models, 25 for canary-1b-v2).
+      CANARY_SUPPORTED_LANGUAGES: ${CANARY_SUPPORTED_LANGUAGES:-}
+      MAX_UPLOAD_MB: ${ASR_MAX_UPLOAD_MB:-200}
+      NEMO_MAX_AUDIO_S: ${NEMO_MAX_AUDIO_S:-1500}
+      NEMO_MATMUL_PRECISION: ${NEMO_MATMUL_PRECISION:-high}
+      NEMO_BF16: ${NEMO_BF16:-false}
       # One shared model on one GPU: bound concurrent inference rather than
       # letting the default thread pool multiply peak VRAM.
       ASR_MAX_CONCURRENCY: ${ASR_MAX_CONCURRENCY:-1}
@@ -317,7 +533,7 @@ services:
       ASR_MODEL_TTL: ${ASR_MODEL_TTL:-300}
       # Global fallback the code reads when the specific TTL is unset.
       MODEL_TTL: ${MODEL_TTL:-300}
-      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
+      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${CANARY_ASR_CACHE_DIR:-canary-asr-cache}:/root/.cache"
@@ -329,6 +545,7 @@ services:
               driver: nvidia
               count: 1
     restart: unless-stopped
+    stop_grace_period: 30s
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5006/health"]
       interval: 30s
@@ -343,15 +560,42 @@ services:
   chatterbox-tts-service:
     profiles: [chatterbox-tts]
     image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-chatterbox-tts:${IMAGE_TAG:-latest}
+    pull_policy: ${PULL_POLICY:-missing}
     build:
       context: ./chatterbox-tts-service
       dockerfile: Dockerfile
+      # Multilingual v3 exists only on GitHub master (PyPI 0.1.7 has no t3_model),
+      # and the package hard-pins torch 2.6.0, which has no Blackwell kernels. The
+      # Dockerfile therefore installs a pinned commit with --no-deps on top of the
+      # cu128 torch below. Overrides, unset by default (the Dockerfile ARGs are
+      # the pins): CHATTERBOX_REF=<commit>, CHATTERBOX_REPO=<git url>.
+      args:
+        - CHATTERBOX_REF
+        - CHATTERBOX_REPO
+        - TORCH_VERSION=${CHATTERBOX_TORCH_VERSION:-2.8.0}
+        - TORCHAUDIO_VERSION=${CHATTERBOX_TORCHAUDIO_VERSION:-2.8.0}
     ports:
-      - "${CHATTERBOX_TTS_PORT:-5007}:5007"
+      - "${BACKEND_BIND_ADDR:-127.0.0.1}:${CHATTERBOX_TTS_PORT:-5007}:5007"
     environment:
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
       NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
       CHATTERBOX_DEFAULT_LANGUAGE: ${CHATTERBOX_DEFAULT_LANGUAGE:-de}
+      # T3 checkpoint: v3 (default), v2, default (= the library's own) or a
+      # .safetensors file name. An installed package without t3_model support
+      # falls back to its default checkpoint with a warning.
+      CHATTERBOX_T3_MODEL: ${CHATTERBOX_T3_MODEL:-v3}
+      # Empty = the library default (2.0 in 0.1.7, 1.2 on master). Must be >= 1.
+      CHATTERBOX_REPETITION_PENALTY: ${CHATTERBOX_REPETITION_PENALTY:-}
+      # Hugging Face revision of the ResembleAI/chatterbox weights (branch, tag
+      # or commit). Pin a commit to stop a weights update changing the voice.
+      CHATTERBOX_HF_REVISION: ${CHATTERBOX_HF_REVISION:-main}
+      # Silence between the chunks one /tts, /clone or /tts-stream response is
+      # generated in; 0 disables. Only the first N seconds of a clone reference
+      # are used.
+      CHATTERBOX_CHUNK_GAP_MS: ${CHATTERBOX_CHUNK_GAP_MS:-150}
+      CHATTERBOX_REF_MAX_SECONDS: ${CHATTERBOX_REF_MAX_SECONDS:-30}
+      MAX_TEXT_CHARS: ${CHATTERBOX_MAX_TEXT_CHARS:-5000}
+      MAX_UPLOAD_MB: ${CHATTERBOX_MAX_UPLOAD_MB:-20}
       # Unload the ~4 GB model after this many idle seconds so it can share a
       # 12 GB card with the STT/ASR stack (which already sits at ~9.7 GB).
       # >0 seconds | 0 = unload immediately | -1 = never unload.
@@ -359,12 +603,13 @@ services:
       # Global fallback the code reads when the specific TTL is unset.
       MODEL_TTL: ${MODEL_TTL:-300}
       # One shared model on one GPU: bound concurrent generation rather than
-      # letting the default thread pool multiply peak VRAM.
+      # letting the default thread pool multiply peak VRAM. (The model itself
+      # cannot run two generations at once: values above 1 only queue.)
       TTS_MAX_CONCURRENCY: ${TTS_MAX_CONCURRENCY:-1}
       # expandable_segments avoids the fragmentation that per-request
       # empty_cache() calls used to (badly) paper over.
       PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
-      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
+      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${CHATTERBOX_TTS_CACHE_DIR:-chatterbox-tts-cache}:/root/.cache"
@@ -376,6 +621,7 @@ services:
               driver: nvidia
               count: 1
     restart: unless-stopped
+    stop_grace_period: 30s
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5007/health"]
       interval: 30s
@@ -389,18 +635,31 @@ services:
   qwen3-tts-service:
     profiles: [qwen3-tts, all]
     image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-qwen3-tts:${IMAGE_TAG:-latest}
+    pull_policy: ${PULL_POLICY:-missing}
     build:
       context: ./qwen3-tts-service
       dockerfile: Dockerfile
+      args:
+        - TORCH_VERSION=${QWEN3_TTS_TORCH_VERSION:-2.8.0}
+        - TORCHAUDIO_VERSION=${QWEN3_TTS_TORCHAUDIO_VERSION:-2.8.0}
     ports:
-      - "${QWEN3_TTS_PORT:-5004}:5004"
+      - "${BACKEND_BIND_ADDR:-127.0.0.1}:${QWEN3_TTS_PORT:-5004}:5004"
     environment:
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
       NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
       # 0.6B by default so the stack fits an 8-12 GB card (repo labels:
       # 2.5 GB vs the 1.7B's 4.5 GB). Both list German. Raise to
-      # Qwen/Qwen3-TTS-12Hz-1.7B-Base if you have the headroom.
+      # Qwen/Qwen3-TTS-12Hz-1.7B-Base if you have the headroom. /tts (built-in
+      # speakers) needs a CustomVoice variant; the Base models clone voices.
       QWEN3_TTS_MODEL: ${QWEN3_TTS_MODEL:-Qwen/Qwen3-TTS-12Hz-0.6B-Base}
+      # Language used when a request says `auto` or names none. A name or ISO
+      # code; `Auto` hands language inference to the model.
+      QWEN3_DEFAULT_LANGUAGE: ${QWEN3_DEFAULT_LANGUAGE:-German}
+      # auto | sdpa | eager | flash_attention_2. The image ships no flash-attn,
+      # so auto means SDPA.
+      QWEN3_TTS_ATTN_IMPLEMENTATION: ${QWEN3_TTS_ATTN_IMPLEMENTATION:-auto}
+      MAX_TEXT_CHARS: ${QWEN3_TTS_MAX_TEXT_CHARS:-5000}
+      MAX_UPLOAD_MB: ${QWEN3_TTS_MAX_UPLOAD_MB:-20}
       # One shared model on one GPU: bound concurrent generation rather than
       # letting the default thread pool multiply peak VRAM.
       TTS_MAX_CONCURRENCY: ${TTS_MAX_CONCURRENCY:-1}
@@ -417,7 +676,7 @@ services:
       # empty_cache() calls used to (badly) paper over.
       PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
       QWEN3_ASR_SERVICE_URL: http://qwen3-asr-service:5002
-      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
+      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-*}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${QWEN3_TTS_CACHE_DIR:-qwen3-tts-cache}:/root/.cache"
@@ -430,6 +689,7 @@ services:
               driver: nvidia
               count: 1
     restart: unless-stopped
+    stop_grace_period: 30s
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5004/health"]
       interval: 30s
@@ -452,11 +712,17 @@ services:
   whisper-cpp:
     profiles: [whisper-cpp]
     image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-whisper-cpp:${IMAGE_TAG:-latest}
+    pull_policy: ${PULL_POLICY:-missing}
     build:
       context: ./whisper-cpp-service
       dockerfile: Dockerfile
+      # The whisper.cpp release the image is compiled from is pinned in the
+      # Dockerfile (ARG WHISPER_CPP_REF). Override with WHISPER_CPP_REF=<tag>;
+      # unset by default so a local build matches the published image.
+      args:
+        - WHISPER_CPP_REF
     ports:
-      - "${WHISPER_CPP_PORT:-5003}:8080"
+      - "${BACKEND_BIND_ADDR:-127.0.0.1}:${WHISPER_CPP_PORT:-5003}:8080"
     environment:
       # Model name maps to ggml-<name>.bin downloaded from HuggingFace on first start
       # Available: tiny, base, small, medium, large-v1, large-v2, large-v3, large-v3-turbo
@@ -486,11 +752,12 @@ services:
   frontend-service:
     profiles: [frontend, all]
     image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-frontend:${IMAGE_TAG:-latest}
+    pull_policy: ${PULL_POLICY:-missing}
     build:
       context: ./frontend-service
       dockerfile: Dockerfile
     ports:
-      - "${FRONTEND_PORT:-3000}:3000"
+      - "${FRONTEND_BIND_ADDR:-0.0.0.0}:${FRONTEND_PORT:-3000}:3000"
     environment:
       # Internal service URLs (container-to-container, don't change these)
       TTS_SERVICE_URL: http://piper-tts-service:5000
@@ -506,11 +773,39 @@ services:
       ENABLE_CHATTERBOX_TTS: ${ENABLE_CHATTERBOX_TTS:-false}
       WHISPER_CPP_SERVICE_URL: ${WHISPER_CPP_SERVICE_URL:-http://whisper-cpp:8080}
       ENABLE_WHISPER_CPP: ${ENABLE_WHISPER_CPP:-false}
-      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
+      # Browser access control. Empty = same-origin only: no CORS headers, and a
+      # state-changing request that carries a foreign Origin is refused (403).
+      # List origins (comma separated) to allow other pages to call the API;
+      # `*` opens it to any page and is logged as a warning. This is deliberately
+      # NOT the backends' setting (BACKEND_ALLOWED_ORIGINS).
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
+      # Origins that are this UI under another name (a reverse proxy that does
+      # not preserve the Host header). Missing behind such a proxy shows up as
+      # 403 on every button. And whether to believe X-Forwarded-Host.
+      TRUSTED_ORIGINS: ${TRUSTED_ORIGINS:-}
+      TRUST_PROXY_HEADERS: ${TRUST_PROXY_HEADERS:-false}
+      # Optional shared secret. Empty = open (fine on a trusted LAN). When set:
+      # Bearer token required on /v1/* and on mutating /api/* calls, except
+      # same-origin browser requests. Not user authentication.
+      API_KEY: ${API_KEY:-}
+      # Largest request body (MB) for uploads (training audio, voice samples,
+      # STT files) and the longest text (characters) for TTS.
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-512}
+      MAX_TTS_CHARS: ${MAX_TTS_CHARS:-20000}
+      # Seconds a GET /api/health result is reused (0 = always probe).
+      HEALTH_CACHE_TTL: ${HEALTH_CACHE_TTL:-2}
+      # uvicorn workers, read by entrypoint.sh. Each is a full copy of the
+      # gateway (~160 MB): use 1 on a memory-constrained board.
+      FRONTEND_WORKERS: ${FRONTEND_WORKERS:-2}
       # Which backend the UI preselects; must be an id from GET /providers.
       DEFAULT_STT_PROVIDER: ${DEFAULT_STT_PROVIDER:-whisper}
       DEFAULT_TTS_PROVIDER: ${DEFAULT_TTS_PROVIDER:-piper}
+      # Advanced. TRAINING_PROVIDER is the provider id that owns training;
+      # PROVIDER_REGISTRY_JSON (JSON) replaces built-in registry entries that have
+      # the same id. Malformed JSON stops the gateway from starting.
+      TRAINING_PROVIDER: ${TRAINING_PROVIDER:-piper-training}
+      PROVIDER_REGISTRY_JSON: ${PROVIDER_REGISTRY_JSON:-}
       # Per-provider timeout for GET /api/health. Probes run concurrently, so
       # this bounds the whole call rather than each probe in sequence.
       PROVIDER_HEALTH_TIMEOUT: ${PROVIDER_HEALTH_TIMEOUT:-6}
@@ -520,6 +815,7 @@ services:
       UPSTREAM_MAX_KEEPALIVE: ${UPSTREAM_MAX_KEEPALIVE:-20}
       UPSTREAM_KEEPALIVE_EXPIRY: ${UPSTREAM_KEEPALIVE_EXPIRY:-115}
     restart: unless-stopped
+    stop_grace_period: 20s
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
       interval: 30s
@@ -528,6 +824,7 @@ services:
       retries: 3
     networks:
       - tts-stt-network
+    # service_started, on purpose: see "Health checks" at the top of this file.
     # Long form with `required: false`: these services live in different
     # profiles, so a short-form dependency makes the whole project invalid
     # ("depends on undefined service") whenever a profile selection omits

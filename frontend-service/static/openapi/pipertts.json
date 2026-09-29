@@ -1,107 +1,22 @@
 {
-  "openapi": "3.0.0",
+  "openapi": "3.1.0",
   "info": {
-    "title": "PiperTTS Service API",
-    "description": "Neural text-to-speech service with multi-language support and intelligent voice selection",
-    "version": "1.0.0"
+    "title": "PiperTTS Service",
+    "description": "Text-to-Speech using Piper with custom and default models",
+    "version": "0.1.0"
   },
-  "servers": [
-    {
-      "url": "http://localhost:5000",
-      "description": "PiperTTS Service"
-    }
-  ],
   "paths": {
-    "/tts": {
-      "post": {
-        "summary": "Generate speech from text",
-        "description": "Convert text to speech using PiperTTS with intelligent voice selection based on language, quality, and gender preferences",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/TTSRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Successfully generated speech",
-            "content": {
-              "audio/wav": {
-                "schema": {
-                  "type": "string",
-                  "format": "binary"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Bad request",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/analyze_audio": {
-      "post": {
-        "summary": "Analyze audio file",
-        "description": "Analyze audio file using FFmpeg to get detailed format information",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "multipart/form-data": {
-              "schema": {
-                "type": "object",
-                "properties": {
-                  "audio_file": {
-                    "type": "string",
-                    "format": "binary",
-                    "description": "Audio file to analyze"
-                  }
-                },
-                "required": ["audio_file"]
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Audio analysis results",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AudioAnalysis"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/voices": {
+    "/": {
       "get": {
-        "summary": "List available voices",
-        "description": "Get list of all available voice models including default and custom voices",
+        "summary": "Root",
+        "description": "Return service identity and readiness status.",
+        "operationId": "root__get",
         "responses": {
           "200": {
-            "description": "List of available voices",
+            "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/Voice"
-                  }
-                }
+                "schema": {}
               }
             }
           }
@@ -110,16 +25,288 @@
     },
     "/health": {
       "get": {
-        "summary": "Health check",
-        "description": "Check if the service is running properly",
+        "summary": "Health",
+        "description": "Health-check endpoint used by Docker and monitoring.",
+        "operationId": "health_health_get",
         "responses": {
           "200": {
-            "description": "Service is healthy",
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ready": {
+      "get": {
+        "summary": "Ready",
+        "description": "Readiness: can this instance synthesise anything right now?\n\n/health only proves the process is up. This answers 503 while no voice model\nis installed (an empty bind-mounted models volume is the usual cause), the\npiper binary is missing, or the output directory is not writable, and lists\nmisconfigured defaults as warnings. Cheap: one directory stat, no model load.",
+        "operationId": "ready_ready_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/voices": {
+      "get": {
+        "summary": "List Voices",
+        "description": "List all available voices grouped by language.",
+        "operationId": "list_voices_voices_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/analyze_audio": {
+      "post": {
+        "summary": "Analyze Audio",
+        "description": "Upload an audio file and receive codec, duration, and quality metadata.",
+        "operationId": "analyze_audio_analyze_audio_post",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_analyze_audio_analyze_audio_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HealthStatus"
+                  "$ref": "#/components/schemas/HTTPValidationError"
                 }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/tts": {
+      "post": {
+        "summary": "Text To Speech",
+        "description": "Generate speech audio from text.\n\nSelects the best matching voice if none is specified.  Custom VITS models\nare served via ONNX Runtime; default Piper voices use the Piper CLI.",
+        "operationId": "text_to_speech_tts_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TTSRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/synthesize": {
+      "post": {
+        "summary": "Synthesize With Custom Voice",
+        "description": "Synthesize speech with a named custom voice (uses ONNX Runtime).",
+        "operationId": "synthesize_with_custom_voice_synthesize_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VoiceCloneRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/upload_model": {
+      "post": {
+        "summary": "Upload Custom Model",
+        "description": "Upload a custom-trained ONNX model and optional JSON config.",
+        "operationId": "upload_custom_model_upload_model_post",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_upload_custom_model_upload_model_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/voice/{voice_name}": {
+      "delete": {
+        "summary": "Delete Custom Voice",
+        "description": "Delete a custom voice and its model files.",
+        "operationId": "delete_custom_voice_voice__voice_name__delete",
+        "parameters": [
+          {
+            "name": "voice_name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Voice Name"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "summary": "Get Voice Info",
+        "description": "Return metadata for a single voice by name.",
+        "operationId": "get_voice_info_voice__voice_name__get",
+        "parameters": [
+          {
+            "name": "voice_name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Voice Name"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/refresh_voices": {
+      "post": {
+        "summary": "Refresh Voices",
+        "description": "Re-scan the default and custom model directories and update the voice registry.",
+        "operationId": "refresh_voices_refresh_voices_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
               }
             }
           }
@@ -129,167 +316,219 @@
   },
   "components": {
     "schemas": {
-      "TTSRequest": {
+      "Body_analyze_audio_analyze_audio_post": {
+        "properties": {
+          "audio_file": {
+            "type": "string",
+            "contentMediaType": "application/octet-stream",
+            "title": "Audio File"
+          }
+        },
         "type": "object",
-        "required": ["text"],
+        "required": [
+          "audio_file"
+        ],
+        "title": "Body_analyze_audio_analyze_audio_post"
+      },
+      "Body_upload_custom_model_upload_model_post": {
+        "properties": {
+          "model_file": {
+            "type": "string",
+            "contentMediaType": "application/octet-stream",
+            "title": "Model File"
+          },
+          "config_file": {
+            "anyOf": [
+              {
+                "type": "string",
+                "contentMediaType": "application/octet-stream"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Config File"
+          },
+          "voice_name": {
+            "type": "string",
+            "title": "Voice Name"
+          },
+          "model_name": {
+            "type": "string",
+            "title": "Model Name"
+          }
+        },
+        "type": "object",
+        "required": [
+          "model_file",
+          "voice_name"
+        ],
+        "title": "Body_upload_custom_model_upload_model_post"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "TTSRequest": {
         "properties": {
           "text": {
             "type": "string",
-            "description": "Text to convert to speech",
-            "example": "Hello, this is a test of the PiperTTS system."
+            "maxLength": 20000,
+            "title": "Text"
           },
           "voice": {
-            "type": "string",
-            "description": "Specific voice ID to use (optional, auto-selected if not provided)",
-            "example": "en_US-lessac-medium"
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 128
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Voice"
           },
           "language": {
-            "type": "string",
-            "description": "Target language for voice selection",
-            "enum": ["auto", "en", "de", "fr", "es", "it", "nl"],
-            "default": "auto",
-            "example": "en"
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 32
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Language"
           },
           "quality": {
             "type": "string",
-            "description": "Voice quality level",
-            "enum": ["x_low", "low", "medium", "high"],
-            "default": "medium",
-            "example": "high"
+            "title": "Quality",
+            "default": "medium"
           },
           "gender": {
-            "type": "string",
-            "description": "Preferred voice gender",
-            "enum": ["any", "male", "female"],
-            "default": "any",
-            "example": "female"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Gender"
           },
           "speed": {
             "type": "number",
-            "description": "Speech speed multiplier",
-            "minimum": 0.5,
-            "maximum": 2.0,
-            "default": 1.0,
-            "example": 1.0
+            "maximum": 4.0,
+            "exclusiveMinimum": 0.0,
+            "title": "Speed",
+            "default": 1.0
           },
           "output_format": {
             "type": "string",
-            "description": "Audio output format",
-            "enum": ["wav", "mp3"],
-            "default": "wav",
-            "example": "wav"
+            "title": "Output Format",
+            "default": "wav"
           }
-        }
-      },
-      "Voice": {
+        },
         "type": "object",
+        "required": [
+          "text"
+        ],
+        "title": "TTSRequest",
+        "description": "Request body for standard Piper text-to-speech synthesis."
+      },
+      "ValidationError": {
         "properties": {
-          "id": {
-            "type": "string",
-            "description": "Unique voice identifier",
-            "example": "en_US-lessac-medium"
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
           },
-          "name": {
+          "msg": {
             "type": "string",
-            "description": "Human-readable voice name",
-            "example": "Lessac"
-          },
-          "language": {
-            "type": "string",
-            "description": "Voice language code",
-            "example": "en"
-          },
-          "gender": {
-            "type": "string",
-            "description": "Voice gender",
-            "enum": ["male", "female", "neutral"],
-            "example": "female"
-          },
-          "quality": {
-            "type": "string",
-            "description": "Voice quality level",
-            "enum": ["x_low", "low", "medium", "high"],
-            "example": "medium"
+            "title": "Message"
           },
           "type": {
             "type": "string",
-            "description": "Voice type",
-            "enum": ["default", "custom"],
-            "example": "default"
-          }
-        }
-      },
-      "AudioAnalysis": {
-        "type": "object",
-        "properties": {
-          "format": {
-            "type": "string",
-            "description": "Audio format",
-            "example": "wav"
+            "title": "Error Type"
           },
-          "duration": {
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      },
+      "VoiceCloneRequest": {
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 20000,
+            "title": "Text"
+          },
+          "voice_name": {
+            "type": "string",
+            "title": "Voice Name"
+          },
+          "reference_audio": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reference Audio"
+          },
+          "speed": {
             "type": "number",
-            "description": "Duration in seconds",
-            "example": 15.3
-          },
-          "sample_rate": {
-            "type": "integer",
-            "description": "Sample rate in Hz",
-            "example": 22050
-          },
-          "channels": {
-            "type": "integer",
-            "description": "Number of audio channels",
-            "example": 1
-          },
-          "bitrate": {
-            "type": "integer",
-            "description": "Bitrate in bits per second",
-            "example": 352800
-          },
-          "codec": {
-            "type": "string",
-            "description": "Audio codec",
-            "example": "pcm_s16le"
-          },
-          "file_size": {
-            "type": "integer",
-            "description": "File size in bytes",
-            "example": 675456
+            "maximum": 4.0,
+            "exclusiveMinimum": 0.0,
+            "title": "Speed",
+            "default": 1.0
           }
-        }
-      },
-      "HealthStatus": {
+        },
         "type": "object",
-        "properties": {
-          "status": {
-            "type": "string",
-            "example": "healthy"
-          },
-          "service": {
-            "type": "string",
-            "example": "PiperTTS Service"
-          },
-          "version": {
-            "type": "string",
-            "example": "1.0.0"
-          },
-          "available_voices": {
-            "type": "integer",
-            "example": 12
-          }
-        }
-      },
-      "Error": {
-        "type": "object",
-        "properties": {
-          "detail": {
-            "type": "string",
-            "description": "Error message",
-            "example": "Invalid language specified"
-          }
-        }
+        "required": [
+          "text",
+          "voice_name"
+        ],
+        "title": "VoiceCloneRequest",
+        "description": "Request body for synthesis with a named custom voice."
       }
     }
-  }
+  },
+  "servers": [
+    {
+      "url": "http://localhost:5000",
+      "description": "Published host port. Bound to 127.0.0.1 unless BACKEND_BIND_ADDR is changed; the gateway on :3000 proxies the routes the UI needs."
+    }
+  ]
 }

@@ -152,3 +152,108 @@ Also nearly free and worth folding into the above: one shared `HF_HOME` plus `HF
 14. **Only with 24 GB, and only if 12 and 13 both disappoint on German** — a vLLM Voxtral-Mini-4B-Realtime container. Best German streaming evidence available; heaviest operational cost in this document.
 15. **`e:/tts-stt/frontend-service/`** — uniform `/ws/transcribe` contract across ASR services (1008 close with a reason for unimplemented ones), then barge-in (`echoCancellation: 'all'` + generation token).
 16. **TTS streaming, last and separately** — benchmark MOSS-TTS-Realtime's `push_text()`/`end_text()` session against `chatterbox-tts-service` on German text before writing any service. If German quality holds, the sentence-chunking layer comes out. If it does not, you keep Chatterbox v3 and the chunking layer, and that is a perfectly good outcome.
+
+---
+
+## Addendum 2026-09-29 (implementation status and corrections)
+
+*Status after the review-fix cycle, with corrections to what §1-§6 assumed. The text above is
+left as written; where it and this addendum disagree, this addendum wins. Commit ids are on the
+`develop` branch. Items marked **(unverified)** could not be checked where the work was done: there
+was no GPU, no Docker daemon, no registry access and no access to huggingface.co, so nothing below
+has been run against a real model or a built image.*
+
+### Corrections
+
+- **Chatterbox v3 is not "one argument".** PyPI `chatterbox-tts` 0.1.7 (2026-03-26) has no `t3_model`
+  argument, and its metadata hard-pins `torch==2.6.0`, which has no Blackwell (sm_120) kernels. The v3
+  checkpoint exists only on GitHub master. The image therefore installs torch 2.8.0 from the cu128
+  index first, then a pinned GitHub commit with `--no-deps` (build args `CHATTERBOX_REF`,
+  `CHATTERBOX_REPO`, `TORCH_VERSION`, `TORCHAUDIO_VERSION`; commit `ae2bd0d`), and
+  `CHATTERBOX_T3_MODEL=v3` (the default) selects the checkpoint, falling back to the library default
+  with a warning if the installed package cannot. The claim in §4 item 2 and §6 step 2 that
+  `chatterbox-tts>=0.1.7` belongs in `requirements.txt` is **wrong**: that file must not list the
+  package. Existing images have to be rebuilt to get v3; a `docker compose pull` of an old tag does
+  not. PerTh watermarking stays on with v3. **(unverified: the first build of this Dockerfile is the
+  real test of the pin.)**
+- **NeMo 3.0.0 was released on 2026-08-07** (PyPI upload time; it is the only 3.x release). The CUDA
+  images now default to `nemo_toolkit[asr]>=3.0.0,<3.1` on torch and torchaudio 2.11.0 (cu128), with a
+  one-argument rollback (`NEMO_TOOLKIT_SPEC='>=2.7.3,<3'`, or the prebuilt `-nemo2` images);
+  commit `fef1dca`. Everything the two services call is unchanged between 2.7.3 and 3.0.0 (read from
+  the wheels; smoke-tested on CPU with random-weight models). Consequences for §4: item 8's "raise
+  the floor to `>=2.7.3`" is now "default 3.0.x, floor of the rollback line 2.7.3"; the `use_cuda_graph_decoder`
+  regression (#15164) is fixed by PR #15298 and the fix is in both lines. Consequences for §2 and item 14:
+  NeMo 3.0 resolves `transformers` 5.17, which already contains `nemotron3_5_asr` and
+  `nemotron_asr_streaming`, so the `transformers>=5.13` streaming route is available inside the
+  same image without a second stack; the German ranking is unchanged (NeMo 3 ships infrastructure and
+  other models, not better German). PyTorch publishes cu128 wheels for 2.7 through 2.11 only, which is
+  what caps torch at 2.11 for Blackwell. **(unverified on a GPU: TDT decoding speed and equality with
+  2.7.3, CUDA-graph decoding, bf16 on Blackwell; the `+cu128` wheel names were inferred, download.pytorch.org
+  was unreachable.)**
+- **A build-time Blackwell check must not use `torch.cuda.get_arch_list()`.** It returns `[]` when no
+  GPU is visible, which is the case on every build host and CI runner, so such a `RUN` line fails every
+  build. The Dockerfiles read the compiled-in list with `torch._C._cuda_getArchFlags().split()`
+  instead (verified on real torch 2.11.0: `sm_75 sm_80 sm_86 sm_90 sm_100 sm_120`); a test
+  (`tests/test_nemo3_dependencies.py`) fails if a Dockerfile asks the GPU API again.
+- **faster-whisper is 1.2.1** (was 1.1.1, which item 7 calls "already new enough"; commit `4e2734a`,
+  after diffing the two wheels: only optional constructor arguments were added). The CTranslate2 bound
+  `>=4.5,<5` is unchanged.
+- **whisper.cpp:** `whisper-cpp-service/Dockerfile` and `Dockerfile.vulkan` still pin **v1.7.6**
+  (`ARG WHISPER_CPP_REF`). v1.9.4 exists. The bump is **proposed, not made**: the gateway depends on the
+  `/inference` route and on `verbose_json` segment fields that were read from the v1.7.6 sources, neither
+  image has been built against 1.9.4, and CI only builds the two whisper-cpp images without running
+  them. To try it: `WHISPER_CPP_REF=v1.9.4 docker compose build whisper-cpp`, run
+  `benchmarks/run_german_eval.py --provider whisper-cpp` against the old and the new image on the same
+  manifest, and change the Dockerfile default only if the results and the `/v1` transcription tests hold.
+- **Granite Speech 4.1 2B** is a benchmark candidate the §5 row does not cover (that row rejects the 9B
+  3.3/4.1 line): Apache-2.0, German is one of six languages, no streaming. It is small enough to co-host.
+  German WER is unpublished **(unverified)**; add it to the `benchmarks/` comparison before deciding.
+- **Fish Audio S2** is non-commercial: skip. **Qwen-Audio-3.1** appears to be hosted-only, with no open
+  weights **(unverified)**.
+- **§6 step 6 (`depends_on: service_healthy`) was deliberately not followed.** `/ready` exists on every
+  model service, but compose keeps `/health` for its healthchecks and `service_started` for the
+  gateway's dependencies, because a first model download takes minutes and optional backends may be
+  absent: gating on readiness keeps the whole UI down for as long as the slowest backend.
+  `tests/test_compose_hygiene.py` enforces this. Operators and setup scripts use `/ready`.
+- **The idle-unload item (§4 item 4)** gained cancellation safety: a client that disconnected while a
+  request was acquiring the model used to leave a reference behind that kept `/unload` answering 409
+  forever (`6fb9076`).
+
+### Status of the 16 optimisation items in §4
+
+| # | Item | Status | Evidence and what is left |
+|---|---|---|---|
+| 1 | `piper-training-service` out of the `all` profile | **done** | `profiles: [training]` in `docker-compose.yml` since `f59d66a`; `docker compose --profile training` opts in |
+| 2 | Chatterbox v3 | **done, see the correction** | `ae2bd0d`; needs a rebuilt image; German A/B against v2 still to run |
+| 3 | German-dedicated checkpoints | **partial** | Mechanism done: `WHISPER_MODEL_SIZE` accepts a Hub id or a path to a CTranslate2 export (`4e2734a`), `PARAKEET_ASR_MODEL` a local `.nemo` file (`fef1dca`), both with the tests. Defaults unchanged (`large-v3-turbo`, `parakeet-tdt-0.6b-v3`): the swap waits for the German comparison in `benchmarks/README.md` (`d06accb`), and the CT2 conversion is the operator's own `ct2-transformers-converter` run |
+| 4 | TTL model unload | **done** | `df31181`, `d55b9e1`, `deddb2f`, hardened in `6fb9076` (`ModelSlot` leases, `release_async`, stale-timer fix) |
+| 5 | `/health` versus `/ready` | **done, compose not gated on it** | `/ready` on all model services plus Piper and training (`6fb9076`, `4e2734a`, `fef1dca`, `29ad92c`, `da53129`, `ae2bd0d`, `570b6e1`, `a6472b8`); preload moved to a background task so `/health` answers during a first download |
+| 6 | LocalAgreement bug | **done** | `stt-service/local_agreement.py`: absolute-time words, a monotonic session-level `confirmed`, window cut at sentence ends (`4e2734a`); `app.js` accepts the cumulative text (`24617af`). Behavioural tests with synthetic audio only; **(unverified with real speech)** |
+| 7 | `BatchedInferencePipeline` | **partial, opt-in** | `STT_BATCHED_INFERENCE=false` (default), `STT_BATCH_SIZE=8`, `/transcribe` only, never the WebSocket (`4e2734a`). The 3.7x is SYSTRAN's figure on an RTX 3070 Ti, not measured here; `stt-service` has no `/transcribe-batch` route, the line numbers in §4 predate the rewrite |
+| 8 | NeMo inference config | **partial** | `NEMO_MATMUL_PRECISION=high` is the default; bf16 is opt-in (`NEMO_BF16=false`, German WER not re-measured); duration-sorted batching **open**; the `nemo_toolkit` floor became default 3.0.x with a 2.7.3 rollback (see above) |
+| 9 | `compute_type` negotiation | **partial** | The CUDA branch probes `get_supported_compute_types` since `cae669f` (the same day as this document, which described an older snapshot), the presets pin `float16` on sm_120, and the ladder is rebuilt from the detected device on every load instead of sticking on the CPU (`4e2734a`). `flash_attention=True` was **not** tried; no A/B |
+| 10 | Measurement (`/metrics`, GPU exporter) | **open** | No Prometheus endpoint anywhere. `benchmarks/` measures accuracy and latency offline (`d06accb`), which is a different thing |
+| 11 | Silero VAD on ingest | **open** | The two WS hallucination thresholds are still the guard |
+| 12 | Utterance-scoped finals | **open** | `WS_MAX_BUFFER_S` (600) still bounds the final decode; the window cut at sentence ends (item 6) helps the partials only |
+| 13 | Semantic end-of-turn | **open** | |
+| 14 | True-streaming model | **open** | The Qwen3-ASR gate (§6 step 12) now has its measuring stick in `benchmarks/`, but the live WebSocket path is not benchmarked; see the NeMo 3 note above for the transformers route |
+| 15 | One `/ws/transcribe` contract | **open** | Only `stt-service` implements it; the gateway refuses other providers with close code 1008 and a reason (`d166d17`) |
+| 16 | Barge-in | **open** | |
+
+### Not in the plan, done in the same cycle
+
+Bounded uploads and recordings on every service (413), same-origin CORS by default with an optional
+`API_KEY`, backends bound to `127.0.0.1` by default (`BACKEND_BIND_ADDR`), the OpenAI error envelope
+for framework errors, `verbose_json`/`srt`/`vtt`/`pcm` on `/v1`, long-audio chunking in Qwen3-ASR,
+serialised training jobs with a clean shutdown, German defaults for Piper and Qwen3-TTS, generated
+OpenAPI specs, and CI that runs the config-drift suites on Python 3.11 and 3.12 and gates image
+publishing on them. `docs/api.md` and `docs/provider-contracts.md` describe the resulting contracts.
+
+### Still to decide with measurements
+
+1. German WER of the German Whisper and Parakeet checkpoints against the defaults, on your own audio
+   (`benchmarks/README.md`).
+2. Whether NeMo 3.0.x is faster and equal on a real GPU: build both lines, follow the smoke test in
+   `parakeet-asr-service/README.md`, and compare text and timings.
+3. Qwen3-ASR's German quality and streaming, then Granite Speech 4.1 2B, before any new service.
+4. whisper.cpp 1.9.4 against 1.7.6 (see above).

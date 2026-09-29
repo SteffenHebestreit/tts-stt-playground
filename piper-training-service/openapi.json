@@ -1,118 +1,22 @@
 {
-  "openapi": "3.0.0",
+  "openapi": "3.1.0",
   "info": {
-    "title": "Universal AI Training Service API - Ultra-Optimized",
-    "description": "🚀 Revolutionary VITS training with 4-8x performance improvements and 70% memory reduction. Features ultra-optimized architecture with mixed precision training, intelligent batch sizing, aggressive memory cleanup, and progressive device fallback (AMD NPU → NVIDIA GPU → AMD GPU → Apple Metal → CPU). CRITICAL PERFORMANCE FIXES APPLIED: Resolved catastrophic training performance (87 batches in hours → 10-50 batches/minute).",
-    "version": "2.1.0"
+    "title": "Piper Voice Training Service",
+    "description": "VITS neural network training pipeline for custom Piper TTS voice models",
+    "version": "0.1.0"
   },
-  "servers": [
-    {
-      "url": "http://localhost:8080",
-      "description": "PiperTTS Training Service"
-    }
-  ],
   "paths": {
-    "/train": {
-      "post": {
-        "summary": "Start AI-accelerated voice training",
-        "description": "Start VITS neural network training with automatic device detection and optimization. Automatically selects the best available hardware: AMD NPU (Strix Halo AI Max 395 - 50 TOPS) → NVIDIA GPU → AMD GPU → Apple Metal → CPU with intelligent memory management and progressive fallback.",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "multipart/form-data": {
-              "schema": {
-                "$ref": "#/components/schemas/TrainingRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Training started successfully",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/TrainingResponse"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Bad request",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/training_status/{session_id}": {
+    "/": {
       "get": {
-        "summary": "Get training status",
-        "description": "Check the progress and status of a training session",
-        "parameters": [
-          {
-            "name": "session_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            },
-            "description": "Training session ID"
-          }
-        ],
+        "summary": "Root",
+        "description": "Root endpoint — service identity.",
+        "operationId": "root__get",
         "responses": {
           "200": {
-            "description": "Training status",
+            "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/TrainingStatus"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/process_audio": {
-      "post": {
-        "summary": "Process audio for training",
-        "description": "Preprocess and segment audio files for training data preparation",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "multipart/form-data": {
-              "schema": {
-                "type": "object",
-                "properties": {
-                  "audio_file": {
-                    "type": "string",
-                    "format": "binary",
-                    "description": "Audio file to process"
-                  },
-                  "voice_name": {
-                    "type": "string",
-                    "description": "Voice model name"
-                  }
-                },
-                "required": ["audio_file", "voice_name"]
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Audio processed successfully",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProcessResponse"
-                }
+                "schema": {}
               }
             }
           }
@@ -121,15 +25,543 @@
     },
     "/health": {
       "get": {
-        "summary": "Health check",
-        "description": "Check if the training service is running properly",
+        "summary": "Health",
+        "description": "Liveness probe. Cheap and independent of the GPU, storage and STT.",
+        "operationId": "health_health_get",
         "responses": {
           "200": {
-            "description": "Service is healthy",
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ready": {
+      "get": {
+        "summary": "Ready",
+        "description": "Readiness: 200 when this service can accept a training job, 503 when its environment is broken.\n\nMirrors /health and adds what a job would need: writable data, checkpoint and\nmodel directories, and the accelerator the container was started for. A\nrunning job does not make the service \"not ready\" (that would take a busy\ntrainer out of rotation); ``accepting_jobs`` says whether the slot is free.",
+        "operationId": "ready_ready_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/deployment-targets": {
+      "get": {
+        "summary": "Deployment Targets",
+        "description": "Return the configured deployment targets for exported model bundles.",
+        "operationId": "deployment_targets_deployment_targets_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/restore-backup": {
+      "post": {
+        "summary": "Restore Backup",
+        "description": "Restore training data from a local backup directory.",
+        "operationId": "restore_backup_restore_backup_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/generate-missing-mels": {
+      "post": {
+        "summary": "Generate Missing Mels",
+        "description": "Generate mel spectrograms for audio files that are missing them.",
+        "operationId": "generate_missing_mels_generate_missing_mels_post",
+        "parameters": [
+          {
+            "name": "model_name",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "stst",
+              "title": "Model Name"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HealthStatus"
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/prepare-dataset": {
+      "post": {
+        "summary": "Prepare Dataset",
+        "description": "Create a training dataset from pre-segmented STT results.",
+        "operationId": "prepare_dataset_prepare_dataset_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DatasetUpload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/test-upload": {
+      "post": {
+        "summary": "Test Upload",
+        "description": "Dry-run upload — returns filenames and content types without processing.",
+        "operationId": "test_upload_test_upload_post",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_test_upload_test_upload_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/train": {
+      "post": {
+        "summary": "Train Model",
+        "description": "New STT-based training endpoint that processes audio files through STT service\nfor proper segmentation before training.\n\nWorkflow:\n1. Save uploaded audio files\n2. Process through STT service for segmentation\n3. Create training segments using ffmpeg\n4. Generate training dataset\n5. Start training with optimized pipeline\n\nAnswers 409 while another job holds the training slot.",
+        "operationId": "train_model_train_post",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_train_model_train_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/resume-training": {
+      "post": {
+        "summary": "Resume Training",
+        "description": "Resume an interrupted training job from its latest checkpoint.\nFinds the newest checkpoint_epoch_N.pt for the job and continues from there.\n\nA job that is still running (or still stopping after a cancel) cannot be\nresumed: 409. So can a job that already completed: it is exported, not resumed.",
+        "operationId": "resume_training_resume_training_post",
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_resume_training_resume_training_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/train-from-dataset": {
+      "post": {
+        "summary": "Train From Dataset",
+        "description": "Start training directly from an already-prepared dataset.\nRequires data/{model_name}/train.json and val.json to exist.\nSkips upload and STT — goes straight to VITS training.",
+        "operationId": "train_from_dataset_train_from_dataset_post",
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_train_from_dataset_train_from_dataset_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/retrain-from-segments": {
+      "post": {
+        "summary": "Retrain From Segments",
+        "description": "Rebuild metadata from existing pre-segmented audio files and retrain.\n\nSkips upload and re-segmentation — uses whatever WAV files are already\nin data/{model_name}/audio/.  Runs STT on each clip to get transcriptions,\nthen calls generate_training_metadata() and train_sync().",
+        "operationId": "retrain_from_segments_retrain_from_segments_post",
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_retrain_from_segments_retrain_from_segments_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/export/{job_id}": {
+      "post": {
+        "summary": "Manual Export Model",
+        "description": "Manually export a completed training checkpoint and deploy it to a configured target.",
+        "operationId": "manual_export_model_export__job_id__post",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_manual_export_model_export__job_id__post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/model/{job_id}": {
+      "delete": {
+        "summary": "Delete Trained Model",
+        "description": "Delete a trained model and all associated files (checkpoint, export, dataset).\n\nRefused (409) while the job is running: the training thread writes into the\ndirectories this removes, and would recreate a half-deleted job.",
+        "operationId": "delete_trained_model_model__job_id__delete",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/status/{job_id}": {
+      "get": {
+        "summary": "Get Training Status",
+        "description": "Return the current status of a training job.",
+        "operationId": "get_training_status_status__job_id__get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/jobs": {
+      "get": {
+        "summary": "List Jobs",
+        "description": "List all training jobs (active and historical).",
+        "operationId": "list_jobs_jobs_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/download/{job_id}": {
+      "get": {
+        "summary": "Download Model",
+        "description": "Download the exported ONNX model for a training job.\n\nLooks up the exported file directly (job_id is path-sanitised) so models\nremain downloadable after a container restart, when completed jobs are no\nlonger present in the in-memory job registry.",
+        "operationId": "download_model_download__job_id__get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/job/{job_id}": {
+      "delete": {
+        "summary": "Cancel Training",
+        "description": "Request cancellation of a running training job.",
+        "operationId": "cancel_training_job__job_id__delete",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
                 }
               }
             }
@@ -140,194 +572,328 @@
   },
   "components": {
     "schemas": {
-      "TrainingRequest": {
-        "type": "object",
-        "required": ["voice_name"],
+      "Body_manual_export_model_export__job_id__post": {
         "properties": {
-          "voice_name": {
+          "model_name": {
             "type": "string",
-            "description": "Unique identifier for the voice model being trained",
-            "example": "my_custom_voice"
+            "title": "Model Name"
+          },
+          "deployment_target": {
+            "type": "string",
+            "title": "Deployment Target",
+            "default": ""
+          }
+        },
+        "type": "object",
+        "required": [
+          "model_name"
+        ],
+        "title": "Body_manual_export_model_export__job_id__post"
+      },
+      "Body_resume_training_resume_training_post": {
+        "properties": {
+          "model_name": {
+            "type": "string",
+            "title": "Model Name"
+          },
+          "job_id": {
+            "type": "string",
+            "title": "Job Id",
+            "default": ""
+          },
+          "extra_epochs": {
+            "type": "integer",
+            "title": "Extra Epochs",
+            "default": 0
+          },
+          "deployment_target": {
+            "type": "string",
+            "title": "Deployment Target",
+            "default": ""
+          }
+        },
+        "type": "object",
+        "required": [
+          "model_name"
+        ],
+        "title": "Body_resume_training_resume_training_post"
+      },
+      "Body_retrain_from_segments_retrain_from_segments_post": {
+        "properties": {
+          "model_name": {
+            "type": "string",
+            "title": "Model Name"
           },
           "language": {
             "type": "string",
-            "description": "Target language for the voice model",
-            "default": "en",
-            "example": "en"
+            "title": "Language",
+            "default": "de"
+          },
+          "epochs": {
+            "type": "integer",
+            "title": "Epochs",
+            "default": 10000
+          },
+          "batch_size": {
+            "type": "integer",
+            "title": "Batch Size",
+            "default": 32
+          },
+          "prefix_filter": {
+            "type": "string",
+            "title": "Prefix Filter",
+            "default": ""
+          },
+          "stt_service_url": {
+            "type": "string",
+            "title": "Stt Service Url",
+            "default": ""
+          },
+          "deployment_target": {
+            "type": "string",
+            "title": "Deployment Target",
+            "default": ""
+          }
+        },
+        "type": "object",
+        "required": [
+          "model_name"
+        ],
+        "title": "Body_retrain_from_segments_retrain_from_segments_post"
+      },
+      "Body_test_upload_test_upload_post": {
+        "properties": {
+          "model_name": {
+            "type": "string",
+            "title": "Model Name"
+          },
+          "audio_files": {
+            "items": {
+              "type": "string",
+              "contentMediaType": "application/octet-stream"
+            },
+            "type": "array",
+            "title": "Audio Files"
+          }
+        },
+        "type": "object",
+        "required": [
+          "model_name",
+          "audio_files"
+        ],
+        "title": "Body_test_upload_test_upload_post"
+      },
+      "Body_train_from_dataset_train_from_dataset_post": {
+        "properties": {
+          "model_name": {
+            "type": "string",
+            "title": "Model Name"
+          },
+          "language": {
+            "type": "string",
+            "title": "Language",
+            "default": "de"
+          },
+          "epochs": {
+            "type": "integer",
+            "title": "Epochs",
+            "default": 10000
+          },
+          "batch_size": {
+            "type": "integer",
+            "title": "Batch Size",
+            "default": 32
+          },
+          "deployment_target": {
+            "type": "string",
+            "title": "Deployment Target",
+            "default": ""
+          }
+        },
+        "type": "object",
+        "required": [
+          "model_name"
+        ],
+        "title": "Body_train_from_dataset_train_from_dataset_post"
+      },
+      "Body_train_model_train_post": {
+        "properties": {
+          "model_name": {
+            "type": "string",
+            "title": "Model Name"
+          },
+          "audio_files": {
+            "items": {
+              "type": "string",
+              "contentMediaType": "application/octet-stream"
+            },
+            "type": "array",
+            "title": "Audio Files"
+          },
+          "language": {
+            "type": "string",
+            "title": "Language",
+            "default": "de"
           },
           "sample_rate": {
             "type": "integer",
-            "description": "Audio sample rate in Hz",
-            "enum": [16000, 22050, 44100],
-            "default": 22050,
-            "example": 22050
+            "title": "Sample Rate",
+            "default": 22050
           },
           "quality": {
             "type": "string",
-            "description": "Training quality level - affects model complexity and training time",
-            "enum": ["low", "medium", "high"],
-            "default": "medium",
-            "example": "medium"
+            "title": "Quality",
+            "default": "medium"
           },
-          "speaker_name": {
+          "stt_service_url": {
             "type": "string",
-            "description": "Optional speaker identifier for multi-speaker models",
-            "example": "speaker_01"
+            "title": "Stt Service Url",
+            "default": ""
           },
-          "audio_files": {
-            "type": "array",
+          "epochs": {
+            "type": "integer",
+            "title": "Epochs",
+            "default": 1000
+          },
+          "batch_size": {
+            "type": "integer",
+            "title": "Batch Size",
+            "default": 32
+          },
+          "deployment_target": {
+            "type": "string",
+            "title": "Deployment Target",
+            "default": ""
+          }
+        },
+        "type": "object",
+        "required": [
+          "model_name",
+          "audio_files"
+        ],
+        "title": "Body_train_model_train_post"
+      },
+      "DatasetUpload": {
+        "properties": {
+          "segments": {
             "items": {
-              "type": "string",
-              "format": "binary"
+              "$ref": "#/components/schemas/SegmentData"
             },
-            "description": "Training audio files - minimum 10 minutes of clean speech recommended. Supports WAV, MP3, FLAC formats."
+            "type": "array",
+            "title": "Segments"
+          },
+          "model_name": {
+            "type": "string",
+            "title": "Model Name"
+          },
+          "language": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Language"
           }
-        }
-      },
-      "TrainingResponse": {
+        },
         "type": "object",
-        "properties": {
-          "session_id": {
-            "type": "string",
-            "description": "Unique training session identifier",
-            "example": "train_20250829_142530_abc123"
-          },
-          "voice_name": {
-            "type": "string",
-            "description": "Voice model name",
-            "example": "my_custom_voice"
-          },
-          "status": {
-            "type": "string",
-            "description": "Initial training status",
-            "enum": ["started", "preparing"],
-            "example": "started"
-          },
-          "total_files": {
-            "type": "integer",
-            "description": "Number of audio files uploaded",
-            "example": 5
-          },
-          "estimated_duration": {
-            "type": "string",
-            "description": "Estimated training duration",
-            "example": "2-4 hours"
-          }
-        }
+        "required": [
+          "segments",
+          "model_name"
+        ],
+        "title": "DatasetUpload",
+        "description": "Payload for creating a dataset from pre-segmented clips."
       },
-      "TrainingStatus": {
-        "type": "object",
-        "properties": {
-          "session_id": {
-            "type": "string",
-            "description": "Training session ID",
-            "example": "train_20250829_142530_abc123"
-          },
-          "status": {
-            "type": "string",
-            "description": "Current training status",
-            "enum": ["preparing", "running", "completed", "failed"],
-            "example": "running"
-          },
-          "progress": {
-            "type": "number",
-            "description": "Training progress percentage",
-            "minimum": 0,
-            "maximum": 100,
-            "example": 45.5
-          },
-          "current_epoch": {
-            "type": "integer",
-            "description": "Current training epoch",
-            "example": 455
-          },
-          "total_epochs": {
-            "type": "integer",
-            "description": "Total training epochs",
-            "example": 1000
-          },
-          "current_loss": {
-            "type": "number",
-            "description": "Current training loss",
-            "example": 0.1234
-          },
-          "best_loss": {
-            "type": "number",
-            "description": "Best training loss achieved",
-            "example": 0.0987
-          },
-          "eta": {
-            "type": "string",
-            "description": "Estimated time remaining",
-            "example": "1h 23m"
-          },
-          "model_path": {
-            "type": "string",
-            "description": "Path to trained model (when completed)",
-            "example": "/models/custom/my_custom_voice.onnx"
-          }
-        }
-      },
-      "ProcessResponse": {
-        "type": "object",
-        "properties": {
-          "status": {
-            "type": "string",
-            "example": "success"
-          },
-          "segments_created": {
-            "type": "integer",
-            "description": "Number of audio segments created",
-            "example": 24
-          },
-          "total_duration": {
-            "type": "number",
-            "description": "Total duration of processed audio",
-            "example": 127.5
-          },
-          "output_path": {
-            "type": "string",
-            "description": "Path to processed audio segments",
-            "example": "/data/my_custom_voice/"
-          }
-        }
-      },
-      "HealthStatus": {
-        "type": "object",
-        "properties": {
-          "status": {
-            "type": "string",
-            "example": "healthy"
-          },
-          "service": {
-            "type": "string",
-            "example": "PiperTTS Training Service"
-          },
-          "version": {
-            "type": "string",
-            "example": "1.0.0"
-          },
-          "gpu_available": {
-            "type": "boolean",
-            "example": true
-          },
-          "active_trainings": {
-            "type": "integer",
-            "description": "Number of currently running training sessions",
-            "example": 1
-          }
-        }
-      },
-      "Error": {
-        "type": "object",
+      "HTTPValidationError": {
         "properties": {
           "detail": {
-            "type": "string",
-            "description": "Error message",
-            "example": "Voice name already exists"
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
           }
-        }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "SegmentData": {
+        "properties": {
+          "audio_path": {
+            "type": "string",
+            "title": "Audio Path"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "start_time": {
+            "type": "number",
+            "title": "Start Time"
+          },
+          "end_time": {
+            "type": "number",
+            "title": "End Time"
+          }
+        },
+        "type": "object",
+        "required": [
+          "audio_path",
+          "text",
+          "start_time",
+          "end_time"
+        ],
+        "title": "SegmentData",
+        "description": "Single STT-derived segment used for dataset preparation."
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
       }
     }
-  }
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8080",
+      "description": "Published host port. Bound to 127.0.0.1 unless BACKEND_BIND_ADDR is changed; the gateway on :3000 proxies the routes the UI needs."
+    }
+  ]
 }

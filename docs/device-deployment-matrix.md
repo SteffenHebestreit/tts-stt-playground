@@ -1,7 +1,8 @@
 # Device deployment matrix
 
 Which services and models to run on each target device, with German as a hard requirement on
-every one. Written 2026-08-08.
+every one. Written 2026-08-08, updated 2026-09-29 (NeMo 3.0 images, Chatterbox v3 build, ports,
+readiness checks; the device measurements are from the original date).
 
 Every performance figure below either carries its hardware or is marked **(unverified)**. Numbers
 without hardware attached are not usable for capacity planning, so they are not presented as if
@@ -15,7 +16,7 @@ they were.
 |---|---|---|---|---|
 | **RK3588S 8 GB**<br>ARM64, no GPU | `whisper-cpp` `small-q5_1` | `piper` `de_DE-thorsten-medium` | ~5.3 GB of 8 GB with the LLM stage co-resident | 30 s clip → ~14 s (RTF 0.47, measured) |
 | **RK3588S 16 GB**<br>ARM64, no GPU | same, or `medium-q5_1` if you can wait | same, + a second voice | ~6.5 GB with `medium` | 30 s clip → ~45 s at `medium` (RTF 1.51, measured) |
-| **RTX 5060 Ti 12 GB**<br>Blackwell sm_120 | `stt-service` `large-v3-turbo`, **`float16`** | `piper` (always-on) + `chatterbox` | ~8 GB of 12 GB | **(unverified)** — no measurement on this GPU |
+| **RTX 5060 Ti**<br>Blackwell sm_120, planned against a 12 GB budget (see the note below) | `stt-service` `large-v3-turbo`, **`float16`** | `piper` (always-on) + `chatterbox` | ~8 GB against that budget | **(unverified)** — no measurement on this GPU |
 | **RTX 4080 16 GB**<br>Ada sm_89 | `stt-service` `large-v3-turbo`, `int8_float16` | `chatterbox` primary, `piper` low-latency tier | ~9 GB of 16 GB | **(unverified)** |
 | **Strix Halo 128 GB**<br>gfx1151, unified | `whisper-cpp` via Vulkan, `large-v3-turbo-q5_0` | `piper` (CPU) | bandwidth-bound, not capacity-bound | `base.en` 2044 s audio in 35.2 s (≈58× RT, ROCm 7.0.1 HIP, Linux) |
 
@@ -34,7 +35,7 @@ names German.
 |---|---|
 | Whisper `small` / `large-v3-turbo` | Multilingual checkpoints (no `.en` suffix). German WER at `small` is **(unverified)** |
 | `piper` `de_DE-thorsten-medium` | A German voice by construction; 18 German Piper voices exist under [csukuangfj](https://huggingface.co/api/models?author=csukuangfj&search=vits-piper-de_DE) |
-| Chatterbox Multilingual | German named in its language list ([model card](https://huggingface.co/ResembleAI/chatterbox)) |
+| Chatterbox Multilingual | German named in its language list ([model card](https://huggingface.co/ResembleAI/chatterbox)). The v3 checkpoint exists only on GitHub master: PyPI `chatterbox-tts` 0.1.7 has no `t3_model` argument, so the image installs a pinned commit (`CHATTERBOX_REF`) with `--no-deps`, because the package hard-pins `torch==2.6.0`, which has no Blackwell kernels, on top of the cu128 torch the Dockerfile installs first. `CHATTERBOX_T3_MODEL=v3` selects it and falls back to the library default with a warning if the installed package cannot. The first build from this Dockerfile is the real test of the pin **(unverified: no image was built where this was written)** |
 | `parakeet-tdt-0.6b-v3` | German WER **5.04 % FLEURS / 4.84 % CoVoST**, CC-BY-4.0 ([card](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)) |
 | `canary-180m-flash` | German WER **4.81 % MLS**, CC-BY-4.0 ([card](https://huggingface.co/nvidia/canary-180m-flash)) |
 | `Qwen3-TTS-12Hz-0.6B-Base` | Declares `de` in its HF language metadata |
@@ -65,6 +66,13 @@ and only one spans the set:
 | CTranslate2 (faster-whisper) | ✅ aarch64 wheels | ✅ **fp16 only** — [INT8 disabled for sm120](https://github.com/OpenNMT/CTranslate2/releases) | ✅ | ❌ no prebuilt ROCm wheel |
 | ggml (whisper.cpp) | ✅ NEON | ✅ CUDA | ✅ CUDA | ✅ Vulkan + HIP |
 | NeMo (parakeet/canary) | ❌ | ✅ | ✅ | ❌ no AMD backend |
+
+The NeMo images default to NeMo 3.0.x on torch 2.11 (cu128), with a one-argument rollback to 2.7.x
+(`NEMO_TOOLKIT_SPEC='>=2.7.3,<3'`, or the prebuilt `-nemo2` images via `NEMO_IMAGE_SUFFIX=-nemo2`).
+PyTorch publishes cu128 wheels for 2.7 through 2.11 only, which is what caps torch there for a
+Blackwell card; a newer torch needs a CUDA 13 wheel and a newer driver. The ROCm parakeet image stays
+on NeMo 2.x and torch 2.5.1. No NeMo 3 run on a GPU has happened yet **(unverified)**; the
+smoke test is in `parakeet-asr-service/README.md`.
 
 **ggml is the only runtime covering all four.** If you want exactly one STT engine,
 `whisper-cpp` is the answer and it already exists in this repo. The cost is that it caps the SBC
@@ -206,8 +214,14 @@ that cannot start, which is worse because it looks supported.
 - **INT8 is disabled for sm_120 in CTranslate2**, so the repo's `int8_float16` default cannot
   apply. The preset pins `WHISPER_COMPUTE_TYPE=float16` explicitly rather than relying on the
   probe silently falling back.
-- This card is **12 GB**, not 16 — three docs previously said 16, which made every VRAM budget
-  read optimistically.
+- The driver has to report CUDA 12.8, that is R570 or newer, for the CUDA 12.8 base images and
+  the cu128 wheels (the NVIDIA compatibility table says so; not verified on this card).
+- **VRAM is not settled by anything in this repository.** Earlier revisions said 12 GB in some
+  files and 16 GB in others for this card (the README, the TrueNAS files and the presets
+  disagreed), and no file records a measurement (`nvidia-smi` output). The `truenas-5060ti.env`
+  preset and the table above plan against 12 GB, the conservative figure, so a larger card only
+  gains headroom; check the real value with
+  `nvidia-smi --query-gpu=name,memory.total --format=csv` and relax the TTLs if you have more.
 
 **Strix Halo (D4) — gfx1151**
 - Strix Halo is **gfx1151 / RDNA 3.5 / Radeon 8060S**. Not `gfx1201` (RDNA 4 *discrete*), not
@@ -218,8 +232,10 @@ that cannot start, which is worse because it looks supported.
   kernels breaks torchaudio resampling, which every ASR/TTS path uses.
 - **Do not use `stt-service` here.** CTranslate2's PyPI wheels are CUDA-only, so
   `FORCE_ACCELERATION=rocm` silently resolves to CPU int8. Use `whisper-cpp` via Vulkan.
-- Reported "VRAM" is misleading: `mem_get_info()` returns the GTT pool, i.e. system RAM. Set
-  `GPU_MEMORY_BUDGET_GB` explicitly.
+- Reported "VRAM" is misleading: `mem_get_info()` returns the GTT pool, i.e. system RAM. Size the
+  models by hand (`MODEL_TTL` and the per-service TTLs keep the resident set small). There is no
+  `GPU_MEMORY_BUDGET_GB` knob: earlier revisions of the presets suggested one, but nothing ever
+  read it.
 - Capacity is huge but **memory bandwidth is shared with the CPU** and is the real limit.
 
 ---
@@ -258,6 +274,20 @@ docker compose --env-file deploy/profiles/workstation-4080.env \
 docker compose --env-file deploy/profiles/strixhalo.env \
   -f docker-compose.yml -f docker-compose.vulkan.yml \
   --profile frontend --profile piper-tts --profile whisper-cpp up -d
+```
+
+Two things to know about any of these. **Only the gateway (port 3000) is published to the network**:
+the backends are bound to `127.0.0.1` (`BACKEND_BIND_ADDR`) and the UI reaches them over the
+internal network, so nothing in the presets needs their ports opened. And **`IMAGE_TAG=latest`
+follows the newest release or master build**; pin `IMAGE_TAG=X.Y.Z` (and set `PULL_POLICY=always`
+only together with `latest`) where a deployment must be reproducible.
+
+The first start downloads models in the background, so containers are healthy long before they can
+transcribe or speak. Ask each service whether it is ready instead of waiting for the healthcheck:
+
+```bash
+curl -fsS http://127.0.0.1:5001/ready      # stt-service; 503 with a reason until the model is in
+curl -fsS http://127.0.0.1:5000/ready      # piper-tts; 503 if no voice is installed
 ```
 
 Verify a non-NVIDIA deployment carries no GPU reservation before starting it:

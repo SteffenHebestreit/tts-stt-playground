@@ -15,10 +15,36 @@ The target architecture is:
 
 ## Current State
 
-- STT is partly generalized: faster-whisper and Qwen3-ASR both conform to the same `/transcribe` response shape.
-- whisper.cpp already exposes an OpenAI-compatible STT API, but most UI and orchestration code is still centered on the local `/transcribe` contract.
-- TTS and training are still strongly Piper- and Qwen3-specific.
-- No single roadmap or provider-contract document existed before this one.
+Status as of 2026-09-29. What exists, and what is still hardcoded:
+
+- **Registry and contracts (phase 1): done.** The gateway builds a provider registry (`GET /providers`),
+  the contracts are written down in [provider-contracts.md](provider-contracts.md), and nine providers
+  are registered: Piper, Qwen3-TTS and Chatterbox (TTS), faster-whisper, Qwen3-ASR, Parakeet, Canary
+  and whisper.cpp (STT), and Piper training. `PROVIDER_REGISTRY_JSON`, `TRAINING_PROVIDER` and
+  `DEFAULT_*_PROVIDER` shape it at deploy time.
+- **STT is generalised.** Five providers speak `stt-form-v1` (four of them) or
+  `openai-audio-transcriptions-v1` (whisper.cpp). The OpenAI-compatible `/v1` surface returns one response shape whichever backend
+  answers, and falls back to the single healthy alternative when the default cannot be reached.
+- **Model services share one lifecycle contract.** `/health` (liveness, never loads a model),
+  `/ready` (503 while the first load runs or after it failed), `POST /unload` (409 while busy) and an
+  idle TTL, implemented once in `model_lifecycle.ModelSlot` and shared by four of the six model
+  services (Qwen3-ASR, Parakeet, Canary, Chatterbox; `stt-service` has its own residency module and
+  Qwen3-TTS a bespoke reaper).
+- **Contract tests exist for the gateway, not yet for the backends.** `tests/test_openai_v1_api.py`
+  asserts the identical response shape across providers and the gateway adapters have unit suites; a
+  test that runs the same request against every real STT backend needs a GPU stack and does not exist.
+- **The OpenAPI specs are generated** from the apps (`scripts/sync_openapi.py`) and CI fails when a
+  committed spec is stale, so the training spec can no longer describe routes that do not exist.
+- **TTS and training are still Piper- and Qwen3-specific in the UI**, although adding Chatterbox
+  needed only registry data, one adapter mapping and no change to the general TTS request path.
+- **Still hardcoded in the gateway** (found while wiring this release, not fixed there): Canary's
+  language list is fixed to en/de/es/fr even when `CANARY_ASR_MODEL=nvidia/canary-1b-v2` supports
+  25; `/api/providers/piper/voices` does not pass on the service's `default_language`; and the
+  Qwen3-TTS adapter maps `auto` to English, which defeats the service's German default
+  (`QWEN3_DEFAULT_LANGUAGE`). Each is a case of provider metadata living in the adapter instead of
+  in the registry, which is what phase 4 is for.
+- **Live transcription is not a shared contract.** Only `stt-service` implements
+  `/ws/transcribe`; the gateway refuses the other providers with a reason (close code 1008).
 
 ## Roadmap
 
@@ -34,6 +60,8 @@ Exit criteria:
 - frontend can discover providers and defaults from registry data
 - provider docs live in-repo and are versioned with the code
 
+Status: **done.**
+
 ### Phase 2: UI Generalization
 
 - Route STT requests by contract type rather than fixed endpoint assumptions.
@@ -44,6 +72,9 @@ Exit criteria:
 
 - adding a new STT backend that matches `stt-form-v1` or `openai-audio-transcriptions-v1` is configuration plus provider deployment
 
+Status: **mostly done.** Parakeet and Canary were added this way. The per-provider language lists
+and the live-transcription path are the remaining exceptions (see above).
+
 ### Phase 3: Contract Tests
 
 - Add tests that assert the frontend registry is coherent.
@@ -53,6 +84,11 @@ Exit criteria:
 Exit criteria:
 
 - provider swaps fail fast in CI when a contract is broken
+
+Status: **partial.** The registry, the `/v1` shape and the adapters are covered; the config-drift
+suites additionally fail CI when compose, `.env.example`, the device presets, the OpenAPI specs or
+the Dockerfiles disagree with each other. A shared conformance suite that runs against each real
+backend is open.
 
 ### Phase 4: TTS Generalization
 
@@ -65,6 +101,10 @@ Exit criteria:
 - basic TTS providers can be added without editing the general TTS request path
 - advanced provider-specific features remain isolated behind explicit capability checks
 
+Status: **partial.** `simple-json-tts-v1` is shared by Piper, Qwen3-TTS and Chatterbox, and
+`chunked-wav-stream-v1` and `saved-voice-library-v1` isolate the advanced features. Qwen3-TTS still
+needs its payload translated by the adapter.
+
 ### Phase 5: Training Abstraction
 
 - Split training orchestration from Piper-specific export assumptions.
@@ -75,12 +115,23 @@ Exit criteria:
 
 - training no longer assumes Piper as the only deployment target
 
+Status: **open** beyond the deployment-target contracts that already exist. Since the last update the
+training service serialises jobs (`TRAINING_MAX_CONCURRENT`), reports `/ready`, and stops cleanly on
+`SIGTERM` so that an image update does not lose a running job.
+
 ## Near-Term Priorities
 
-1. Keep growing the provider registry instead of adding new hardcoded frontend URLs.
-2. Prefer contract adapters over provider-specific branching when integrating new STT backends.
-3. Define a neutral simple-TTS contract before adding more TTS providers.
-4. Move training export and voice management behind explicit capability contracts.
+1. Move the remaining per-provider metadata (Canary languages, Piper's default language, the Qwen3
+   `auto` mapping) out of the gateway adapters and into registry data or the services' own `/status`.
+2. Keep growing the provider registry instead of adding new hardcoded frontend URLs.
+3. Prefer contract adapters over provider-specific branching when integrating new STT backends.
+4. Decide the live-transcription contract (`/ws/transcribe`) before a second provider implements it.
+   The benchmark in [`benchmarks/README.md`](../benchmarks/README.md#comparing-whisper-parakeet-qwen3-asr-and-a-german-fine-tune)
+   is the decision gate for which engine that is.
+5. Move training export and voice management behind explicit capability contracts.
+
+The model and optimisation plan, with the status of each item, is
+[model-and-optimisation-research-2026-08.md](model-and-optimisation-research-2026-08.md).
 
 ## Non-Goals
 

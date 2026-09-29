@@ -6,6 +6,11 @@
 #   docker compose -f docker-compose.yml -f docker-compose.dev.yml --profile all up
 #
 # Data volumes live in the base file; only source/static is added here.
+#
+# Every local module a service's app.py imports must be mounted (by name, one
+# line each): an unlisted module keeps the copy baked into the image, so edits to
+# it silently do nothing, and against an older image the container dies at
+# import. tests/test_docker_image_contents.py enforces the list.
 
 services:
   piper-tts-service:
@@ -17,6 +22,9 @@ services:
   piper-training-service:
     volumes:
       - "./piper-training-service/app.py:/app/app.py"
+      - "./piper-training-service/audio_sources.py:/app/audio_sources.py"
+      - "./piper-training-service/job_control.py:/app/job_control.py"
+      - "./piper-training-service/phonemization.py:/app/phonemization.py"
       - "./piper-training-service/training_pipeline.py:/app/training_pipeline.py"
       - "./piper-training-service/dataset.py:/app/dataset.py"
       - "./piper-training-service/vits_model.py:/app/vits_model.py"
@@ -32,25 +40,34 @@ services:
     volumes:
       - "./stt-service/app.py:/app/app.py"
       - "./stt-service/json_utils.py:/app/json_utils.py"
+      - "./stt-service/local_agreement.py:/app/local_agreement.py"
       - "./stt-service/residency.py:/app/residency.py"
       - "./stt-service/requirements.txt:/app/requirements.txt"
 
   qwen3-asr-service:
     volumes:
       - "./qwen3-asr-service/app.py:/app/app.py"
+      - "./qwen3-asr-service/audio_pipeline.py:/app/audio_pipeline.py"
       - "./qwen3-asr-service/model_lifecycle.py:/app/model_lifecycle.py"
 
   parakeet-asr-service:
     volumes:
       - "./parakeet-asr-service/app.py:/app/app.py"
+      - "./parakeet-asr-service/nemo_common.py:/app/nemo_common.py"
       - "./parakeet-asr-service/transcription.py:/app/transcription.py"
       - "./parakeet-asr-service/model_lifecycle.py:/app/model_lifecycle.py"
 
   canary-asr-service:
     volumes:
       - "./canary-asr-service/app.py:/app/app.py"
+      - "./canary-asr-service/nemo_common.py:/app/nemo_common.py"
       - "./canary-asr-service/transcription.py:/app/transcription.py"
       - "./canary-asr-service/model_lifecycle.py:/app/model_lifecycle.py"
+
+  chatterbox-tts-service:
+    volumes:
+      - "./chatterbox-tts-service/app.py:/app/app.py"
+      - "./chatterbox-tts-service/model_lifecycle.py:/app/model_lifecycle.py"
 
   qwen3-tts-service:
     volumes:
@@ -60,5 +77,6 @@ services:
     volumes:
       - "./frontend-service/app.py:/app/app.py"
       - "./frontend-service/openai_router.py:/app/openai_router.py"
+      - "./frontend-service/entrypoint.sh:/app/entrypoint.sh"
       - "./frontend-service/static:/app/static"
       - "./frontend-service/templates:/app/templates"

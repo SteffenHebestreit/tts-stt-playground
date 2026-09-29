@@ -8,8 +8,8 @@
 #     --profile frontend --profile piper-tts --profile whisper-cpp up -d
 #
 # This overlay covers ONLY the three services that can run on ARM64:
-#   frontend-service   python:3.10-slim  (multi-arch)
-#   piper-tts-service  python:3.10-slim + piper_arm64 (multi-arch)
+#   frontend-service   python:3.12-slim  (multi-arch)
+#   piper-tts-service  python:3.12-slim + piper_arm64 (multi-arch)
 #   whisper-cpp        ubuntu:22.04, ggml compiled from source with NEON
 #
 # Everything else in this repo is built on nvidia/cuda:* or rocm/* bases, which

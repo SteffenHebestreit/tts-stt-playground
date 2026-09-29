@@ -45,7 +45,10 @@
 #
 #   Reported VRAM is misleading here: mem_get_info() returns the GTT pool, i.e.
 #   system RAM, so "free VRAM" can read as tens of GB that the CPU also needs.
-#   Set GPU_MEMORY_BUDGET_GB rather than trusting auto-detection.
+#   Size the models by hand (MODEL_TTL and the per-service TTLs keep the
+#   resident set small) rather than trusting auto-detection. There is no
+#   GPU_MEMORY_BUDGET_GB knob: earlier revisions of this file and of the
+#   strixhalo profile suggested one, but nothing ever read it.
 #
 #   Host prep (do this once, it is not automatable from a container): keep the
 #   BIOS dedicated-VRAM reservation SMALL and raise the shared GTT limit instead
@@ -146,6 +149,9 @@ services:
     pull_policy: build
     build:
       dockerfile: Dockerfile.rocm
+      # TORCH_VERSION / TORCHAUDIO_VERSION from the base file pin the CUDA wheels;
+      # this Dockerfile installs ROCm torch and declares no such ARG.
+      args: !reset null
     environment:
       <<: *rocm-env
     <<: *rocm-devices
@@ -160,6 +166,9 @@ services:
     pull_policy: build
     build:
       dockerfile: Dockerfile.rocm
+      # TORCH_VERSION / TORCHAUDIO_VERSION from the base file pin the CUDA wheels;
+      # this Dockerfile installs ROCm torch and declares no such ARG.
+      args: !reset null
     environment:
       <<: *rocm-env
     <<: *rocm-devices
@@ -183,6 +192,12 @@ services:
     pull_policy: build
     build:
       dockerfile: Dockerfile.rocm
+      # The base file's args describe the CUDA image (NeMo 3.0.x on cu128 torch).
+      # This image sits on rocm6.2 torch 2.5.1, below the torch >= 2.6 that both
+      # NeMo 2.7 and 3.x require, so Dockerfile.rocm pins the 2.x line itself
+      # (its own NEMO_TOOLKIT_SPEC default). Without this reset the merge keeps
+      # the CUDA args and silently builds this image against NeMo 3.
+      args: !reset null
     environment:
       <<: *rocm-env
     <<: *rocm-devices
