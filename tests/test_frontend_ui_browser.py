@@ -128,6 +128,8 @@ class Api:
         self.on("GET", "/api/training/jobs", {"jobs": []})
         self.on("POST", "/api/tts", ("audio/wav", _wav()))
         self.on("POST", "/api/stt", {"text": "hallo welt", "language": "de"})
+        # asked before the live socket is opened, to collect an API key if one is needed
+        self.on("POST", "/api/auth/check", ("text/plain", b""), status=204)
 
     def on(self, method, path, body, status=200):
         """`body` is JSON-able, a (content_type, bytes) pair, or a callable(route, request)."""
@@ -682,3 +684,213 @@ def test_api_docs_status_comes_from_the_gateway_and_reflects_reality(ui):
     hostnames = ui.page.evaluate(
         "Array.from(document.querySelectorAll('a.api-link')).map(a => new URL(a.href).hostname)")
     assert "localhost" not in hostnames or urlparse(ui.base).hostname == "localhost"
+
+
+# --- API key and DNS rebinding, against a real gateway ---------------------------------
+#
+# Nothing under /api is mocked here: the requests reach a gateway that runs with
+# API_KEY (only its backends are stubbed), so what is checked is the whole loop -
+# the 401 challenge, the prompt, the header on the retry, the WebSocket subprotocol -
+# rather than the page's half alone.
+
+KEY = "s3cret-key"
+
+
+class _HangingUpstream:
+    """The STT service's WebSocket: takes anything, says nothing, never hangs up."""
+
+    def __init__(self, dialled, url):
+        dialled.append(url)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def send(self, message):
+        pass
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        import asyncio
+        await asyncio.Event().wait()
+
+
+class KeyedUi:
+    def __init__(self, page, base, dialled):
+        self.page, self.base, self.dialled = page, base, dialled
+        self.dialogs: list[str] = []
+        self.answers: list = []                     # what the next prompts get; None dismisses
+        self.requests: list[tuple] = []             # (method, path, Authorization header)
+        page.on("dialog", self._dialog)
+        page.on("request", lambda r: self.requests.append(
+            (r.method, urlparse(r.url).path, r.headers.get("authorization"))))
+        page.route("**/favicon.ico", lambda route: route.fulfill(status=204))
+
+    def _dialog(self, dialog):
+        self.dialogs.append(dialog.message)
+        answer = self.answers.pop(0) if self.answers else None
+        dialog.dismiss() if answer is None else dialog.accept(answer)
+
+    def open(self):
+        self.page.goto(self.base, wait_until="load")
+        self.page.wait_for_selector("#stt-tab-button")
+
+    def open_tts(self):
+        self.open()
+        self.page.click("#tts-tab-button")
+        self.page.wait_for_selector("#generate-tts-button", state="visible")
+
+    def posts(self, path):
+        return [auth for method, p, auth in self.requests if method == "POST" and p == path]
+
+    def wait_posts(self, path, count):
+        deadline = time.time() + TIMEOUT_MS / 1000
+        while time.time() < deadline and len(self.posts(path)) < count:
+            self.page.wait_for_timeout(25)
+        assert len(self.posts(path)) >= count, f"wanted {count} POST {path}, saw {self.requests}"
+
+    def wait_text(self, selector, fragment):
+        self.page.wait_for_function(
+            "([sel, text]) => { const el = document.querySelector(sel); return !!el && el.innerText.includes(text); }",
+            arg=[selector, fragment], timeout=TIMEOUT_MS)
+
+
+def _serve(module):
+    server = uvicorn.Server(uvicorn.Config(module.app, host="127.0.0.1", port=0, log_level="warning"))
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.time() + 15
+    while not server.started and time.time() < deadline:
+        time.sleep(0.02)
+    if not server.started:
+        pytest.fail("the gateway did not start")
+    return server, thread, server.servers[0].sockets[0].getsockname()[1]
+
+
+@pytest.fixture
+def keyed_ui(browser, monkeypatch):
+    from frontend_loader import install_stub
+    import websockets
+
+    module = load_frontend_app({"API_KEY": KEY})
+
+    def backend(method, url, kwargs):
+        import httpx
+        if url.endswith("/tts"):
+            return httpx.Response(200, content=_wav(), headers={"content-type": "audio/wav"})
+        return {"status": "healthy", "providers": {}, "voices": []}
+
+    install_stub(monkeypatch, module, backend)
+    dialled = []
+    monkeypatch.setattr(websockets, "connect", lambda url, **kw: _HangingUpstream(dialled, url))
+    server, thread, port = _serve(module)
+    context = browser.new_context()
+    page = context.new_page()
+    page.set_default_timeout(TIMEOUT_MS)
+    yield KeyedUi(page, f"http://127.0.0.1:{port}", dialled)
+    context.close()
+    server.should_exit = True
+    thread.join(timeout=10)
+
+
+def test_with_an_api_key_the_ui_asks_once_and_sends_it_from_then_on(keyed_ui):
+    ui = keyed_ui
+    ui.answers.append(KEY)
+    ui.open_tts()
+    ui.page.click("#generate-tts-button")
+    ui.wait_text("#tts-result-status", "Speech generated")
+    ui.page.click("#generate-tts-button")
+    ui.wait_posts("/api/tts", 3)
+
+    assert len(ui.dialogs) == 1 and "API key" in ui.dialogs[0]
+    assert ui.posts("/api/tts") == [None, f"Bearer {KEY}", f"Bearer {KEY}"]
+    assert ui.page.evaluate("sessionStorage.getItem('tts-stt.api-key')") == KEY
+    assert ui.page.evaluate("localStorage.length") == 0, "the key must not outlive the tab"
+
+
+def test_a_wrong_key_is_reported_and_asked_for_again(keyed_ui):
+    ui = keyed_ui
+    ui.answers.extend(["wrong", KEY])
+    ui.open_tts()
+    ui.page.click("#generate-tts-button")
+    ui.wait_text("#tts-result-status", "API key")
+    assert "Speech generated" not in ui.page.inner_text("#tts-result-status")
+    assert ui.page.evaluate("sessionStorage.getItem('tts-stt.api-key')") is None
+
+    ui.page.click("#generate-tts-button")
+    ui.wait_text("#tts-result-status", "Speech generated")
+    assert len(ui.dialogs) == 2
+
+
+def test_declining_the_prompt_leaves_the_action_refused(keyed_ui):
+    ui = keyed_ui
+    ui.answers.append(None)
+    ui.open_tts()
+    ui.page.click("#generate-tts-button")
+    ui.wait_text("#tts-result-status", "API key")
+    assert ui.posts("/api/tts") == [None], "no retry without a key"
+
+
+def test_live_transcription_needs_the_key_and_the_socket_carries_it(keyed_ui):
+    ui = keyed_ui
+    ui.answers.append(KEY)
+    ui.open()
+    ui.page.click("#live-stt-button")
+    ui.wait_text("#live-stt-status", "Listening")
+
+    assert ui.posts("/api/auth/check") == [None, f"Bearer {KEY}"]
+    assert len(ui.dialogs) == 1
+    assert len(ui.dialled) == 1, "the relay accepted the socket and dialled the STT service"
+
+
+def test_live_transcription_without_a_key_is_refused_before_the_relay_dials_anything(keyed_ui):
+    ui = keyed_ui
+    ui.answers.append(None)
+    ui.open()
+    ui.page.click("#live-stt-button")
+    ui.wait_text("#live-stt-status", "API key")
+    assert "valid API key is required" in ui.page.inner_text("#live-stt-status")
+    assert ui.dialled == [], "an unauthenticated socket reached the STT service"
+    assert not ui.page.evaluate("document.querySelector('#live-stt-button').disabled")
+
+
+def test_a_page_on_a_rebound_hostname_gets_nothing_from_the_gateway(browser, monkeypatch):
+    """Chromium is told that evil.example is the gateway's own address, which is what a DNS
+    rebinding attack achieves: the page's origin and the request's Host are the attacker's
+    name, they match, and the browser calls it same-origin. The gateway refuses it by name."""
+    module = load_frontend_app()
+    from frontend_loader import install_stub
+    stub = install_stub(monkeypatch, module, lambda m, u, k: {"status": "ok"})
+    server, thread, port = _serve(module)
+    rebinding = browser.browser_type.launch(
+        headless=True, args=[*CHROMIUM_ARGS, "--host-resolver-rules=MAP evil.example 127.0.0.1"])
+    try:
+        context = rebinding.new_context()
+        page = context.new_page()
+        page.set_default_timeout(TIMEOUT_MS)
+
+        control = page.goto(f"http://127.0.0.1:{port}/", wait_until="load")
+        assert control.status == 200
+        page.wait_for_selector("#stt-tab-button")
+        page.wait_for_timeout(300)                 # the UI's own start-up calls have been made
+        stub.calls.clear()
+
+        rebound = page.goto(f"http://evil.example:{port}/", wait_until="load")
+        assert rebound.status == 403
+        assert "host_not_allowed" in page.content() or "not allowed" in page.content()
+
+        # the attack itself: script on the rebound page calling the destructive API
+        outcome = page.evaluate("""async () => {
+            const response = await fetch('/api/training/model/job-1', { method: 'DELETE' });
+            return response.status;
+        }""")
+        assert outcome == 403
+        assert stub.calls == [], "the request reached a backend"
+    finally:
+        rebinding.close()
+        server.should_exit = True
+        thread.join(timeout=10)

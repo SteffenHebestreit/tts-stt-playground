@@ -79,6 +79,9 @@ const harness = {
     requests: [],
     fetchQueue: [],
     alerts: [],
+    prompts: [],
+    promptAnswers: [],
+    storageThrows: false,
     consoleErrors: [],
     notifications: () => {
         const container = elements.get('notification-container');
@@ -100,7 +103,26 @@ const harness = {
         json: async () => body,
         blob: async () => ({ type: 'audio/wav' }),
     }),
+    // What the gateway answers when API_KEY is set and the request had no valid key.
+    unauthorized: (challenge = 'Bearer') => ({
+        ok: false,
+        status: 401,
+        statusText: 'Unauthorized',
+        headers: { get: (name) => (String(name).toLowerCase() === 'www-authenticate' ? challenge : null) },
+        json: async () => ({ detail: 'A valid API key is required (Authorization: Bearer <key>).' }),
+        blob: async () => ({ type: 'application/json' }),
+    }),
 };
+
+// sessionStorage, backed by a Map; `harness.storageThrows` makes it behave like a
+// browser with site data blocked (every access throws).
+const storageData = new Map();
+const sessionStorage = {
+    getItem: (k) => { if (harness.storageThrows) throw new Error('blocked'); return storageData.has(k) ? storageData.get(k) : null; },
+    setItem: (k, v) => { if (harness.storageThrows) throw new Error('blocked'); storageData.set(k, String(v)); },
+    removeItem: (k) => { if (harness.storageThrows) throw new Error('blocked'); storageData.delete(k); },
+};
+harness.storage = storageData;
 
 // Fake timers: nothing runs until the scenario says so.
 let timerSeq = 0;
@@ -137,11 +159,24 @@ const context = {
     setInterval: addTimer,
     clearInterval: (id) => timers.delete(id),
     fetch: async (url, options = {}) => {
-        harness.requests.push({ url: String(url), method: (options && options.method) || 'GET' });
+        const sent = options && options.headers ? new Headers(options.headers) : null;
+        harness.requests.push({
+            url: String(url),
+            method: (options && options.method) || 'GET',
+            authorization: sent ? sent.get('authorization') : null,
+            body: options ? options.body : undefined,
+        });
         const next = harness.fetchQueue.shift();
         if (typeof next === 'function') return next(url, options);
         return next || harness.json({});
     },
+    sessionStorage,
+    prompt: (message) => {
+        harness.prompts.push(String(message));
+        const answer = harness.promptAnswers.shift();
+        return answer === undefined ? null : answer;
+    },
+    Headers, TextEncoder, btoa,
     confirm: () => true,
     alert: (m) => harness.alerts.push(String(m)),
     AbortSignal, FormData, Blob, Event, Promise, JSON, Math, Number, String, Array, Object, Set, Map, WeakMap, Date,
@@ -647,3 +682,319 @@ def test_training_form_rejects_unparseable_numbers_instead_of_sending_nan(tmp_pa
     assert out["emptyEpochs"]["className"] == "error" and "epochs" in out["emptyEpochs"]["text"]
     assert out["emptyBatch"]["className"] == "error" and "batch" in out["emptyBatch"]["text"].lower()
     assert out["requests"] == 0, "nothing may be sent with NaN in the form"
+
+
+# --- the API key ------------------------------------------------------------------
+#
+# With API_KEY set the gateway wants `Authorization: Bearer <key>` on every /v1 call and
+# every state-changing /api call, the UI's included (a request that merely looks like the
+# UI is exactly what a DNS-rebinding page sends). The page learns it needs a key from a
+# 401 carrying `WWW-Authenticate: Bearer`, asks once, keeps the key for the tab, and
+# sends it from then on. Without API_KEY none of this shows.
+
+
+def test_without_a_key_nothing_extra_is_sent_and_nobody_is_asked(tmp_path):
+    out = run_js(tmp_path, """
+        const response = await fetch('/api/training/model/job-1', { method: 'DELETE' });
+        return { ok: response.ok, requests: harness.requests, prompts: harness.prompts,
+                 stored: Array.from(harness.storage.keys()) };
+    """)
+    assert out["ok"] is True
+    assert [r["authorization"] for r in out["requests"]] == [None]
+    assert out["prompts"] == [] and out["stored"] == []
+
+
+def test_a_challenge_prompts_once_retries_with_the_key_and_remembers_it(tmp_path):
+    out = run_js(tmp_path, """
+        harness.promptAnswers.push('  s3cret  ');
+        harness.fetchQueue.push(harness.unauthorized(), harness.json({ deleted: true }));
+        const first = await fetch('/api/training/model/job-1', { method: 'DELETE' });
+        const firstBody = await first.json();
+
+        // later calls carry the key straight away, reads included
+        harness.fetchQueue.push(harness.json({ ok: 1 }), harness.json({ ok: 2 }));
+        await fetch('/api/providers/qwen3/unload', { method: 'POST' });
+        await fetch('/api/health');
+        return {
+            firstBody,
+            auth: harness.requests.map((r) => r.authorization),
+            urls: harness.requests.map((r) => r.url),
+            prompts: harness.prompts,
+            stored: harness.storage.get('tts-stt.api-key'),
+        };
+    """)
+    assert out["firstBody"] == {"deleted": True}
+    assert out["auth"] == [None, "Bearer s3cret", "Bearer s3cret", "Bearer s3cret"]
+    assert len(out["prompts"]) == 1 and "requires an API key" in out["prompts"][0]
+    assert out["stored"] == "s3cret", "kept for the tab, whitespace trimmed"
+
+
+def test_declining_the_prompt_shows_the_401_and_asks_again_next_time(tmp_path):
+    out = run_js(tmp_path, """
+        harness.promptAnswers.push(null, '   ');                   // cancel, then an empty entry
+        harness.fetchQueue.push(harness.unauthorized(), harness.unauthorized());
+        const a = await fetch('/api/tts', { method: 'POST', body: '{}' });
+        const b = await fetch('/api/tts', { method: 'POST', body: '{}' });
+        return { statuses: [a.status, b.status], requests: harness.requests.length,
+                 prompts: harness.prompts.length, stored: harness.storage.size };
+    """)
+    assert out["statuses"] == [401, 401]
+    assert out["requests"] == 2, "no retry without a key"
+    assert out["prompts"] == 2 and out["stored"] == 0
+
+
+def test_a_refused_key_is_dropped_and_asked_for_again(tmp_path):
+    out = run_js(tmp_path, """
+        setGatewayApiKey('rotated-away');
+        harness.promptAnswers.push('fresh');
+        harness.fetchQueue.push(harness.unauthorized(), harness.json({ ok: true }));
+        const response = await fetch('/api/training/train', { method: 'POST', body: 'x' });
+        return { ok: response.ok, auth: harness.requests.map((r) => r.authorization),
+                 prompt: harness.prompts[0], stored: harness.storage.get('tts-stt.api-key') };
+    """)
+    assert out["ok"] is True
+    assert out["auth"] == ["Bearer rotated-away", "Bearer fresh"]
+    assert "not accepted" in out["prompt"]
+    assert out["stored"] == "fresh"
+
+
+def test_a_wrong_key_is_not_kept(tmp_path):
+    out = run_js(tmp_path, """
+        harness.promptAnswers.push('typo');
+        harness.fetchQueue.push(harness.unauthorized(), harness.unauthorized());
+        const response = await fetch('/api/tts', { method: 'POST', body: '{}' });
+        return { status: response.status, requests: harness.requests.length, stored: harness.storage.size };
+    """)
+    assert out["status"] == 401
+    assert out["requests"] == 2, "one retry only, never a loop"
+    assert out["stored"] == 0
+
+
+def test_simultaneous_challenges_share_one_prompt(tmp_path):
+    out = run_js(tmp_path, """
+        harness.promptAnswers.push('s3cret');
+        let seen = 0;
+        const handler = () => (seen++ < 2 ? harness.unauthorized() : harness.json({ ok: true }));
+        harness.fetchQueue.push(handler, handler, handler, handler);
+        const [a, b] = await Promise.all([
+            fetch('/api/training/model/a', { method: 'DELETE' }),
+            fetch('/api/training/model/b', { method: 'DELETE' }),
+        ]);
+        return { ok: [a.ok, b.ok], prompts: harness.prompts.length,
+                 auth: harness.requests.map((r) => r.authorization) };
+    """)
+    assert out["ok"] == [True, True]
+    assert out["prompts"] == 1, "two dialogs for one missing key"
+    assert out["auth"].count("Bearer s3cret") == 2
+
+
+def test_the_key_is_only_ever_sent_to_the_gateway(tmp_path):
+    out = run_js(tmp_path, """
+        setGatewayApiKey('s3cret');
+        for (const url of ['/static/js/mic-worklet.js', 'https://cdn.example/x.js', '//evil.example/api/x',
+                           'api/relative', '/apix', '/v10/models']) {
+            await fetch(url);
+        }
+        await fetch('/api/health');
+        await fetch('/v1/models');
+        return harness.requests.map((r) => [r.url, r.authorization]);
+    """)
+    assert [entry for entry in out if entry[1]] == [["/api/health", "Bearer s3cret"], ["/v1/models", "Bearer s3cret"]]
+
+
+def test_a_401_that_is_not_a_key_challenge_does_not_prompt(tmp_path):
+    out = run_js(tmp_path, """
+        harness.fetchQueue.push(harness.json({ detail: 'nope' }, 401), harness.unauthorized('Basic realm="x"'));
+        const a = await fetch('/api/tts', { method: 'POST', body: '{}' });
+        const b = await fetch('/api/tts', { method: 'POST', body: '{}' });
+        return { statuses: [a.status, b.status], prompts: harness.prompts.length };
+    """)
+    assert out["statuses"] == [401, 401] and out["prompts"] == 0
+
+
+def test_the_retry_sends_the_same_body_and_options(tmp_path):
+    out = run_js(tmp_path, """
+        harness.promptAnswers.push('k');
+        harness.fetchQueue.push(harness.unauthorized(), harness.json({ ok: true }));
+        const form = new FormData();
+        form.append('provider', 'whisper');
+        await fetch('/api/stt', { method: 'POST', body: form, headers: { 'X-Trace': '1' } });
+        return { sameBody: harness.requests[0].body === form && harness.requests[1].body === form,
+                 methods: harness.requests.map((r) => r.method) };
+    """)
+    assert out["sameBody"] is True
+    assert out["methods"] == ["POST", "POST"]
+
+
+def test_a_browser_that_blocks_storage_still_works_from_memory(tmp_path):
+    out = run_js(tmp_path, """
+        harness.storageThrows = true;
+        harness.promptAnswers.push('s3cret');
+        harness.fetchQueue.push(harness.unauthorized(), harness.json({ ok: 1 }), harness.json({ ok: 2 }));
+        await fetch('/api/tts', { method: 'POST', body: '{}' });
+        await fetch('/api/tts', { method: 'POST', body: '{}' });
+        return { auth: harness.requests.map((r) => r.authorization), prompts: harness.prompts.length,
+                 reread: readStoredApiKey() };
+    """)
+    assert out["auth"] == [None, "Bearer s3cret", "Bearer s3cret"]
+    assert out["prompts"] == 1
+    assert out["reread"] == ""
+
+
+def test_the_key_is_read_back_from_session_storage(tmp_path):
+    out = run_js(tmp_path, """
+        sessionStorage.setItem('tts-stt.api-key', 'from-an-earlier-load');
+        return readStoredApiKey();
+    """)
+    assert out == "from-an-earlier-load"
+
+
+def test_the_key_is_never_written_to_local_storage_or_the_page(tmp_path):
+    out = run_js(tmp_path, """
+        harness.promptAnswers.push('s3cret');
+        harness.fetchQueue.push(harness.unauthorized(), harness.json({ ok: 1 }));
+        await fetch('/api/tts', { method: 'POST', body: '{}' });
+        return { local: typeof localStorage, storedKeys: Array.from(harness.storage.keys()) };
+    """)
+    assert out == {"local": "undefined", "storedKeys": ["tts-stt.api-key"]}
+
+
+# --- the API key on the live-transcription WebSocket ---------------------------------------
+
+
+def _b64url(text: str) -> str:
+    import base64
+    return base64.urlsafe_b64encode(text.encode("utf-8")).decode().rstrip("=")
+
+
+def test_socket_protocols_carry_the_key_the_way_the_gateway_reads_it(tmp_path):
+    key = "pässwörd, with spaces/and=signs+more"
+    out = run_js(tmp_path, f"""
+        const without = liveSocketProtocols();
+        setGatewayApiKey({json.dumps(key)});
+        return {{ without: without === undefined, with: liveSocketProtocols() }};
+    """)
+    assert out["without"] is True, "no key: the socket is opened exactly as before, with no protocol argument"
+    assert out["with"] == ["tts-stt.v1", "bearer." + _b64url(key)]
+    assert all(c.isalnum() or c in "-_." for c in out["with"][1]), "must stay inside the subprotocol token alphabet"
+
+
+def test_live_transcription_asks_for_the_key_before_the_microphone_and_offers_it_to_the_socket(tmp_path):
+    out = run_js(tmp_path, """
+        const order = [];
+        harness.promptAnswers.push('s3cret');
+        harness.fetchQueue.push(
+            () => { order.push('auth-check'); return harness.unauthorized(); },
+            () => { order.push('auth-check-retry'); return harness.json({}, 204); });
+        navigator.mediaDevices = { getUserMedia: async () => { order.push('microphone'); return { getTracks: () => [] }; } };
+        const sockets = [];
+        const RealConstants = WebSocket;
+        globalThis.WebSocket = Object.assign(function FakeSocket(url, protocols) {
+            order.push('socket');
+            sockets.push({ url, protocols, argCount: arguments.length });
+            this.readyState = 0;
+        }, RealConstants);
+
+        await toggleLiveTranscription();
+        return { order, sockets, requests: harness.requests.map((r) => [r.method, r.url, r.authorization]) };
+    """)
+    assert out["order"] == ["auth-check", "auth-check-retry", "microphone", "socket"]
+    assert out["requests"] == [["POST", "/api/auth/check", None], ["POST", "/api/auth/check", "Bearer s3cret"]]
+    assert out["sockets"][0]["protocols"] == ["tts-stt.v1", "bearer." + _b64url("s3cret")]
+    assert out["sockets"][0]["url"].startswith("ws://gateway.test/ws/stt?provider=")
+
+
+def test_live_transcription_without_a_key_opens_the_socket_with_one_argument(tmp_path):
+    out = run_js(tmp_path, """
+        navigator.mediaDevices = { getUserMedia: async () => ({ getTracks: () => [] }) };
+        const sockets = [];
+        const RealConstants = WebSocket;
+        globalThis.WebSocket = Object.assign(function FakeSocket(url, protocols) {
+            sockets.push({ argCount: arguments.length });
+            this.readyState = 0;
+        }, RealConstants);
+        await toggleLiveTranscription();
+        return { sockets, prompts: harness.prompts.length };
+    """)
+    assert out["sockets"] == [{"argCount": 1}]
+    assert out["prompts"] == 0
+
+
+def test_a_socket_refused_for_the_key_says_so_and_forgets_the_key(tmp_path):
+    out = run_js(tmp_path, """
+        setGatewayApiKey('stale');
+        navigator.mediaDevices = { getUserMedia: async () => ({ getTracks: () => [] }) };
+        let socket;
+        const RealConstants = WebSocket;
+        globalThis.WebSocket = Object.assign(function FakeSocket() { socket = this; this.readyState = 0; }, RealConstants);
+        await toggleLiveTranscription();
+        socket.onclose({ code: 1008, reason: 'A valid API key is required' });
+        return { stored: harness.storage.size, status: harness.status('live-stt-status') };
+    """)
+    assert out["stored"] == 0
+    assert out["status"]["className"] == "error"
+    assert "API key" in out["status"]["text"]
+
+
+def test_an_unreachable_gateway_does_not_stop_the_socket_attempt(tmp_path):
+    """The check is only there to collect a key; the socket reports a dead server itself."""
+    out = run_js(tmp_path, """
+        harness.fetchQueue.push(() => { throw new TypeError('Failed to fetch'); });
+        navigator.mediaDevices = { getUserMedia: async () => ({ getTracks: () => [] }) };
+        const sockets = [];
+        const RealConstants = WebSocket;
+        globalThis.WebSocket = Object.assign(function FakeSocket(url) { sockets.push(url); this.readyState = 0; }, RealConstants);
+        await toggleLiveTranscription();
+        return sockets.length;
+    """)
+    assert out == 1
+
+
+# --- STT language --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("selected", ["auto", "de", "en"])
+def test_the_stt_upload_always_says_which_language_it_wants(tmp_path, selected):
+    """"auto" used to be left out of the form, which a service reads as "use the server default"
+    (German in the TrueNAS profile) instead of "detect"."""
+    out = run_js(tmp_path, f"""
+        harness.el('stt-file').files = [new Blob(['RIFF....'])];
+        harness.el('stt-language').value = {json.dumps(selected)};
+        harness.el('enable-segmentation').checked = false;
+        harness.el('stt-engine-select').value = 'whisper';
+        harness.fetchQueue.push(harness.json({{ text: 'hallo', segments: [] }}));
+        await processSTT();
+        const form = harness.requests[0].body;
+        return {{ url: harness.requests[0].url, fields: Array.from(form.keys()), language: form.get('language'),
+                 provider: form.get('provider') }};
+    """)
+    assert out["url"] == "/api/stt"
+    assert out["language"] == selected
+    assert out["provider"] == "whisper"
+
+
+def test_the_auth_check_is_made_once_per_accepted_key_not_on_every_start(tmp_path):
+    out = run_js(tmp_path, """
+        await ensureApiKeyForSocket();
+        await ensureApiKeyForSocket();
+        await ensureApiKeyForSocket();
+        const afterAccepted = harness.requests.length;
+
+        // the key changes (or is dropped after a refused socket): ask the gateway again
+        setGatewayApiKey('another');
+        await ensureApiKeyForSocket();
+        return { afterAccepted, total: harness.requests.length };
+    """)
+    assert out == {"afterAccepted": 1, "total": 2}
+
+
+def test_a_failed_auth_check_is_not_remembered_as_accepted(tmp_path):
+    out = run_js(tmp_path, """
+        harness.fetchQueue.push(() => { throw new TypeError('Failed to fetch'); }, harness.json({}, 500));
+        await ensureApiKeyForSocket();            // network error
+        await ensureApiKeyForSocket();            // server error
+        await ensureApiKeyForSocket();            // finally fine
+        await ensureApiKeyForSocket();            // remembered now
+        return harness.requests.length;
+    """)
+    assert out == 3

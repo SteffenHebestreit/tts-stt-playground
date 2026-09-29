@@ -30,13 +30,18 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 from urllib.parse import urlsplit
 import asyncio
+import base64
+import binascii
 import hashlib
 import hmac
 import httpx
+import ipaddress
 import json
 import logging
 import os
+import re
 import time
+import uuid
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO)
@@ -152,7 +157,9 @@ trusted_origins = set(_split_origins(os.getenv("TRUSTED_ORIGINS", "")))
 # same-origin.
 TRUST_PROXY_HEADERS = os.getenv("TRUST_PROXY_HEADERS", "false").strip().lower() in {"1", "true", "yes", "on"}
 
-# Optional shared secret. Unset keeps the service open on the LAN as before.
+# Optional shared secret. Unset keeps the service open on the LAN as before. Set,
+# it is required on every /v1 call and on every state-changing /api call, from the
+# bundled UI as well (which asks for it once per browser tab, see app.js).
 API_KEY = os.getenv("API_KEY", "").strip()
 
 # Upload cap for anything that is not JSON or the OpenAI transcription route.
@@ -169,9 +176,20 @@ MAX_JSON_BODY_BYTES = 1024 * 1024
 # multipart framing and the non-file fields around the 25 MB file itself
 _MULTIPART_SLACK_BYTES = 1024 * 1024
 
+# How many uploads one worker process forwards at the same time. Each holds its
+# whole body in RAM until the backend has answered, so without a cap the memory
+# bound is "MAX_UPLOAD_MB times however many clients connect". Requests over the
+# cap are answered 503 + Retry-After without reading their body.
+MAX_CONCURRENT_UPLOADS = _env_number("MAX_CONCURRENT_UPLOADS", 4, int)
+UPLOAD_RETRY_AFTER_S = 5
+
 # Longest text a TTS request may carry (Piper and Qwen3 both synthesise a whole
-# request in one go; an unbounded string is an unbounded GPU job).
-MAX_TTS_CHARS = _env_number("MAX_TTS_CHARS", 20000, int)
+# request in one go; an unbounded string is an unbounded GPU job). The default is
+# what the smallest backend accepts (chatterbox and qwen3-tts: MAX_TEXT_CHARS=5000);
+# a larger value only moves the failure from an early, clear 422 here to a 413
+# from the backend after the request has already been queued. Keep it <= the
+# smallest MAX_TEXT_CHARS of the TTS backends in use.
+MAX_TTS_CHARS = _env_number("MAX_TTS_CHARS", 5000, int)
 
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
@@ -230,20 +248,122 @@ def _origin_permitted(origin: str, headers: Headers) -> bool:
     return _is_same_origin(origin, headers)
 
 
+# --- host validation (DNS rebinding) --------------------------------------------
+#
+# The Origin check above compares `Origin` with `Host`, and under DNS rebinding
+# both come from the attacker: a page on evil.example whose name is re-pointed at
+# this service's LAN address sends `Host: evil.example:3000` together with
+# `Origin: http://evil.example:3000`, which match, and the browser even labels the
+# request `Sec-Fetch-Site: same-origin`. So the Host itself has to be one that
+# names this service. A rebound name is always a public DNS name, and public DNS
+# names have a dot and are not on the list below, so they are refused.
+#
+# Accepted without configuration (none of these can be rebound by a third party):
+#   - any IP literal: the browser does no DNS lookup, so there is nothing to rebind;
+#   - `localhost`, `*.localhost`, `*.local` (mDNS), `*.localdomain`, `*.lan`,
+#     `*.internal` and `*.home.arpa`: not resolvable through public DNS;
+#   - single-label names (`truenas`, `frontend-service`): a public name always has
+#     a dot, and these are what a Docker network or a LAN search domain provides.
+# Anything else (a real domain in front of a reverse proxy, a Tailscale MagicDNS
+# name) is listed in TRUSTED_HOSTS, or comes in through TRUSTED_ORIGINS.
+
+_LOCAL_HOST_SUFFIXES = (".local", ".localhost", ".localdomain", ".lan", ".internal", ".home.arpa")
+_HOST_PATTERN = re.compile(
+    r"^(?:\[(?P<v6>[0-9A-Fa-f:.]+(?:%[0-9A-Za-z._~-]+)?)\]|(?P<name>[A-Za-z0-9._-]+))"
+    r"(?::(?P<port>[0-9]{1,5}))?$"
+)
+
+
+def _parse_host_header(value: str) -> Optional[str]:
+    """The lower-cased hostname of a Host header, or None when it is not a plain host[:port].
+
+    Strict on purpose: userinfo, paths, backslashes and whitespace never occur in
+    a genuine Host header, and a lenient URL parser would read some of them
+    differently from the browser that (did not) send them.
+    """
+    match = _HOST_PATTERN.match(value.strip())
+    if not match:
+        return None
+    host = (match.group("v6") or match.group("name")).lower().rstrip(".")
+    return host or None
+
+
+def _normalize_host_entry(entry: str) -> Optional[str]:
+    """A TRUSTED_HOSTS entry as a bare lower-case host, keeping a leading `*.`."""
+    text = entry.strip().lower()
+    if not text:
+        return None
+    wildcard = text.startswith("*.")
+    if wildcard:
+        text = text[2:]
+    parsed = _parse_host_header(urlsplit(text).netloc if "://" in text else text.split("/")[0])
+    if not parsed:
+        logger.warning("TRUSTED_HOSTS entry %r is not a hostname; ignored", entry)
+        return None
+    return f"*.{parsed}" if wildcard else parsed
+
+
+def _split_hosts(raw: str) -> list[str]:
+    return [h for h in (_normalize_host_entry(e) for e in (raw or "").split(",")) if h]
+
+
+# `*` here (and only here) switches the check off, for setups where every
+# hostname reaches the service anyway. It is not a list: names go in TRUSTED_HOSTS.
+_allowed_hosts_setting = [e.strip() for e in os.getenv("ALLOWED_HOSTS", "").split(",") if e.strip()]
+ALLOW_ANY_HOST = "*" in _allowed_hosts_setting
+if _allowed_hosts_setting and not ALLOW_ANY_HOST:
+    logger.warning(
+        "ALLOWED_HOSTS only understands '*' (turn the Host check off); list hostnames in "
+        "TRUSTED_HOSTS instead. Ignoring ALLOWED_HOSTS=%r.", ",".join(_allowed_hosts_setting))
+if ALLOW_ANY_HOST:
+    logger.warning(
+        "ALLOWED_HOSTS='*': the Host header is not validated, so a web page that re-points "
+        "its own DNS name at this service (DNS rebinding) is treated as same-origin. Prefer "
+        "listing the names you use in TRUSTED_HOSTS.")
+
+_trusted_hosts = set(_split_hosts(os.getenv("TRUSTED_HOSTS", "")))
+# A TRUSTED_ORIGINS entry says "this UI is also reachable as https://tts.example.com",
+# which is also a statement about the Host it arrives with.
+for _origin in trusted_origins:
+    _key = _origin_key(_origin)
+    if _key:
+        _trusted_hosts.add(_key[0])
+_trusted_host_names = frozenset(h for h in _trusted_hosts if not h.startswith("*."))
+_trusted_host_suffixes = tuple(f".{h[2:]}" for h in _trusted_hosts if h.startswith("*."))
+
+
+def _host_allowed(host_header: Optional[str]) -> bool:
+    """May a request addressed to this Host reach the service at all?"""
+    if ALLOW_ANY_HOST or not host_header:
+        # No Host header at all is an HTTP/1.0 client, never a rebinding browser.
+        return True
+    host = _parse_host_header(host_header)
+    if host is None:
+        return False
+    try:
+        ipaddress.ip_address(host.split("%", 1)[0])
+        return True
+    except ValueError:
+        pass
+    if "." not in host:
+        return True
+    return (
+        host in _trusted_host_names
+        or host.endswith(_LOCAL_HOST_SUFFIXES)
+        or host.endswith(_trusted_host_suffixes)
+    )
+
+
 def _bearer_key_ok(headers: Headers) -> bool:
     scheme, _, token = headers.get("authorization", "").partition(" ")
     if scheme.lower() != "bearer" or not API_KEY:
         return False
+    return _key_matches(token.strip())
+
+
+def _key_matches(candidate: str) -> bool:
     # Constant time: a plain == leaks how much of a guess was right.
-    return hmac.compare_digest(token.strip().encode("utf-8"), API_KEY.encode("utf-8"))
-
-
-def _is_browser_same_origin(headers: Headers) -> bool:
-    """A request the bundled UI could have made (as opposed to a script)."""
-    origin = headers.get("origin")
-    if origin is not None and _is_same_origin(origin, headers):
-        return True
-    return headers.get("sec-fetch-site") in ("same-origin", "none")
+    return hmac.compare_digest(candidate.encode("utf-8"), API_KEY.encode("utf-8"))
 
 
 def _guard_verdict(method: str, path: str, headers: Headers) -> Optional[tuple[int, str, str]]:
@@ -251,6 +371,15 @@ def _guard_verdict(method: str, path: str, headers: Headers) -> Optional[tuple[i
     if method == "OPTIONS":
         # A CORS preflight: carries no credentials and changes nothing.
         return None
+
+    host = _request_host(headers)
+    if not _host_allowed(host):
+        return (
+            403,
+            f"Host {(host or '')[:100]!r} is not allowed. If this is the name you use to reach "
+            "this service, add its hostname to TRUSTED_HOSTS.",
+            "host_not_allowed",
+        )
 
     if method not in _SAFE_METHODS:
         origin = headers.get("origin")
@@ -263,17 +392,48 @@ def _guard_verdict(method: str, path: str, headers: Headers) -> Optional[tuple[i
             )
 
     if API_KEY:
-        if is_v1_path(path):
-            needs_key = True
-        else:
-            # Browsers cannot attach a header to a plain form/link, and the
-            # bundled UI has no key to send, so mutating /api calls from the UI
-            # itself are exempt. This stops other web pages and scripts that
-            # do not spoof browser headers; it is not user authentication.
-            needs_key = path.startswith("/api/") and method not in _SAFE_METHODS \
-                and not _is_browser_same_origin(headers)
+        # No exemption for "the request looks like it came from the UI": Origin,
+        # Host and Sec-Fetch-Site are all under a rebinding page's control, so
+        # none of them says who is calling. The UI sends the key like any client.
+        needs_key = is_v1_path(path) or (path.startswith("/api/") and method not in _SAFE_METHODS)
         if needs_key and not _bearer_key_ok(headers):
             return 401, "A valid API key is required (Authorization: Bearer <key>).", "invalid_api_key"
+    return None
+
+
+# Browsers cannot put a header on a WebSocket handshake, so the key travels as a
+# subprotocol next to the real one: `new WebSocket(url, ["tts-stt.v1", "bearer.<b64url(key)>"])`.
+# base64url keeps it inside the token alphabet subprotocol names must use. Scripts
+# can use `Authorization: Bearer` on the upgrade request instead. The real
+# protocol name (`tts-stt.v1`) is whatever the client offers first; the server
+# only has to echo one back that is not the credential.
+_WS_KEY_PROTOCOL_PREFIX = "bearer."
+
+
+def _websocket_key_ok(websocket: WebSocket) -> bool:
+    if _bearer_key_ok(websocket.headers):
+        return True
+    for protocol in websocket.scope.get("subprotocols") or []:
+        if not protocol.startswith(_WS_KEY_PROTOCOL_PREFIX):
+            continue
+        encoded = protocol[len(_WS_KEY_PROTOCOL_PREFIX):]
+        try:
+            candidate = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode("utf-8")
+        except (binascii.Error, ValueError):
+            continue
+        if _key_matches(candidate):
+            return True
+    return False
+
+
+def _websocket_subprotocol(websocket: WebSocket) -> Optional[str]:
+    """The subprotocol to echo: a browser fails the handshake if it offered some and none is chosen.
+
+    Never the `bearer.` one, which is the credential and must not be reflected.
+    """
+    for protocol in websocket.scope.get("subprotocols") or []:
+        if not protocol.startswith(_WS_KEY_PROTOCOL_PREFIX):
+            return protocol
     return None
 
 
@@ -422,8 +582,56 @@ class _BodyLimitMiddleware:
             await self._reject(scope, receive, send, limit)
 
 
+_upload_slots = openai_router.Slots(MAX_CONCURRENT_UPLOADS)
+
+
+class _UploadSlotMiddleware:
+    """Cap how many large request bodies one worker buffers at the same time.
+
+    Only requests that *can* carry a large body count: JSON is capped at 1 MiB
+    (`MAX_JSON_BODY_BYTES`) and never needs a slot, so a burst of small API
+    calls cannot be locked out by a few big uploads. Everything else - multipart
+    uploads, and any body whose Content-Type says it is not JSON, since FastAPI
+    reads it before it decides it does not want it - takes a slot for as long as
+    the request is being handled.
+
+    Innermost of the middlewares, so a request the guard or the size limit
+    refuses never occupies one.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope["method"] in _SAFE_METHODS:
+            await self.app(scope, receive, send)
+            return
+        content_type = Headers(scope=scope).get("content-type", "")
+        if _body_limit_for(scope["path"], content_type) <= MAX_JSON_BODY_BYTES:
+            await self.app(scope, receive, send)
+            return
+
+        if not _upload_slots.try_acquire():
+            response = _refusal(
+                scope["path"], 503,
+                f"The server is already handling {_upload_slots.limit} uploads. "
+                f"Try again in {UPLOAD_RETRY_AFTER_S} seconds.",
+                "server_busy",
+            )
+            response.headers["Retry-After"] = str(UPLOAD_RETRY_AFTER_S)
+            # The body was never read; it is still on the wire.
+            response.headers["Connection"] = "close"
+            await response(scope, receive, send)
+            return
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            _upload_slots.release()
+
+
 # Outermost last: CORS must wrap everything so even a 403/413 carries the CORS
 # headers the calling page needs in order to read it.
+app.add_middleware(_UploadSlotMiddleware)
 app.add_middleware(_BodyLimitMiddleware)
 app.add_middleware(_RequestGuardMiddleware)
 app.add_middleware(_SecurityHeadersMiddleware)
@@ -518,6 +726,9 @@ def _build_stt_messages() -> dict:
         "unknown": "Unknown",
         "not_available": "N/A",
     }
+
+
+_BUILT_ENTRIES: dict = {}
 
 
 def _build_provider_registry() -> dict:
@@ -1269,6 +1480,10 @@ def _build_provider_registry() -> dict:
         },
     }
 
+    # Remembered before the override below can replace it: an entry the operator
+    # supplied is theirs, and nothing may rewrite it from what a backend reports.
+    _BUILT_ENTRIES["canary"] = providers.get("canary")
+
     override = os.getenv("PROVIDER_REGISTRY_JSON", "").strip()
     if override:
         parsed = json.loads(override)
@@ -1279,6 +1494,88 @@ def _build_provider_registry() -> dict:
 
 
 PROVIDER_REGISTRY = _build_provider_registry()
+
+
+# --- settings the backends report ---------------------------------------------------
+#
+# Canary decodes only the languages its checkpoint was trained on, and which those
+# are depends on CANARY_ASR_MODEL: en/de/es/fr for the flash models, 25 European
+# languages for canary-1b-v2 (or whatever CANARY_SUPPORTED_LANGUAGES says). The
+# list in the registry above is only the fallback for a service that cannot be
+# asked; when it answers, its own /status (`supported_languages`, `default_language`,
+# `current_model`) replaces it, so the selector offers exactly what the service will
+# accept instead of a copy that goes stale.
+
+_LANGUAGE_NAMES = {
+    "ar": "Arabic", "bg": "Bulgarian", "cs": "Czech", "da": "Danish", "de": "German",
+    "el": "Greek", "en": "English", "es": "Spanish", "et": "Estonian", "fi": "Finnish",
+    "fr": "French", "hr": "Croatian", "hu": "Hungarian", "it": "Italian", "ja": "Japanese",
+    "ko": "Korean", "lt": "Lithuanian", "lv": "Latvian", "mt": "Maltese", "nl": "Dutch",
+    "pl": "Polish", "pt": "Portuguese", "ro": "Romanian", "ru": "Russian", "sk": "Slovak",
+    "sl": "Slovenian", "sv": "Swedish", "tr": "Turkish", "uk": "Ukrainian", "zh": "Chinese",
+}
+_CANARY_LANGUAGE_REFRESH_S = 300.0    # how long a discovered list is trusted
+_CANARY_LANGUAGE_RETRY_S = 20.0       # how soon to ask again after a failed attempt
+_canary_languages = {"next_at": None}
+# Injectable so tests can move time instead of sleeping.
+_language_clock = time.monotonic
+
+
+def _apply_canary_status(entry: dict, payload: Any) -> bool:
+    """Put the languages (and model) a canary /status reports into its registry entry."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("supported_languages"), list):
+        return False
+    codes = []
+    for item in payload["supported_languages"]:
+        code = item.strip().lower() if isinstance(item, str) else ""
+        if re.fullmatch(r"[a-z]{2,3}", code) and code not in codes:
+            codes.append(code)
+    if not codes:
+        return False
+
+    settings = entry.setdefault("settings", {})
+    default = (_reported_default_language(payload) or "").lower()
+    if default not in codes:
+        current = (settings.get("defaults") or {}).get("language")
+        default = current if current in codes else codes[0]
+    ordered = sorted(codes, key=lambda c: (c != default, _LANGUAGE_NAMES.get(c, c.upper())))
+    settings["languages"] = [{"value": c, "label": _LANGUAGE_NAMES.get(c, c.upper())} for c in ordered]
+    settings["defaults"] = {**(settings.get("defaults") or {}), "language": default}
+
+    model = payload.get("current_model")
+    model = model.rsplit("/", 1)[-1] if isinstance(model, str) and model.strip() else "realtime"
+    shown = "/".join(ordered) if len(ordered) <= 6 else f"{len(ordered)} languages"
+    entry["display_name"] = f"Canary ({model}, {shown})"
+    return True
+
+
+async def _refresh_canary_languages() -> None:
+    """Ask the canary service which languages it decodes, at most once per interval.
+
+    Never raises and never waits long: the page that calls it must render even
+    when canary is down (the built-in list is then used, and the next attempt is
+    held back for `_CANARY_LANGUAGE_RETRY_S` so a dead service costs one short
+    connect attempt per interval rather than one per page load).
+    """
+    entry = PROVIDER_REGISTRY["providers"].get("canary")
+    # An operator who replaced the entry through PROVIDER_REGISTRY_JSON chose those
+    # languages on purpose and is left alone.
+    if entry is None or entry is not _BUILT_ENTRIES.get("canary"):
+        return
+    now = _language_clock()
+    if _canary_languages["next_at"] is not None and now < _canary_languages["next_at"]:
+        return
+    # Provisional, so concurrent page loads do not each probe a dead service.
+    _canary_languages["next_at"] = now + _CANARY_LANGUAGE_RETRY_S
+    try:
+        response = await _get_http_client().get(
+            f"{entry['internal_url']}/status", timeout=_timeout(2.0))
+        payload = response.json() if response.status_code == 200 else None
+    except Exception as exc:
+        logger.info("canary /status could not be read (%s); keeping the built-in language list", type(exc).__name__)
+        return
+    if _apply_canary_status(entry, payload):
+        _canary_languages["next_at"] = now + _CANARY_LANGUAGE_REFRESH_S
 
 
 def _template_provider_lists() -> tuple[list[tuple[str, dict]], list[tuple[str, dict]], list[tuple[str, dict]]]:
@@ -1313,9 +1610,15 @@ def _get_provider(provider_id: str, kind: Optional[str] = None) -> dict:
 
 
 def _normalize_qwen3_language(language: str) -> str:
-    """Map common language codes to the English labels expected by Qwen3-TTS."""
+    """Map common language codes to the English labels expected by Qwen3-TTS.
+
+    "auto" and an empty value stay "auto": the service resolves that itself, to
+    QWEN3_DEFAULT_LANGUAGE (German unless the operator changed it). Answering
+    "English" here, as this used to, overrode the operator's choice on every
+    request that did not name a language.
+    """
     language_map = {
-        "auto": "English",
+        "auto": "auto",
         "en": "English",
         "en_us": "English",
         "en_gb": "English",
@@ -1336,7 +1639,9 @@ def _normalize_qwen3_language(language: str) -> str:
         # Qwen3-TTS has no Dutch support; fall back to English rather than erroring
         "nl": "English",
     }
-    normalized = (language or "English").strip().lower().replace("-", "_")
+    normalized = (language or "auto").strip().lower().replace("-", "_")
+    if not normalized:
+        return "auto"
     return language_map.get(normalized, language if language and language[:1].isupper() else "English")
 
 
@@ -1608,23 +1913,112 @@ def _normalize_training_export_response(payload: dict) -> dict:
     return normalized_payload
 
 
+# --- what a client is told when a backend fails ----------------------------------
+#
+# A backend's error body is written for the operator: a 500 carries `str(exception)`
+# (file paths under /app/models, a whole traceback), and a connection error names
+# the internal URL. Echoing those to every caller hands out the deployment layout
+# for free, so a client gets a status-appropriate sentence and a request id, and
+# the detail goes to the log under the same id.
+#
+# 4xx answers are different: a backend uses them to explain what is wrong with the
+# request ("Language 'xx' is not supported ... Supported: ...", "text is 5001
+# characters; the limit is 5000"), and the UI shows exactly that. Those are
+# forwarded when they are one short line of prose; anything that looks like a
+# traceback, a filesystem path or a URL is treated like a 5xx.
+
+_MAX_CLIENT_DETAIL_CHARS = 500
+_UNSAFE_DETAIL = re.compile(
+    r"Traceback \(most recent call last\)"
+    r"|File \""
+    r"|://"
+    r"|(?<![\w.-])/(?:app|home|usr|tmp|root|opt|var|etc|models?|data|mnt|srv|proc|sys|run|lib|workspace)\b"
+    r"|\b[A-Za-z]:\\"
+)
+
+
+def _new_request_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+def _client_safe_detail(detail: Any) -> Optional[str]:
+    """`detail` as one short, plain sentence a client may see, or None when it may not."""
+    if isinstance(detail, list):
+        # FastAPI's own validation errors: [{"loc": [...], "msg": "...", "input": ...}].
+        # `input` echoes the request and `ctx` can hold anything, so only loc + msg.
+        parts = []
+        for item in detail[:3]:
+            if isinstance(item, dict) and isinstance(item.get("msg"), str):
+                loc = ".".join(str(p) for p in item.get("loc", ()) if p not in ("body", "query", "path"))
+                parts.append(f"{loc}: {item['msg']}" if loc else item["msg"])
+        detail = "; ".join(parts)
+    if not isinstance(detail, str):
+        return None
+    text = detail.strip()
+    if not text or len(text) > _MAX_CLIENT_DETAIL_CHARS or "\n" in text or "\r" in text:
+        return None
+    if _UNSAFE_DETAIL.search(text):
+        return None
+    return text
+
+
+def _generic_upstream_detail(status: int, request_id: str) -> str:
+    if status >= 500:
+        return f"The backend service failed to handle the request (HTTP {status}). Request id: {request_id}."
+    return f"The backend service rejected the request (HTTP {status}). Request id: {request_id}."
+
+
+def _upstream_error_detail(payload: Any) -> Any:
+    """The message field of a backend's JSON error, whichever convention it follows."""
+    if not isinstance(payload, dict):
+        return None
+    detail = payload.get("detail") or payload.get("error") or payload.get("message")
+    if isinstance(detail, dict):
+        detail = detail.get("message")
+    return detail
+
+
 def _build_error_from_response(response: httpx.Response) -> HTTPException:
-    """Convert an upstream HTTP error into a frontend HTTPException."""
-    detail = response.text
+    """Convert an upstream HTTP error into a frontend HTTPException.
+
+    The status is the backend's own; the message is what `_client_safe_detail`
+    lets through (4xx only) or a generic sentence with a request id. The raw body
+    is logged, never returned.
+    """
+    status = response.status_code
+    raw = response.text or ""
+    detail: Any = None
     try:
-        payload = response.json()
-        detail = payload.get("detail") or payload
+        detail = _upstream_error_detail(response.json())
     except Exception:
         pass
-    return HTTPException(status_code=response.status_code, detail=detail)
+
+    safe = _client_safe_detail(detail) if status < 500 else None
+    if safe is not None:
+        return HTTPException(status_code=status, detail=safe)
+
+    request_id = _new_request_id()
+    try:
+        url = response.request.url
+    except RuntimeError:        # a Response built by hand has no request attached
+        url = "unknown url"
+    logger.warning(
+        "backend %s answered HTTP %s [request id %s]: %s", url, status, request_id, raw[:2000])
+    return HTTPException(status_code=status, detail=_generic_upstream_detail(status, request_id))
 
 
 def _build_upstream_request_error(service_name: str, exc: httpx.RequestError) -> HTTPException:
-    """Convert an upstream transport failure into a 503 frontend HTTPException."""
+    """Convert an upstream transport failure into a 503 frontend HTTPException.
+
+    The client learns which service is down, not where it lives: the internal URL
+    and the transport error are logged under the request id in the message.
+    """
+    request_id = _new_request_id()
     request_url = getattr(getattr(exc, "request", None), "url", None)
-    detail = f"{service_name} is unavailable"
-    if request_url:
-        detail = f"{service_name} is unavailable: {request_url}"
+    logger.warning(
+        "%s is unreachable [request id %s]: %s: %s (%s)",
+        service_name, request_id, type(exc).__name__, exc, request_url or "no url")
+    detail = f"{service_name} is unavailable. Request id: {request_id}."
     # /v1 may only swap providers when the request never got to a backend. A
     # read timeout means one accepted the audio and is still working on it, so
     # repeating the job elsewhere would run it twice (minutes of GPU time).
@@ -2015,12 +2409,24 @@ async def _build_frontend_stt_payload(provider_id: str, form, contract: str) -> 
     filename = audio.filename or "audio.bin"
     content_type = audio.content_type or "application/octet-stream"
     content = await audio.read()
-    language = str(form.get("language", "auto")).strip()
+    raw_language = form.get("language")
+    language = str(raw_language).strip() if raw_language is not None else ""
+    if language.lower() == "auto":
+        language = "auto"
 
     data: dict = {}
     if contract == "stt-form-v1":
         files = [("audio", (filename, content, content_type))]
-        if language and language != "auto":
+        # "auto" is an answer, not an omission, and the services treat the two
+        # differently: an explicit "auto" means detect the language, while a
+        # missing field means STT_DEFAULT_LANGUAGE (German in the TrueNAS
+        # profile). Dropping "auto" here, as this used to, forced every
+        # Auto-Detect upload to the operator's default language while the live
+        # microphone path (which sends "auto") detected. All stt-form-v1
+        # backends accept it: whisper detects, qwen3-asr and parakeet detect,
+        # canary (no language identification) takes its default. A request that
+        # names no language still names none.
+        if language:
             data["language"] = language
         return "/transcribe", data, files
 
@@ -2113,6 +2519,7 @@ def _voice_id_param():
 @app.get("/", response_class=HTMLResponse)
 async def read_root(request: Request):
     """Render the main web UI page with service URLs injected into the template."""
+    await _refresh_canary_languages()
     tts_providers, stt_providers, status_providers = _template_provider_lists()
     # Request-first signature. The legacy TemplateResponse(name, context) form
     # is not merely deprecated in Starlette 1.x, it is gone: the name slot takes
@@ -2160,6 +2567,7 @@ async def health():
 @app.get("/providers")
 async def providers():
     """Return the UI provider registry and provider contracts."""
+    await _refresh_canary_languages()
     return PROVIDER_REGISTRY
 
 
@@ -2172,6 +2580,16 @@ HEALTH_CACHE_TTL_S = float(os.getenv("HEALTH_CACHE_TTL", "2"))
 # Injectable so tests can move time instead of sleeping.
 _health_clock = time.monotonic
 _health_cache: dict = {"at": None, "value": None, "inflight": None}
+
+
+def _reported_default_language(payload: Any) -> Optional[str]:
+    """`default_language` from a backend body, when it is a short plain code or name."""
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("default_language")
+    if isinstance(value, str) and 0 < len(value.strip()) <= 64:
+        return value.strip()
+    return None
 
 
 async def _probe_all_providers() -> dict:
@@ -2190,7 +2608,7 @@ async def _probe_all_providers() -> dict:
                 pass
             if not isinstance(body, dict):
                 body = {}
-            return provider_id, {
+            result = {
                 "healthy": response.status_code < 400,
                 "status_code": response.status_code,
                 "latency_ms": round((time.monotonic() - started) * 1000, 1),
@@ -2204,6 +2622,12 @@ async def _probe_all_providers() -> dict:
                 "model_size": body.get("model_size") or body.get("current_model"),
                 "device": body.get("device"),
             }
+            # The language the backend falls back to for "auto"; the UI names it
+            # in the language selector. Only what a backend actually reports.
+            default_language = _reported_default_language(body)
+            if default_language:
+                result["default_language"] = default_language
+            return provider_id, result
         except Exception as exc:
             return provider_id, {
                 "healthy": False,
@@ -2265,6 +2689,19 @@ async def provider_health():
     return await _cached_provider_health()
 
 
+@app.post("/api/auth/check", status_code=204)
+async def auth_check():
+    """204 when the caller may use the state-changing API, 401 when `API_KEY` is set and was not sent.
+
+    The request guard does the checking (this is a POST under /api, so it needs
+    the key exactly when every other mutating call does); the handler only
+    answers. The UI calls it before opening the live-transcription WebSocket,
+    where a browser cannot react to a 401 the way it does for fetch(), so that
+    the key is known before the socket is dialled.
+    """
+    return Response(status_code=204)
+
+
 @app.get("/api/providers/{provider_id}/voices")
 async def provider_voices(provider_id: str):
     """Return a normalized voice catalog for a TTS provider."""
@@ -2273,19 +2710,31 @@ async def provider_voices(provider_id: str):
 
     if contract == "voice-catalog-v1":
         response = await _provider_get(provider_id, "/voices", timeout=15.0)
-        return {
+        payload = _upstream_json(response, provider, dict)
+        result = {
             "provider": provider_id,
             "contract": contract,
-            "voices": _normalize_piper_voice_catalog(_upstream_json(response, provider, dict)),
+            "voices": _normalize_piper_voice_catalog(payload),
         }
+        # What "auto" resolves to on this backend (PIPER_DEFAULT_LANGUAGE); the UI
+        # names it in the language selector instead of guessing.
+        default_language = _reported_default_language(payload)
+        if default_language:
+            result["default_language"] = default_language
+        return result
 
     if contract == "speaker-catalog-v1":
         response = await _provider_get(provider_id, "/speakers", timeout=15.0)
-        return {
+        payload = _upstream_json(response, provider, dict)
+        result = {
             "provider": provider_id,
             "contract": contract,
-            "voices": _normalize_qwen3_voice_catalog(_upstream_json(response, provider, dict)),
+            "voices": _normalize_qwen3_voice_catalog(payload),
         }
+        default_language = _reported_default_language(payload)
+        if default_language:
+            result["default_language"] = default_language
+        return result
 
     raise HTTPException(status_code=400, detail=f"Provider {provider_id} does not expose a normalized voice catalog")
 
@@ -2371,6 +2820,14 @@ async def provider_unload(provider_id: str):
         # `**body` on a list or a bare string raised TypeError: a backend that
         # answered "ok" turned a successful unload into a 500.
         body = {"detail": body}
+    if response.status_code >= 500:
+        # A failure body is written for the operator (tracebacks, paths): log it
+        # and give the caller the same sentence every other route gives.
+        body = {"detail": _build_error_from_response(response).detail}
+    elif response.status_code >= 400 and "detail" in body and _client_safe_detail(body["detail"]) is None:
+        # A 409 "busy" with its reference count is a designed answer and passes
+        # intact; only a `detail` that is not a plain sentence is replaced.
+        body = {**body, "detail": _build_error_from_response(response).detail}
     return JSONResponse(status_code=response.status_code, content={"provider": provider_id, **body})
 
 
@@ -2504,9 +2961,25 @@ async def frontend_ws_stt(websocket: WebSocket):
     # can dial this endpoint and stream the microphone through it. The same rule
     # as for state-changing HTTP requests applies — same origin, or listed.
     # Clients that send no Origin (scripts) are not a browser-borne risk.
+    # The Host check applies here too: under DNS rebinding the page's Origin
+    # equals its Host, so the Origin rule below cannot tell it from the real UI.
+    if not _host_allowed(_request_host(websocket.headers)):
+        await websocket.close(code=1008)
+        return
+
     origin = websocket.headers.get("origin")
     if origin and not _origin_permitted(origin, websocket.headers):
         await websocket.close(code=1008)  # policy violation
+        return
+
+    # The HTTP middleware only sees HTTP scopes, so the API key has to be checked
+    # here. The handshake is completed first and then closed with a reason: a
+    # close before accept becomes a bare HTTP 403, which a browser reports as
+    # code 1006 with no reason, and the UI could not tell "needs the key" from
+    # "server down".
+    if API_KEY and not _websocket_key_ok(websocket):
+        await websocket.accept(subprotocol=_websocket_subprotocol(websocket))
+        await websocket.close(code=1008, reason="A valid API key is required")
         return
 
     provider_id = websocket.query_params.get("provider", "whisper")
@@ -2531,16 +3004,18 @@ async def frontend_ws_stt(websocket: WebSocket):
 
     upstream_url = provider["internal_url"].replace("http://", "ws://").replace("https://", "wss://") + "/ws/transcribe"
 
-    await websocket.accept()
+    await websocket.accept(subprotocol=_websocket_subprotocol(websocket))
     try:
         async with websockets.connect(
             upstream_url,
             max_size=None,        # audio frames are not size-bounded by the protocol
             ping_interval=20,
             open_timeout=10,
-            # Forward the browser's origin so the STT service can apply its own
-            # allow-list; without it the upstream only ever sees no origin.
-            additional_headers={"Origin": origin} if origin else None,
+            # No Origin header, like every other server-to-server call. The browser's
+            # Origin was validated above, against this service's own Host; forwarding
+            # it made the STT service compare a foreign Origin with *its* Host
+            # (stt-service:8000) and refuse the handshake, which is precisely what
+            # its origin guard is for.
         ) as upstream:
             async def client_to_upstream():
                 while True:

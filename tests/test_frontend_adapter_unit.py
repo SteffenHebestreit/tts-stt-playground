@@ -833,11 +833,16 @@ def test_normalize_qwen3_language(frontend_module):
     fn = frontend_module._normalize_qwen3_language
     assert fn("de") == "German"
     assert fn("en_US") == "English"
-    assert fn("auto") == "English"
     assert fn("nl") == "English"          # Dutch unsupported -> English
     assert fn("French") == "French"       # already a capitalized label
     assert fn("zz") == "English"          # unknown lowercase -> English
-    assert fn("") == "English"
+
+
+@pytest.mark.parametrize("value", ["auto", "AUTO", " Auto ", "", "   ", None])
+def test_qwen3_language_auto_stays_auto_so_the_service_default_applies(frontend_module, value):
+    """qwen3-tts resolves "auto" and an empty value to QWEN3_DEFAULT_LANGUAGE (German unless
+    the operator changed it). Answering "English" here overrode that on every request."""
+    assert frontend_module._normalize_qwen3_language(value) == "auto"
 
 
 def test_format_frontend_timestamp(frontend_module):
@@ -962,18 +967,37 @@ def test_normalize_training_export_response(frontend_module):
 
 
 def test_build_error_from_response(frontend_module):
-    resp = httpx.Response(502, json={"detail": "boom"}, request=httpx.Request("GET", "http://svc/x"))
+    """A 4xx keeps the backend's own explanation; the status is always the backend's."""
+    resp = httpx.Response(
+        400, json={"detail": "Language 'xx' is not supported. Supported: de, en."},
+        request=httpx.Request("GET", "http://svc/x"))
     exc = frontend_module._build_error_from_response(resp)
+    assert exc.status_code == 400
+    assert exc.detail == "Language 'xx' is not supported. Supported: de, en."
+
+
+def test_build_error_from_response_hides_what_a_5xx_says(frontend_module, caplog):
+    resp = httpx.Response(502, json={"detail": "boom at /app/models/x.onnx"},
+                          request=httpx.Request("GET", "http://svc/x"))
+    with caplog.at_level("WARNING"):
+        exc = frontend_module._build_error_from_response(resp)
     assert exc.status_code == 502
-    assert exc.detail == "boom"
+    assert "boom" not in exc.detail and "/app/" not in exc.detail
+    request_id = exc.detail.rsplit("Request id: ", 1)[1].rstrip(".")
+    assert any(request_id in r.getMessage() and "boom at /app/models/x.onnx" in r.getMessage()
+               for r in caplog.records), "the detail belongs in the log, under the same id"
 
 
-def test_build_upstream_request_error(frontend_module):
+def test_build_upstream_request_error(frontend_module, caplog):
     err = httpx.ConnectError("refused", request=httpx.Request("POST", "http://svc:5005/transcribe"))
-    exc = frontend_module._build_upstream_request_error("Parakeet ASR", err)
+    with caplog.at_level("WARNING"):
+        exc = frontend_module._build_upstream_request_error("Parakeet ASR", err)
     assert exc.status_code == 503
     assert "Parakeet ASR is unavailable" in exc.detail
-    assert "http://svc:5005/transcribe" in exc.detail
+    assert "svc" not in exc.detail and "5005" not in exc.detail and "://" not in exc.detail
+    request_id = exc.detail.rsplit("Request id: ", 1)[1].rstrip(".")
+    assert any(request_id in r.getMessage() and "http://svc:5005/transcribe" in r.getMessage()
+               for r in caplog.records), "the URL belongs in the log, under the same id"
 
 
 def test_get_http_client_is_shared_and_recreated(frontend_module, monkeypatch):
@@ -1181,11 +1205,20 @@ def test_openai_contract_forwards_an_explicit_language(frontend_module):
     assert data.get("language") == "de"
 
 
-def test_native_contract_still_omits_auto(frontend_module):
-    """stt-form-v1 backends auto-detect when the field is absent, and
-    faster-whisper rejects the literal string 'auto' — so this one must NOT
-    start sending it."""
-    _path, data, _files = _build(frontend_module, "stt-form-v1", language="auto")
+@pytest.mark.parametrize("spelling", ["auto", "AUTO", " Auto "])
+def test_native_contract_sends_auto_explicitly(frontend_module, spelling):
+    """stt-form-v1 services read an explicit "auto" as "detect the language" and a missing
+    field as "use STT_DEFAULT_LANGUAGE". Dropping "auto" made every Auto-Detect upload
+    German on a deployment whose default is 'de', while the live microphone (which does
+    send "auto") detected."""
+    _path, data, _files = _build(frontend_module, "stt-form-v1", language=spelling)
+    assert data.get("language") == "auto"
+
+
+def test_native_contract_leaves_the_field_out_when_no_language_was_given(frontend_module):
+    _path, data, _files = _build(frontend_module, "stt-form-v1")
+    assert "language" not in data
+    _path, data, _files = _build(frontend_module, "stt-form-v1", language="  ")
     assert "language" not in data
 
     _path, data, _files = _build(frontend_module, "stt-form-v1", language="de")
