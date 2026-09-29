@@ -20,6 +20,6 @@ tokenizers>=0.13.0
 huggingface-hub>=0.23,<1.0
 # Still needed by huggingface-hub 0.x; declared so the cap above and this line
 # are lifted together.
-requests>=2.31.0
+requests>=2.34.2
 onnxruntime>=1.18.0
 librosa
