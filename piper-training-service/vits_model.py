@@ -1,7 +1,18 @@
-"""VITS (Conditional Variational Autoencoder with Adversarial Learning) model.
+"""Experimental mel-flow-vocoder text-to-speech model (historically named "VITS").
 
-Implements TextEncoder, DurationPredictor, PosteriorEncoder, HiFiGAN decoder,
-ResidualCouplingBlock, and monotonic alignment for end-to-end TTS training.
+This is NOT a VITS in the sense of the paper or of Piper. Training reconstructs
+the waveform from the ground-truth mel through ``mel_projection -> flow ->
+HiFi-GAN generator``, so the reconstruction loss never reaches the text encoder;
+the text encoder is trained only by a duration regressor whose targets are a
+synthetic uniform split (see ``TTSDataset._estimate_durations``). There is no
+monotonic alignment search, no posterior encoder, no prior/KL term and no
+discriminator. ``training_utils.TRAINER_KIND`` / ``TRAINER_CAVEAT`` carry the
+same statement into job state, checkpoints and the exported model.
+
+The class names are kept so existing checkpoints and imports keep working.
+
+Inference (``forward`` without a mel) is written with tensor ops only, so the
+ONNX export is length dependent: the output length follows the text length.
 """
 
 import torch
@@ -14,47 +25,15 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-
-def monotonic_align(attn_map: torch.Tensor, x_mask: torch.Tensor, y_mask: torch.Tensor) -> torch.Tensor:
-    """
-    Monotonic alignment via dynamic programming.
-    Replaces the external monotonic_align dependency.
-    """
-    b, t_x, t_y = attn_map.shape
-    device = attn_map.device
-
-    alignment = torch.zeros_like(attn_map)
-
-    for i in range(b):
-        x_len = x_mask[i].sum().item()
-        y_len = y_mask[i].sum().item()
-
-        if x_len == 0 or y_len == 0:
-            continue
-
-        attn_slice = attn_map[i, :x_len, :y_len]
-
-        path = torch.zeros(x_len, dtype=torch.long, device=device)
-        for j in range(x_len):
-            if j == 0:
-                path[j] = 0
-            else:
-                min_pos = path[j-1]
-                max_pos = min(y_len - 1, min_pos + 3)
-                if max_pos > min_pos:
-                    path[j] = min_pos + torch.argmax(attn_slice[j, min_pos:max_pos+1])
-                else:
-                    path[j] = min_pos
-
-        for j, k in enumerate(path):
-            if j < t_x and k < t_y:
-                alignment[i, j, k] = 1.0
-
-    return alignment
+# Bounds on the number of output frames one token may occupy at inference.
+# Same values the eager implementation used; ``forward`` clamps log-durations to
+# roughly [0.13, 33] frames before they get here, so 50 is a backstop.
+MIN_FRAMES_PER_TOKEN = 1
+MAX_FRAMES_PER_TOKEN = 50
 
 
 class VITS(nn.Module):
-    """VITS model for TTS training."""
+    """Mel-flow-vocoder model with a duration predictor (see the module docstring)."""
 
     def __init__(self, config):
         """Build the encoder, duration predictor, flow, and vocoder modules."""
@@ -91,13 +70,18 @@ class VITS(nn.Module):
             n_layers=4
         )
 
+        upsample_rates = [8, 8, 2, 2]
         self.vocoder = HiFiGANGenerator(
             hidden_channels=config['hidden_channels'],
             resblock_kernel_sizes=[3, 7, 11],
             resblock_dilation_sizes=[[1, 3, 5], [1, 3, 5], [1, 3, 5]],
-            upsample_rates=[8, 8, 2, 2],
-            upsample_kernel_sizes=[16, 16, 4, 4]
+            upsample_rates=upsample_rates,
+            upsample_kernel_sizes=[16, 16, 4, 4],
+            initial_channels=config.get('vocoder_channels', 512),
         )
+        # Samples produced per mel frame; the reconstruction loss needs it to
+        # mask the padding of a batch.
+        self.samples_per_frame = int(np.prod(upsample_rates))
 
     def forward(self, text, text_lengths, mel_spec=None, mel_lengths=None):
         """Run training-mode or inference-mode synthesis depending on mel inputs."""
@@ -120,41 +104,45 @@ class VITS(nn.Module):
             flow_mask = mel_mask if mel_mask is not None else text_mask
             z, log_det = self.flow(mel_projected, flow_mask)
 
-            try:
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                audio = self.vocoder(z)
-            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
-                if "out of memory" in str(e).lower():
-                    logger.warning(f"Vocoder GPU OOM — falling back to CPU (z shape: {z.shape})")
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    z_cpu = z.detach().cpu()
-                    vocoder_device = next(self.vocoder.parameters()).device
-                    if vocoder_device != torch.device('cpu'):
-                        self.vocoder = self.vocoder.cpu()
-                    with torch.no_grad():
-                        audio_cpu = self.vocoder(z_cpu)
-                        audio = audio_cpu.to(z.device)
-                    if vocoder_device != torch.device('cpu'):
-                        self.vocoder = self.vocoder.to(vocoder_device)
-                    logger.info("CPU vocoder fallback completed")
-                else:
-                    raise
+            # No empty_cache() before the vocoder: it ran on every step, forcing
+            # the allocator to hand memory back to the driver and re-request it
+            # for the next batch (a device-wide sync each time).
+            #
+            # An out-of-memory error is deliberately NOT handled here. It used to
+            # be caught and the vocoder re-run on the CPU under no_grad, which
+            # returns a waveform without a graph: the step then trained only the
+            # duration head, silently, and moved the vocoder between devices on
+            # every affected step. The training loop halves the batch on OOM
+            # instead, and fails the job if that is not enough.
+            audio = self.vocoder(z)
 
             return audio, log_duration, log_det
         else:
             # Inference mode — predict durations, expand, decode
             # Clamp log_duration to prevent exploding repeat counts (0.13–33 frames)
             duration = torch.exp(log_duration.clamp(-2.0, 3.5)) * text_mask
-            expanded = self.expand_encodings(text_encoded, duration)
-            expanded = expanded.transpose(1, 2)
-            z = self.flow.inverse(expanded)
+            frames = self.frames_per_token(duration, text_mask)
+            expanded = self._expand(text_encoded, frames)
+            # Zero the frames past each item's own length, as training does with
+            # its mel mask; a no-op for the batch of one the exported graph serves.
+            frame_mask = (
+                torch.arange(expanded.shape[1], device=expanded.device)[None, :]
+                < frames.sum(dim=1)[:, None]
+            )
+            z = self.flow.inverse(expanded.transpose(1, 2), frame_mask)
             audio = self.vocoder(z)
             return audio
 
     def compute_loss(self, batch: Dict) -> Dict[str, torch.Tensor]:
-        """Compute reconstruction, duration, and KL training losses."""
+        """Compute reconstruction, duration, and log-determinant training losses.
+
+        Padding is excluded from both the reconstruction and the duration mean.
+        Before, a padded duration slot (prediction 0.0) was compared with
+        ``log(0 + 1e-6)`` = -13.8, so every padded position added a constant
+        ~190 to the squared error: a batch of unequal lengths reported a loss
+        dominated by padding, and the real positions were down-weighted by the
+        share of padding.
+        """
         dev = self.get_device()
 
         text = batch['text']
@@ -181,7 +169,15 @@ class VITS(nn.Module):
 
         if audio is not None:
             min_len = min(pred_audio.shape[-1], audio.shape[-1])
-            recon_loss = F.mse_loss(pred_audio[..., :min_len], audio[..., :min_len])
+            sq_err = (pred_audio[..., :min_len] - audio[..., :min_len]) ** 2
+            if mel_lengths is not None:
+                sample_mask = (
+                    torch.arange(min_len, device=sq_err.device)[None, :]
+                    < (mel_lengths * self.samples_per_frame)[:, None]
+                )
+                recon_loss = (sq_err * sample_mask).sum() / sample_mask.sum().clamp(min=1)
+            else:
+                recon_loss = sq_err.mean()
         elif mel_spec is not None:
             recon_loss = F.l1_loss(
                 pred_audio,
@@ -201,9 +197,19 @@ class VITS(nn.Module):
             duration_target = duration_target[:, :min_len]
             log_duration = log_duration[:, :min_len]
 
-        duration_loss = F.mse_loss(log_duration, torch.log(duration_target + 1e-6))
+        duration_mask = (
+            torch.arange(log_duration.shape[1], device=log_duration.device)[None, :]
+            < text_lengths[:, None]
+        )
+        duration_sq_err = (log_duration - torch.log(duration_target + 1e-6)) ** 2
+        duration_loss = (
+            (duration_sq_err * duration_mask).sum() / duration_mask.sum().clamp(min=1)
+        )
 
-        # Clamp log_det to prevent FP16 overflow → NaN
+        # Clamp log_det to prevent FP16 overflow → NaN. Note the clamp also makes
+        # this term a constant for any realistic input (the summed log-determinant
+        # is in the tens of thousands), so it contributes no gradient; it is kept
+        # only so logged totals stay comparable with earlier runs.
         kl_loss = -torch.mean(log_det.float().clamp(-100.0, 100.0))
 
         return {
@@ -216,36 +222,56 @@ class VITS(nn.Module):
         """Return the device the model parameters reside on."""
         return next(self.parameters()).device
 
-    def expand_encodings(self, encodings, durations):
-        """Repeat each encoder frame according to its predicted duration."""
+    @staticmethod
+    def frames_per_token(durations, mask=None):
+        """Integer number of output frames for each token, ``[B, T]`` int64.
+
+        Rounded to the nearest frame. The eager code used ``int()``, which
+        truncates and so lost half a frame per token on average: output biased
+        short, and every token shorter than two frames counted as one. Masked
+        (padding) positions get 0 frames; before, a padding slot was forced up to
+        1 frame, so a shorter text in a padded batch was followed by silence.
+        """
+        frames = torch.floor(durations + 0.5).clamp(MIN_FRAMES_PER_TOKEN, MAX_FRAMES_PER_TOKEN).long()
+        if mask is not None:
+            frames = frames * mask.long()
+        return frames
+
+    @staticmethod
+    def _expand(encodings, frames):
+        """Repeat token ``t`` ``frames[b, t]`` times, as tensor ops only.
+
+        The previous implementation looped over tokens and called ``.item()``.
+        That is data dependent control flow: tracing froze the durations of the
+        random dummy input into the graph (the same output length for every text,
+        and nothing past the dummy's 100 tokens). Here the output frame ``p``
+        belongs to the token whose cumulative end is the first one above ``p``,
+        which is a comparison and a sum, so the output length stays a function of
+        the input in eager mode, when traced and when exported.
+
+        The comparison is ``[B, L, T]``. That is small for the sentence-sized
+        input the exported graph serves; it is not meant for whole documents.
+        """
         batch_size, seq_len, hidden_size = encodings.shape
-        expanded = []
+        ends = torch.cumsum(frames, dim=1)
+        total = ends[:, -1]
+        out_len = torch.clamp(total.max(), min=1)
+        position = torch.arange(out_len, device=encodings.device)
+        token_index = (position[None, :, None] >= ends[:, None, :]).sum(dim=-1)
+        token_index = token_index.clamp(max=seq_len - 1)
+        gathered = torch.gather(
+            encodings, 1, token_index.unsqueeze(-1).expand(-1, -1, hidden_size)
+        )
+        valid = position[None, :] < total[:, None]
+        return gathered * valid.unsqueeze(-1).to(encodings.dtype)
 
-        for b in range(batch_size):
-            expanded_seq = []
-            for t in range(seq_len):
-                # Cap at 50 frames per phoneme to prevent runaway expansion
-                duration = max(1, min(50, int(durations[b, t].item())))
-                expanded_seq.append(encodings[b, t:t+1].repeat(duration, 1))
+    def expand_encodings(self, encodings, durations, mask=None):
+        """Repeat each encoder frame according to its predicted duration.
 
-            if expanded_seq:
-                expanded.append(torch.cat(expanded_seq, dim=0))
-            else:
-                expanded.append(torch.zeros(1, hidden_size, device=encodings.device))
-
-        max_len = max(e.shape[0] for e in expanded) if expanded else 1
-
-        padded = []
-        for e in expanded:
-            pad_len = max_len - e.shape[0]
-            if pad_len > 0:
-                e = torch.cat([e, torch.zeros(pad_len, hidden_size, device=e.device)], dim=0)
-            padded.append(e)
-
-        if not padded:
-            logger.error("expand_encodings: padded list is empty — returning None")
-            return None
-        return torch.stack(padded)
+        ``mask`` (``[B, T]`` bool, True for real tokens) keeps padding out of the
+        output; without it every position counts as a token.
+        """
+        return self._expand(encodings, self.frames_per_token(durations, mask))
 
 
 class TextEncoder(nn.Module):
@@ -365,14 +391,14 @@ class HiFiGANGenerator(nn.Module):
     """Simplified HiFi-GAN vocoder generator."""
 
     def __init__(self, hidden_channels, resblock_kernel_sizes, resblock_dilation_sizes,
-                 upsample_rates, upsample_kernel_sizes):
+                 upsample_rates, upsample_kernel_sizes, initial_channels=512):
         """Build the upsampling stack and residual blocks for waveform generation."""
         super().__init__()
-        self.pre_conv = nn.Conv1d(hidden_channels, 512, 7, padding=3)
+        self.pre_conv = nn.Conv1d(hidden_channels, initial_channels, 7, padding=3)
         self.upsample_layers = nn.ModuleList()
         self.resblock_layers = nn.ModuleList()
 
-        channel_size = 512
+        channel_size = initial_channels
         for i, (u, k) in enumerate(zip(upsample_rates, upsample_kernel_sizes)):
             self.upsample_layers.append(
                 nn.ConvTranspose1d(channel_size, channel_size // 2, k, u, padding=(k-u)//2)
@@ -393,8 +419,6 @@ class HiFiGANGenerator(nn.Module):
             x = upsample(x)
             res_outputs = [resblock(x) for resblock in resblocks]
             x = torch.stack(res_outputs, dim=0).mean(dim=0)
-            if i % 2 == 0 and torch.cuda.is_available():
-                torch.cuda.empty_cache()
         x = F.leaky_relu(x, 0.1)
         x = self.post_conv(x)
         return torch.tanh(x).squeeze(1)
@@ -519,6 +543,10 @@ class VITSConfig:
         self.n_layers = kwargs.get('n_layers', 6)
         self.n_vocab = kwargs.get('n_vocab', 256)
         self.n_heads = kwargs.get('n_heads', 2)
+        # Width of the first vocoder stage (halved at each upsampling stage). The
+        # default is the architecture existing checkpoints were trained with; it
+        # is a knob so tests can build a small model.
+        self.vocoder_channels = kwargs.get('vocoder_channels', 512)
         self.language = kwargs.get('language', 'en')
         self.speaker_name = kwargs.get('speaker_name', 'default')
 

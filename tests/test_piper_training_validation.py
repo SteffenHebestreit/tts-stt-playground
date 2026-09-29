@@ -216,3 +216,200 @@ def test_a_different_seed_gives_a_different_split():
     _t1, v1 = validation.split_train_val(_entries(100), seed=1)
     _t2, v2 = validation.split_train_val(_entries(100), seed=2)
     assert v1 != v2
+
+
+# --- persisted vocabulary ---
+#
+# The vocabulary used to be rebuilt from train.json wherever it was needed: by the
+# dataset when a run started and again by the exporter when it ended. Its ids are
+# the row numbers of the trained embedding, so any dataset change in between
+# re-numbered the symbols under the weights.
+
+GOOD_VOCAB = {"<pad>": 0, "<unk>": 1, "<start>": 2, "<end>": 3, " ": 4, "a": 5}
+
+
+def test_validate_phoneme_id_map_accepts_what_the_dataset_builds():
+    built = validation.phoneme_id_map_from_entries([{"phonemes": "abc"}])
+    assert validation.validate_phoneme_id_map(built, n_vocab=256) == built
+
+
+@pytest.mark.parametrize("mapping,fragment", [
+    ({}, "empty"),
+    (None, "empty"),
+    (["a"], "empty"),
+    ({"<pad>": 0, "<unk>": 0}, "both"),                       # two symbols, one row
+    ({"<pad>": 0, "<unk>": 1, "a": -1}, "invalid id"),
+    ({"<pad>": 0, "<unk>": 1, "a": 1.5}, "invalid id"),
+    ({"<pad>": 0, "<unk>": 1, "a": True}, "invalid id"),      # bool is an int subclass
+    ({"<pad>": 0, "<unk>": 1, "": 2}, "invalid symbol"),
+    ({"<pad>": 0, "a": 1}, "<unk>"),
+    ({"<unk>": 1, "a": 2}, "<pad>"),
+])
+def test_validate_phoneme_id_map_rejects_what_an_embedding_cannot_use(mapping, fragment):
+    with pytest.raises(ValueError, match=fragment):
+        validation.validate_phoneme_id_map(mapping)
+
+
+def test_validate_phoneme_id_map_checks_the_embedding_size():
+    """An id at or above the row count is an out-of-range lookup, a device-side
+    assert on GPU."""
+    assert validation.validate_phoneme_id_map(GOOD_VOCAB, n_vocab=6) == GOOD_VOCAB
+    with pytest.raises(ValueError, match="embedding"):
+        validation.validate_phoneme_id_map(GOOD_VOCAB, n_vocab=5)
+
+
+def test_save_and_load_vocab_round_trip_without_leaving_a_temp_file(tmp_path):
+    path = tmp_path / validation.VOCAB_FILENAME
+    vocab = {**GOOD_VOCAB, "ʃ": 6, "ç": 7}
+
+    validation.save_vocab(path, vocab, n_vocab=256, boundary_tokens=True)
+
+    assert validation.load_vocab(path, n_vocab=256) == vocab
+    assert [p.name for p in tmp_path.iterdir()] == [validation.VOCAB_FILENAME]
+    assert '"ʃ"' in path.read_text(encoding="utf-8"), "non-ASCII symbols are written as themselves"
+
+
+def test_save_vocab_refuses_an_invalid_vocabulary_and_writes_nothing(tmp_path):
+    path = tmp_path / validation.VOCAB_FILENAME
+    with pytest.raises(ValueError):
+        validation.save_vocab(path, {"a": 0})
+    assert not path.exists()
+
+
+@pytest.mark.parametrize("content", ["not json", "[]", '{"phoneme_id_map": []}', '{"other": 1}'])
+def test_load_vocab_rejects_a_damaged_file(tmp_path, content):
+    path = tmp_path / validation.VOCAB_FILENAME
+    path.write_text(content)
+    with pytest.raises(ValueError):
+        validation.load_vocab(path)
+
+
+def test_load_vocab_reports_a_missing_file_as_a_value_error(tmp_path):
+    with pytest.raises(ValueError, match="cannot read"):
+        validation.load_vocab(tmp_path / "nope.json")
+
+
+def test_vocab_for_checkpoint_prefers_the_embedded_map_over_the_file(tmp_path):
+    validation.save_vocab(tmp_path / validation.VOCAB_FILENAME, {**GOOD_VOCAB, "z": 6})
+
+    vocab, source = validation.vocab_for_checkpoint({"phoneme_to_id": GOOD_VOCAB}, tmp_path)
+
+    assert (vocab, source) == (GOOD_VOCAB, "checkpoint")
+
+
+def test_vocab_for_checkpoint_falls_back_to_the_file_beside_it(tmp_path):
+    validation.save_vocab(tmp_path / validation.VOCAB_FILENAME, GOOD_VOCAB)
+
+    vocab, source = validation.vocab_for_checkpoint({"model_state_dict": {}}, tmp_path)
+
+    assert (vocab, source) == (GOOD_VOCAB, validation.VOCAB_FILENAME)
+
+
+def test_vocab_for_checkpoint_reports_none_for_a_legacy_checkpoint(tmp_path):
+    assert validation.vocab_for_checkpoint({"model_state_dict": {}}, tmp_path) == (None, "none")
+
+
+def test_vocab_for_checkpoint_raises_on_an_invalid_embedded_map_instead_of_guessing(tmp_path):
+    validation.save_vocab(tmp_path / validation.VOCAB_FILENAME, GOOD_VOCAB)
+    with pytest.raises(ValueError):
+        validation.vocab_for_checkpoint({"phoneme_to_id": {"a": 0}}, tmp_path)
+
+
+# --- env_int ---
+
+
+@pytest.mark.parametrize("raw,expected", [
+    (None, 5), ("", 5), ("   ", 5),          # unset -> default
+    ("3", 3), (" 7 ", 7), ("0", 0),
+    ("five", 5), ("2.5", 5),                 # a typo must not stop the service
+])
+def test_env_int_reads_the_variable_or_falls_back(monkeypatch, raw, expected):
+    if raw is None:
+        monkeypatch.delenv("PT_TEST_KNOB", raising=False)
+    else:
+        monkeypatch.setenv("PT_TEST_KNOB", raw)
+    assert validation.env_int("PT_TEST_KNOB", 5) == expected
+
+
+def test_env_int_clamps_to_the_minimum(monkeypatch):
+    monkeypatch.setenv("PT_TEST_KNOB", "0")
+    assert validation.env_int("PT_TEST_KNOB", 5, minimum=1) == 1
+    monkeypatch.setenv("PT_TEST_KNOB", "-4")
+    assert validation.env_int("PT_TEST_KNOB", 5, minimum=0) == 0
+
+
+# --- prune_old_checkpoints ---
+#
+# 10000 epochs at the default save interval is 2000 checkpoints of a few hundred
+# MB each; nothing ever deleted one.
+
+
+def _touch_checkpoints(directory, epochs, extra=("final_model.pt", "best_model.pt", "vocab.json", "job_state.json")):
+    for epoch in epochs:
+        (directory / f"checkpoint_epoch_{epoch}.pt").write_bytes(b"x")
+    for name in extra:
+        (directory / name).write_bytes(b"x")
+
+
+def _remaining_epochs(directory):
+    return sorted(
+        int(p.stem.rsplit("_", 1)[1]) for p in directory.glob("checkpoint_epoch_*.pt")
+        if p.stem.rsplit("_", 1)[1].isdigit()
+    )
+
+
+def test_prune_keeps_the_newest_n_by_epoch_number_not_by_name(tmp_path):
+    """Sorted as text, checkpoint_epoch_100 comes before checkpoint_epoch_25."""
+    _touch_checkpoints(tmp_path, [5, 10, 25, 100, 105])
+
+    removed = validation.prune_old_checkpoints(tmp_path, keep_last=2)
+
+    assert _remaining_epochs(tmp_path) == [100, 105]
+    assert sorted(p.name for p in removed) == [
+        "checkpoint_epoch_10.pt", "checkpoint_epoch_25.pt", "checkpoint_epoch_5.pt",
+    ]
+
+
+def test_prune_never_touches_final_best_vocab_or_state(tmp_path):
+    _touch_checkpoints(tmp_path, range(5, 55, 5))
+
+    validation.prune_old_checkpoints(tmp_path, keep_last=1)
+
+    assert sorted(p.name for p in tmp_path.iterdir() if not p.name.startswith("checkpoint_epoch_")) == [
+        "best_model.pt", "final_model.pt", "job_state.json", "vocab.json",
+    ]
+
+
+def test_prune_honours_protected_paths(tmp_path):
+    """The checkpoint a resume started from is still referenced until the first
+    new one is written."""
+    _touch_checkpoints(tmp_path, [5, 10, 15, 20])
+
+    validation.prune_old_checkpoints(tmp_path, keep_last=1, protect=(tmp_path / "checkpoint_epoch_5.pt",))
+
+    assert _remaining_epochs(tmp_path) == [5, 20]
+
+
+def test_prune_with_fewer_files_than_the_limit_deletes_nothing(tmp_path):
+    _touch_checkpoints(tmp_path, [5, 10])
+    assert validation.prune_old_checkpoints(tmp_path, keep_last=5) == []
+    assert _remaining_epochs(tmp_path) == [5, 10]
+
+
+@pytest.mark.parametrize("keep_last", [0, -1])
+def test_prune_disabled_keeps_everything(tmp_path, keep_last):
+    _touch_checkpoints(tmp_path, [5, 10, 15])
+    assert validation.prune_old_checkpoints(tmp_path, keep_last=keep_last) == []
+    assert _remaining_epochs(tmp_path) == [5, 10, 15]
+
+
+def test_prune_ignores_look_alike_names_and_a_missing_directory(tmp_path):
+    for name in ("checkpoint_epoch_5.pt.tmp", "checkpoint_epoch_x.pt", "checkpoint_epoch_7.pt.bak"):
+        (tmp_path / name).write_bytes(b"x")
+    _touch_checkpoints(tmp_path, [5, 10, 15], extra=())
+
+    validation.prune_old_checkpoints(tmp_path, keep_last=1)
+
+    assert _remaining_epochs(tmp_path) == [15]
+    assert (tmp_path / "checkpoint_epoch_5.pt.tmp").exists()
+    assert validation.prune_old_checkpoints(tmp_path / "does-not-exist", keep_last=1) == []

@@ -6,12 +6,13 @@ import json
 import logging
 import shutil
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import Callable, List, Dict, Optional, Tuple
 import numpy as np
 import tempfile
 from dataclasses import dataclass
 
-from stt_processor import STTProcessor, SegmentInfo
+from phonemization import phonemize_texts
+from stt_processor import STTProcessor, SegmentInfo, STTError, default_min_confidence
 from validation import split_train_val
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,8 @@ class AudioSegmenter:
     def __init__(self):
         """Initialise the segmenter and resolve the ffmpeg executable."""
         self.ffmpeg_path = self._find_ffmpeg()
+        # Segments dropped by the last generate_training_metadata() call.
+        self.phonemization_failures = 0
 
     def _find_ffmpeg(self) -> str:
         """Locate the ffmpeg executable in PATH."""
@@ -182,7 +185,9 @@ class AudioSegmenter:
         model_name: str,
         stt_service_url: str = "http://stt-service:8000",
         sample_rate: int = 22050,
-        quality_filters: Optional[Dict] = None
+        quality_filters: Optional[Dict] = None,
+        language: Optional[str] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
     ) -> Tuple[List[TrainingSegment], Dict]:
         """
         Run STT + segmentation on a list of audio files.
@@ -194,9 +199,20 @@ class AudioSegmenter:
             stt_service_url: Whisper STT service URL.
             sample_rate: Target sample rate for extracted segments.
             quality_filters: Optional overrides for duration/confidence filters.
+            language: Dataset language passed to the STT service ("de"); None
+                lets the service detect it per request.
+            should_stop: Polled between files; when it returns True the run
+                ends early with what has been produced so far. A file can take
+                many minutes of STT, so a cancelled job should not wait for the
+                rest of the upload.
 
         Returns:
             Tuple of (training_segments, processing_stats dict).
+
+        Raises:
+            STTError: no file produced any segment and at least one failed
+                because the STT service errored. Reported as such rather than
+                as an empty dataset.
         """
         logger.info(f"Processing {len(audio_files)} audio files for training dataset")
 
@@ -204,7 +220,7 @@ class AudioSegmenter:
             quality_filters = {
                 'min_duration': 1.0,
                 'max_duration': 15.0,
-                'min_confidence': 0.6,
+                'min_confidence': default_min_confidence(),
                 'min_text_length': 10
             }
 
@@ -216,16 +232,20 @@ class AudioSegmenter:
             'segments_after_quality_filter': 0,
             'segments_created': 0,
             'total_audio_duration': 0.0,
-            'training_audio_duration': 0.0
+            'training_audio_duration': 0.0,
+            'stt_errors': [],
         }
 
-        async with STTProcessor(stt_service_url) as stt_processor:
+        async with STTProcessor(stt_service_url, language=language) as stt_processor:
             for audio_file in audio_files:
+                if should_stop is not None and should_stop():
+                    logger.info("Stop requested; skipping the remaining audio files")
+                    break
                 try:
                     logger.info(f"Processing: {audio_file.name}")
 
                     import librosa
-                    file_duration = librosa.get_duration(path=str(audio_file))
+                    file_duration = await asyncio.to_thread(librosa.get_duration, path=str(audio_file))
                     processing_stats['total_audio_duration'] += file_duration
                     logger.info(f"  Duration: {file_duration:.1f}s")
 
@@ -255,9 +275,20 @@ class AudioSegmenter:
                     processing_stats['files_processed'] += 1
                     logger.info(f"  {audio_file.name}: {len(training_segments)} training segments")
 
+                except STTError as e:
+                    logger.error(f"  STT failed for {audio_file.name}: {e}")
+                    processing_stats['files_failed'] += 1
+                    processing_stats['stt_errors'].append(f"{audio_file.name}: {e}")
                 except Exception as e:
                     logger.error(f"  Failed to process {audio_file.name}: {e}")
                     processing_stats['files_failed'] += 1
+
+        if not all_training_segments and processing_stats['stt_errors']:
+            errors = processing_stats['stt_errors']
+            raise STTError(
+                f"STT failed for {len(errors)} of {len(audio_files)} file(s) and no segments were "
+                f"produced; first error: {errors[0]}"
+            )
 
         logger.info(
             f"Processing complete — {processing_stats['files_processed']}/{len(audio_files)} files, "
@@ -276,8 +307,13 @@ class AudioSegmenter:
         """
         Write train.json, val.json, and metadata.json for the training dataset.
 
-        Phonemizes each segment using espeak via the phonemizer library.
-        Falls back to raw text if phonemizer is not available.
+        Phonemizes each segment using espeak via the phonemizer library. A
+        segment that cannot be phonemised is dropped and counted (see
+        ``phonemization_failures``), never kept with its raw text as "phonemes":
+        the text would be turned into ids by the same vocabulary builder and
+        teach the model spellings it never sees at inference. If phonemizer is
+        missing, or more than PHONEMIZER_MAX_FAILURE_FRACTION of the segments
+        fail, ``PhonemizationError`` is raised and no dataset is written.
 
         Args:
             training_segments: Prepared audio segments.
@@ -290,32 +326,14 @@ class AudioSegmenter:
         """
         logger.info(f"Generating training metadata for {len(training_segments)} segments")
 
-        lang_map = {
-            'de': 'de', 'en': 'en-us', 'fr': 'fr-fr', 'es': 'es',
-            'it': 'it', 'nl': 'nl', 'pt': 'pt', 'ru': 'ru',
-        }
-        phonemizer_lang = lang_map.get(language, 'en-us')
-
-        try:
-            from phonemizer.backend import EspeakBackend
-            from phonemizer import phonemize
-            import ctypes.util as _cu
-            _so = _cu.find_library('espeak-ng') or '/usr/lib/x86_64-linux-gnu/libespeak-ng.so.1'
-            EspeakBackend.set_library(_so)
-            has_phonemizer = True
-        except ImportError:
-            has_phonemizer = False
-            logger.warning("phonemizer not available — using raw text as phonemes")
+        all_phonemes = phonemize_texts([segment.text for segment in training_segments], language)
 
         metadata = []
-        for i, segment in enumerate(training_segments):
-            phonemes = segment.text
-            if has_phonemizer:
-                try:
-                    from phonemizer import phonemize
-                    phonemes = phonemize(segment.text, language=phonemizer_lang, backend='espeak', strip=True)
-                except Exception as e:
-                    logger.warning(f"Phonemization failed for segment {i}: {e}")
+        self.phonemization_failures = 0
+        for segment, phonemes in zip(training_segments, all_phonemes):
+            if phonemes is None:
+                self.phonemization_failures += 1
+                continue
 
             metadata.append({
                 "audio_path": f"audio/{segment.audio_path.name}",

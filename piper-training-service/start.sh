@@ -9,7 +9,12 @@ check_nvidia() {
     if command -v nvidia-smi &> /dev/null; then
         echo "✅ NVIDIA GPU detected:"
         nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits
-        export CUDA_VISIBLE_DEVICES=0
+        # Only a default. `export CUDA_VISIBLE_DEVICES=0` here overrode the
+        # value compose (and .env) pass in, so choosing another GPU, or setting
+        # it empty to hide them all, did nothing. `=` rather than `:=` keeps an
+        # explicitly empty value, which is how CUDA is told to see no device.
+        : "${CUDA_VISIBLE_DEVICES=0}"
+        export CUDA_VISIBLE_DEVICES
         return 0
     else
         echo "❌ No NVIDIA GPU detected"
@@ -38,7 +43,7 @@ check_amd() {
             echo "   using HSA_OVERRIDE_GFX_VERSION=${HSA_OVERRIDE_GFX_VERSION}"
         fi
         return 0
-    elif lspci | grep -i amd | grep -i vga &> /dev/null; then
+    elif command -v lspci &> /dev/null && lspci | grep -i amd | grep -i vga &> /dev/null; then
         echo "✅ AMD GPU detected (no ROCm, using CPU fallback)"
         echo "💡 For optimal performance, install ROCm: https://docs.amd.com/bundle/ROCm-Installation-Guide-v5.4.3/page/How_to_Install_ROCm.html"
         return 1
@@ -83,22 +88,32 @@ fi
 export TRAINING_DEVICE_TYPE=$DEVICE_TYPE
 
 # Memory optimization based on available RAM
-TOTAL_RAM=$(free -g | awk '/^Mem:/{print $2}')
+TOTAL_RAM=$(free -g 2>/dev/null | awk '/^Mem:/{print $2}')
+TOTAL_RAM=${TOTAL_RAM:-0}
 echo "💾 Total system RAM: ${TOTAL_RAM}GB"
 
+# PYTORCH_CUDA_ALLOC_CONF is only defaulted from the RAM size: compose sets it
+# (TRAINING_PYTORCH_CUDA_ALLOC_CONF) and an explicit setting must win.
 if [ "$TOTAL_RAM" -lt 16 ]; then
     echo "⚠️ Low RAM detected, enabling aggressive memory optimization"
-    export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+    : "${PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512}"
+    export PYTORCH_CUDA_ALLOC_CONF
     export TRAINING_MEMORY_OPTIMIZATION=aggressive
 elif [ "$TOTAL_RAM" -lt 32 ]; then
     echo "✅ Moderate RAM, enabling standard memory optimization"
-    export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:1024
+    : "${PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:1024}"
+    export PYTORCH_CUDA_ALLOC_CONF
     export TRAINING_MEMORY_OPTIMIZATION=standard
 else
     echo "✅ High RAM, using performance optimization"
     export TRAINING_MEMORY_OPTIMIZATION=performance
 fi
 
-# Start the training service
+# Start the training service.
+#
+# exec: python becomes this process (PID 1 in the container). Without it bash
+# stays PID 1, `docker stop` delivers SIGTERM to bash, which does not forward it,
+# and the service never learns it is being stopped: no chance to ask the running
+# job to stop, so an update or restart always ended in SIGKILL mid-epoch.
 echo "🚀 Starting TTS Training Service with $DEVICE_TYPE acceleration..."
-python3 app.py
+exec python3 app.py

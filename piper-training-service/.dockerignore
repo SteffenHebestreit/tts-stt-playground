@@ -1,7 +1,24 @@
+# Runtime state: mounted as volumes, never part of the image.
 data/
 checkpoints/
 models/
 configs/
+
+# Python and tooling droppings.
 __pycache__/
 *.pyc
 .pytest_cache/
+.venv/
+venv/
+.git/
+
+# Secrets and partial files that must never be baked into a layer.
+.env
+.env.*
+*.partial
+*.tmp
+*.log
+
+# Documentation and the API snapshot: not read at runtime.
+README.md
+openapi.json

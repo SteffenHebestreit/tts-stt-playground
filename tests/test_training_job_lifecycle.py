@@ -14,9 +14,12 @@ the *job id*. Retraining a voice is the normal workflow and produces several
 jobs sharing one `data/<name>` and one deployed voice, so removing an old job
 took the current one's dataset and undeployed its voice.
 
-Static, because `app.py` and `training_pipeline.py` both import torch. The
-epoch-bound validator these endpoints now call is unit-tested for real in
-`test_piper_training_validation.py`.
+Static, because `training_pipeline.py` and `model_exporter.py` import torch. The
+checks on `app.py` here are a cheap structural backstop only: the behaviour they
+stand for (a cancelled job is never exported, a crashing trainer ends the job
+`failed`, one job at a time, resume/delete/cancel races) is exercised through the
+real endpoints in `test_piper_training_service_jobs.py`. The epoch-bound
+validator these endpoints call is unit-tested in `test_piper_training_validation.py`.
 """
 
 from __future__ import annotations
@@ -91,7 +94,7 @@ TRAINING_CALLERS = [
     "run_stt_based_training",
     "run_training",
     "_run_retrain_from_segments",
-    "_resume",
+    "run_resume_training",
 ]
 
 
@@ -114,8 +117,9 @@ def test_every_caller_handles_cancellation_separately_from_failure(caller: str):
 
 @pytest.mark.parametrize("caller", TRAINING_CALLERS)
 def test_every_caller_guards_the_train_sync_call(caller: str):
-    """These all run as BackgroundTasks, where an unhandled exception is
-    swallowed by the event loop and leaves the job status stuck."""
+    """These all run detached from the request that started them, where an
+    unhandled exception is swallowed by the event loop and leaves the job
+    status stuck."""
     node = _function(APP, caller)
     assert node is not None
 

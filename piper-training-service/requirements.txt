@@ -1,22 +1,27 @@
-# torch and torchaudio are installed separately in Dockerfile with CUDA support
-numpy>=1.24.0,<2.0.0
-scipy>=1.10.0
-librosa>=0.10.0
-matplotlib>=3.7.0
-tensorboard>=2.13.0
-fastapi>=0.104.0
-uvicorn[standard]>=0.24.0
-pydantic>=2.5.0
-onnx>=1.14.0
-onnxruntime>=1.15.0
-phonemizer>=3.2.0
-scikit-learn>=1.3.0
-pyyaml>=6.0
-tqdm>=4.65.0
-aiohttp>=3.8.0
-aiofiles>=23.1.0
-soundfile>=0.12.0
-python-multipart>=0.0.6
-psutil>=5.9.0
-GPUtil>=1.4.0
-py-cpuinfo>=9.0.0
+# torch is installed separately in the Dockerfiles, pinned to the version the ONNX
+# export test passes on (torch 2.11.0 for CUDA, 2.5.1 for ROCm; see the comments there).
+# torchaudio is not installed: nothing in this service imports it.
+#
+# Pins were resolved together (Python 3.11) and the training/export suite
+# (tests/test_piper_training_core_*.py) was run against them. Only packages this
+# service imports directly are listed; scipy, numba and scikit-learn arrive as
+# librosa dependencies and tensorboard, matplotlib, tqdm, pyyaml, psutil, GPUtil
+# and py-cpuinfo were imported by nothing.
+numpy==1.26.4
+librosa==0.11.0
+soundfile==0.14.0
+phonemizer==3.4.0
+aiohttp==3.14.3
+aiofiles==25.1.0
+
+fastapi==0.141.1
+uvicorn[standard]==0.54.0
+pydantic==2.13.5
+python-multipart==0.0.32
+
+# torch.onnx.export(dynamo=False) raises "Module onnx is not installed!" without
+# onnx, and the export is verified by running it in onnxruntime (model_exporter.py).
+# onnxscript is not needed: it belongs to the torch.export-based exporter this
+# service does not use.
+onnx==1.23.0
+onnxruntime==1.30.0
