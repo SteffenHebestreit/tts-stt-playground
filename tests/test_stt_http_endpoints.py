@@ -83,12 +83,12 @@ def test_ready_is_200_for_a_model_that_was_unloaded_and_can_reload(client, stt_a
 def test_ready_is_503_after_every_load_attempt_failed(client, stt_app):
     stt_app.whisper_model = None
     stt_app.model_loaded = False
-    stt_app.startup_error = "no such model"
+    stt_app.startup_error = "model_files_unavailable"
     response = client.get("/ready")
     assert response.status_code == 503
     body = response.json()
     assert body["ready"] is False and body["reason"] == "load_failed"
-    assert body["detail"] == "no such model"
+    assert body["detail"] == "model_files_unavailable"
 
 
 def test_ready_is_503_while_a_load_is_running(client, stt_app, monkeypatch):
@@ -154,7 +154,9 @@ def test_a_model_that_cannot_load_answers_503_and_leaves_no_upload_behind(client
     stt_app.model_loaded = False
     response = _post(client)
     assert response.status_code == 503
-    assert "weights are corrupt" in response.json()["detail"]
+    # The category says what kind of failure it was; the exception text is in the log.
+    assert response.json()["detail"] == "Model not available: load_error"
+    assert "weights are corrupt" not in response.text
     assert _leftovers(scratch) == [], "the upload of a refused request was left on disk"
     stt_app.startup_error = None
 

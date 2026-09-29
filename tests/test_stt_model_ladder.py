@@ -6,6 +6,7 @@ class the test controls, so an out-of-memory error is just an exception raised
 from its constructor.
 """
 
+import logging
 import threading
 
 import pytest
@@ -213,15 +214,21 @@ def test_the_configured_model_dir_becomes_faster_whispers_download_root():
     )
 
 
-def test_a_failed_load_in_offline_mode_says_the_cache_is_the_problem(app, recorder, monkeypatch):
+def test_a_failed_load_in_offline_mode_says_the_cache_is_the_problem(app, recorder, monkeypatch, caplog):
+    """The hint is for the operator, so it goes to the log; a probe gets a category."""
     recorder.reset(fail_when=lambda size, device: True)
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
-    app.load_model()
-    assert app.startup_error and "HF_HUB_OFFLINE" in app.startup_error
-
-    monkeypatch.delenv("HF_HUB_OFFLINE")
-    app.load_model()
+    with caplog.at_level(logging.ERROR):
+        app.load_model()
+    assert app.startup_error
+    assert "HF_HUB_OFFLINE" in caplog.text and "cache" in caplog.text
     assert "HF_HUB_OFFLINE" not in app.startup_error
+
+    caplog.clear()
+    monkeypatch.delenv("HF_HUB_OFFLINE")
+    with caplog.at_level(logging.ERROR):
+        app.load_model()
+    assert "HF_HUB_OFFLINE" not in caplog.text
 
 
 # --- startup preload ---------------------------------------------------------
