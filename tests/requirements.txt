@@ -22,7 +22,7 @@ uvicorn==0.54.0
 
 # Needed by the offline stt-service WebSocket tests, which stub torch and
 # faster-whisper but exercise the real numpy buffer handling.
-numpy>=1.24
+numpy>=2.5.3
 
 # The config-drift suites (test_env_wiring, test_docker_image_contents) parse
 # compose files and `importorskip` this. Without it they were reported as
