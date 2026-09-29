@@ -34,7 +34,8 @@ REAL_ASYNC_CLIENT = httpx.AsyncClient
 # developer's shell cannot change what a test measures.
 MANAGED_ENV = (
     "ALLOWED_ORIGINS", "ALLOW_CREDENTIALS", "TRUSTED_ORIGINS", "TRUST_PROXY_HEADERS",
-    "API_KEY", "MAX_UPLOAD_MB", "MAX_TTS_CHARS", "HEALTH_CACHE_TTL",
+    "TRUSTED_HOSTS", "ALLOWED_HOSTS",
+    "API_KEY", "MAX_UPLOAD_MB", "MAX_TTS_CHARS", "MAX_CONCURRENT_UPLOADS", "HEALTH_CACHE_TTL",
     "DEFAULT_STT_PROVIDER", "DEFAULT_TTS_PROVIDER", "PROVIDER_REGISTRY_JSON",
     "ENABLE_WHISPER_CPP", "ENABLE_PARAKEET_ASR", "ENABLE_CANARY_ASR",
     "ENABLE_CHATTERBOX_TTS", "APP_VERSION",
@@ -51,7 +52,9 @@ def load_frontend_app(env: Optional[dict] = None):
     module = module_from_spec(spec)
 
     previous_cwd = os.getcwd()
-    saved = {key: os.environ.get(key) for key in MANAGED_ENV}
+    # Anything the caller sets (a backend URL, say) is put back too, not only the
+    # names the gateway is known to read.
+    saved = {key: os.environ.get(key) for key in (*MANAGED_ENV, *env)}
     sys.path.insert(0, str(SERVICE_DIR))
     try:
         for key in MANAGED_ENV:
@@ -148,6 +151,38 @@ def asgi_client(module, **kwargs) -> httpx.AsyncClient:
     """A real async client that talks to the app in-process (no sockets)."""
     return REAL_ASYNC_CLIENT(
         transport=httpx.ASGITransport(app=module.app), base_url="http://testserver", **kwargs)
+
+
+async def asgi_call(app, method: str, path: str, headers=(), body: bytes = b""):
+    """One HTTP request straight into the ASGI app, with exactly the headers given.
+
+    Unlike a client this adds nothing of its own - no Host, no Content-Length -
+    which is what a test of "there is no Host header" or "the body is chunked"
+    needs. Returns ``(status, headers_dict, body_bytes)``.
+    """
+    scope = {
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": method,
+        "scheme": "http", "path": path, "raw_path": path.encode(), "query_string": b"",
+        "root_path": "", "server": ("testserver", 80), "client": ("127.0.0.1", 1234),
+        "headers": [(k.lower().encode(), v.encode()) for k, v in headers],
+    }
+    sent = []
+    delivered = False
+
+    async def receive():
+        nonlocal delivered
+        if not delivered:
+            delivered = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message)
+
+    await app(scope, receive, send)
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    payload = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
+    return start["status"], {k.decode().lower(): v.decode() for k, v in start["headers"]}, payload
 
 
 def wav_bytes(samples: bytes = b"\x00\x00" * 160, *, rate: int = 22050,

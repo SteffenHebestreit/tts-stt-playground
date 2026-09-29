@@ -1,163 +1,476 @@
-# Jinja2 template rendered from questions.yaml values into a docker-compose.
-#
-# SCAFFOLD: plain Jinja2 (no ix-lib) so it is readable and adaptable. TrueNAS's
-# own app engine uses additional ix-lib helpers; validate/adjust for your
-# release. The fully supported, no-template path is docker-compose.truenas-app.yml.
+{#-
+  Renders to a docker compose file from the answers in questions.yaml (`values`).
+
+  STATUS: a scaffold in plain Jinja2, so it renders on its own (scripts/truenas/render_catalog.py
+  does exactly that and tests/test_truenas_catalog.py feeds the result to `docker compose config`).
+  TrueNAS renders catalog apps with its own ix-lib helpers and expects the
+  trains/<train>/<app>/<version>/ layout; this has never been loaded by a real TrueNAS. The
+  supported install path is Install via YAML with docker-compose.truenas-app.yml, and a test keeps
+  this template equivalent to it: same services, images, environment, volumes and health checks at
+  the default answers. Left out on purpose: the `diun` watcher and its labels, and the compose
+  profiles (here an optional service is a question, not a line to delete).
+
+  Rules the tests hold this file to:
+    * Answers that a `show_if` hides may be missing. GPU-only settings are therefore read only under
+      `values.use_gpu`, and the render must work with StrictUndefined.
+    * Free text (API key, origins, model names) goes through q(): a JSON string is valid YAML, and
+      `$` is doubled so that Compose does not interpolate it.
+
+  ixVolume: TrueNAS injects `ix_volumes` (dataset name -> path); the shape is assumed, so a
+  plain string and a {host_path: ...} mapping are both accepted.
+-#}
+{%- if values.storage_type == 'ix_volume' %}
+  {%- set _iv = values.ix_volumes[values.ix_volume_dataset] %}
+  {%- set data = _iv.host_path if _iv is mapping else _iv %}
+{%- else %}
+  {%- set data = values.host_path %}
+{%- endif %}
 {%- set reg = values.image_registry %}
 {%- set tag = values.image_tag %}
-{%- set data = values.host_path %}
-{%- set origins = values.allowed_origins %}
-{%- set bhost = values.browser_host %}
-{%- macro gpu() %}
-    {%- if values.use_gpu %}
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ["{{ values.gpu_device_id }}"]
-              capabilities: [gpu]
-    {%- endif %}
+{%- macro q(value) -%}
+{{ (value | string | replace('$', '$$')) | tojson }}
+{%- endmacro %}
+{#- probe 'health': GET /health must answer 2xx. probe 'any': any HTTP answer counts (whisper-server). -#}
+{%- macro healthcheck(port, start, probe='health') -%}
+healthcheck:
+  {%- if probe == 'any' %}
+  test: ["CMD-SHELL", "curl -s http://localhost:{{ port }}/ > /dev/null || exit 1"]
+  {%- else %}
+  test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:{{ port }}/health"]
+  {%- endif %}
+  interval: 15s
+  timeout: 10s
+  start_period: {{ start }}s
+  retries: 4
+{%- endmacro %}
+{%- macro gpu_deploy() -%}
+deploy:
+  resources:
+    reservations:
+      devices:
+        - driver: nvidia
+          device_ids: [{{ q(values.gpu_device_id) }}]
+          capabilities: [gpu]
 {%- endmacro %}
 name: tts-stt
+# Read by the Apps UI for the Web UI button; ignored by Docker Compose.
+x-portals:
+  - name: Web UI
+    scheme: http
+    host: 0.0.0.0
+    port: {{ values.frontend_port }}
+    path: /
 services:
+  piper-voices-seed:
+    image: {{ reg }}/tts-stt-piper-tts:{{ tag }}
+    pull_policy: "{{ values.pull_policy }}"
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -eu
+        src=/app/models/default
+        dst=/seed/default
+        mkdir -p "$$dst"
+        copied=0
+        for f in "$$src"/*; do
+          [ -e "$$f" ] || continue
+          name=$${f##*/}
+          if [ ! -e "$$dst/$$name" ]; then
+            cp "$$f" "$$dst/$$name.part"
+            mv "$$dst/$$name.part" "$$dst/$$name"
+            copied=$$((copied + 1))
+          fi
+        done
+        echo "piper-voices-seed: $$copied new voice file(s) copied into $$dst"
+    volumes:
+      - "{{ data }}/models:/seed"
+    restart: "no"
+    network_mode: none
+
   frontend-service:
     image: {{ reg }}/tts-stt-frontend:{{ tag }}
+    pull_policy: "{{ values.pull_policy }}"
     ports:
-      - "{{ values.frontend_port }}:3000"
+      - "0.0.0.0:{{ values.frontend_port }}:3000"
     environment:
-      TTS_SERVICE_URL: http://piper-tts-service:5000
-      STT_SERVICE_URL: http://stt-service:8000
-      VOICE_TRAINING_URL: http://piper-training-service:8080
-      QWEN3_TTS_SERVICE_URL: http://qwen3-tts-service:5004
-      QWEN3_ASR_SERVICE_URL: http://qwen3-asr-service:5002
-      PARAKEET_ASR_SERVICE_URL: http://parakeet-asr-service:5005
-      WHISPER_CPP_SERVICE_URL: http://whisper-cpp:8080
-      ENABLE_PARAKEET_ASR: "{{ values.enable_parakeet | lower }}"
+      TTS_SERVICE_URL: "http://piper-tts-service:5000"
+      STT_SERVICE_URL: "http://stt-service:8000"
+      VOICE_TRAINING_URL: "http://piper-training-service:8080"
+      QWEN3_TTS_SERVICE_URL: "http://qwen3-tts-service:5004"
+      QWEN3_ASR_SERVICE_URL: "http://qwen3-asr-service:5002"
+      PARAKEET_ASR_SERVICE_URL: "http://parakeet-asr-service:5005"
+      CANARY_ASR_SERVICE_URL: "http://canary-asr-service:5006"
+      CHATTERBOX_TTS_SERVICE_URL: "http://chatterbox-tts-service:5007"
+      WHISPER_CPP_SERVICE_URL: "http://whisper-cpp:8080"
+      ENABLE_PARAKEET_ASR: "{{ (values.use_gpu and values.enable_parakeet) | lower }}"
+      ENABLE_CANARY_ASR: "{{ (values.use_gpu and values.enable_canary) | lower }}"
+      ENABLE_CHATTERBOX_TTS: "{{ (values.use_gpu and values.enable_chatterbox) | lower }}"
       ENABLE_WHISPER_CPP: "{{ values.enable_whisper_cpp | lower }}"
-      ALLOWED_ORIGINS: "{{ origins }}"
-      BROWSER_TTS_URL: "http://{{ bhost }}:5000"
-      BROWSER_STT_URL: "http://{{ bhost }}:5001"
-      BROWSER_TRAINING_URL: "http://{{ bhost }}:8080"
-      BROWSER_QWEN3_TTS_URL: "http://{{ bhost }}:5004"
-      BROWSER_QWEN3_ASR_URL: "http://{{ bhost }}:5002"
-      BROWSER_PARAKEET_ASR_URL: "http://{{ bhost }}:5005"
-      BROWSER_WHISPER_CPP_URL: "http://{{ bhost }}:5003"
+      ALLOWED_ORIGINS: {{ q(values.allowed_origins) }}
+      ALLOW_CREDENTIALS: "false"
+      TRUSTED_ORIGINS: {{ q(values.trusted_origins) }}
+      TRUST_PROXY_HEADERS: "false"
+      API_KEY: {{ q(values.api_key) }}
+      MAX_UPLOAD_MB: "512"
+      MAX_TTS_CHARS: "20000"
+      HEALTH_CACHE_TTL: "2"
+      FRONTEND_WORKERS: "2"
+      DEFAULT_STT_PROVIDER: "whisper"
+      DEFAULT_TTS_PROVIDER: "piper"
+      TRAINING_PROVIDER: "piper-training"
+      PROVIDER_REGISTRY_JSON: ""
+      PROVIDER_HEALTH_TIMEOUT: "6"
+      UPSTREAM_MAX_CONNECTIONS: "100"
+      UPSTREAM_MAX_KEEPALIVE: "20"
+      UPSTREAM_KEEPALIVE_EXPIRY: "115"
     restart: unless-stopped
+    stop_grace_period: 20s
+    {{ healthcheck(3000, 30) | indent(4) }}
+    depends_on:
+      piper-tts-service:
+        condition: service_started
+        required: false
+      stt-service:
+        condition: service_started
+        required: false
     networks: [tts-stt-network]
 
   piper-tts-service:
     image: {{ reg }}/tts-stt-piper-tts:{{ tag }}
+    pull_policy: "{{ values.pull_policy }}"
     {%- if values.expose_backend_ports %}
-    ports: ["5000:5000"]
+    ports: ["127.0.0.1:5000:5000"]
     {%- endif %}
     environment:
-      ALLOWED_ORIGINS: "{{ origins }}"
+      PIPER_DATA_DIR: "/app/models"
+      PIPER_OUTPUT_DIR: "/app/output"
+      OUTPUT_RETENTION_HOURS: "24"
+      OUTPUT_PRUNE_INTERVAL_S: "3600"
+      ONNX_NUM_THREADS: "2"
+      ONNX_SESSION_CACHE_SIZE: "4"
+      PIPER_STRICT_LANGUAGE: "false"
+      PIPER_DEFAULT_LANGUAGE: "de"
+      PIPER_DEFAULT_VOICE: ""
+      PIPER_AUTO_DETECT: "true"
+      PIPER_TIMEOUT_S: "60"
+      PIPER_MAX_CONCURRENCY: ""
+      MAX_TEXT_CHARS: "20000"
+      MAX_UPLOAD_MB: "100"
+      MAX_ANALYZE_UPLOAD_MB: "25"
+      ALLOWED_ORIGINS: "*"
+      ALLOW_CREDENTIALS: "false"
     volumes:
       - "{{ data }}/models:/app/models"
       - "{{ data }}/output:/app/output"
     restart: unless-stopped
+    stop_grace_period: 20s
+    {{ healthcheck(5000, 90) | indent(4) }}
+    depends_on:
+      piper-voices-seed:
+        condition: service_completed_successfully
     networks: [tts-stt-network]
 
   stt-service:
     image: {{ reg }}/tts-stt-stt:{{ tag }}
+    pull_policy: "{{ values.pull_policy }}"
     {%- if values.expose_backend_ports %}
-    ports: ["5001:8000"]
+    ports: ["127.0.0.1:5001:8000"]
     {%- endif %}
     environment:
+      {%- if values.use_gpu %}
+      NVIDIA_VISIBLE_DEVICES: {{ q(values.gpu_device_id) }}
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      {%- endif %}
       USE_CUDA: "{{ values.use_gpu | lower }}"
       FORCE_ACCELERATION: "{{ 'cuda' if values.use_gpu else 'cpu' }}"
-      NVIDIA_VISIBLE_DEVICES: "{{ values.gpu_device_id if values.use_gpu else '' }}"
-      WHISPER_MODEL_SIZE: "{{ values.whisper_model_size }}"
-      ALLOWED_ORIGINS: "{{ origins }}"
+      WHISPER_MODEL_SIZE: {{ q(values.whisper_model_size) }}
+      WHISPER_COMPUTE_TYPE: "{{ 'float16' if values.use_gpu else '' }}"
+      WHISPER_OOM_FALLBACK: "small"
+      WS_MAX_QUEUE: "128"
+      KEEPALIVE_TIMEOUT: "120"
+      WS_WINDOW_S: "8.0"
+      WS_MIN_NEW_AUDIO_S: "0.5"
+      WS_MAX_SESSIONS: "4"
+      WS_MAX_BUFFER_S: "600.0"
+      WS_NO_SPEECH_THRESHOLD: "0.6"
+      WS_MIN_AVG_LOGPROB: "-1.0"
+      WS_MAX_INTERIM_ERRORS: "3"
+      WS_IDLE_TIMEOUT_S: "60"
+      WS_LANGUAGE_LOCK_PROB: "0.8"
+      STT_DEFAULT_LANGUAGE: {{ q(values.stt_default_language) }}
+      WHISPER_NUM_WORKERS: "2"
+      MAX_UPLOAD_MB: "200"
+      MAX_AUDIO_SECONDS: "7200"
+      STT_BATCH_WORKERS: ""
+      STT_BATCHED_INFERENCE: "false"
+      STT_BATCH_SIZE: "8"
+      WHISPER_MODEL_DIR: ""
+      HF_HUB_OFFLINE: "0"
+      STT_MODEL_TTL: "{{ values.model_ttl }}"
+      MODEL_TTL: "{{ values.model_ttl }}"
+      OMP_NUM_THREADS: "4"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+      ALLOWED_ORIGINS: "*"
+      ALLOW_CREDENTIALS: "false"
     volumes:
       - "{{ data }}/models:/app/models"
-      - "{{ data }}/.cache:/root/.cache"
+      - "{{ data }}/cache:/root/.cache"
     restart: unless-stopped
-    {{- gpu() }}
+    stop_grace_period: 30s
+    {{ healthcheck(8000, 600) | indent(4) }}
+    {%- if values.use_gpu %}
+    {{ gpu_deploy() | indent(4) }}
+    {%- endif %}
     networks: [tts-stt-network]
 
+  {%- if values.use_gpu %}
   qwen3-asr-service:
     image: {{ reg }}/tts-stt-qwen3-asr:{{ tag }}
+    pull_policy: "{{ values.pull_policy }}"
     {%- if values.expose_backend_ports %}
-    ports: ["5002:5002"]
+    ports: ["127.0.0.1:5002:5002"]
     {%- endif %}
     environment:
-      NVIDIA_VISIBLE_DEVICES: "{{ values.gpu_device_id if values.use_gpu else '' }}"
-      QWEN3_ASR_MODEL: "{{ values.qwen3_asr_model }}"
-      ALLOWED_ORIGINS: "{{ origins }}"
+      NVIDIA_VISIBLE_DEVICES: {{ q(values.gpu_device_id) }}
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      QWEN3_ASR_MODEL: {{ q(values.qwen3_asr_model) }}
+      QWEN3_ASR_CHUNK_S: "30"
+      QWEN3_ASR_BATCH_SIZE: "4"
+      QWEN3_ASR_MAX_NEW_TOKENS: ""
+      QWEN3_ASR_ATTN_IMPLEMENTATION: ""
+      MAX_UPLOAD_MB: "200"
+      MAX_AUDIO_SECONDS: "7200"
+      ASR_MAX_CONCURRENCY: "1"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+      ASR_MODEL_TTL: "{{ values.model_ttl }}"
+      MODEL_TTL: "{{ values.model_ttl }}"
+      ALLOWED_ORIGINS: "*"
+      ALLOW_CREDENTIALS: "false"
     volumes:
-      - "{{ data }}/hf-cache/qwen3-asr:/root/.cache"
+      - "{{ data }}/cache:/root/.cache"
     restart: unless-stopped
-    {{- gpu() }}
+    stop_grace_period: 30s
+    {{ healthcheck(5002, 600) | indent(4) }}
+    {%- if values.use_gpu %}
+    {{ gpu_deploy() | indent(4) }}
+    {%- endif %}
     networks: [tts-stt-network]
 
   qwen3-tts-service:
     image: {{ reg }}/tts-stt-qwen3-tts:{{ tag }}
+    pull_policy: "{{ values.pull_policy }}"
     {%- if values.expose_backend_ports %}
-    ports: ["5004:5004"]
+    ports: ["127.0.0.1:5004:5004"]
     {%- endif %}
     environment:
-      NVIDIA_VISIBLE_DEVICES: "{{ values.gpu_device_id if values.use_gpu else '' }}"
-      QWEN3_TTS_MODEL: "{{ values.qwen3_tts_model }}"
-      QWEN3_ASR_SERVICE_URL: http://qwen3-asr-service:5002
-      ALLOWED_ORIGINS: "{{ origins }}"
+      NVIDIA_VISIBLE_DEVICES: {{ q(values.gpu_device_id) }}
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      QWEN3_TTS_MODEL: {{ q(values.qwen3_tts_model) }}
+      QWEN3_DEFAULT_LANGUAGE: "German"
+      QWEN3_TTS_ATTN_IMPLEMENTATION: "auto"
+      MAX_TEXT_CHARS: "5000"
+      MAX_UPLOAD_MB: "20"
+      TTS_MAX_CONCURRENCY: "1"
+      TTS_MAX_BATCH: "8"
+      TTS_MODEL_TTL: "{{ values.model_ttl }}"
+      MODEL_TTL: "{{ values.model_ttl }}"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+      QWEN3_ASR_SERVICE_URL: "http://qwen3-asr-service:5002"
+      ALLOWED_ORIGINS: "*"
+      ALLOW_CREDENTIALS: "false"
     volumes:
-      - "{{ data }}/hf-cache/qwen3-tts:/root/.cache"
+      - "{{ data }}/cache:/root/.cache"
       - "{{ data }}/qwen3-voices:/app/voices"
     restart: unless-stopped
-    {{- gpu() }}
+    stop_grace_period: 30s
+    {{ healthcheck(5004, 600) | indent(4) }}
+    depends_on:
+      qwen3-asr-service:
+        condition: service_started
+        required: false
+    {%- if values.use_gpu %}
+    {{ gpu_deploy() | indent(4) }}
+    {%- endif %}
     networks: [tts-stt-network]
+  {%- endif %}
 
-  {%- if values.enable_parakeet %}
+  {%- if values.use_gpu and values.enable_canary %}
+
+  canary-asr-service:
+    image: {{ reg }}/tts-stt-canary-asr:{{ tag }}
+    pull_policy: "{{ values.pull_policy }}"
+    {%- if values.expose_backend_ports %}
+    ports: ["127.0.0.1:5006:5006"]
+    {%- endif %}
+    environment:
+      NVIDIA_VISIBLE_DEVICES: {{ q(values.gpu_device_id) }}
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      CANARY_ASR_MODEL: "nvidia/canary-180m-flash"
+      ASR_MAX_BATCH: "8"
+      CANARY_DEFAULT_LANGUAGE: "de"
+      CANARY_SUPPORTED_LANGUAGES: ""
+      MAX_UPLOAD_MB: "200"
+      NEMO_MAX_AUDIO_S: "1500"
+      NEMO_MATMUL_PRECISION: "high"
+      NEMO_BF16: "false"
+      ASR_MAX_CONCURRENCY: "1"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+      ASR_MODEL_TTL: "{{ values.model_ttl }}"
+      MODEL_TTL: "{{ values.model_ttl }}"
+      ALLOWED_ORIGINS: "*"
+      ALLOW_CREDENTIALS: "false"
+    volumes:
+      - "{{ data }}/cache:/root/.cache"
+    restart: unless-stopped
+    stop_grace_period: 30s
+    {{ healthcheck(5006, 900) | indent(4) }}
+    {%- if values.use_gpu %}
+    {{ gpu_deploy() | indent(4) }}
+    {%- endif %}
+    networks: [tts-stt-network]
+  {%- endif %}
+
+  {%- if values.use_gpu and values.enable_parakeet %}
+
   parakeet-asr-service:
     image: {{ reg }}/tts-stt-parakeet-asr:{{ tag }}
+    pull_policy: "{{ values.pull_policy }}"
     {%- if values.expose_backend_ports %}
-    ports: ["5005:5005"]
+    ports: ["127.0.0.1:5005:5005"]
     {%- endif %}
     environment:
-      NVIDIA_VISIBLE_DEVICES: "{{ values.gpu_device_id if values.use_gpu else '' }}"
+      NVIDIA_VISIBLE_DEVICES: {{ q(values.gpu_device_id) }}
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
       PARAKEET_ASR_MODEL: "nvidia/parakeet-tdt-0.6b-v3"
-      ALLOWED_ORIGINS: "{{ origins }}"
+      ASR_MAX_BATCH: "8"
+      MAX_UPLOAD_MB: "200"
+      NEMO_MAX_AUDIO_S: "1500"
+      NEMO_MATMUL_PRECISION: "high"
+      NEMO_BF16: "false"
+      ASR_MAX_CONCURRENCY: "1"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+      ASR_MODEL_TTL: "{{ values.model_ttl }}"
+      MODEL_TTL: "{{ values.model_ttl }}"
+      ALLOWED_ORIGINS: "*"
+      ALLOW_CREDENTIALS: "false"
     volumes:
-      - "{{ data }}/hf-cache/parakeet:/root/.cache"
+      - "{{ data }}/cache:/root/.cache"
     restart: unless-stopped
-    {{- gpu() }}
+    stop_grace_period: 30s
+    {{ healthcheck(5005, 900) | indent(4) }}
+    {%- if values.use_gpu %}
+    {{ gpu_deploy() | indent(4) }}
+    {%- endif %}
     networks: [tts-stt-network]
   {%- endif %}
 
-  {%- if values.enable_whisper_cpp %}
-  whisper-cpp:
-    image: {{ reg }}/tts-stt-whisper-cpp:{{ tag }}
+  {%- if values.use_gpu and values.enable_chatterbox %}
+
+  chatterbox-tts-service:
+    image: {{ reg }}/tts-stt-chatterbox-tts:{{ tag }}
+    pull_policy: "{{ values.pull_policy }}"
     {%- if values.expose_backend_ports %}
-    ports: ["5003:8080"]
+    ports: ["127.0.0.1:5007:5007"]
     {%- endif %}
     environment:
-      WHISPER_MODEL: "large-v3"
+      NVIDIA_VISIBLE_DEVICES: {{ q(values.gpu_device_id) }}
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      CHATTERBOX_DEFAULT_LANGUAGE: "de"
+      CHATTERBOX_T3_MODEL: "v3"
+      CHATTERBOX_REPETITION_PENALTY: ""
+      CHATTERBOX_HF_REVISION: "main"
+      CHATTERBOX_CHUNK_GAP_MS: "150"
+      CHATTERBOX_REF_MAX_SECONDS: "30"
+      MAX_TEXT_CHARS: "5000"
+      MAX_UPLOAD_MB: "20"
+      TTS_MODEL_TTL: "{{ values.model_ttl }}"
+      MODEL_TTL: "{{ values.model_ttl }}"
+      TTS_MAX_CONCURRENCY: "1"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+      ALLOWED_ORIGINS: "*"
+      ALLOW_CREDENTIALS: "false"
     volumes:
-      - "{{ data }}/whisper-cpp-models:/models"
+      - "{{ data }}/cache:/root/.cache"
     restart: unless-stopped
+    stop_grace_period: 30s
+    {{ healthcheck(5007, 900) | indent(4) }}
+    {%- if values.use_gpu %}
+    {{ gpu_deploy() | indent(4) }}
+    {%- endif %}
     networks: [tts-stt-network]
   {%- endif %}
 
-  {%- if values.enable_training %}
+  {%- if values.use_gpu and values.enable_training %}
+
   piper-training-service:
     image: {{ reg }}/tts-stt-piper-training:{{ tag }}
+    pull_policy: "{{ values.pull_policy }}"
     {%- if values.expose_backend_ports %}
-    ports: ["8080:8080"]
+    ports: ["127.0.0.1:8080:8080"]
     {%- endif %}
     environment:
-      NVIDIA_VISIBLE_DEVICES: "{{ values.gpu_device_id if values.use_gpu else '' }}"
+      NVIDIA_VISIBLE_DEVICES: {{ q(values.gpu_device_id) }}
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:1024"
+      PYTHONUNBUFFERED: "1"
+      STT_SERVICE_URL: "http://stt-service:8000"
+      PIPER_TTS_SERVICE_URL: "http://piper-tts-service:5000"
+      SHARED_MODELS_DIR: "/app/shared_models"
+      DEFAULT_DEPLOYMENT_TARGET: "piper-volume"
+      DEPLOYMENT_TARGETS_JSON: ""
       MAX_TRAIN_BATCH_SIZE: "4"
-      ALLOWED_ORIGINS: "{{ origins }}"
-    shm_size: 1gb
+      ALLOW_CLIENT_STT_URL: "false"
+      TRAINING_MAX_CONCURRENT: "1"
+      TRAINING_DEFAULT_LANGUAGE: "de"
+      TRAINING_ALLOWED_AUDIO_DIRS: ""
+      TRAINING_ALLOWED_URL_HOSTS: ""
+      STT_MIN_CONFIDENCE: "0.6"
+      PHONEMIZER_MAX_FAILURE_FRACTION: "0.05"
+      TRAIN_MAX_CONSECUTIVE_FAILURES: "5"
+      KEEP_LAST_CHECKPOINTS: "5"
+      TRAIN_NUM_WORKERS: "2"
+      TRAINING_SHUTDOWN_GRACE_S: "30"
+      UVICORN_TIMEOUT_KEEP_ALIVE: "75"
+      MAX_UPLOAD_MB: "500"
+      MAX_TEXT_CHARS: "1000"
+      ALLOWED_ORIGINS: "*"
+      ALLOW_CREDENTIALS: "false"
     volumes:
       - "{{ data }}/piper-training-service/data:/app/data"
       - "{{ data }}/piper-training-service/checkpoints:/app/checkpoints"
       - "{{ data }}/piper-training-service/models:/app/models"
+      - "{{ data }}/piper-training-service/configs:/app/configs"
       - "{{ data }}/models:/app/shared_models"
+    shm_size: 1gb
     restart: unless-stopped
-    {{- gpu() }}
+    stop_grace_period: 60s
+    {{ healthcheck(8080, 180) | indent(4) }}
+    depends_on:
+      stt-service:
+        condition: service_started
+        required: false
+    {%- if values.use_gpu %}
+    {{ gpu_deploy() | indent(4) }}
+    {%- endif %}
+    networks: [tts-stt-network]
+  {%- endif %}
+
+  {%- if values.enable_whisper_cpp %}
+
+  whisper-cpp:
+    image: {{ reg }}/tts-stt-whisper-cpp:{{ tag }}
+    pull_policy: "{{ values.pull_policy }}"
+    {%- if values.expose_backend_ports %}
+    ports: ["127.0.0.1:5003:8080"]
+    {%- endif %}
+    environment:
+      WHISPER_MODEL: "large-v3-turbo-q5_0"
+      EXTRA_ARGS: ""
+    volumes:
+      - "{{ data }}/whisper-cpp-models:/models"
+    restart: unless-stopped
+    stop_grace_period: 20s
+    {{ healthcheck(8080, 600, 'any') | indent(4) }}
     networks: [tts-stt-network]
   {%- endif %}
 

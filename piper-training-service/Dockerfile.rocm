@@ -25,12 +25,10 @@ WORKDIR /app
 
 RUN pip3 install --upgrade pip setuptools wheel
 
-COPY requirements.txt .
-
-# Install non-torch deps first (requirements.txt has no torch line)
-RUN pip3 install --no-cache-dir -r requirements.txt
-
-# Install ROCm-enabled PyTorch LAST so it is not overwritten by any dep.
+# Install ROCm-enabled PyTorch first, BEFORE `COPY requirements.txt`: a COPY whose
+# file changed invalidates every layer after it, so with the COPY first, editing
+# any requirement downloaded this multi-GB wheel again. requirements.txt has no
+# torch line, and the constraint below keeps it that way (see there).
 #
 # Pinned to 2.5.1, the newest release the rocm6.2 index serves (the ASR
 # Dockerfile.rocm files note the same). The ONNX export uses the TorchScript
@@ -38,7 +36,15 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 # was run on 2.5.1 as well as on the 2.11.0 the CUDA image pins. Moving to a newer
 # ROCm wheel index means re-running it there. torchaudio is not installed: nothing
 # in this service imports it.
-RUN pip3 install --no-cache-dir torch==2.5.1 --index-url https://download.pytorch.org/whl/rocm6.2
+ARG TORCH_VERSION=2.5.1
+RUN pip3 install --no-cache-dir "torch==${TORCH_VERSION}" --index-url https://download.pytorch.org/whl/rocm6.2
+
+# The other requirements, with torch held by a constraint: this is what used to
+# be guaranteed by installing torch last. If a requirement ever asks for another
+# release the build fails here instead of replacing the ROCm wheel with a PyPI one.
+COPY requirements.txt .
+RUN printf 'torch==%s\n' "${TORCH_VERSION}" > /tmp/torch-constraints.txt \
+    && pip3 install --no-cache-dir -c /tmp/torch-constraints.txt -r requirements.txt
 
 COPY . .
 

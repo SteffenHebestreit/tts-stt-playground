@@ -249,12 +249,39 @@ def test_tts_text_over_the_limit_is_rejected(monkeypatch):
     assert client.post("/api/tts", json={"provider": "piper", "text": "a" * 50}).status_code == 200
 
 
-def test_default_tts_limit_is_20000_characters(monkeypatch):
+def test_default_tts_limit_is_5000_characters(monkeypatch):
+    """5000 is what chatterbox and qwen3-tts accept (MAX_TEXT_CHARS); a larger gateway
+    default let 5001-20000 characters through to a 413 from the backend."""
     module = load_frontend_app()
+    stub = install_stub(monkeypatch, module, _backend)
+    client = TestClient(module.app)
+    for provider in ("piper", "qwen3"):
+        assert client.post("/api/tts", json={"provider": provider, "text": "a" * 5001}).status_code == 422
+    assert stub.calls == [], "an over-long text reached a backend"
+    assert client.post("/api/tts", json={"provider": "piper", "text": "a" * 5000}).status_code == 200
+
+
+def test_tts_limit_can_be_raised_for_backends_that_take_more(monkeypatch):
+    """Piper's own default is 20000, so a Piper-only deployment can lift the gateway cap."""
+    module = load_frontend_app({"MAX_TTS_CHARS": "20000"})
     install_stub(monkeypatch, module, _backend)
     client = TestClient(module.app)
-    assert client.post("/api/tts", json={"provider": "piper", "text": "a" * 20001}).status_code == 422
     assert client.post("/api/tts", json={"provider": "piper", "text": "a" * 20000}).status_code == 200
+    assert client.post("/api/tts", json={"provider": "piper", "text": "a" * 20001}).status_code == 422
+
+
+def test_gateway_default_does_not_exceed_the_smallest_tts_backend_default():
+    """The two numbers live in different services; this is the check that they stay ordered."""
+    import chatterbox_loader
+    import qwen3_tts_loader
+
+    gateway = load_frontend_app().MAX_TTS_CHARS
+    backends = {
+        "chatterbox": chatterbox_loader.load_app().MAX_TEXT_CHARS,
+        "qwen3-tts": qwen3_tts_loader.load_app().MAX_TEXT_CHARS,
+    }
+    assert gateway <= min(backends.values()), (
+        f"the gateway accepts {gateway} characters but {backends} would answer 413 beyond that")
 
 
 @pytest.mark.parametrize("field,limit", [
@@ -400,3 +427,171 @@ def test_a_caller_that_gives_up_does_not_cancel_the_shared_probe(monkeypatch):
     result = asyncio.run(run())
     assert set(result["providers"]) == set(module.PROVIDER_REGISTRY["providers"])
     assert all(entry["healthy"] for entry in result["providers"].values())
+
+
+# --- concurrent uploads --------------------------------------------------------
+#
+# Every upload is held whole in RAM until its backend has answered, so the memory
+# bound was "MAX_UPLOAD_MB times however many clients connect". Uploads past
+# MAX_CONCURRENT_UPLOADS are refused with 503 + Retry-After before their body is
+# read; JSON calls, which are capped at 1 MiB, never compete for a slot.
+
+
+class _GatedBackend:
+    """A backend whose /transcribe answers only when the test says so."""
+
+    def __init__(self):
+        self.started = 0
+        self.gate = None          # created inside the event loop that uses it
+
+    async def __call__(self, method, url, kwargs):
+        if url.endswith("/transcribe"):
+            self.started += 1
+            await self.gate.wait()
+            return {"text": "hallo", "segments": [], "language": "de"}
+        return _backend(method, url, kwargs)
+
+
+def _upload(client, name="a.wav"):
+    return client.post(
+        "/api/stt", data={"provider": "whisper"}, files={"audio": (name, b"RIFF....", "audio/wav")})
+
+
+def _run(scenario, timeout=20.0):
+    """Run a scenario that waits on a gated backend; a gate that never opens fails, not hangs.
+
+    (Without an upload cap, a second upload also waits at the gate forever.)
+    """
+    async def bounded():
+        return await asyncio.wait_for(scenario, timeout)
+
+    return asyncio.run(bounded())
+
+
+async def _until(predicate, what, timeout=5.0):
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not predicate():
+        if asyncio.get_running_loop().time() > deadline:
+            raise AssertionError(f"timed out waiting for {what}")
+        await asyncio.sleep(0.005)
+
+
+def test_uploads_over_the_cap_get_503_with_retry_after_and_never_reach_a_backend(monkeypatch):
+    module = load_frontend_app({"MAX_CONCURRENT_UPLOADS": "1"})
+    backend = _GatedBackend()
+    stub = install_stub(monkeypatch, module, backend)
+
+    async def scenario():
+        backend.gate = asyncio.Event()
+        async with asgi_client(module) as client:
+            first = asyncio.ensure_future(_upload(client))
+            await _until(lambda: backend.started == 1, "the first upload to reach the backend")
+
+            refused = await _upload(client, "second.wav")
+            v1_refused = await client.post(
+                "/v1/audio/transcriptions", files={"file": ("a.wav", b"RIFF....", "audio/wav")})
+            calls_while_busy = len(stub.calls)
+
+            backend.gate.set()
+            assert (await first).status_code == 200
+            after = await _upload(client, "third.wav")
+            return refused, v1_refused, calls_while_busy, after
+
+    refused, v1_refused, calls_while_busy, after = _run(scenario())
+
+    assert refused.status_code == 503
+    assert refused.headers["retry-after"] == "5"
+    assert refused.headers["connection"] == "close"        # its body was never read
+    assert "1 uploads" in refused.json()["detail"]
+    assert v1_refused.status_code == 503
+    assert v1_refused.headers["retry-after"] == "5"
+    assert v1_refused.json()["error"]["code"] == "server_busy"
+    assert calls_while_busy == 1, "a refused upload was forwarded"
+    assert after.status_code == 200, "the slot was not released when the first upload finished"
+    assert module._upload_slots.active == 0
+
+
+def test_json_calls_do_not_compete_with_uploads_for_a_slot(monkeypatch):
+    module = load_frontend_app({"MAX_CONCURRENT_UPLOADS": "1"})
+    backend = _GatedBackend()
+    install_stub(monkeypatch, module, backend)
+
+    async def scenario():
+        backend.gate = asyncio.Event()
+        async with asgi_client(module) as client:
+            first = asyncio.ensure_future(_upload(client))
+            await _until(lambda: backend.started == 1, "the upload to reach the backend")
+            tts = await client.post("/api/tts", json={"provider": "piper", "text": "hi"})
+            health = await client.get("/api/health")
+            models = await client.post("/api/providers/qwen3/models/select", json={"model": "x"})
+            backend.gate.set()
+            await first
+            return tts, health, models
+
+    tts, health, models = _run(scenario())
+    assert tts.status_code == 200
+    assert health.status_code == 200
+    assert models.status_code != 503
+
+
+def test_a_body_that_is_not_declared_json_takes_a_slot(monkeypatch):
+    """FastAPI reads a body before it decides the Content-Type is wrong, so a JSON route
+    posted with another type could make the gateway buffer up to MAX_UPLOAD_MB."""
+    module = load_frontend_app({"MAX_CONCURRENT_UPLOADS": "1"})
+    backend = _GatedBackend()
+    install_stub(monkeypatch, module, backend)
+
+    async def scenario():
+        backend.gate = asyncio.Event()
+        async with asgi_client(module) as client:
+            first = asyncio.ensure_future(_upload(client))
+            await _until(lambda: backend.started == 1, "the upload to reach the backend")
+            odd = await client.post(
+                "/api/tts", content=b"x" * 100, headers={"content-type": "application/octet-stream"})
+            backend.gate.set()
+            await first
+            return odd
+
+    assert _run(scenario()).status_code == 503
+
+
+@pytest.mark.parametrize("how", ["backend-error", "too-large", "handler-exception"])
+def test_the_slot_is_released_however_the_request_ends(monkeypatch, how):
+    env = {"MAX_CONCURRENT_UPLOADS": "1", "MAX_UPLOAD_MB": "2"}
+    module = load_frontend_app(env)
+
+    def handler(method, url, kwargs):
+        if how == "backend-error":
+            return httpx.Response(500, json={"detail": "boom"})
+        if how == "handler-exception":
+            raise RuntimeError("unexpected")
+        return {"text": "ok", "segments": []}
+
+    install_stub(monkeypatch, module, handler)
+    client = TestClient(module.app, raise_server_exceptions=False)
+    payload = b"\0" * (3 * MIB) if how == "too-large" else b"RIFF...."
+    client.post("/api/stt", data={"provider": "whisper"}, files={"audio": ("a.wav", payload, "audio/wav")})
+    assert module._upload_slots.active == 0
+
+    # ...so the next upload is not refused
+    monkeypatch.setattr(module, "_upload_slots", module.openai_router.Slots(1))
+    install_stub(monkeypatch, module, lambda m, u, k: {"text": "ok", "segments": []})
+    r = client.post("/api/stt", data={"provider": "whisper"}, files={"audio": ("a.wav", b"RIFF....", "audio/wav")})
+    assert r.status_code == 200
+
+
+def test_a_request_the_guard_refuses_never_takes_a_slot(monkeypatch):
+    module = load_frontend_app({"MAX_CONCURRENT_UPLOADS": "1", "API_KEY": "k"})
+    install_stub(monkeypatch, module, _backend)
+    client = TestClient(module.app)
+    for _ in range(3):
+        assert _upload(client).status_code == 401
+    assert module._upload_slots.active == 0
+    assert _upload(client).status_code == 401       # still the key, not "busy"
+
+
+def test_upload_cap_is_configurable_and_documented_default_is_four():
+    assert load_frontend_app().MAX_CONCURRENT_UPLOADS == 4
+    assert load_frontend_app({"MAX_CONCURRENT_UPLOADS": "9"}).MAX_CONCURRENT_UPLOADS == 9
+    assert load_frontend_app({"MAX_CONCURRENT_UPLOADS": "0"}).MAX_CONCURRENT_UPLOADS == 4
+    assert load_frontend_app({"MAX_CONCURRENT_UPLOADS": "many"}).MAX_CONCURRENT_UPLOADS == 4

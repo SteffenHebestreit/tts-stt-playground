@@ -94,6 +94,18 @@
         }
       }
     },
+    "/api/auth/check": {
+      "post": {
+        "summary": "Auth Check",
+        "description": "204 when the caller may use the state-changing API, 401 when `API_KEY` is set and was not sent.\n\nThe request guard does the checking (this is a POST under /api, so it needs\nthe key exactly when every other mutating call does); the handler only\nanswers. The UI calls it before opening the live-transcription WebSocket,\nwhere a browser cannot react to a 401 the way it does for fetch(), so that\nthe key is known before the socket is dialled.",
+        "operationId": "auth_check_api_auth_check_post",
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          }
+        }
+      }
+    },
     "/api/providers/{provider_id}/voices": {
       "get": {
         "summary": "Provider Voices",
@@ -1151,7 +1163,7 @@
           },
           "text": {
             "type": "string",
-            "maxLength": 20000,
+            "maxLength": 5000,
             "title": "Text"
           },
           "voice": {
@@ -1266,7 +1278,7 @@
         "properties": {
           "text": {
             "type": "string",
-            "maxLength": 20000,
+            "maxLength": 5000,
             "title": "Text"
           },
           "voice_description": {

@@ -12,6 +12,7 @@ import math
 import tempfile
 import shutil
 import numpy as np
+import re
 import uuid
 import logging
 import inspect
@@ -26,11 +27,12 @@ import aiohttp
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.datastructures import Headers
 from pydantic import BaseModel
 import uvicorn
 
 import training_utils as _training_utils
+from body_limit import BodyLimitMiddleware
+from origin_guard import OriginGuardMiddleware, parse_allowed_origins
 from training_pipeline import OptimizedTrainingPipeline, TrainingCancelled
 from data_processor import DataProcessor
 from model_exporter import ModelExporter
@@ -40,6 +42,10 @@ from phonemization import PhonemizationError, normalize_language, stt_language
 from stt_processor import STTError, STTProcessor, confidence_from_result, default_min_confidence
 from validation import (
     safe_name as _safe_name,
+    stored_name as _stored_name,
+    is_safe_name as _is_safe_name,
+    confined_path as _confined_path,
+    is_within as _is_within,
     coerce_resume_int as _coerce_resume_int,
     coerce_resume_path as _coerce_resume_path,
     validate_epochs as _validate_epochs,
@@ -135,10 +141,6 @@ app = FastAPI(
     lifespan=_lifespan,
 )
 
-class _BodyTooLarge(Exception):
-    """Raised into the app from `receive()` once the body passes its limit."""
-
-
 def _body_limit_for(path: str) -> int:
     """Largest request body a route accepts: audio uploads get MAX_UPLOAD_MB, the rest 16 MB."""
     if path in ("/train", "/test-upload"):
@@ -146,91 +148,37 @@ def _body_limit_for(path: str) -> int:
     return MAX_SMALL_BODY_BYTES
 
 
-class _BodyLimitMiddleware:
-    """Refuse an oversized request body with 413 before it is spooled to disk.
-
-    Starlette writes a multipart upload to a temp file before the handler runs,
-    so a cap inside the handler cannot stop a client filling the disk. Two
-    checks, because the client controls both: Content-Length rejects an honest
-    oversized request without reading a byte, and a running count catches a
-    chunked upload or an understated length.
-    """
-
-    def __init__(self, app):
-        self.app = app
-
-    @staticmethod
-    async def _reject(scope, receive, send, limit: int):
-        response = JSONResponse(
-            status_code=413,
-            content={"detail": f"Request body too large. Maximum is {limit / (1024 * 1024):g} MB."},
-            # The unread rest of the body is still on the wire.
-            headers={"Connection": "close"},
-        )
-        await response(scope, receive, send)
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or scope["method"] in ("GET", "HEAD", "OPTIONS"):
-            await self.app(scope, receive, send)
-            return
-
-        limit = _body_limit_for(scope["path"])
-        try:
-            declared = int(Headers(scope=scope).get("content-length", ""))
-        except ValueError:
-            declared = None
-        if declared is not None and declared > limit:
-            await self._reject(scope, receive, send, limit)
-            return
-
-        received = 0
-        exceeded = False
-        started = False
-
-        async def limited_receive():
-            nonlocal received, exceeded
-            if exceeded:
-                raise _BodyTooLarge()
-            message = await receive()
-            if message["type"] == "http.request":
-                received += len(message.get("body", b""))
-                if received > limit:
-                    exceeded = True
-                    raise _BodyTooLarge()
-            return message
-
-        async def guarded_send(message):
-            nonlocal started
-            if exceeded and not started:
-                return  # the app's own answer to the aborted read; the 413 replaces it
-            if message["type"] == "http.response.start":
-                started = True
-            await send(message)
-
-        try:
-            await self.app(scope, limited_receive, guarded_send)
-        except _BodyTooLarge:
-            pass
-        if exceeded and not started:
-            await self._reject(scope, receive, send, limit)
-
-
-# Added before CORS so that CORS wraps it and a 413 still carries the CORS headers.
-app.add_middleware(_BodyLimitMiddleware)
-
-allowed_origins_str = os.getenv("ALLOWED_ORIGINS", "*")
-allowed_origins = [origin.strip() for origin in allowed_origins_str.split(",")] if allowed_origins_str else ["*"]
+# Starlette writes a multipart upload to a temp file before the handler runs, so a
+# cap inside the handler cannot stop a client filling the disk. body_limit.py
+# checks the declared Content-Length AND counts the bytes that arrive, so a
+# chunked upload or an understated length is cut off at the limit as well.
+#
+# Unset or empty ALLOWED_ORIGINS means no CORS headers at all (it used to mean
+# "*"); "*" only when it is written down (and logged); otherwise an explicit list.
+# Independently of CORS, origin_guard.py answers 403 to a state-changing request
+# that carries a foreign Origin header: a multipart POST is a "simple request" a
+# page can send without any preflight (/train-from-dataset, /resume-training,
+# /export/{id}), so CORS alone never protected these routes. Requests without an
+# Origin (the gateway, curl) are not affected.
+allowed_origins = parse_allowed_origins(os.getenv("ALLOWED_ORIGINS", ""))
 allow_credentials = os.getenv("ALLOW_CREDENTIALS", "false").strip().lower() in {"1", "true", "yes", "on"}
 if "*" in allowed_origins and allow_credentials:
     allow_credentials = False
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=allow_credentials,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Each add_middleware wraps what was added before it: the body limit is innermost,
+# the origin guard refuses foreign browser origins before a byte of body is
+# counted, and CORS is outermost so a 403/413 still carries the CORS headers a
+# listed origin needs in order to read it.
+app.add_middleware(BodyLimitMiddleware, limit_for=_body_limit_for)
+app.add_middleware(OriginGuardMiddleware, allowed_origins=allowed_origins)
+if allowed_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins,
+        allow_credentials=allow_credentials,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 training_pipeline = OptimizedTrainingPipeline()
 data_processor = DataProcessor()
@@ -401,10 +349,25 @@ async def refresh_deployment_target(target: dict):
                 raise RuntimeError(f"Refresh failed: {resp.status} - {body}")
 
 
+def _voice_dir(shared_models_dir, model_name: str) -> Path:
+    """``<shared models>/custom/<model_name>``, refusing a name that would leave ``custom/``.
+
+    Every caller validated the name at its endpoint; this is the second guard
+    for the two places that create or delete that directory.
+    """
+    try:
+        return _confined_path(Path(shared_models_dir) / "custom", model_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid model_name: {exc}")
+
+
 async def deploy_model_bundle(job_id: str, model_name: str, onnx_path: Path, target_id: Optional[str] = None) -> dict:
     """Deploy an exported model bundle to the selected target."""
     resolved_target_id, target = resolve_deployment_target(target_id)
     config_path = onnx_path.parent / f"{onnx_path.stem}.json"
+    if resolved_target_id != "none" and not _is_safe_name(model_name):
+        # Becomes a directory name, an uploaded file name and a form field below.
+        raise HTTPException(status_code=400, detail=f"Invalid model_name: {model_name!r}")
 
     if resolved_target_id == "none":
         return {
@@ -415,7 +378,7 @@ async def deploy_model_bundle(job_id: str, model_name: str, onnx_path: Path, tar
 
     if target.get("deployment_contract") == "piper-shared-volume-v1":
         shared_models_dir = Path(target["shared_models_dir"])
-        custom_dir = shared_models_dir / "custom" / model_name
+        custom_dir = _voice_dir(shared_models_dir, model_name)
 
         # Off the event loop (the ONNX is tens of MB, on a network share more),
         # and through a temp name + rename: the Piper runtime scans this
@@ -494,8 +457,12 @@ async def remove_model_from_deployment_target(model_name: str, target_id: Option
     if resolved_target_id == "none":
         return
 
+    if not _is_safe_name(model_name):
+        # The name is about to become a directory to delete or a URL segment.
+        raise HTTPException(status_code=400, detail=f"Invalid model_name: {model_name!r}")
+
     if target.get("deployment_contract") == "piper-shared-volume-v1":
-        model_dir = Path(target["shared_models_dir"]) / "custom" / model_name
+        model_dir = _voice_dir(target["shared_models_dir"], model_name)
         if model_dir.exists():
             await asyncio.to_thread(shutil.rmtree, model_dir)
         try:
@@ -526,12 +493,21 @@ def _model_name_from_disk(job_id: str) -> Optional[str]:
     not tell which dataset belonged to the job it was deleting, and quietly left
     both the dataset and the deployed voice behind.
     """
+    if not _is_safe_name(job_id):
+        return None
     state_path = Path("checkpoints") / job_id / "job_state.json"
     try:
         with open(state_path) as f:
-            return json.load(f).get("model_name")
+            state = json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
+    recorded = state.get("model_name") if isinstance(state, dict) else None
+    model_name = _stored_name(recorded)
+    if recorded and model_name is None:
+        # A name that is not one we could have written: never used to build a
+        # path (it would feed rmtree below), so the dataset is simply not found.
+        logger.warning("Ignoring invalid model_name %r in %s", recorded, state_path)
+    return model_name
 
 
 def _other_jobs_using_model(model_name: str, excluding_job_id: str) -> list[str]:
@@ -550,8 +526,13 @@ def _other_jobs_using_model(model_name: str, excluding_job_id: str) -> list[str]
                 state = json.load(f)
         except (OSError, json.JSONDecodeError):
             continue
-        if state.get("model_name") == model_name:
-            others.append(state.get("job_id") or state_file.parent.name)
+        if isinstance(state, dict) and state.get("model_name") == model_name:
+            # The id is only reported (response body, log line), but it comes
+            # from a file: a value that is not a job id is replaced by the
+            # directory name, shown escaped when that is not one either.
+            label = (_stored_name(state.get("job_id")) or _stored_name(state_file.parent.name)
+                     or ascii(state_file.parent.name))
+            others.append(label)
 
     for other_id, job in training_jobs.items():
         if other_id != excluding_job_id and job.model_name == model_name:
@@ -573,6 +554,18 @@ async def restore_interrupted_jobs():
             status = state.get("status", "unknown")
             if not job_id or status == "completed":
                 continue  # Skip finished jobs
+            # The id names checkpoints/<id> and models/<id> from here on; a state
+            # file that carries something else is not one this service wrote.
+            if not _is_safe_name(job_id):
+                logger.warning("Ignoring %r: its job_id %r is not a valid job id", str(state_file), job_id)
+                continue
+            recorded_model = state.get("model_name")
+            model_name = _stored_name(recorded_model)
+            if recorded_model and model_name is None:
+                # Restored without a name rather than with one that would feed
+                # rmtree(data/<name>) on the first DELETE /model/<job_id>.
+                logger.warning("Job %s: ignoring invalid model_name %r in %r",
+                               job_id, recorded_model, str(state_file))
             epoch = state.get("epoch", 0)
             # A job that ended on its own keeps the outcome it had; only a job the
             # process died under (state still says "training") is "interrupted".
@@ -593,13 +586,13 @@ async def restore_interrupted_jobs():
                 total_epochs=state.get("total_epochs", 10000),
                 loss=state.get("loss"),
                 message=message,
-                model_name=state.get("model_name"),
+                model_name=model_name,
                 trainer_kind=state.get("trainer_kind"),
                 trainer_caveat=state.get("trainer_caveat"),
             )
             logger.info(f"Restored {restored} job {job_id} (epoch {epoch})")
         except Exception as e:
-            logger.warning(f"Could not restore job from {state_file}: {e}")
+            logger.warning("Could not restore job from %r: %s", str(state_file), e)
 
 
 # --- job bookkeeping -----------------------------------------------------------
@@ -1186,6 +1179,9 @@ async def test_upload(
         raise HTTPException(status_code=500, detail=f"Test upload failed: {str(e)}")
 
 
+_CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
 def _upload_filename(raw: str, position: int, used_stems: set) -> str:
     """A safe, unique on-disk name for an uploaded file.
 
@@ -1194,6 +1190,11 @@ def _upload_filename(raw: str, position: int, used_stems: set) -> str:
     other's file and then each other's segments, silently.
     """
     name = Path(raw.replace("\\", "/")).name
+    # The name is the client's and ends up in log lines all over the pipeline
+    # (segmenter, STT client, dataset) as well as in segment file names: control
+    # characters (an ESC sequence can rewrite a terminal, CR/LF forge log lines)
+    # are replaced once here rather than escaped at every one of those sites.
+    name = _CONTROL_CHARACTERS.sub("_", name)
     if name in ("", ".", ".."):
         name = f"upload_{position:03d}"
     path = Path(name)
@@ -1537,7 +1538,8 @@ async def resume_training(
                    "Train a new model first."
         )
 
-    resumed_job_id   = str(target_state.get("job_id") or "").strip()
+    # Read back from disk: only ever a valid job id, since it names checkpoints/<id>.
+    resumed_job_id   = _stored_name(target_state.get("job_id")) or ""
     latest_ckpt_path = _coerce_resume_path(target_state.get("latest_checkpoint"))
     saved_epoch      = _coerce_resume_int(target_state.get("epoch", 0), 0)
     total_epochs     = _coerce_resume_int(target_state.get("total_epochs", 10000), 10000)
@@ -1572,6 +1574,12 @@ async def resume_training(
         total_epochs = saved_epoch + extra_epochs
 
     total_epochs = max(total_epochs, saved_epoch or 1)
+
+    if latest_ckpt_path is not None and not _is_within(latest_ckpt_path, Path("checkpoints") / resumed_job_id):
+        raise HTTPException(
+            status_code=400,
+            detail=f"The recorded checkpoint {str(latest_ckpt_path)!r} is not inside checkpoints/{resumed_job_id}.",
+        )
 
     if latest_ckpt_path is None or not latest_ckpt_path.exists():
         raise HTTPException(
@@ -1833,7 +1841,7 @@ async def _run_retrain_from_segments(
                         async with lock:
                             errors.append(f"{audio_path.name}: {e}")
                             if len(errors) <= 5:
-                                logger.warning(f"[{job_id}] STT failed for {audio_path.name}: {e}")
+                                logger.warning("[%s] STT failed for %r: %s", job_id, audio_path.name, e)
                     finally:
                         async with lock:
                             completed += 1
@@ -1986,9 +1994,26 @@ async def delete_trained_model(job_id: str):
         # deployed voice were then silently left behind, exactly as before.
         model_name = _model_name_from_disk(job_id)
         deployment_target = None
-        if job_id in training_jobs:
-            model_name = training_jobs[job_id].model_name or model_name
-            deployment_target = training_jobs[job_id].deployment_target
+        record = training_jobs.get(job_id)
+        if record is not None:
+            # Both sources are names, not paths, until they have passed the
+            # check: the disk one was validated by _model_name_from_disk, the
+            # in-memory one is re-checked here so that no route to rmtree below
+            # depends on how the record got into memory.
+            model_name = _stored_name(record.model_name) or model_name
+            deployment_target = record.deployment_target
+
+        # Every path that is about to be deleted is built and confined BEFORE
+        # anything is removed or forgotten: a name or id that resolves outside
+        # its root refuses the whole request instead of half-deleting it.
+        try:
+            checkpoint_dir = _confined_path("checkpoints", job_id)
+            model_dir = _confined_path("models", job_id)
+            dataset_dir = _confined_path("data", model_name) if model_name else None
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"Refusing to delete: {exc}")
+
+        if record is not None:
             del training_jobs[job_id]
             logger.info(f"Removed job {job_id} from active jobs")
 
@@ -1998,13 +2023,11 @@ async def delete_trained_model(job_id: str):
         siblings = _other_jobs_using_model(model_name, job_id) if model_name else []
 
         # Remove checkpoint directory
-        checkpoint_dir = Path(f"checkpoints/{job_id}")
         if checkpoint_dir.exists():
             await asyncio.to_thread(shutil.rmtree, checkpoint_dir)
             logger.info(f"Deleted checkpoint directory: {checkpoint_dir}")
 
         # Remove exported model directory
-        model_dir = Path(f"models/{job_id}")
         if model_dir.exists():
             await asyncio.to_thread(shutil.rmtree, model_dir)
             logger.info(f"Deleted model directory: {model_dir}")
@@ -2021,7 +2044,6 @@ async def delete_trained_model(job_id: str):
                 f"by job(s) {', '.join(siblings)}"
             )
         elif model_name:
-            dataset_dir = Path(f"data/{model_name}")
             if dataset_dir.exists():
                 await asyncio.to_thread(shutil.rmtree, dataset_dir)
                 logger.info(f"Deleted dataset directory: {dataset_dir}")
@@ -2042,6 +2064,8 @@ async def delete_trained_model(job_id: str):
             "retained_for_jobs": siblings,
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)}")
 
@@ -2150,9 +2174,13 @@ def update_training_status(job_id: str, update: dict):
 if __name__ == "__main__":
     # timeout_keep_alive: uvicorn's default of 5 s closes idle connections the
     # frontend's pooled client may still try to reuse ("server disconnected").
-    # This is the effective place for it: the image starts through start.sh,
-    # which runs this file, not the uvicorn CLI.
+    # It has to outlast the gateway's pool: the gateway keeps upstream
+    # connections for UPSTREAM_KEEPALIVE_EXPIRY (115 s), and at 75 s the server
+    # closed the ones the pool still thought were live. 120 s like the other
+    # backends. This is the effective place for it: the image starts through
+    # start.sh, which runs this file, not the uvicorn CLI (a flag on the
+    # Dockerfile's CMD would reach nothing).
     uvicorn.run(
         app, host="0.0.0.0", port=8080,
-        timeout_keep_alive=int(_env_number("UVICORN_TIMEOUT_KEEP_ALIVE", 75, int)),
+        timeout_keep_alive=int(_env_number("UVICORN_TIMEOUT_KEEP_ALIVE", 120, int)),
     )

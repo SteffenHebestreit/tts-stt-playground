@@ -268,10 +268,11 @@ capabilities, contracts and settings. Use it to find voice names and to check wh
 is present before relying on it.
 
 The `canary` entry's language list follows the checkpoint the Canary service runs: the gateway reads
-`supported_languages` from the service's `GET /status` (cached for a minute), so
+`supported_languages` from the service's `GET /status` (refreshed every five minutes), so
 `CANARY_ASR_MODEL=nvidia/canary-1b-v2` shows 25 languages and the flash models four. While the
-service cannot be reached the entry falls back to `de`, `en`, `es`, `fr`, and after a first answer it
-keeps the last one. An entry you replace through `PROVIDER_REGISTRY_JSON` is left as you wrote it.
+service cannot be reached the entry falls back to `de`, `en`, `es`, `fr` (asked again after 20
+seconds), and after a first answer it keeps the last one. An entry you replace through
+`PROVIDER_REGISTRY_JSON` is left as you wrote it.
 
 `GET /health` on the gateway is liveness only (the Docker healthcheck).
 

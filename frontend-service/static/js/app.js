@@ -26,6 +26,139 @@ let currentTTSEngine = providerRegistry.ui?.default_tts_provider || 'piper';
 let trainingDeploymentRegistry = null;
 const qwen3ProviderId = 'qwen3';
 
+// ============================================================
+// API key
+// ============================================================
+//
+// When the gateway runs with API_KEY it requires `Authorization: Bearer <key>` on
+// every /v1 call and every state-changing /api call, this page included (it is
+// not treated as more trustworthy than a script: a rebinding page looks exactly
+// like it). The page learns that from the first 401 that carries a
+// `WWW-Authenticate: Bearer` challenge, asks for the key once, keeps it for this
+// browser tab (sessionStorage, so it is gone when the tab closes and never
+// reaches localStorage) and sends it on every later gateway request. With no
+// API_KEY nothing is ever prompted and nothing extra is sent.
+
+const API_KEY_STORAGE_KEY = 'tts-stt.api-key';
+const LIVE_STT_PROTOCOL = 'tts-stt.v1';
+const LIVE_STT_KEY_PROTOCOL_PREFIX = 'bearer.';
+
+function readStoredApiKey() {
+    try {
+        return window.sessionStorage.getItem(API_KEY_STORAGE_KEY) || '';
+    } catch {
+        return '';   // storage blocked (private window, site data off): keep it in memory only
+    }
+}
+
+let gatewayApiKey = readStoredApiKey();
+let apiKeyPromptInFlight = null;
+// The gateway has answered /api/auth/check with a 2xx for the key held now.
+let socketAuthAccepted = false;
+
+function setGatewayApiKey(key) {
+    if ((key || '') !== gatewayApiKey) socketAuthAccepted = false;
+    gatewayApiKey = key || '';
+    try {
+        if (gatewayApiKey) window.sessionStorage.setItem(API_KEY_STORAGE_KEY, gatewayApiKey);
+        else window.sessionStorage.removeItem(API_KEY_STORAGE_KEY);
+    } catch {
+        // memory copy above is enough for this page's lifetime
+    }
+}
+
+/** Gateway calls are the same-origin /api/... and /v1/... paths every fetch here uses. */
+function isGatewayRequest(input) {
+    return typeof input === 'string' && /^\/(?:api|v1)(?:\/|$)/.test(input);
+}
+
+function isApiKeyChallenge(response) {
+    if (!response || response.status !== 401) return false;
+    const challenge = response.headers && typeof response.headers.get === 'function'
+        ? response.headers.get('WWW-Authenticate') : '';
+    return /bearer/i.test(challenge || '');
+}
+
+function withApiKey(init, key) {
+    if (!key) return init;
+    const headers = new Headers((init && init.headers) || {});
+    headers.set('Authorization', `Bearer ${key}`);
+    return { ...(init || {}), headers };
+}
+
+/** Ask the user for the key. Concurrent callers share one prompt; null means they declined. */
+function promptForApiKey(previousWasRejected) {
+    if (!apiKeyPromptInFlight) {
+        apiKeyPromptInFlight = Promise.resolve().then(() => {
+            if (typeof window.prompt !== 'function') return null;
+            const entered = window.prompt(previousWasRejected
+                ? 'The API key was not accepted. Enter the API key for this server:'
+                : 'This server requires an API key. Enter it to continue:');
+            return entered && entered.trim() ? entered.trim() : null;
+        }).finally(() => { apiKeyPromptInFlight = null; });
+    }
+    return apiKeyPromptInFlight;
+}
+
+const nativeFetch = window.fetch.bind(window);
+
+window.fetch = async function gatewayFetch(input, init) {
+    if (!isGatewayRequest(input)) return nativeFetch(input, init);
+
+    const sentKey = gatewayApiKey;
+    const response = await nativeFetch(input, withApiKey(init, sentKey));
+    if (!isApiKeyChallenge(response)) return response;
+
+    // Another request may have collected a key while this one was in flight.
+    if (gatewayApiKey && gatewayApiKey !== sentKey) {
+        return nativeFetch(input, withApiKey(init, gatewayApiKey));
+    }
+    if (sentKey) setGatewayApiKey('');   // the stored key was refused: do not keep offering it
+
+    const entered = await promptForApiKey(Boolean(sentKey));
+    if (!entered) return response;       // declined: the caller shows the 401 it got
+
+    setGatewayApiKey(entered);
+    const retried = await nativeFetch(input, withApiKey(init, entered));
+    if (isApiKeyChallenge(retried)) setGatewayApiKey('');   // wrong key: ask again next time
+    return retried;
+};
+
+function base64UrlEncode(text) {
+    let binary = '';
+    new TextEncoder().encode(text).forEach((byte) => { binary += String.fromCharCode(byte); });
+    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+/**
+ * Subprotocols for the live-transcription socket. A browser cannot put an
+ * Authorization header on a WebSocket handshake, so the key rides next to the
+ * real protocol name; the server never echoes the `bearer.` one back.
+ * Undefined (no argument at all) when there is no key, as before.
+ */
+function liveSocketProtocols() {
+    if (!gatewayApiKey) return undefined;
+    return [LIVE_STT_PROTOCOL, LIVE_STT_KEY_PROTOCOL_PREFIX + base64UrlEncode(gatewayApiKey)];
+}
+
+/**
+ * Make sure the gateway knows whether it wants a key before the socket is dialled.
+ * A failed WebSocket handshake tells a page nothing, but an ordinary fetch can
+ * carry a 401 and prompt for the key, so this cheap POST does that first. It
+ * never throws: an unreachable server is reported by the socket attempt itself.
+ */
+async function ensureApiKeyForSocket() {
+    // Once the gateway has accepted this tab (no key needed, or a valid one), later
+    // starts do not repeat the round trip; dropping the key resets it.
+    if (socketAuthAccepted) return;
+    try {
+        const response = await fetch('/api/auth/check', { method: 'POST' });
+        socketAuthAccepted = Boolean(response && response.status >= 200 && response.status < 300);
+    } catch {
+        // reported by the WebSocket attempt
+    }
+}
+
 function removeOptionalProvider(providerId) {
     if (providerRegistry.providers?.[providerId]) {
         delete providerRegistry.providers[providerId];
@@ -2038,7 +2171,11 @@ async function processSTT() {
         const formData = new FormData();
         formData.append('provider', sttEngine);
         formData.append('audio', fileInput.files[0]);
-        if (language !== 'auto') formData.append('language', language);
+        // "auto" is sent, not left out: a missing field means "the server's
+        // default language" (German in the TrueNAS profile), an explicit "auto"
+        // means detect - which is what the Auto-Detect option promises, and what
+        // the live microphone path below already does.
+        formData.append('language', language || 'auto');
 
         const engineLabel = getProviderDisplayName(sttEngine);
         showStatus(
@@ -2448,6 +2585,15 @@ async function toggleLiveTranscription() {
     const wsScheme = window.location.protocol === 'https:' ? 'wss' : 'ws';
     const wsUrl = `${wsScheme}://${window.location.host}/ws/stt?provider=${encodeURIComponent(getLiveSttProviderId())}`;
 
+    // With API_KEY set the socket needs the key too, and only a fetch can ask for
+    // it (see ensureApiKeyForSocket). Before the microphone, so the user is not
+    // asked for microphone access by a session that is about to be refused.
+    await ensureApiKeyForSocket();
+    if (liveSTT.generation !== session) {
+        release();
+        return;
+    }
+
     try {
         if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
             // Undefined (not a rejection) on plain http:// pages other than
@@ -2474,7 +2620,8 @@ async function toggleLiveTranscription() {
     liveSTT.droppedFrames = 0;
     showStatus('live-stt-status', 'info', 'Connecting...');
 
-    const socket = new WebSocket(wsUrl);
+    const protocols = liveSocketProtocols();
+    const socket = protocols ? new WebSocket(wsUrl, protocols) : new WebSocket(wsUrl);
     socket.binaryType = 'arraybuffer';
     liveSTT.socket = socket;
     // Distinguishes "server delivered the final transcript and closed" from
@@ -2595,6 +2742,9 @@ async function toggleLiveTranscription() {
     socket.onclose = (event) => {
         if (liveSTT.generation !== session) return;
         release();
+        // Refused for the key: the one on hand is missing or wrong, so the next
+        // attempt starts by asking for it again instead of offering it.
+        if (event && event.code === 1008 && /api key/i.test(event.reason || '')) setGatewayApiKey('');
         const wasLive = liveSTT.active;
         const wasWaiting = liveSTT.awaitingFinal;
         liveSTT.awaitingFinal = false;

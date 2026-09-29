@@ -112,8 +112,8 @@ Normalized response:
 ```
 
 `default_language` (`voice-catalog-v1` only) is what the backend does for `language: "auto"` —
-Piper's `PIPER_DEFAULT_LANGUAGE` — or `null` when it does not say. The UI names it in the
-"Automatic" language option instead of assuming one.
+Piper's `PIPER_DEFAULT_LANGUAGE` — and is left out when the backend reports nothing usable. The UI
+names it in the "Automatic" language option instead of assuming one.
 
 ### `GET /api/providers/{provider_id}/custom-voices`
 

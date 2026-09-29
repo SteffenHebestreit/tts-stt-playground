@@ -43,6 +43,42 @@ def test_safe_name_rejects_traversal(value):
     assert "model_name" in exc.value.detail
 
 
+@pytest.mark.parametrize("value", [
+    "a\nb", "a\rb", "a\r\nINFO forged", "\x1b[31mred", "a b", "a\tb", "a?b", "a#b", "a%2e%2e", "a%00",
+    "voice.v2", "café", "名前", "a;b", "a$b", "a'b", 'a"b', "a*b", "a:b", "-".join(["x"] * 40),
+])
+def test_safe_name_rejects_what_the_other_services_reject(value):
+    """piper, qwen3 and the gateway accept [A-Za-z0-9_-] only, so a name outside it trains and
+    then cannot be deployed. The old check let all of these through."""
+    with pytest.raises(HTTPException) as exc:
+        validation.safe_name(value, field="model_name")
+    assert exc.value.status_code == 400
+    assert "\n" not in exc.value.detail and "\x1b" not in exc.value.detail, "the detail must escape the value"
+
+
+@pytest.mark.parametrize("value", ["a" * 64, "A" * 64, "0", "_", "-", "Voice_2-final", "550e8400-e29b-41d4-a716-446655440000"])
+def test_safe_name_accepts_the_whole_shared_alphabet_up_to_64_characters(value):
+    assert validation.safe_name(value) == value
+
+
+def test_safe_name_is_at_most_64_characters():
+    with pytest.raises(HTTPException):
+        validation.safe_name("a" * 65)
+
+
+@pytest.mark.parametrize("value", [None, 5, 1.5, ["a"], b"a", {"a": 1}])
+def test_safe_name_rejects_values_that_are_not_strings(value):
+    with pytest.raises(HTTPException) as exc:
+        validation.safe_name(value, field="job_id")
+    assert exc.value.status_code == 400
+
+
+def test_a_trailing_newline_is_stripped_not_kept():
+    """`fullmatch`, not `$`: 'abc\\n' must not pass as 'abc' with the newline still on it."""
+    assert validation.safe_name("abc\n") == "abc"
+    assert validation.NAME_PATTERN.fullmatch("abc\n") is None
+
+
 # --- coerce_resume_int ---
 
 @pytest.mark.parametrize("value,default,expected", [

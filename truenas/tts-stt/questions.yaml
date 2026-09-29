@@ -1,30 +1,99 @@
-# TrueNAS SCALE configuration form for TTS-STT Studio.
+# Configuration form for TTS-STT Studio when it is installed from a custom catalog.
 #
-# This describes the point-and-click options shown when installing the app from
-# a custom catalog. The values are consumed by templates/docker-compose.yaml.
+# The answers become `values` in templates/docker-compose.yaml. tests/test_truenas_catalog.py
+# checks that every question is used by the template and every value the template reads is asked
+# here, and that the rendered stack matches docker-compose.truenas-app.yml.
 #
-# NOTE: TrueNAS's app engine renders templates with its internal ix-lib Jinja2
-# helpers, which evolve per release. Treat this as a starting scaffold and
-# validate on your target TrueNAS version. The fully supported path is
-# "Install via YAML" with docker-compose.truenas-app.yml (see truenas/README.md).
+# STATUS: a scaffold. TrueNAS renders catalog apps with its own ix-lib helpers and expects the
+# repository in the trains/<train>/<app>/<version>/ layout, which this directory is not. It has
+# never been loaded by a real TrueNAS. The supported install path is Install via YAML with
+# docker-compose.truenas-app.yml (see truenas/README.md).
 
 groups:
-  - name: Network
-    description: Host ports exposed by the stack
   - name: Storage
-    description: Where persistent data lives on the pool
+    description: Where models, cache, voices and generated audio live
+  - name: Release
+    description: Which version runs, and how updates arrive
+  - name: Network
+    description: Ports
   - name: GPU
-    description: NVIDIA GPU acceleration
+    description: NVIDIA acceleration
+  - name: Optional services
+    description: Heavier backends, off by default (each adds VRAM)
   - name: Models
-    description: Which models each engine loads
-  - name: Backends
-    description: Optional, heavier backends (opt-in)
+    description: Which models the engines load
   - name: Access
-    description: CORS and browser-facing URLs
-  - name: Images
-    description: Container image source
+    description: Browser access, reverse proxy, API key
 
 questions:
+  # --- Storage ---
+  - variable: storage_type
+    label: Storage type
+    description: >-
+      Host path uses a dataset you created (snapshots and shares work as you set them up).
+      ixVolume lets TrueNAS create a dataset on the Apps pool for you.
+    group: Storage
+    schema:
+      type: string
+      default: host_path
+      required: true
+      enum:
+        - {value: host_path, description: Host path (a dataset you created, recommended)}
+        - {value: ix_volume, description: ixVolume (dataset created by TrueNAS on the Apps pool)}
+
+  - variable: host_path
+    label: Data dataset (host path)
+    description: >-
+      Models, cache, saved voices and output are stored here, in subdirectories the app creates.
+      Create the dataset first (Datasets -> Add Dataset). Example: /mnt/tank/apps/tts-stt
+    group: Storage
+    schema:
+      type: hostpath
+      show_if: [["storage_type", "=", "host_path"]]
+      required: true
+
+  - variable: ix_volume_dataset
+    label: ixVolume dataset name
+    group: Storage
+    schema:
+      type: string
+      default: data
+      show_if: [["storage_type", "=", "ix_volume"]]
+      required: true
+
+  # --- Release ---
+  - variable: image_tag
+    label: Release (image tag)
+    description: >-
+      A pinned release changes only when you change it. "latest" follows the newest build and
+      should go with Pull policy "always". Snapshot the dataset before changing this.
+    group: Release
+    schema:
+      type: string
+      default: "0.2.0"
+      required: true
+
+  - variable: pull_policy
+    label: Pull policy
+    description: >-
+      missing = pull only images the host does not have (use with a pinned release).
+      always = pull on every start, so "latest" really updates.
+    group: Release
+    schema:
+      type: string
+      default: missing
+      enum:
+        - {value: missing, description: missing (pinned release)}
+        - {value: always, description: always (follow "latest")}
+
+  - variable: image_registry
+    label: Image registry / owner
+    description: Change only for a fork; images are named <registry>/tts-stt-<service>.
+    group: Release
+    schema:
+      type: string
+      default: ghcr.io/steffenhebestreit
+
   # --- Network ---
   - variable: frontend_port
     label: Web UI port
@@ -32,62 +101,109 @@ questions:
     schema:
       type: int
       default: 3000
+      min: 1
+      max: 65535
       required: true
 
   - variable: expose_backend_ports
-    label: Also expose backend service ports (5000-5007, 8080)
+    label: Also publish backend ports on this host (127.0.0.1 only)
     description: >-
-      NOT needed for the web UI. Everything the browser uses is proxied through
-      the frontend on the Web UI port, including live microphone transcription.
-      Turn this on only to call the TTS/STT APIs directly from your own scripts.
+      Not needed for the web UI: it reaches every backend through the frontend, live microphone
+      included. Turn this on only to call the TTS/STT APIs from a script on the NAS itself.
     group: Network
     schema:
       type: boolean
       default: false
 
-  # --- Storage ---
-  - variable: host_path
-    label: Data dataset (host path)
-    description: All models, output, caches and training data are stored here.
-    group: Storage
-    schema:
-      type: hostpath
-      required: true
-
   # --- GPU ---
   - variable: use_gpu
     label: Use NVIDIA GPU
+    description: >-
+      Off runs only the web UI, Piper and Whisper on the CPU (slow); the Qwen and optional GPU
+      services are not started.
     group: GPU
     schema:
       type: boolean
       default: true
 
   - variable: gpu_device_id
-    label: GPU device id
-    description: Index of the NVIDIA card to use (single-GPU hosts use 0).
+    label: GPU
+    description: Index or GPU-xxxx UUID from `nvidia-smi -L`. A single-GPU host uses 0.
     group: GPU
     schema:
       type: string
       default: "0"
       show_if: [["use_gpu", "=", true]]
 
+  # --- Optional services ---
+  - variable: enable_canary
+    label: Canary-ASR (fastest German STT, 180M parameters, about 2 GB VRAM)
+    group: Optional services
+    schema:
+      type: boolean
+      default: false
+      show_if: [["use_gpu", "=", true]]
+
+  - variable: enable_parakeet
+    label: Parakeet-ASR (25 European languages, about 3 GB VRAM)
+    group: Optional services
+    schema:
+      type: boolean
+      default: false
+      show_if: [["use_gpu", "=", true]]
+
+  - variable: enable_chatterbox
+    label: Chatterbox-TTS (streaming German TTS with cloning, about 4 GB VRAM)
+    description: The only TTS backend that streams sentence by sentence, so speech starts early.
+    group: Optional services
+    schema:
+      type: boolean
+      default: false
+      show_if: [["use_gpu", "=", true]]
+
+  - variable: enable_training
+    label: Voice training
+    description: Run it on demand. An idle container still holds a CUDA context (about 0.5 GB).
+    group: Optional services
+    schema:
+      type: boolean
+      default: false
+      show_if: [["use_gpu", "=", true]]
+
+  - variable: enable_whisper_cpp
+    label: whisper.cpp (CPU-only STT, OpenAI-compatible)
+    group: Optional services
+    schema:
+      type: boolean
+      default: false
+
   # --- Models ---
   - variable: whisper_model_size
-    label: Whisper STT model
+    label: Whisper model
     description: >-
-      large-v3-turbo is the best latency/accuracy trade for live transcription.
-      Choose large-v3 only if you need speech translation, which turbo cannot do.
+      large-v3-turbo is the best latency/accuracy trade for live transcription but cannot
+      translate. Choose large-v3 if you need speech translation.
     group: Models
     schema:
       type: string
       default: large-v3-turbo
       enum:
-        - {value: large-v3-turbo, description: large-v3-turbo (recommended — fastest at near-best accuracy)}
-        - {value: tiny, description: tiny (fastest, low accuracy)}
-        - {value: base, description: base}
+        - {value: large-v3-turbo, description: large-v3-turbo (recommended, about 1.6 GB VRAM)}
+        - {value: large-v3, description: large-v3 (best accuracy, can translate, about 3.1 GB VRAM)}
+        - {value: medium, description: medium}
         - {value: small, description: small}
-        - {value: medium, description: medium (balanced)}
-        - {value: large-v3, description: large-v3 (best accuracy, only option that can translate)}
+        - {value: base, description: base}
+        - {value: tiny, description: tiny (fastest, lowest accuracy)}
+
+  - variable: stt_default_language
+    label: Default transcription language
+    description: >-
+      Language for API requests that name none. de is German-first; leave empty to auto-detect.
+      The web UI sends its own choice.
+    group: Models
+    schema:
+      type: string
+      default: de
 
   - variable: qwen3_tts_model
     label: Qwen3-TTS model
@@ -96,8 +212,8 @@ questions:
       type: string
       default: Qwen/Qwen3-TTS-12Hz-0.6B-Base
       enum:
-        - {value: Qwen/Qwen3-TTS-12Hz-0.6B-Base, description: 0.6B Base (16 GB friendly)}
-        - {value: Qwen/Qwen3-TTS-12Hz-1.7B-Base, description: 1.7B Base (higher quality)}
+        - {value: Qwen/Qwen3-TTS-12Hz-0.6B-Base, description: 0.6B Base (about 2.5 GB VRAM)}
+        - {value: Qwen/Qwen3-TTS-12Hz-1.7B-Base, description: 1.7B Base (better quality, about 4.5 GB VRAM)}
 
   - variable: qwen3_asr_model
     label: Qwen3-ASR model
@@ -106,81 +222,45 @@ questions:
       type: string
       default: Qwen/Qwen3-ASR-1.7B
 
-  # --- Backends ---
-  - variable: enable_parakeet
-    label: Enable Parakeet-ASR (realtime, 25 EU langs incl. German)
-    description: Fast multilingual STT. Heavy NeMo image; uses extra VRAM.
-    group: Backends
-    schema:
-      type: boolean
-      default: false
-
-  - variable: enable_canary
-    label: Enable Canary-ASR (fastest German STT, 180M params)
+  - variable: model_ttl
+    label: Free a model after this many idle seconds
     description: >-
-      NVIDIA canary-180m-flash. Smallest and fastest German STT in the stack.
-      Heavy NeMo image; ~2 GB VRAM.
-    group: Backends
+      Idle GPU models are unloaded and reload on the next request, so the sum of all models
+      need not fit at once. 0 = unload immediately, -1 = never unload.
+    group: Models
     schema:
-      type: boolean
-      default: false
-
-  - variable: enable_chatterbox
-    label: Enable Chatterbox-TTS (streaming German TTS + cloning)
-    description: >-
-      Resemble AI Chatterbox Multilingual (MIT). The only TTS backend that
-      streams sentence-by-sentence, so speech starts before the whole text is
-      synthesized. ~4 GB VRAM.
-    group: Backends
-    schema:
-      type: boolean
-      default: false
-
-  - variable: enable_whisper_cpp
-    label: Enable whisper.cpp (CPU, OpenAI-compatible STT)
-    group: Backends
-    schema:
-      type: boolean
-      default: false
-
-  - variable: enable_training
-    label: Enable voice-training service
-    group: Backends
-    schema:
-      type: boolean
-      default: false
+      type: int
+      default: 300
+      min: -1
 
   # --- Access ---
   - variable: allowed_origins
-    label: Allowed CORS origins
-    description: Use "*" for LAN use, or the exact frontend origin in production.
-    group: Access
-    schema:
-      type: string
-      default: "*"
-
-  - variable: browser_host
-    label: Browser-facing host (legacy — usually leave as-is)
+    label: Allowed cross-origin callers
     description: >-
-      Only used when "expose backend service ports" is enabled, so that direct
-      API callers get correct URLs. The web UI does not need this: it reaches
-      every backend through the frontend proxy on the Web UI port.
+      Leave empty. The web UI is same-origin, also over http://<ip>:3000. List origins (comma
+      separated) only for scripts running in other web pages.
     group: Access
     schema:
       type: string
-      default: localhost
+      default: ""
 
-  # --- Images ---
-  - variable: image_registry
-    label: Image registry / owner
-    group: Images
+  - variable: trusted_origins
+    label: Reverse proxy public URL
+    description: >-
+      Behind an HTTPS reverse proxy that does not pass the original Host header, enter its URL
+      (https://voice.example.com). Without it every button answers 403.
+    group: Access
     schema:
       type: string
-      default: ghcr.io/steffenhebestreit
+      default: ""
 
-  - variable: image_tag
-    label: Image tag
-    group: Images
+  - variable: api_key
+    label: API key (optional)
+    description: >-
+      If set, /v1/* and mutating /api/* calls from scripts need "Authorization: Bearer <key>".
+      Same-origin browser requests do not. This is not user authentication.
+    group: Access
     schema:
       type: string
-      default: latest
+      private: true
+      default: ""

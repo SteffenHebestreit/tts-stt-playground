@@ -36,10 +36,10 @@ WORKDIR /app
 # Upgrade pip and install basic build tools
 RUN pip3 install --upgrade pip setuptools wheel
 
-# Install Python dependencies in stages to avoid conflicts
-COPY requirements.txt .
-
-# Install core dependencies first with CUDA support.
+# Install PyTorch first, with CUDA 12.8 support (Blackwell / RTX 50 series, sm_120).
+# It comes BEFORE `COPY requirements.txt`: a COPY whose file changed invalidates
+# every layer after it, so with the COPY first, editing any requirement downloaded
+# this multi-GB wheel again.
 #
 # torch is pinned, not "whatever is newest". model_exporter.py exports with the
 # TorchScript tracer (torch.onnx.export(dynamo=False)), which PyTorch has
@@ -53,10 +53,23 @@ COPY requirements.txt .
 # of that test.
 #
 # torchaudio is not installed: nothing in this service imports it.
-RUN pip3 install --no-cache-dir torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
+#
+# PyTorch publishes cu128 wheels for 2.7 through 2.11 only (2.12 and later ship
+# CUDA 12.6 / 13.x), so a bump past 2.11 needs a different index and driver.
+ARG TORCH_VERSION=2.11.0
+RUN pip3 install --no-cache-dir "torch==${TORCH_VERSION}" --index-url https://download.pytorch.org/whl/cu128
 
-# Install the rest of the requirements
-RUN pip3 install --no-cache-dir -r requirements.txt
+# Fail here, not after the rest of the build, if the wheel just installed cannot
+# run on an RTX 50 card. torch.cuda.get_arch_list() is empty on a build host
+# without a GPU, so read the compiled-in list with _cuda_getArchFlags instead.
+RUN python3 -c "import torch; arches = torch._C._cuda_getArchFlags().split(); assert str(torch.version.cuda).startswith('12.8'), 'torch %s is built for CUDA %s, not 12.8' % (torch.__version__, torch.version.cuda); assert 'sm_120' in arches, 'torch %s has no sm_120 kernels (Blackwell): %s' % (torch.__version__, arches)"
+
+# Install the rest of the requirements. torch is held by a constraint: if a
+# requirement ever asks for another release, the build fails here instead of
+# replacing the cu128 wheel with a PyPI one.
+COPY requirements.txt .
+RUN printf 'torch==%s\n' "${TORCH_VERSION}" > /tmp/torch-constraints.txt \
+    && pip3 install --no-cache-dir -c /tmp/torch-constraints.txt -r requirements.txt
 
 # Copy application code
 COPY . .

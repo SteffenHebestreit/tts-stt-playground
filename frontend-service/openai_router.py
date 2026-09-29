@@ -21,6 +21,7 @@ import io
 import json
 import logging
 import math
+import os
 import sys
 import wave
 from array import array
@@ -56,8 +57,8 @@ STT_FORMATS_SUPPORTED = {"json", "text", "srt", "verbose_json", "vtt"}
 _SEGMENT_FORMATS = {"srt", "verbose_json", "vtt"}
 
 # `opus`, `aac` and `flac` are still refused: they would need an encoder each
-# and no client here has asked for one. `pcm` is a header strip of the WAV every
-# backend already emits, so it costs nothing.
+# and no client here has asked for one. `pcm` is the WAV every backend already
+# emits without its header, resampled to OpenAI's 24 kHz where it is not already.
 SPEECH_FORMATS = {"mp3", "opus", "aac", "flac", "wav", "pcm"}
 SPEECH_FORMATS_SUPPORTED = {"mp3", "wav", "pcm"}
 SPEECH_MEDIA_TYPES = {"mp3": "audio/mpeg", "wav": "audio/wav", "pcm": "audio/pcm"}
@@ -67,6 +68,64 @@ MAX_SPEECH_INPUT = 4096
 
 # Ceiling for one ffmpeg transcode. Well above any realistic synthesis length.
 FFMPEG_TIMEOUT_S = 120.0
+
+# OpenAI documents `pcm` as 24 kHz, 16-bit, mono, little-endian, and stock clients
+# play it back at exactly that rate. Backends produce 22.05 kHz (Piper medium/high),
+# 16 kHz (Piper low) or 24 kHz (Qwen3, Chatterbox), so anything else is resampled.
+PCM_SAMPLE_RATE = 24000
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    """A positive integer from the environment, or `default` when unset or unusable."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("%s=%r is not an integer; using %d", name, raw, default)
+        return default
+    if value < 1:
+        logger.warning("%s=%r must be at least 1; using %d", name, raw, default)
+        return default
+    return value
+
+
+# Every mp3 (the default format) and every resampled pcm response is one ffmpeg
+# process. They are cheap one at a time, but a burst of requests used to start a
+# process each, with the WAV held in memory beside it. Per worker process; over
+# the cap the request is answered 503 + Retry-After, which OpenAI clients retry.
+MAX_CONCURRENT_FFMPEG = _env_positive_int("MAX_CONCURRENT_FFMPEG", 4)
+FFMPEG_RETRY_AFTER_S = 2
+
+
+class Slots:
+    """A counter of concurrent users of something scarce. Non-blocking: a full house is refused.
+
+    Plain integers rather than an asyncio.Semaphore: nothing ever waits, and a
+    semaphore binds to one event loop, which breaks under a test client that
+    starts a loop per request. One event loop per worker process, so no lock.
+    """
+
+    def __init__(self, limit: int):
+        self.limit = limit
+        self.active = 0
+
+    def try_acquire(self) -> bool:
+        if self.active >= self.limit:
+            return False
+        self.active += 1
+        return True
+
+    def release(self) -> None:
+        self.active = max(0, self.active - 1)
+
+
+_ffmpeg_slots = Slots(MAX_CONCURRENT_FFMPEG)
+
+
+class FfmpegBusy(Exception):
+    """Every ffmpeg slot is taken; the caller should answer 503 and ask for a retry."""
 
 # OpenAI's own voice names. They mean nothing to any backend here, so forwarding
 # one makes the provider fail to resolve a voice instead of using its default.
@@ -153,28 +212,39 @@ def http_exception_response(request: Request, exc: Any) -> JSONResponse:
     return response
 
 
-async def _wav_to_mp3(wav_bytes: bytes) -> Optional[bytes]:
-    """Transcode WAV to MP3 with ffmpeg. Returns None if ffmpeg is unavailable.
+async def _run_ffmpeg(output_args: list[str], wav_bytes: bytes, label: str) -> Optional[bytes]:
+    """Pipe a WAV through ffmpeg and return what it wrote, or None if that did not work.
 
-    mp3 is the spec's DEFAULT response_format, so a client that sends no format
-    at all expects it. Every TTS backend here emits WAV, so the container
-    conversion belongs at the gateway rather than in each service.
+    None covers ffmpeg not being installed, exiting non-zero, timing out and
+    producing nothing; the reason is logged. Raises `FfmpegBusy` before starting
+    anything when `MAX_CONCURRENT_FFMPEG` processes are already running.
 
     Asynchronous on purpose: a blocking `subprocess.run` inside an `async def`
     stalls the whole worker for the length of the encode — health checks and the
     `/ws/stt` relay included — and every mp3 request is one, because mp3 is the
     default format.
     """
+    if not _ffmpeg_slots.try_acquire():
+        logger.warning("all %d ffmpeg slots are busy; refusing the %s conversion",
+                       _ffmpeg_slots.limit, label)
+        raise FfmpegBusy()
+    try:
+        return await _ffmpeg_pipe(output_args, wav_bytes, label)
+    finally:
+        _ffmpeg_slots.release()
+
+
+async def _ffmpeg_pipe(output_args: list[str], wav_bytes: bytes, label: str) -> Optional[bytes]:
     try:
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-f", "wav", "-i", "pipe:0", "-f", "mp3", "-b:a", "64k", "pipe:1",
+            "-f", "wav", "-i", "pipe:0", *output_args, "pipe:1",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
     except FileNotFoundError:
-        logger.warning("ffmpeg not installed; cannot serve response_format=mp3")
+        logger.warning("ffmpeg not installed; cannot serve response_format=%s", label)
         return None
     except OSError as e:
         logger.warning("ffmpeg could not be started: %s", e)
@@ -184,10 +254,10 @@ async def _wav_to_mp3(wav_bytes: bytes) -> Optional[bytes]:
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(wav_bytes), timeout=FFMPEG_TIMEOUT_S)
     except asyncio.TimeoutError:
-        logger.warning("ffmpeg mp3 transcode timed out after %gs", FFMPEG_TIMEOUT_S)
+        logger.warning("ffmpeg %s transcode timed out after %gs", label, FFMPEG_TIMEOUT_S)
         return None
     except Exception as e:
-        logger.warning("ffmpeg mp3 transcode error: %s", e)
+        logger.warning("ffmpeg %s transcode error: %s", label, e)
         return None
     finally:
         # A cancelled request (client went away) or a timeout must not leave an
@@ -206,17 +276,55 @@ async def _wav_to_mp3(wav_bytes: bytes) -> Optional[bytes]:
 
     if proc.returncode == 0 and stdout:
         return stdout
-    logger.warning("ffmpeg mp3 transcode failed (rc=%s): %s",
-                   proc.returncode, stderr[:200].decode("utf-8", "replace"))
+    logger.warning("ffmpeg %s transcode failed (rc=%s): %s",
+                   label, proc.returncode, stderr[:200].decode("utf-8", "replace"))
     return None
+
+
+async def _wav_to_mp3(wav_bytes: bytes) -> Optional[bytes]:
+    """Transcode WAV to MP3 with ffmpeg. Returns None if ffmpeg is unavailable.
+
+    mp3 is the spec's DEFAULT response_format, so a client that sends no format
+    at all expects it. Every TTS backend here emits WAV, so the container
+    conversion belongs at the gateway rather than in each service.
+    """
+    return await _run_ffmpeg(["-f", "mp3", "-b:a", "64k"], wav_bytes, "mp3")
+
+
+def _wav_info(wav_bytes: bytes) -> tuple[int, int, int]:
+    """(channels, sample width in bytes, sample rate) from a WAV header. ValueError if it is not one."""
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as reader:
+            return reader.getnchannels(), reader.getsampwidth(), reader.getframerate()
+    except (wave.Error, EOFError) as e:
+        raise ValueError(f"not a PCM WAV file ({e})") from e
+
+
+async def wav_to_pcm_24k(wav_bytes: bytes) -> Optional[bytes]:
+    """A 16-bit PCM WAV as raw 24 kHz mono little-endian samples: OpenAI's `pcm` format.
+
+    A WAV that already is 24 kHz only loses its header (and is mixed down to mono
+    if it has more channels), with no subprocess. Any other rate goes through
+    ffmpeg (`-ar 24000 -ac 1 -f s16le`); None means that was not possible
+    (ffmpeg missing or failing). Raises ValueError for audio that is not 16-bit
+    PCM and `FfmpegBusy` when no ffmpeg slot is free.
+    """
+    _channels, width, rate = _wav_info(wav_bytes)
+    if width != 2:
+        raise ValueError(f"unsupported sample width: {width * 8}-bit (need 16-bit)")
+    if rate == PCM_SAMPLE_RATE:
+        raw, _ = await asyncio.to_thread(wav_to_pcm, wav_bytes)
+        return raw
+    return await _run_ffmpeg(
+        ["-ar", str(PCM_SAMPLE_RATE), "-ac", "1", "-f", "s16le"], wav_bytes, "pcm")
 
 
 def wav_to_pcm(wav_bytes: bytes) -> tuple[bytes, int]:
     """Strip a 16-bit PCM WAV down to raw little-endian mono samples.
 
-    Returns ``(pcm, sample_rate)``. The rate is the backend's own — nothing is
-    resampled, so a caller that needs OpenAI's 24 kHz must read it from the
-    response. Raises ValueError for anything that is not 16-bit PCM.
+    Returns ``(pcm, sample_rate)``. The rate is the WAV's own: nothing is
+    resampled here (`wav_to_pcm_24k` does that). Raises ValueError for anything
+    that is not 16-bit PCM.
     """
     try:
         with wave.open(io.BytesIO(wav_bytes), "rb") as reader:
@@ -240,6 +348,18 @@ def wav_to_pcm(wav_bytes: bytes) -> tuple[bytes, int]:
             mono.byteswap()
         raw = mono.tobytes()
     return raw, rate
+
+
+def backend_detail(exc: Any) -> str:
+    """The text of a backend failure as a client may see it.
+
+    `post_form`/`post_json` raise HTTPExceptions whose detail the gateway has
+    already reduced to a short sentence and a request id (the backend's own body,
+    with its tracebacks and paths, is only in the log). A detail of any other
+    shape - a dict, a list - is not something to show a client, so it is not.
+    """
+    detail = getattr(exc, "detail", None)
+    return detail if isinstance(detail, str) and detail.strip() else "The backend could not complete the request."
 
 
 def _number(value: Any, default: float) -> float:
@@ -456,8 +576,12 @@ def build_router(
             return openai_error(503, f"No speech-to-text provider available: {exc.detail}")
 
         # "auto" must be sent explicitly, not omitted: whisper.cpp defaults to
-        # English when the field is absent, which silently mis-transcribes.
+        # English when the field is absent, which silently mis-transcribes, and
+        # the stt-form-v1 services read a missing field as "use
+        # STT_DEFAULT_LANGUAGE" but an explicit "auto" as "detect".
         lang = (language or "").strip()
+        if lang.lower() == "auto":
+            lang = "auto"
         want_segments = fmt in _SEGMENT_FORMATS
 
         async def transcribe_with(pid: str, prov: dict):
@@ -473,8 +597,10 @@ def build_router(
             else:
                 files = [("audio", (file.filename or "audio.wav", content,
                                     file.content_type or "application/octet-stream"))]
-                # faster-whisper rejects the literal "auto"; absence means detect.
-                if lang and lang.lower() != "auto":
+                # Every stt-form-v1 service accepts the literal "auto" and detects
+                # (canary, which cannot, takes its default). Absence is NOT the
+                # same thing: it means the operator's STT_DEFAULT_LANGUAGE.
+                if lang:
                     data["language"] = lang
                 if prompt:
                     data["initial_prompt"] = prompt
@@ -493,7 +619,7 @@ def build_router(
             # (/api/stt names its provider and stays strict.)
             alternative = await _healthy_alternative(provider_id)
             if alternative is None:
-                return openai_error(502, f"Transcription backend failed: {exc.detail}")
+                return openai_error(502, f"Transcription backend failed: {backend_detail(exc)}")
             logger.warning(
                 "default STT provider '%s' is unreachable (%s); falling back to '%s'",
                 provider_id, exc.detail, alternative)
@@ -501,9 +627,9 @@ def build_router(
             try:
                 upstream = await transcribe_with(alternative, get_provider(alternative, kind="stt"))
             except HTTPException as fallback_exc:
-                return openai_error(502, f"Transcription backend failed: {fallback_exc.detail}")
+                return openai_error(502, f"Transcription backend failed: {backend_detail(fallback_exc)}")
         except HTTPException as exc:
-            return openai_error(502, f"Transcription backend failed: {exc.detail}")
+            return openai_error(502, f"Transcription backend failed: {backend_detail(exc)}")
 
         try:
             payload = upstream.json()
@@ -616,28 +742,44 @@ def build_router(
             upstream = await post_json(provider_id, "/tts", payload,
                                        timeout=max(read_timeout, 600.0))
         except HTTPException as exc:
-            return openai_error(502, f"Speech backend failed: {exc.detail}")
+            return openai_error(502, f"Speech backend failed: {backend_detail(exc)}")
 
         audio = upstream.content
         headers = {"X-Provider": provider_id}
-        if fmt == "mp3":
-            # Looked up at call time so a deployment (or a test) can swap the
-            # converter without rebuilding the router.
-            converted = await (mp3_converter or _wav_to_mp3)(audio)
-            if converted is None:
-                return openai_error(
-                    501,
-                    "response_format 'mp3' requires ffmpeg, which is not available "
-                    "in this deployment. Use response_format='wav'.",
-                    param="response_format", code="unsupported_value")
-            audio = converted
-        elif fmt == "pcm":
-            try:
-                audio, rate = await asyncio.to_thread(wav_to_pcm, audio)
-            except ValueError as e:
-                return openai_error(502, f"Speech backend returned audio that cannot be sent as pcm: {e}")
-            # Raw samples carry no header, so the rate has to travel out of band.
-            headers["X-Sample-Rate"] = str(rate)
+        try:
+            if fmt == "mp3":
+                # Looked up at call time so a deployment (or a test) can swap the
+                # converter without rebuilding the router.
+                converted = await (mp3_converter or _wav_to_mp3)(audio)
+                if converted is None:
+                    return openai_error(
+                        501,
+                        "response_format 'mp3' requires ffmpeg, which is not available "
+                        "in this deployment. Use response_format='wav'.",
+                        param="response_format", code="unsupported_value")
+                audio = converted
+            elif fmt == "pcm":
+                try:
+                    converted = await wav_to_pcm_24k(audio)
+                except ValueError as e:
+                    return openai_error(502, f"Speech backend returned audio that cannot be sent as pcm: {e}")
+                if converted is None:
+                    return openai_error(
+                        501,
+                        "response_format 'pcm' needs ffmpeg to resample this voice to 24 kHz, "
+                        "and it is not available in this deployment. Use response_format='wav'.",
+                        param="response_format", code="unsupported_value")
+                audio = converted
+                # OpenAI's pcm is 24 kHz mono, always: wav_to_pcm_24k resamples
+                # whatever the backend produced. Raw samples carry no header, so
+                # the rate still travels out of band for clients that ask.
+                headers["X-Sample-Rate"] = str(PCM_SAMPLE_RATE)
+        except FfmpegBusy:
+            busy = openai_error(
+                503, "The server is busy converting audio. Try again shortly.",
+                code="server_busy")
+            busy.headers["Retry-After"] = str(FFMPEG_RETRY_AFTER_S)
+            return busy
 
         return Response(
             content=audio,

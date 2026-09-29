@@ -41,10 +41,10 @@ Status as of 2026-09-29. What exists, and what is still hardcoded:
   display name are refreshed from the service's `/status`, so they follow `CANARY_ASR_MODEL`
   (fallback en/de/es/fr while it is unreachable); `/api/providers/piper/voices` passes on the
   service's `default_language`; and the Qwen3-TTS adapter forwards `auto` and languages the model
-  lacks instead of mapping them to English, so `QWEN3_DEFAULT_LANGUAGE` and the service's 400
-  apply. These three were hardcoded in the adapter when this release was wired. Canary is still the
-  only registry entry that is updated from its service; the others are static, which is what
-  phase 4 is for.
+  lacks instead of mapping them to English, and its registry defaults to `auto`, so
+  `QWEN3_DEFAULT_LANGUAGE` and the service's 400 apply. These were hardcoded in the adapter when
+  this release was wired. Canary is still the only registry entry that is updated from its
+  service; the others are static, which is what phase 4 is for.
 - **Live transcription is not a shared contract.** Only `stt-service` implements
   `/ws/transcribe`; the gateway refuses the other providers with a reason (close code 1008).
 

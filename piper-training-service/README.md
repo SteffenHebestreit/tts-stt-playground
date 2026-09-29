@@ -88,6 +88,14 @@ lists any job ids that kept them alive in `retained_for_jobs`.
 
 A job that is still running is refused with **409**: cancel it, wait until it has stopped, then delete it.
 
+Names and ids are checked twice. A `model_name` (and any job id in a path) must be 1-64
+characters from `[A-Za-z0-9_-]`, the alphabet the Piper runtime and the gateway accept;
+anything else is answered with 400 (surrounding whitespace is trimmed). The same rule is
+applied again to every name read back from `checkpoints/<job>/job_state.json` before it is
+turned into a path, and a directory that would resolve outside `data/`, `checkpoints/` or
+`models/` is never removed. A state file with a name outside the alphabet is restored
+without a model name, so deleting that job removes its own files but no dataset.
+
 ### Where `/prepare-dataset` may read audio from
 
 `audio_path` is client input, so it is restricted:
@@ -131,7 +139,7 @@ After a restart, jobs found in `checkpoints/` reappear as `interrupted` (state s
 | `STT_MIN_CONFIDENCE` | `0.6` | Lowest `exp(avg_logprob)` a transcript segment needs to be trained on (0..1). |
 | `PHONEMIZER_MAX_FAILURE_FRACTION` | `0.05` | Share of samples that may fail phonemisation before the dataset build is abandoned. |
 | `TRAINING_SHUTDOWN_GRACE_S` | `30` | How long shutdown waits for running jobs to stop. Keep the container's stop grace period above it. |
-| `UVICORN_TIMEOUT_KEEP_ALIVE` | `75` | Idle keep-alive of the HTTP server, so the frontend's pooled connections are not closed under it. |
+| `UVICORN_TIMEOUT_KEEP_ALIVE` | `120` | Idle keep-alive of the HTTP server, so the frontend's pooled connections are not closed under it. Keep it at or above the gateway's `UPSTREAM_KEEPALIVE_EXPIRY` (115). |
 | `TRAINING_DEVICE_TYPE` | set by `start.sh` | `cuda`, `hip`, `mps` or `cpu`, as detected at startup. `/ready` answers 503 if it says a GPU but PyTorch runs on the CPU. |
 | `STT_SERVICE_URL` | `http://stt-service:8000` | STT backend used for segmentation and transcription. The only source for that address — `/train` and `/retrain-from-segments` accept an `stt_service_url` field but reject any value that does not match this one. |
 | `ALLOW_CLIENT_STT_URL` | `false` | Honour a per-request `stt_service_url` instead. Leave off: it lets any caller redirect the service's uploads to a host of their choosing and read the resulting error out of the job status. |
@@ -139,7 +147,7 @@ After a restart, jobs found in `checkpoints/` reappear as `interrupted` (state s
 | `SHARED_MODELS_DIR` | `/app/shared_models` | Shared model directory used by the `piper-volume` target |
 | `DEFAULT_DEPLOYMENT_TARGET` | `piper-volume` | Default deployment target used after export |
 | `DEPLOYMENT_TARGETS_JSON` | unset | Optional JSON override for deployment targets and default target |
-| `ALLOWED_ORIGINS` | `*` | Comma-separated CORS origins |
+| `ALLOWED_ORIGINS` | *(empty)* | Comma-separated origins a browser page may call this service from. **Unset or empty: no CORS headers at all.** `*` opens it to every page and must be written down (it logs a warning). Independently of this, a state-changing request (anything but `GET`/`HEAD`/`OPTIONS`) that carries an `Origin` header for another host than the one it was sent to is refused with `403` unless the origin is listed: a multipart `POST` (`/train-from-dataset`, `/resume-training`, `/export/{id}`) needs no CORS preflight, so CORS alone never protected these. Requests without an `Origin` (the gateway, curl) are not affected |
 | `ALLOW_CREDENTIALS` | `false` | Enables CORS credentials when origins are explicit |
 
 ## Health and readiness

@@ -241,6 +241,18 @@
   -F "language=de"</pre>
                 </div>
                 <div class="code-example">
+                    <h4>When the server runs with API_KEY:</h4>
+                    <pre># /v1/* and every state-changing /api/* call
+curl -H "Authorization: Bearer $API_KEY" ...
+
+# /ws/stt from a browser: the key rides as a subprotocol
+new WebSocket(url, ["tts-stt.v1", "bearer." + base64url(key)])
+# scripts can send the Authorization header on the upgrade request instead</pre>
+                </div>
+                <div class="api-links">
+                    <a href="/static/openapi/gateway.json" class="api-link" target="_blank">OpenAPI Spec</a>
+                </div>
+                <div class="code-example">
                     <h4>Live transcription protocol:</h4>
                     <pre># client -> server
 {"language": "de"}            # optional first frame, "auto" = detect
@@ -252,11 +264,8 @@
 {"type": "final", "text": "...", "language": "de", "duration": 12.3}
 {"type": "warning" | "error", "message": "..."}</pre>
                 </div>
-                <div class="api-links">
-                    <a href="/static/openapi/gateway.json" class="api-link" target="_blank">OpenAPI Spec</a>
-                </div>
             </div>
-
+            
             <!-- PiperTTS Service -->
             <div class="service-card">
                 <h2>🔊 PiperTTS Service</h2>

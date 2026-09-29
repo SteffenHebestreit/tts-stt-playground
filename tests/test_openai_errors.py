@@ -214,14 +214,20 @@ def test_no_fallback_when_nothing_is_healthy(monkeypatch):
     assert _posted_hosts(stub) == ["stt-service"]
 
 
-def test_no_fallback_when_the_default_answered_with_an_error(monkeypatch):
+def test_no_fallback_when_the_default_answered_with_an_error(monkeypatch, caplog):
     """A backend that is up and says the request failed would say the same thing
     to any other provider; only 'could not be reached' justifies a swap."""
     handler = _fleet({"stt-service", "qwen3-asr-service"}, transcribe_status=500)
     _, stub, client = _client(monkeypatch, handler=handler)
-    r = _transcribe(client)
+    with caplog.at_level(logging.WARNING):
+        r = _transcribe(client)
     assert r.status_code == 502
-    assert "model exploded" in r.json()["error"]["message"]
+    message = r.json()["error"]["message"]
+    # what the backend said is for the operator; the caller gets a request id that finds it
+    assert "model exploded" not in message
+    request_id = message.rsplit("Request id: ", 1)[1].rstrip(".")
+    assert any(request_id in rec.getMessage() and "model exploded" in rec.getMessage()
+               for rec in caplog.records)
     assert _posted_hosts(stub) == ["stt-service"]
 
 

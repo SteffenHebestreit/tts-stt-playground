@@ -293,14 +293,25 @@ def test_auto_language_is_sent_explicitly_to_whisper_cpp(whispercpp_app, monkeyp
     assert _StubClient.last_post["data"]["language"] == "auto"
 
 
-def test_auto_language_is_omitted_for_faster_whisper(whisper_app, monkeypatch):
-    """The inverse: faster-whisper rejects the literal string 'auto', so the
-    field must be absent for it to auto-detect."""
+def test_auto_language_is_sent_explicitly_to_faster_whisper(whisper_app, monkeypatch):
+    """faster-whisper's service accepts the literal 'auto' and detects. Leaving it out is
+    a different request: a missing field means STT_DEFAULT_LANGUAGE, which the TrueNAS
+    profile sets to 'de', so 'auto' used to be answered with German transcription."""
+    client = _client(whisper_app, monkeypatch)
+    for spelling in ("auto", "AUTO", " Auto "):
+        _StubClient.last_post = {}
+        client.post("/v1/audio/transcriptions",
+                    files={"file": ("a.wav", WAV, "audio/wav")},
+                    data={"model": "whisper-1", "language": spelling})
+        assert _StubClient.last_post["data"]["language"] == "auto", spelling
+
+
+def test_an_omitted_language_stays_omitted_for_faster_whisper(whisper_app, monkeypatch):
+    """No language at all still means "the operator's default", not "detect"."""
     client = _client(whisper_app, monkeypatch)
     _StubClient.last_post = {}
     client.post("/v1/audio/transcriptions",
-                files={"file": ("a.wav", WAV, "audio/wav")},
-                data={"model": "whisper-1", "language": "auto"})
+                files={"file": ("a.wav", WAV, "audio/wav")}, data={"model": "whisper-1"})
     assert "language" not in _StubClient.last_post["data"]
 
 
@@ -703,16 +714,69 @@ def _speech_app(monkeypatch, wav):
     return TestClient(module.app)
 
 
-def test_pcm_is_the_wav_without_its_header(monkeypatch):
+def test_pcm_that_is_already_24khz_is_the_wav_without_its_header_and_needs_no_ffmpeg(tmp_path, monkeypatch):
+    """Qwen3 and Chatterbox produce 24 kHz, which is what OpenAI's pcm is: a header strip."""
+    monkeypatch.setenv("PATH", str(tmp_path))          # no ffmpeg anywhere
     samples = struct.pack("<hhh", 1, -2, 300)
-    client = _speech_app(monkeypatch, wav_bytes(samples, rate=22050))
+    client = _speech_app(monkeypatch, wav_bytes(samples, rate=24000))
     r = client.post("/v1/audio/speech", json={"input": "hi", "response_format": "pcm"})
     assert r.status_code == 200
     assert r.content == samples
     assert r.headers["content-type"] == "audio/pcm"
-    # raw samples carry no rate; it is not resampled, so the caller has to be told
-    assert r.headers["x-sample-rate"] == "22050"
+    assert r.headers["x-sample-rate"] == "24000"
     assert r.headers["x-provider"] == "piper"
+
+
+@pytest.mark.parametrize("rate", [22050, 16000, 44100])
+def test_pcm_from_any_other_rate_is_resampled_to_24khz_with_ffmpeg(tmp_path, monkeypatch, rate):
+    """Piper voices are 22.05 or 16 kHz, and stock OpenAI clients play `pcm` at 24 kHz, so
+    unresampled samples came out slow and low. The stand-in ffmpeg records how it was
+    called and what it was fed, and answers with bytes the WAV cannot have contained."""
+    _fake_ffmpeg(tmp_path, 'printf "%s\\n" "$@" > "$0.args"; cat > "$0.stdin"; printf "RESAMPLED-24K"')
+    _path_with(monkeypatch, tmp_path)
+    wav = wav_bytes(struct.pack("<hhh", 1, -2, 300), rate=rate)
+    client = _speech_app(monkeypatch, wav)
+
+    r = client.post("/v1/audio/speech", json={"input": "hi", "response_format": "pcm"})
+
+    assert r.status_code == 200
+    assert r.content == b"RESAMPLED-24K"
+    assert r.headers["content-type"] == "audio/pcm"
+    assert r.headers["x-sample-rate"] == "24000", "the header must describe the bytes that are sent"
+    args = (tmp_path / "ffmpeg.args").read_text().split()
+    assert args[args.index("-ar") + 1] == "24000"
+    assert args[args.index("-ac") + 1] == "1"
+    last_format_flag = max(i for i, arg in enumerate(args) if arg == "-f")   # the input's `-f wav` comes first
+    assert args[last_format_flag + 1] == "s16le"
+    assert args[-1] == "pipe:1"
+    assert (tmp_path / "ffmpeg.stdin").read_bytes() == wav, "ffmpeg must be fed the backend's WAV"
+
+
+def test_pcm_that_needs_resampling_without_ffmpeg_is_a_documented_501(tmp_path, monkeypatch):
+    """Header-stripping at the wrong rate would be the silent slow-audio bug again."""
+    monkeypatch.setenv("PATH", str(tmp_path))
+    client = _speech_app(monkeypatch, wav_bytes(struct.pack("<hhh", 1, -2, 300), rate=22050))
+    r = client.post("/v1/audio/speech", json={"input": "hi", "response_format": "pcm"})
+    assert r.status_code == 501
+    error = r.json()["error"]
+    assert error["code"] == "unsupported_value" and error["param"] == "response_format"
+    assert "24 kHz" in error["message"] and "wav" in error["message"]
+
+
+def test_failing_resample_is_reported_not_returned_as_audio(tmp_path, monkeypatch):
+    _fake_ffmpeg(tmp_path, "cat >/dev/null; echo 'boom' >&2; exit 1")
+    _path_with(monkeypatch, tmp_path)
+    client = _speech_app(monkeypatch, wav_bytes(struct.pack("<hhh", 1, -2, 300), rate=22050))
+    r = client.post("/v1/audio/speech", json={"input": "hi", "response_format": "pcm"})
+    assert r.status_code == 501
+
+
+def test_wav_format_keeps_the_backends_own_rate(monkeypatch):
+    """Only `pcm` (a headerless format) has to agree with what clients assume."""
+    wav = wav_bytes(struct.pack("<hhh", 1, -2, 300), rate=22050)
+    client = _speech_app(monkeypatch, wav)
+    r = client.post("/v1/audio/speech", json={"input": "hi", "response_format": "wav"})
+    assert r.status_code == 200 and r.content == wav
 
 
 def test_pcm_downmixes_to_mono(monkeypatch):
@@ -888,3 +952,86 @@ def test_non_object_backend_reply_is_a_502_envelope(monkeypatch):
     r = _transcribe_fmt(_stt_client(monkeypatch, ["not", "an", "object"]), "json")
     assert r.status_code == 502
     assert set(r.json()["error"]) == {"message", "type", "param", "code"}
+
+
+# --- ffmpeg concurrency --------------------------------------------------------
+#
+# Every mp3 response (the default format) and every resampled pcm response starts
+# an ffmpeg process with the WAV held beside it. A burst used to start one per
+# request; now at most MAX_CONCURRENT_FFMPEG run per worker and the rest are told
+# to retry, which stock OpenAI clients do on their own.
+
+
+def _slow_ffmpeg_app(tmp_path, monkeypatch, slots):
+    _fake_ffmpeg(tmp_path, "cat >/dev/null; sleep 0.4; printf 'ID3-encoded'")
+    _path_with(monkeypatch, tmp_path)
+    module = load_frontend_app()
+    monkeypatch.setattr(module.openai_router, "_ffmpeg_slots", module.openai_router.Slots(slots))
+    install_stub(monkeypatch, module, lambda m, u, k: httpx.Response(
+        200, content=wav_bytes(), headers={"content-type": "audio/wav"}))
+    return module
+
+
+def test_ffmpeg_processes_are_capped_and_the_overflow_is_told_to_retry(tmp_path, monkeypatch):
+    module = _slow_ffmpeg_app(tmp_path, monkeypatch, slots=2)
+
+    async def burst():
+        async with asgi_client(module) as client:
+            responses = await asyncio.gather(*(
+                client.post("/v1/audio/speech", json={"input": f"text {i}"}) for i in range(5)))
+            later = await client.post("/v1/audio/speech", json={"input": "after the burst"})
+            return responses, later
+
+    responses, later = asyncio.run(burst())
+    statuses = sorted(r.status_code for r in responses)
+    assert statuses == [200, 200, 503, 503, 503], statuses
+    for r in responses:
+        if r.status_code == 503:
+            assert r.headers["retry-after"] == "2"
+            error = r.json()["error"]
+            assert error["code"] == "server_busy" and error["type"] == "server_error"
+    assert later.status_code == 200, "the slots were not given back"
+    assert module.openai_router._ffmpeg_slots.active == 0
+
+
+def test_pcm_resampling_shares_the_same_cap_but_24khz_pcm_and_wav_do_not_use_it(tmp_path, monkeypatch):
+    module = _slow_ffmpeg_app(tmp_path, monkeypatch, slots=0)          # every slot is taken
+
+    def speech(rate, fmt):
+        install_stub(monkeypatch, module, lambda m, u, k: httpx.Response(
+            200, content=wav_bytes(struct.pack("<hh", 5, 6), rate=rate),
+            headers={"content-type": "audio/wav"}))
+        return TestClient(module.app).post(
+            "/v1/audio/speech", json={"input": "hi", "response_format": fmt})
+
+    assert speech(22050, "pcm").status_code == 503
+    assert speech(22050, "mp3").status_code == 503
+    assert speech(24000, "pcm").status_code == 200
+    assert speech(22050, "wav").status_code == 200
+
+
+def test_ffmpeg_slot_is_released_after_a_failed_or_timed_out_run(tmp_path, monkeypatch):
+    _fake_ffmpeg(tmp_path, "cat >/dev/null; exec sleep 3")
+    _path_with(monkeypatch, tmp_path)
+    module = load_frontend_app()
+    router = module.openai_router
+    monkeypatch.setattr(router, "_ffmpeg_slots", router.Slots(1))
+    monkeypatch.setattr(router, "FFMPEG_TIMEOUT_S", 0.3)
+    assert asyncio.run(router._wav_to_mp3(wav_bytes())) is None
+    assert router._ffmpeg_slots.active == 0
+
+    monkeypatch.setenv("PATH", str(tmp_path / "nowhere"))
+    assert asyncio.run(router._wav_to_mp3(wav_bytes())) is None
+    assert router._ffmpeg_slots.active == 0
+
+
+@pytest.mark.parametrize("raw,expected", [
+    (None, 4), ("", 4), ("7", 7), (" 3 ", 3), ("0", 4), ("-2", 4), ("many", 4), ("2.5", 4),
+])
+def test_max_concurrent_ffmpeg_setting_is_read_defensively(monkeypatch, raw, expected):
+    router = load_frontend_app().openai_router
+    if raw is None:
+        monkeypatch.delenv("MAX_CONCURRENT_FFMPEG", raising=False)
+    else:
+        monkeypatch.setenv("MAX_CONCURRENT_FFMPEG", raw)
+    assert router._env_positive_int("MAX_CONCURRENT_FFMPEG", 4) == expected

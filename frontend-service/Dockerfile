@@ -8,7 +8,9 @@ WORKDIR /app
 # ffmpeg is required by /v1/audio/speech: mp3 is the OpenAI default
 # response_format, every TTS backend here emits WAV, and doing the container
 # conversion once at the gateway beats teaching each backend to transcode.
-# Without it that endpoint returns a documented 501 pointing at wav.
+# It also resamples response_format=pcm to OpenAI's 24 kHz for Piper voices
+# (22.05/16 kHz). Without it those two formats return a documented 501 pointing
+# at wav; MAX_CONCURRENT_FFMPEG bounds how many run at once.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ffmpeg \
