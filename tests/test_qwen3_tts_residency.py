@@ -566,5 +566,6 @@ def test_a_failed_switch_is_a_500_and_leaves_the_desired_model_alone(clean, monk
     monkeypatch.setattr(m, "load_model", broken)
     with pytest.raises(m.HTTPException) as exc:
         asyncio.run(m.switch_model(m.LoadModelRequest(model=DESIGN_17)))
-    assert exc.value.status_code == 500 and "download failed" in exc.value.detail
+    assert exc.value.status_code == 500 and "download failed" not in exc.value.detail
+    assert exc.value.headers["X-Request-ID"] in exc.value.detail
     assert m._desired_model_name == BASE_06

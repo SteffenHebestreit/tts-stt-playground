@@ -42,7 +42,8 @@ MANAGED_ENV = (
     "QWEN3_TTS_MODEL", "QWEN3_DEFAULT_LANGUAGE", "QWEN3_TTS_ATTN_IMPLEMENTATION",
     "MAX_TEXT_CHARS", "MAX_UPLOAD_MB", "TTS_MODEL_TTL", "MODEL_TTL",
     "TTS_MAX_CONCURRENCY", "TTS_MAX_BATCH", "VOICES_DIR", "QWEN3_ASR_SERVICE_URL",
-    "ALLOWED_ORIGINS", "ALLOW_CREDENTIALS",
+    "ALLOWED_ORIGINS", "ALLOW_CREDENTIALS", "QWEN3_TTS_REF_MAX_SECONDS",
+    "TTS_QUEUE_TIMEOUT_S", "TTS_MAX_QUEUE",
 )
 
 BASE_06 = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
@@ -152,6 +153,7 @@ def load_app(voices_dir: Optional[str] = None, **env):
         assert spec.loader is not None
         sys.modules[name] = module
         spec.loader.exec_module(module)
+        _stand_in_for_the_reference_decoder(module)
         return module
     finally:
         sys.path.remove(str(SERVICE_DIR))
@@ -160,6 +162,20 @@ def load_app(voices_dir: Optional[str] = None, **env):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+
+
+def _stand_in_for_the_reference_decoder(module) -> None:
+    """Reference clips in these tests are placeholder bytes, not audio.
+
+    The service measures every reference clip (soundfile, else librosa) before it
+    uses it. The default here says "one second long"; a test of that check puts the
+    real function back with ``module._measure_reference = module._real_measure_reference``
+    (the pre-fix service has no such function, and nothing happens).
+    """
+    real = getattr(module, "_measure_reference", None)
+    if real is not None:
+        module._real_measure_reference = real
+        module._measure_reference = lambda path, cap: (1.0, True)
 
 
 @dataclass

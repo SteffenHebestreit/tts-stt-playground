@@ -54,6 +54,9 @@ RUN python3 -c "import torch; arches = torch._C._cuda_getArchFlags().split(); as
 
 # Copy application code
 COPY app.py .
+# Request-body limit and cross-origin guard, imported by app.py at startup.
+COPY body_limit.py .
+COPY origin_guard.py .
 
 # Pre-download model during build (cached in Docker layer)
 # Uncomment to bake model into image for faster startup:

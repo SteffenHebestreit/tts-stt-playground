@@ -16,6 +16,7 @@ import subprocess
 import threading
 import tempfile
 import logging
+import uuid
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
@@ -29,6 +30,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 import uvicorn
+
+from body_limit import BodyLimitMiddleware
+from origin_guard import OriginGuardMiddleware, parse_allowed_origins
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -50,6 +54,23 @@ def _number(raw, name, default, cast=int, minimum=None):
         logger.warning("Ignoring %s=%r (below %s); using %s", name, raw, minimum, default)
         return default
     return value
+
+
+def _failure(status_code: int, public: str, detail: object = None, *, exc_info: bool = False) -> HTTPException:
+    """An error for the client that says *public* and a request id, nothing else.
+
+    The exception text (library messages carry paths, URLs and tensor shapes) is
+    written to the log under the same id, so an operator can find it and a caller
+    cannot read the container's internals out of an unauthenticated response.
+    Call with ``exc_info=True`` from an ``except`` block.
+    """
+    request_id = uuid.uuid4().hex[:12]
+    logger.error("[request %s] %s: %s", request_id, public, detail, exc_info=exc_info)
+    return HTTPException(
+        status_code=status_code,
+        detail=f"{public} (request id {request_id}).",
+        headers={"X-Request-ID": request_id},
+    )
 
 
 # --- Model registry ----------------------------------------------------------
@@ -260,13 +281,22 @@ _UPLOAD_CHUNK = _MIB
 # multipart boundaries and part headers on top of the file bytes
 _MULTIPART_SLACK = _MIB
 
+# The byte limit does not bound what a reference clip costs: a few MB of silent FLAC
+# or low-bitrate Opus decode to hours of samples, and the model library decodes and
+# embeds all of it. A clip is measured (header first, then a decode that stops at the
+# limit, since a header can lie) and refused above this many seconds. A voice needs
+# 3-10 s; the model does not use more than a few seconds of it anyway.
+REF_MAX_SECONDS = _number(
+    os.getenv("QWEN3_TTS_REF_MAX_SECONDS"), "QWEN3_TTS_REF_MAX_SECONDS", 60.0, float, minimum=1.0)
+
 # Attention kernel. `auto` keeps the historic behaviour (FlashAttention-2 when the
 # package imports on CUDA, else SDPA); the image no longer ships flash-attn, so
 # that means SDPA unless you built your own image.
 ATTN_IMPLEMENTATION = (os.getenv("QWEN3_TTS_ATTN_IMPLEMENTATION") or "auto").strip().lower()
 
-allowed_origins_str = os.getenv("ALLOWED_ORIGINS", "*")
-allowed_origins = [origin.strip() for origin in allowed_origins_str.split(",")] if allowed_origins_str else ["*"]
+# Unset or empty means no CORS headers at all (it used to mean "*"); "*" only when
+# it is written down (and logged); otherwise an explicit list. origin_guard.py.
+allowed_origins = parse_allowed_origins(os.getenv("ALLOWED_ORIGINS", ""))
 allow_credentials = os.getenv("ALLOW_CREDENTIALS", "false").strip().lower() in {"1", "true", "yes", "on"}
 if "*" in allowed_origins and allow_credentials:
     allow_credentials = False
@@ -294,8 +324,17 @@ _preload_pending = False
 # One process-global model on one GPU. Without this, requests dispatched onto the
 # default thread pool (min(32, cpu+4) workers) all enter the model at once and
 # multiply peak VRAM while making every individual request slower.
-_GEN_SEM = asyncio.Semaphore(_number(
-    os.getenv("TTS_MAX_CONCURRENCY"), "TTS_MAX_CONCURRENCY", 1, int, minimum=1))
+_GEN_CONCURRENCY = _number(os.getenv("TTS_MAX_CONCURRENCY"), "TTS_MAX_CONCURRENCY", 1, int, minimum=1)
+_GEN_SEM = asyncio.Semaphore(_GEN_CONCURRENCY)
+# Waiting for that permit (and for the model lock during a load) used to be unbounded,
+# and every waiter holds its request and a spooled upload. A wait now ends after
+# TTS_QUEUE_TIMEOUT_S, and at most TTS_MAX_QUEUE requests may be queued behind the
+# TTS_MAX_CONCURRENCY that are running: the next one is turned away at once. Both
+# answer 503 with Retry-After.
+QUEUE_TIMEOUT_S = _number(os.getenv("TTS_QUEUE_TIMEOUT_S"), "TTS_QUEUE_TIMEOUT_S", 60.0, float, minimum=0.1)
+MAX_QUEUE = _number(os.getenv("TTS_MAX_QUEUE"), "TTS_MAX_QUEUE", 4 * _GEN_CONCURRENCY, int, minimum=0)
+# Requests that hold an admission ticket (see _admit): running, waiting, or finishing.
+_admitted = 0
 # Sentences generated in one forward pass. Peak VRAM scales with this, so it has
 # to be bounded by configuration rather than by how long a caller's text is.
 TTS_MAX_BATCH = _number(os.getenv("TTS_MAX_BATCH"), "TTS_MAX_BATCH", 8, int, minimum=1)
@@ -416,16 +455,66 @@ def _release_gen(_fut=None) -> None:
     _GEN_SEM.release()
 
 
+def _busy(message: str) -> HTTPException:
+    """503 telling the caller to come back: the service is saturated or a load is slow."""
+    return HTTPException(
+        status_code=503, detail=message,
+        headers={"Retry-After": str(max(1, int(QUEUE_TIMEOUT_S // 4)))},
+    )
+
+
+def _shed_if_saturated() -> None:
+    """503 at once when TTS_MAX_CONCURRENCY + TTS_MAX_QUEUE requests already hold a ticket.
+
+    A cheap look, taken before a request costs anything (copying its upload,
+    decoding it); `_admit` takes the ticket itself.
+    """
+    if _admitted >= _GEN_CONCURRENCY + MAX_QUEUE:
+        raise _busy(f"The service is saturated ({MAX_QUEUE} requests already queued, TTS_MAX_QUEUE); retry shortly.")
+
+
+@contextmanager
+def _admit():
+    """An admission ticket for a request that will use the model, for as long as it does.
+
+    It bounds how many requests can be waiting for the model lock or a generation
+    permit, and so how many spooled uploads they hold. Nothing else is taken or
+    given here (the in-flight accounting the reaper relies on is `_acquire_model`'s
+    and `_gen`'s), so leaving the block on any path, cancellation included, just
+    returns the ticket. Event-loop only: no await between the check and the count.
+    """
+    global _admitted
+    _shed_if_saturated()
+    _admitted += 1
+    try:
+        yield
+    finally:
+        _admitted -= 1
+
+
+async def _bounded_wait(acquire, what: str) -> None:
+    """Await an asyncio lock/semaphore acquire for at most TTS_QUEUE_TIMEOUT_S, else 503.
+
+    On timeout or cancellation nothing is held, so the caller has nothing to give back.
+    """
+    try:
+        await asyncio.wait_for(acquire, timeout=QUEUE_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        raise _busy(f"{what} did not become available within {QUEUE_TIMEOUT_S:g}s (TTS_QUEUE_TIMEOUT_S); retry shortly.")
+
+
 async def _gen(fn, *args, **kwargs):
     """Run a blocking model call off the event loop, bounded by _GEN_SEM.
 
     The permit and the in-flight hold are released when the WORKER THREAD ends,
     not when this coroutine does. If the caller is cancelled (client gone,
     shutdown) the thread keeps reading the weights, and releasing either early
-    would let the reaper or a model switch pull them out from under it.
+    would let the reaper or a model switch pull them out from under it. Waiting for
+    the permit is bounded (see QUEUE_TIMEOUT_S); the in-flight hold is only taken
+    once the permit is held, so a wait that times out or is cancelled owes nothing.
     """
     global _inflight
-    await _GEN_SEM.acquire()
+    await _bounded_wait(_GEN_SEM.acquire(), "A generation slot")
     with _inflight_lock:
         _inflight += 1
     try:
@@ -570,26 +659,36 @@ async def _acquire_model():
     Note this reloads ``_desired_model_name``, not the env default: after the
     idle TTL has unloaded a model the user explicitly switched to, reloading the
     env default instead would silently revert their choice.
+
+    The request holds an admission ticket (`_admit`) from here to the end of the
+    ``with`` block, and waits for the lock at most TTS_QUEUE_TIMEOUT_S (a first
+    load or a model switch holds it for minutes; 503 with Retry-After, as /ready
+    says "loading"). Neither changes what is counted as in flight: the count is
+    raised inside the lock exactly as before, and only once the lock is held.
     """
     global _inflight, _active_requests
-    async with _LOAD_LOCK:
-        model = tts_model
-        if model is None:
-            model = await asyncio.to_thread(load_model, _desired_model_name)
-        name = current_model_name
-        # Raised before the lock is released, so the reaper's re-check under the
-        # same lock cannot miss this request.
-        with _inflight_lock:
-            _inflight += 1
-            _active_requests += 1
-        _touch_model()
-    try:
-        yield model, name
-    finally:
-        with _inflight_lock:
-            _inflight -= 1
-            _active_requests -= 1
-        _touch_model()
+    with _admit():
+        await _bounded_wait(_LOAD_LOCK.acquire(), "The model")
+        try:
+            model = tts_model
+            if model is None:
+                model = await asyncio.to_thread(load_model, _desired_model_name)
+            name = current_model_name
+            # Raised before the lock is released, so the reaper's re-check under the
+            # same lock cannot miss this request.
+            with _inflight_lock:
+                _inflight += 1
+                _active_requests += 1
+            _touch_model()
+        finally:
+            _LOAD_LOCK.release()
+        try:
+            yield model, name
+        finally:
+            with _inflight_lock:
+                _inflight -= 1
+                _active_requests -= 1
+            _touch_model()
 
 
 async def _drain_requests(timeout: float) -> None:
@@ -668,7 +767,7 @@ _UPLOAD_PATHS = {"/clone", "/clone-with-ref-text", "/voices/save"}
 
 
 def _body_limit(path: str) -> int:
-    """Largest request body (bytes) accepted at *path*, by declared Content-Length."""
+    """Largest request body (bytes) accepted at *path*."""
     # Up to three text fields per request (text, ref_text / instruct / description).
     # 12 bytes per character is the worst case, a JSON-escaped astral character.
     text = MAX_TEXT_CHARS * 12 * 3 + 64 * 1024
@@ -677,41 +776,26 @@ def _body_limit(path: str) -> int:
     return text
 
 
-class _BodyLimitMiddleware:
-    """Answer 413 from the Content-Length header, before anything is buffered.
-
-    FastAPI parses the whole body (multipart parts are spooled to disk, JSON is
-    held in memory) before a handler runs, so a size check inside the handler
-    comes after the cost was paid. Clients that send no Content-Length (chunked)
-    are still bounded per field by the handlers.
-    """
-
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] == "http" and scope["method"] in ("POST", "PUT"):
-            declared = dict(scope["headers"]).get(b"content-length", b"")
-            limit = _body_limit(scope["path"])
-            if declared.isdigit() and int(declared) > limit:
-                response = JSONResponse(
-                    status_code=413,
-                    content={"detail": f"Request body is larger than {limit / _MIB:.3g} MB."},
-                )
-                await response(scope, receive, send)
-                return
-        await self.app(scope, receive, send)
-
-
-# Added before CORS so CORS is the outer layer and a 413 still carries its headers.
-app.add_middleware(_BodyLimitMiddleware)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=allow_credentials,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# FastAPI parses the whole body (multipart parts are spooled to disk, JSON is held
+# in memory) before a handler runs, so a size check inside the handler comes after
+# the cost was paid. body_limit.py checks the declared Content-Length AND counts
+# the bytes that arrive, so a chunked upload is cut off at the limit too.
+#
+# Each add_middleware wraps what was added before it: the body limit is innermost,
+# the origin guard (403 for a state-changing request with a foreign Origin header;
+# no Origin, e.g. the gateway or curl, is not affected) comes next, and CORS is
+# outermost so a 403/413 still carries the CORS headers a listed origin needs in
+# order to read it. CORS is only added when origins are configured.
+app.add_middleware(BodyLimitMiddleware, limit_for=_body_limit)
+app.add_middleware(OriginGuardMiddleware, allowed_origins=allowed_origins)
+if allowed_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins,
+        allow_credentials=allow_credentials,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
 def _require_text(text: Optional[str], field: str = "Text") -> str:
@@ -721,7 +805,7 @@ def _require_text(text: Optional[str], field: str = "Text") -> str:
     if len(text) > MAX_TEXT_CHARS:
         raise HTTPException(
             status_code=413,
-            detail=f"{field} is {len(text)} characters; the limit is {MAX_TEXT_CHARS} (MAX_TEXT_CHARS).",
+            detail=f"{field} is {len(text)} characters; the limit is {MAX_TEXT_CHARS} (raise it with MAX_TEXT_CHARS).",
         )
     return text
 
@@ -732,21 +816,24 @@ def _bound_optional_text(text: Optional[str], field: str) -> str:
     if len(text) > MAX_TEXT_CHARS:
         raise HTTPException(
             status_code=413,
-            detail=f"{field} is {len(text)} characters; the limit is {MAX_TEXT_CHARS} (MAX_TEXT_CHARS).",
+            detail=f"{field} is {len(text)} characters; the limit is {MAX_TEXT_CHARS} (raise it with MAX_TEXT_CHARS).",
         )
     return text
 
 
 @contextmanager
 def _as_server_error(what: str):
-    """Turn an unexpected failure into a logged 500; HTTPExceptions pass through."""
+    """Turn an unexpected failure into a logged 500; HTTPExceptions pass through.
+
+    The client gets *what* failed and a request id; the exception itself (model
+    library messages name paths, URLs and tensor shapes) is in the log under the id.
+    """
     try:
         yield
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"{what} error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _failure(500, f"{what} failed", e, exc_info=True)
 
 
 @app.get("/health")
@@ -796,7 +883,9 @@ async def ready():
         body.update(ready=False, reason="loading")
         return JSONResponse(content=body, status_code=503, headers={"Retry-After": "5"})
     if _last_load_error and not resident:
-        body.update(ready=False, reason="load_failed", detail=_last_load_error)
+        # Unauthenticated: a category, not the exception (download URLs, cache paths).
+        # The text is in the service log, written when the load failed.
+        body.update(ready=False, reason="load_failed", detail="The model failed to load; see the service log.")
         return JSONResponse(content=body, status_code=503)
     if not resident:
         body["reason"] = "unloaded"
@@ -928,7 +1017,7 @@ async def switch_model(request: LoadModelRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to load model: {str(e)}")
+        raise _failure(500, "The model could not be loaded", e, exc_info=True)
 
 
 @app.get("/speakers")
@@ -1010,6 +1099,76 @@ async def _spool_upload(upload: UploadFile, limit: Optional[int] = None) -> str:
     if total == 0:
         _cleanup_temp(path)
         raise HTTPException(status_code=400, detail="Reference audio is empty")
+    return path
+
+
+_MEASURE_BLOCK = 65536  # frames per read while measuring a reference clip
+
+
+def _measure_reference(path: str, cap: float) -> tuple:
+    """``(seconds, complete)`` for the clip; when *complete* is False it is longer than *cap* and decoding stopped there.
+
+    The header is read first (a WAV or FLAC that declares an hour is refused without
+    decoding a sample). Then the decode itself is limited to *cap* plus one frame,
+    block by block: a header can be wrong or absent, and a highly compressible file
+    is a few MB that expand to hours. libsndfile is the first choice (wav, flac,
+    ogg, mp3); a container it does not read (m4a, webm) goes to librosa, whose
+    `duration` limits the decode the same way. Raises when neither can read it.
+    """
+    try:
+        with sf.SoundFile(path) as clip:
+            rate = clip.samplerate
+            if clip.frames > 0 and clip.frames / rate > cap:
+                return clip.frames / rate, True  # the header says so
+            budget = int(cap * rate) + 1
+            seen = 0
+            while seen < budget:
+                block = clip.read(min(_MEASURE_BLOCK, budget - seen), dtype="float32", always_2d=True)
+                if len(block) == 0:
+                    return seen / rate, True
+                seen += len(block)
+            return seen / rate, False
+    except Exception:
+        pass  # not a format libsndfile reads
+    import librosa
+    audio, rate = librosa.load(path, sr=16000, mono=True, duration=cap + 1.0)
+    seconds = len(audio) / rate
+    return seconds, seconds <= cap
+
+
+def _check_reference_duration(path: str) -> None:
+    """400 for a clip that cannot be decoded or is empty, 413 past QWEN3_TTS_REF_MAX_SECONDS."""
+    try:
+        seconds, complete = _measure_reference(path, REF_MAX_SECONDS)
+    except Exception as e:
+        logger.warning("Could not decode a reference clip: %s", e)
+        raise HTTPException(
+            status_code=400, detail="Could not decode the reference audio (unsupported or corrupt file).")
+    if seconds <= 0:
+        raise HTTPException(status_code=400, detail="Reference audio contains no samples.")
+    if seconds > REF_MAX_SECONDS:
+        # `complete` False: decoding stopped at the limit, so the real length is unknown.
+        length = f"{seconds:.0f} s long" if complete else "longer than the limit"
+        raise HTTPException(
+            status_code=413,
+            detail=f"Reference audio is {length} (the limit is {REF_MAX_SECONDS:g} s; "
+                   "raise it with QWEN3_TTS_REF_MAX_SECONDS).",
+        )
+
+
+async def _spool_reference(upload: UploadFile) -> str:
+    """`_spool_upload` for a reference clip, which must also be short enough (see REF_MAX_SECONDS).
+
+    Turned away with 503 before the copy when the service is saturated. The copy is
+    removed again on every path that refuses the clip.
+    """
+    _shed_if_saturated()
+    path = await _spool_upload(upload)
+    try:
+        await asyncio.to_thread(_check_reference_duration, path)
+    except BaseException:
+        _cleanup_temp(path)
+        raise
     return path
 
 
@@ -1367,7 +1526,7 @@ async def save_voice(
     tmp_path = None
     trimmed_path = None
     try:
-        tmp_path = await _spool_upload(file)
+        tmp_path = await _spool_reference(file)
         with _as_server_error("Save voice"):
             # Held for the whole request, including the wait on the ASR service:
             # the reaper must not unload the model in that gap.
@@ -1384,11 +1543,13 @@ async def save_voice(
                         asr_result = await _auto_transcribe(tmp_path, file.filename or "reference.wav")
                     except _AsrUnavailable as e:
                         if mode == "icl":
+                            # Not `e`: an httpx error names the internal service address.
+                            logger.warning(f"Transcription for an in-context voice failed: {e}")
                             raise HTTPException(
                                 status_code=502,
                                 detail=(
-                                    f"In-context cloning needs a transcript and the Qwen3-ASR service "
-                                    f"failed ({e}). Pass ref_text to skip transcription."
+                                    "In-context cloning needs a transcript and the Qwen3-ASR service "
+                                    "is unavailable. Pass ref_text to skip transcription."
                                 ),
                             )
                         logger.warning(f"Saving voice without a transcript or trim: {e}")
@@ -1570,7 +1731,7 @@ async def clone_voice(
 
     tmp_path = None
     try:
-        tmp_path = await _spool_upload(file)
+        tmp_path = await _spool_reference(file)
         with _as_server_error("Voice clone"):
             async with _acquire_model() as (model, model_name):
                 _require_capability(model_name, "voice_clone", _BASE_MODELS)
@@ -1626,7 +1787,7 @@ async def clone_voice_with_ref_text(
 
     tmp_path = None
     try:
-        tmp_path = await _spool_upload(file)
+        tmp_path = await _spool_reference(file)
         with _as_server_error("High-quality clone"):
             async with _acquire_model() as (model, model_name):
                 # The sibling /clone endpoint checks this; this one did not, so calling
