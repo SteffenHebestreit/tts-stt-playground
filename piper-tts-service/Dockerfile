@@ -1,4 +1,5 @@
-FROM python:3.10-slim
+# 3.10 reaches end of life in 2026-10; requirements.txt is resolved and tested on 3.12.
+FROM python:3.12-slim
 
 # Install system dependencies.
 # alsa-utils and pulseaudio were removed deliberately: this service only ever
@@ -11,7 +12,9 @@ RUN apt-get update && apt-get install -y \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Piper TTS.
+# Install Piper TTS. rhasspy/piper is archived upstream (its successor,
+# OHF-Voice/piper1-gpl, is a Python package with a different CLI); v1.2.0 stays
+# until that migration is done.
 # TARGETARCH is supplied by BuildKit and is exactly "amd64" or "arm64", which
 # matches the release asset names. Hardcoding piper_amd64 made this image
 # unbuildable for ARM SBCs (RK3588), where Piper is the primary TTS engine.
@@ -31,37 +34,32 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Create directories
 RUN mkdir -p /app/models /app/output /app/voices
 
-# Download default models for multiple languages
-RUN mkdir -p /app/models/default && \
-    cd /app/models/default && \
-    # English voices
-    wget -q https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx && \
-    wget -q https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json && \
-    wget -q https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/amy/medium/en_US-amy-medium.onnx && \
-    wget -q https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/amy/medium/en_US-amy-medium.onnx.json && \
-    wget -q https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_GB/alan/medium/en_GB-alan-medium.onnx && \
-    wget -q https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_GB/alan/medium/en_GB-alan-medium.onnx.json && \
-    # German voices
-    wget -q https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/de/de_DE/thorsten/medium/de_DE-thorsten-medium.onnx && \
-    wget -q https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/de/de_DE/thorsten/medium/de_DE-thorsten-medium.onnx.json && \
-    wget -q https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/de/de_DE/eva_k/x_low/de_DE-eva_k-x_low.onnx && \
-    wget -q https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/de/de_DE/eva_k/x_low/de_DE-eva_k-x_low.onnx.json && \
-    # French voices
-    wget -q https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/fr/fr_FR/siwis/medium/fr_FR-siwis-medium.onnx && \
-    wget -q https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/fr/fr_FR/siwis/medium/fr_FR-siwis-medium.onnx.json && \
-    # Spanish voices
-    wget -q https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/es/es_ES/mls_9972/low/es_ES-mls_9972-low.onnx && \
-    wget -q https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/es/es_ES/mls_9972/low/es_ES-mls_9972-low.onnx.json && \
-    # Italian voices
-    wget -q https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/it/it_IT/riccardo/x_low/it_IT-riccardo-x_low.onnx && \
-    wget -q https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/it/it_IT/riccardo/x_low/it_IT-riccardo-x_low.onnx.json && \
-    # Dutch voices
-    wget -q https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/nl/nl_NL/mls_5809/low/nl_NL-mls_5809-low.onnx && \
-    wget -q https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/nl/nl_NL/mls_5809/low/nl_NL-mls_5809-low.onnx.json
+# Voices shipped in the image, as Piper voice ids (<lang>-<speaker>-<quality>).
+# This is the only list: the service does not need it, it registers whatever
+# <id>.onnx + <id>.onnx.json pairs it finds in /app/models/default when it starts
+# (and on POST /refresh_voices). A bind-mounted models volume hides these files
+# anyway, so voices can also simply be copied into that volume.
+# Change the set at build time: --build-arg PIPER_VOICES="de_DE-thorsten-medium ..."
+ARG PIPER_VOICES="en_US-lessac-medium en_US-amy-medium en_GB-alan-medium de_DE-thorsten-medium de_DE-eva_k-x_low fr_FR-siwis-medium es_ES-mls_9972-low it_IT-riccardo-x_low nl_NL-mls_5809-low"
+ARG PIPER_VOICES_REVISION=v1.0.0
+RUN set -eu; \
+    mkdir -p /app/models/default; \
+    cd /app/models/default; \
+    for voice in ${PIPER_VOICES}; do \
+      lang="${voice%%-*}"; rest="${voice#*-}"; speaker="${rest%-*}"; quality="${rest##*-}"; \
+      base="https://huggingface.co/rhasspy/piper-voices/resolve/${PIPER_VOICES_REVISION}/${lang%%_*}/${lang}/${speaker}/${quality}/${voice}"; \
+      wget -q "${base}.onnx" "${base}.onnx.json"; \
+    done
 
 # Copy application code
 COPY . .
 
 EXPOSE 5000
 
-CMD ["python", "app.py"]
+# /health is liveness only; /ready also fails while no voice model is installed.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:5000/health || exit 1
+
+# 120 s keep-alive: the gateway pools connections, and uvicorn's 5 s default closes
+# them between requests, racing the next one.
+CMD ["python", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "5000", "--timeout-keep-alive", "120"]

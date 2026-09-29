@@ -1,12 +1,22 @@
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-python-multipart==0.0.6
-pydantic==2.5.0
-numpy==1.24.3
-requests==2.31.0
-aiofiles==23.2.0
-librosa==0.10.1
-soundfile==0.12.1
-pydub==0.25.1
-phonemizer==3.3.0
-onnxruntime==1.18.0
+# Resolved together on Python 3.12 (the image's base) and the service's tests
+# (tests/test_piper_tts_*.py) run against exactly these, including
+# test_piper_tts_inference.py, which drives onnxruntime, librosa and soundfile.
+# fastapi/uvicorn/python-multipart/pydantic are the set the rest of the repo uses.
+# python-multipart <0.0.18 and starlette 0.27 (fastapi 0.104) carry multipart
+# DoS advisories, and /upload_model and /analyze_audio take unauthenticated uploads.
+fastapi==0.141.1
+uvicorn[standard]==0.54.0
+python-multipart==0.0.32
+pydantic==2.13.5
+
+# numpy 1.24 has no Python 3.12 wheels. onnxruntime 1.30 and librosa 0.11 both work
+# with numpy 2 (the training service that exports these voices verifies its ONNX
+# with onnxruntime 1.30 too).
+numpy==2.4.6
+librosa==0.11.0
+soundfile==0.14.0
+phonemizer==3.4.0
+onnxruntime==1.30.0
+
+# Removed: requests and pydub (imported nowhere) and aiofiles (uploads are copied
+# to disk in a worker thread by the standard library now).
