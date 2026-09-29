@@ -21,12 +21,3 @@ target-version = "py310"
 
 [lint]
 select = ["E9", "F63", "F7", "F82"]
-
-[lint.per-file-ignores]
-# `del model` at the end of export_to_onnx makes ruff treat the name as unbound
-# inside the `lambda: torch.onnx.export(model, ...)` above it, which is only
-# called earlier, through asyncio.to_thread. It works today, but it is a closure
-# over a variable the same function deletes. Passing the arguments to
-# to_thread directly (no lambda) removes both the fragility and this entry.
-# Not fixed here: piper-training-service is owned by the trainer work.
-"piper-training-service/model_exporter.py" = ["F821"]

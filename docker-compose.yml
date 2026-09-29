@@ -514,10 +514,6 @@ services:
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
       NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
       CANARY_ASR_MODEL: ${CANARY_ASR_MODEL:-nvidia/canary-180m-flash}
-      # Peak VRAM scales with this; lower it before lowering model size.
-      # (Canary decodes one file per pass and no longer reads it: it stays only
-      # until canary-asr-service/app.py drops its leftover read.)
-      ASR_MAX_BATCH: ${ASR_MAX_BATCH:-8}
       CANARY_DEFAULT_LANGUAGE: ${CANARY_DEFAULT_LANGUAGE:-de}
       # Comma/space separated codes to accept instead of the table derived from
       # CANARY_ASR_MODEL (en,de,es,fr for the flash models, 25 for canary-1b-v2).

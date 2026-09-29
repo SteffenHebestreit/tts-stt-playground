@@ -57,7 +57,7 @@ Every `/v1` failure - including the ones FastAPI raises itself (missing form fie
 ## Features
 
 - Frontend entrypoint for STT, TTS, Qwen3 voice cloning, and training flows
-- Injects a provider registry plus browser-facing service URLs into the HTML template
+- Injects the provider registry into the HTML template (no backend URLs: every call goes through this gateway)
 - Serves static assets with restart-based cache busting
 - Exposes health data for all backend services used by the UI
 - Exposes optional providers such as `whisper-cpp` only when explicitly enabled in the frontend environment
@@ -109,6 +109,8 @@ Every `/v1` failure - including the ones FastAPI raises itself (missing form fie
 | `HEALTH_CACHE_TTL` | `2` | Seconds `/api/health` results are reused; `0` disables the cache |
 | `PROVIDER_HEALTH_TIMEOUT` | `6` | Per-provider timeout for a health probe, in seconds |
 | `FRONTEND_WORKERS` | `2` | uvicorn worker processes (the container's `entrypoint.sh` reads it; a value that is not a positive integer falls back to 2). Use `1` on memory-constrained boards |
+
+There are no browser-visible backend URLs to configure: the browser only talks to this service (`/api/*`, `/v1/*`, and the `/ws/stt` relay), and the gateway proxies every backend call over the internal `*_SERVICE_URL` addresses above. The former `BROWSER_*_URL` variables are no longer read anywhere.
 
 JSON request bodies are capped at 1 MiB regardless of `MAX_UPLOAD_MB`, and `/v1/audio/transcriptions` at 25 MB (plus multipart framing), as OpenAI does. Other free-text fields (`voice` 256, `language` 64, `instructions` and `voice_description` 4000 characters) are bounded too.
 

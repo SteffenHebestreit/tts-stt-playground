@@ -306,7 +306,6 @@ services:
       NVIDIA_VISIBLE_DEVICES: {{ q(values.gpu_device_id) }}
       NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
       CANARY_ASR_MODEL: "nvidia/canary-180m-flash"
-      ASR_MAX_BATCH: "8"
       CANARY_DEFAULT_LANGUAGE: "de"
       CANARY_SUPPORTED_LANGUAGES: ""
       MAX_UPLOAD_MB: "200"

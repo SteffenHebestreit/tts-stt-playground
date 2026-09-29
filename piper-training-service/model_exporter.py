@@ -193,22 +193,21 @@ class ModelExporter:
                 warnings.simplefilter("ignore")
                 with torch.no_grad():
                     await asyncio.to_thread(
-                        lambda: torch.onnx.export(
-                            model,
-                            (dummy_text, dummy_text_lengths),
-                            str(onnx_path),
-                            input_names=['text', 'text_lengths'],
-                            output_names=['audio'],
-                            dynamic_axes={
-                                'text': {0: 'batch_size', 1: 'sequence'},
-                                'text_lengths': {0: 'batch_size'},
-                                'audio': {0: 'batch_size', 1: 'time'}
-                            },
-                            opset_version=ONNX_OPSET,
-                            do_constant_folding=True,
-                            verbose=False,
-                            **onnx_export_kwargs(),
-                        )
+                        torch.onnx.export,
+                        model,
+                        (dummy_text, dummy_text_lengths),
+                        str(onnx_path),
+                        input_names=['text', 'text_lengths'],
+                        output_names=['audio'],
+                        dynamic_axes={
+                            'text': {0: 'batch_size', 1: 'sequence'},
+                            'text_lengths': {0: 'batch_size'},
+                            'audio': {0: 'batch_size', 1: 'time'}
+                        },
+                        opset_version=ONNX_OPSET,
+                        do_constant_folding=True,
+                        verbose=False,
+                        **onnx_export_kwargs(),
                     )
 
         except Exception as e:
