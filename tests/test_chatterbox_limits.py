@@ -240,11 +240,16 @@ def test_unload_does_not_block_the_event_loop(monkeypatch):
     """The unload takes the slot lock and runs the unload hooks (seconds on a real GPU)."""
     install_chatterbox(monkeypatch)
     app = load_app()
-    started, release, blocked = threading.Event(), threading.Event(), []
+    started, release, blocked, hook_thread = threading.Event(), threading.Event(), [], []
 
     def slow_forget(model):
+        hook_thread.append(threading.get_ident())
         started.set()
-        if not release.wait(1.0):
+        # An upper bound that only a hook stuck on the event loop ever reaches, not a
+        # duration under test: 1 s was short enough for a busy CI box to trip it while the
+        # loop was fine. The verdict is which thread ran the hook (below), and `release`
+        # being set by a free loop.
+        if not release.wait(10.0):
             blocked.append(True)  # nothing could set `release`: the loop was stuck in here
         app._forget_chatterbox(model)
 
@@ -254,13 +259,15 @@ def test_unload_does_not_block_the_event_loop(monkeypatch):
     TestClient(app.app).post("/tts", json={"text": "Wärmen.", "language": "de"})
 
     async def main():
+        loop_thread = threading.get_ident()
         task = asyncio.ensure_future(app.unload())
         assert await asyncio.to_thread(started.wait, 5), "the unload never ran"
         release.set()
-        return await task
+        return loop_thread, await task
 
-    result = asyncio.run(main())
+    loop_thread, result = asyncio.run(main())
 
+    assert hook_thread and hook_thread[0] != loop_thread, "the unload hook ran on the event loop thread"
     assert not blocked, "POST /unload blocked the event loop"
     assert result["unloaded"] is True
 

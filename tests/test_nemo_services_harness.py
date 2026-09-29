@@ -239,7 +239,11 @@ if mode == "fail":
     open(root + "/calls.jsonl", "a").write(json.dumps(record) + "\\n")
     sys.exit(1)
 if mode == "hang":
-    open(root + "/pid", "w").write(str(os.getpid()))
+    # Written to a temp file and renamed: a reader that polls for `pid` must never
+    # see it created but still empty (that raised ValueError in int("")).
+    with open(root + "/pid.tmp", "w") as fh:
+        fh.write(str(os.getpid()))
+    os.replace(root + "/pid.tmp", root + "/pid")
     open(root + "/calls.jsonl", "a").write(json.dumps(record) + "\\n")
     time.sleep(60)
 if mode == "wait":
@@ -302,8 +306,12 @@ class FakeFfmpeg:
         return (self.dir / "running").exists()
 
     def hung_pid(self) -> int | None:
-        pid = self.dir / "pid"
-        return int(pid.read_text()) if pid.exists() else None
+        """The hung fake's pid; None until it has published it (a missing or empty file is "not yet")."""
+        try:
+            text = (self.dir / "pid").read_text().strip()
+        except OSError:
+            return None
+        return int(text) if text.isdigit() else None
 
 
 def process_alive(pid: int) -> bool:

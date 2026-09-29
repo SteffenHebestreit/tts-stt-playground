@@ -31,7 +31,7 @@ pytest.importorskip("numpy", reason="qwen3-tts app.py requires numpy")
 
 from qwen3_tts_loader import (  # noqa: E402
     BASE_06, BASE_17, CUSTOM_06, SERVICE_DIR, FakeQwenModel, client,
-    install_qwen_tts, load_app,
+    install_qwen_tts, load_app, stubbed_imports,
 )
 
 
@@ -459,12 +459,14 @@ def test_generation_concurrency_is_configurable(limit, expect_parallel):
 
 def test_running_the_module_directly_keeps_connections_alive_for_the_gateway(monkeypatch):
     """The gateway pools upstream sockets; uvicorn's 5 s default closes them first."""
-    load_app()          # installs a uvicorn stand-in where the real one is absent
-    import uvicorn
+    import uvicorn     # the real one: tests/requirements.txt installs it
     calls = []
     monkeypatch.setattr(uvicorn, "run", lambda *a, **k: calls.append((a, k)))
 
-    runpy.run_path(str(SERVICE_DIR / "app.py"), run_name="__main__")
+    # The module is executed again as __main__, so it needs its torch / soundfile
+    # stand-ins again; they exist only for the duration of this call.
+    with stubbed_imports():
+        runpy.run_path(str(SERVICE_DIR / "app.py"), run_name="__main__")
 
     ((args, kwargs),) = calls
     assert kwargs["port"] == 5004 and kwargs["timeout_keep_alive"] == 120

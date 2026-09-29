@@ -32,6 +32,7 @@ from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from test_stt_support import (
@@ -379,8 +380,9 @@ def test_a_waiter_cancelled_before_its_acquire_started_takes_nothing(stt_app, no
         with pytest.raises(asyncio.CancelledError):
             await second
         gate.set()
-        with pytest.raises(Exception):
+        with pytest.raises(HTTPException) as failed:
             await first
+        assert failed.value.status_code == 503
         # One worker, first in first out: once this returns, the second acquire
         # would already have run had it not been withdrawn.
         await asyncio.wrap_future(stt_app._acquire_executor.submit(lambda: None))

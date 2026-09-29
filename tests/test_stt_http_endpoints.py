@@ -14,6 +14,7 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 from starlette.datastructures import UploadFile
+from starlette.requests import ClientDisconnect
 
 from test_stt_support import (
     FakeBatchedPipeline, FakeWhisper, Info, LiveSession, Segment, load_stt_app,
@@ -535,7 +536,7 @@ def test_a_reference_taken_for_a_stream_that_never_starts_is_given_back(stt_app,
             raise OSError("client already gone")
 
         scope = {"type": "http", "asgi": {"spec_version": "2.5"}, "method": "POST", "path": "/transcribe-stream"}
-        with pytest.raises(Exception):
+        with pytest.raises(ClientDisconnect):  # Starlette turns the failed send into this
             await response(scope, receive, send)
         assert await _eventually(lambda: stt_app._model_refs == 0), "the reference leaked"
 
@@ -561,7 +562,7 @@ def test_a_disconnect_mid_stream_releases_promptly(stt_app, scratch):
                 raise OSError("connection reset")
 
         scope = {"type": "http", "asgi": {"spec_version": "2.5"}, "method": "POST", "path": "/transcribe-stream"}
-        with pytest.raises(Exception):
+        with pytest.raises(ClientDisconnect):  # Starlette turns the failed send into this
             await response(scope, receive, send)
         assert await _eventually(lambda: stt_app._model_refs == 0), "the reference leaked after the disconnect"
 

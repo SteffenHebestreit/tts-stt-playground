@@ -44,11 +44,15 @@ def _client(stt_app):
 def client(stt_app, _client):
     """A client with a fresh scripted model; fails the test if it leaks a reference."""
     stt_app._idle_unloader.cancel()
+    # Module-scoped app: one test's stray reference must fail that test, not every
+    # test after it (which is what a leak looked like under a random order).
+    stt_app._model_refs = 0
     _client.fake_model = reset_model(stt_app)
     yield _client
-    assert wait_until(lambda: stt_app._model_refs == 0 and stt_app._live_sessions == 0), (
-        f"a session leaked: refs={stt_app._model_refs} sessions={stt_app._live_sessions}"
-    )
+    leaked = not wait_until(lambda: stt_app._model_refs == 0 and stt_app._live_sessions == 0)
+    refs, sessions = stt_app._model_refs, stt_app._live_sessions
+    stt_app._model_refs = 0
+    assert not leaked, f"a session leaked: refs={refs} sessions={sessions}"
 
 
 def _truth(n_words=40):
@@ -424,24 +428,42 @@ def test_a_cancelled_acquire_does_not_leak_its_reference(stt_app):
     """A worker thread cannot be interrupted: when the awaiting task is cancelled
     mid-load the thread still takes its reference, so it has to be handed back."""
     stt_app._idle_unloader.cancel()
-    gate = threading.Event()
+    reset_model(stt_app)
+    stt_app._model_refs = 0
+    entered = threading.Event()  # the worker is inside the acquire
+    gate = threading.Event()  # lets that acquire go on
+    landed = threading.Event()  # the worker holds its reference
+    seen = {}
     real_acquire = stt_app.acquire_model
 
     def slow_acquire():
+        entered.set()
         gate.wait(5)
-        return real_acquire()
+        model = real_acquire()
+        # Observed by the worker itself, before its future completes, so it cannot
+        # race the give-back: this is what makes "back to 0" mean "handed back"
+        # rather than "never taken".
+        seen["refs_when_landed"] = stt_app._model_refs
+        landed.set()
+        return model
 
     stt_app.acquire_model = slow_acquire
-    reset_model(stt_app)
 
     async def scenario():
         task = asyncio.create_task(stt_app._hold_model_async())
-        await asyncio.sleep(0.05)
+        # Cancel only once the worker is really inside the acquire (a job still
+        # queued is cancelled cleanly and takes no reference, which is a different
+        # path), and off the loop so the task gets to submit it.
+        assert await asyncio.to_thread(entered.wait, 5), "the acquire never started"
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
         gate.set()
-        for _ in range(200):
+        # Wait for the reference to be TAKEN before waiting for it to be given back.
+        # Polling for 0 straight after gate.set() passes at once, because the worker
+        # has not landed yet, and then lands after the test has finished.
+        assert await asyncio.to_thread(landed.wait, 5), "the acquire never completed"
+        for _ in range(500):
             if stt_app._model_refs == 0:
                 return
             await asyncio.sleep(0.01)
@@ -449,10 +471,15 @@ def test_a_cancelled_acquire_does_not_leak_its_reference(stt_app):
 
     try:
         asyncio.run(scenario())
+        assert seen["refs_when_landed"] == 1, "the acquire never took a reference: the test proves nothing"
+        assert stt_app._model_refs == 0
     finally:
         stt_app.acquire_model = real_acquire
         gate.set()
+        landed.wait(5)
         wait_until(lambda: stt_app._model_refs == 0)
+        # Whatever happened above, do not hand a stray reference to the next test.
+        stt_app._model_refs = 0
 
 
 # --- a model that unloads the moment it is idle ------------------------------
