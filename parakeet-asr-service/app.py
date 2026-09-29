@@ -11,40 +11,73 @@ import os
 import time
 import shutil
 import asyncio
-import subprocess
-import tempfile
 import logging
-from contextlib import asynccontextmanager
-from pathlib import Path
+from contextlib import AsyncExitStack, asynccontextmanager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 import torch
-import librosa
-import soundfile as sf
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
 from model_lifecycle import ModelSlot, ttl_from_env
+from nemo_common import (
+    MIB, MULTIPART_SLACK, BodyLimitMiddleware, env_flag, env_number, filter_transcribe_kwargs,
+    is_cuda_oom, load_nemo_model, matmul_precision_from_env, move_to_cpu, prepared_upload,
+    runtime_versions, transcribe_results, tune_for_inference,
+)
 from transcription import parse_hypothesis as _parse_hypothesis
+
+# Upload bounds. The gateway limits what it forwards, but a direct caller must not
+# be able to fill the disk, and NeMo encodes a file in ONE pass: past ~24 minutes
+# (full attention) parakeet-tdt-0.6b-v3 runs out of GPU memory and the request
+# used to die as a generic 500.
+MAX_UPLOAD_BYTES = int(env_number("MAX_UPLOAD_MB", 200.0, minimum=0.001) * MIB)
+MAX_AUDIO_SECONDS = env_number("NEMO_MAX_AUDIO_S", 1500.0, minimum=0.0)  # 0 = unlimited
+
+# TF32 matmuls are what NVIDIA's transcribe script runs with. bf16 halves the
+# weight memory and is faster still, but German WER has not been re-measured
+# under it, so it stays opt-in.
+MATMUL_PRECISION = matmul_precision_from_env()
+USE_BF16 = env_flag("NEMO_BF16")
 
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
-    """Pre-load the model on startup so the first request is fast."""
+    """Pre-load the model in the background so the first request is fast.
+
+    Background, not before ``yield``: a first start downloads ~2.5 GB, and doing
+    that before the server accepts connections leaves the port closed (and
+    /health unreachable) for minutes. /health answers straight away, /ready is
+    503 "loading" until the model is in.
+    """
+    global _preload_pending
+    preload = None
     if MODEL_TTL == 0:
         # "Release it the moment nothing is using it" — preloading ~3 GB only to
         # drop it on the first release is work with no beneficiary.
         logger.info("Preload skipped: ASR_MODEL_TTL=0 unloads on every idle")
     else:
-        try:
-            get_model()
-        except Exception as e:
-            logger.warning(f"Could not preload model: {e}")
-    yield
+        _preload_pending = True
+        preload = asyncio.create_task(_startup_preload())
+    try:
+        yield
+    finally:
+        if preload is not None:
+            preload.cancel()
+
+
+async def _startup_preload():
+    global _preload_pending
+    try:
+        await asyncio.to_thread(get_model)
+    except Exception as e:
+        logger.warning(f"Could not preload model: {e}")
+    finally:
+        _preload_pending = False
 
 
 app = FastAPI(
@@ -59,6 +92,19 @@ allow_credentials = os.getenv("ALLOW_CREDENTIALS", "false").strip().lower() in {
 if "*" in allowed_origins and allow_credentials:
     allow_credentials = False
 
+# Single-file routes only: a batch legitimately carries many files, each of which
+# is bounded on its own. 64 KiB covers the small text fields.
+_single_upload_limit = MAX_UPLOAD_BYTES + MULTIPART_SLACK + 64 * 1024
+# Added before CORS so CORS is the outer layer and a 413 still carries its headers.
+app.add_middleware(
+    BodyLimitMiddleware,
+    limits={
+        "/transcribe": _single_upload_limit,
+        "/v1/audio/transcriptions": _single_upload_limit,
+        "/detect_language": _single_upload_limit,
+    },
+    detail=f"Request body is larger than the upload limit of {MAX_UPLOAD_BYTES / MIB:g} MB (MAX_UPLOAD_MB).",
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
@@ -76,10 +122,13 @@ else:
     device = "cpu"
 
 MODEL_NAME = os.getenv("PARAKEET_ASR_MODEL", "nvidia/parakeet-tdt-0.6b-v3")
-TARGET_SAMPLE_RATE = 16000  # Parakeet expects 16 kHz mono input
 
 asr_model = None
 model_loaded = False
+compute_dtype = "float32"
+# A startup preload has been scheduled and has not finished: /ready reports
+# "loading" for that window instead of "ready, never loaded".
+_preload_pending = False
 
 _FFMPEG = shutil.which("ffmpeg")
 
@@ -90,6 +139,11 @@ _FFMPEG = shutil.which("ffmpeg")
 _NEMO_RUNTIME_KWARGS = {"batch_size": 1, "num_workers": 0, "verbose": False}
 _NEMO_MAX_BATCH = max(1, int(os.getenv("ASR_MAX_BATCH", "8")))
 _ASR_SEM = asyncio.Semaphore(max(1, int(os.getenv("ASR_MAX_CONCURRENCY", "1"))))
+
+_OOM_DETAIL = (
+    "GPU out of memory while transcribing. Send a shorter file, lower NEMO_MAX_AUDIO_S or "
+    "ASR_MAX_BATCH, or free the VRAM another service holds (POST /unload on it)."
+)
 
 
 async def _asr(fn, *args, **kwargs):
@@ -106,18 +160,21 @@ async def _asr(fn, *args, **kwargs):
 
 def _load_parakeet():
     """Load the Parakeet model onto the active device."""
-    global asr_model, model_loaded
+    global asr_model, model_loaded, compute_dtype
     logger.info(f"Loading Parakeet model '{MODEL_NAME}' on {device}...")
     try:
         import nemo.collections.asr as nemo_asr
 
-        model = nemo_asr.models.ASRModel.from_pretrained(model_name=MODEL_NAME)
+        model = load_nemo_model(nemo_asr, MODEL_NAME)
         model.eval()
         if device == "cuda":
             model = model.to("cuda")
+        model, compute_dtype = tune_for_inference(
+            model, torch, device=device, matmul_precision=MATMUL_PRECISION, bf16=USE_BF16
+        )
         asr_model = model
         model_loaded = True
-        logger.info(f"Parakeet model '{MODEL_NAME}' loaded on {device}")
+        logger.info(f"Parakeet model '{MODEL_NAME}' loaded on {device} ({compute_dtype})")
         return model
     except Exception as e:
         logger.error(f"Failed to load Parakeet model: {e}", exc_info=True)
@@ -138,7 +195,7 @@ def _release_parakeet(model) -> None:
     asr_model = None
     model_loaded = False
     try:
-        model.cpu()
+        move_to_cpu(model)
     except Exception as e:
         logger.warning(f"Could not move Parakeet off the GPU before unload: {e}")
 
@@ -165,69 +222,81 @@ def get_model():
         return model
 
 
-async def _save_upload(upload: UploadFile) -> tuple[str, bytes]:
-    """Save an uploaded file to a temp path and return ``(tmp_path, raw_bytes)``."""
-    suffix = Path(upload.filename).suffix if upload.filename else ".wav"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        content = await upload.read()
-        tmp.write(content)
-        return tmp.name, content
+def _prepared_upload(upload: UploadFile):
+    """The upload as a 16 kHz mono file NeMo can read; see ``prepared_upload``."""
+    return prepared_upload(
+        upload, max_bytes=MAX_UPLOAD_BYTES, max_seconds=MAX_AUDIO_SECONDS, ffmpeg=_FFMPEG,
+    )
 
 
-def _needs_conversion(src_path: str) -> bool:
-    """True unless the file is already a 16 kHz mono WAV.
+def _free_gpu_cache() -> None:
+    """After an out-of-memory the failed attempt's blocks are still cached."""
+    if device != "cuda":
+        return
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
 
-    Probing costs microseconds; the ffmpeg fork/exec it avoids costs tens of
-    milliseconds, which is a large fraction of a short-utterance request.
+
+def _server_error(exc: Exception) -> HTTPException:
+    """The HTTP failure for an unexpected exception; out-of-memory is not a 500."""
+    if is_cuda_oom(exc):
+        _free_gpu_cache()
+        return HTTPException(status_code=503, detail=_OOM_DETAIL)
+    return HTTPException(status_code=500, detail=str(exc))
+
+
+def _transcribe(model, audio_paths: list, **overrides) -> list:
+    """``model.transcribe`` with only the arguments this NeMo build takes; one result per file.
+
+    Feature-detected rather than version-checked: 2.7.x and 3.x share the same
+    signature and return a list of ``Hypothesis``, and a build that lacks
+    ``timestamps`` still answers (text only; the handler then reports a single
+    segment covering the file).
     """
-    try:
-        info = sf.info(src_path)
-    except Exception:
-        return True
-    return not (info.format == "WAV" and info.samplerate == TARGET_SAMPLE_RATE and info.channels == 1)
-
-
-def _audio_duration(path: str) -> float:
-    """Duration in seconds, read from the header rather than decoding the file."""
-    try:
-        info = sf.info(path)
-        return info.frames / float(info.samplerate) if info.samplerate else 0.0
-    except Exception:
-        # Formats libsndfile cannot open (some mp3/opus builds) still need librosa.
-        return float(librosa.get_duration(path=path))
-
-
-def _prepare_audio(src_path: str) -> str:
-    """Convert any input to 16 kHz mono WAV via ffmpeg; fall back to the original."""
-    if not _FFMPEG or not _needs_conversion(src_path):
-        return src_path
-    out_path = f"{src_path}.16k.wav"
-    cmd = [
-        _FFMPEG, "-y", "-i", src_path,
-        "-ar", str(TARGET_SAMPLE_RATE), "-ac", "1", "-f", "wav",
-        out_path,
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, timeout=120)
-        if result.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-            return out_path
-        logger.warning(f"ffmpeg conversion failed (rc={result.returncode}); using original file")
-    except Exception as e:
-        logger.warning(f"ffmpeg conversion error: {e}; using original file")
-    return src_path
+    kwargs = filter_transcribe_kwargs(model, {"timestamps": True, **_NEMO_RUNTIME_KWARGS, **overrides})
+    return transcribe_results(model.transcribe(audio_paths, **kwargs))
 
 
 def _run_transcription(model, audio_path: str) -> tuple[str, list]:
     """Run Parakeet on a single prepared audio file; return ``(text, segments)``."""
-    output = model.transcribe([audio_path], timestamps=True, **_NEMO_RUNTIME_KWARGS)
-    return _parse_hypothesis(output[0]) if output else ("", [])
+    results = _transcribe(model, [audio_path])
+    return _parse_hypothesis(results[0]) if results else ("", [])
 
 
 def _run_transcription_batch(model, audio_paths: list) -> list:
     """Run Parakeet on several prepared files in one batched call (NeMo batches internally)."""
-    kwargs = {**_NEMO_RUNTIME_KWARGS, "batch_size": min(len(audio_paths), _NEMO_MAX_BATCH)}
-    outputs = model.transcribe(audio_paths, timestamps=True, **kwargs)
-    return [_parse_hypothesis(hyp) for hyp in (outputs or [])]
+    results = _transcribe(model, audio_paths, batch_size=min(len(audio_paths), _NEMO_MAX_BATCH))
+    return [_parse_hypothesis(hyp) for hyp in results]
+
+
+def _run_transcription_files(model, audio_paths: list) -> list:
+    """Transcribe *audio_paths*; one item each: ``(text, segments)`` or the ``Exception`` for that file.
+
+    One batched pass first. If that fails as a whole, one unreadable file would
+    sink every other file in the request, so the files are retried one at a time
+    (which also lowers peak VRAM after an out-of-memory). A batch that comes back
+    with fewer results than files is the model's failure for the missing ones,
+    reported as such rather than as a silent ``null``.
+    """
+    try:
+        parsed = _run_transcription_batch(model, audio_paths)
+    except Exception as e:
+        if len(audio_paths) == 1:
+            return [e]
+        logger.warning(f"Batched transcription failed ({e}); retrying {len(audio_paths)} files one by one")
+        if is_cuda_oom(e):
+            _free_gpu_cache()
+        singly: list = []
+        for path in audio_paths:
+            try:
+                singly.append(_run_transcription(model, path))
+            except Exception as single:
+                singly.append(single)
+        return singly
+    missing = RuntimeError("The model returned no transcription for this file.")
+    return [parsed[i] if i < len(parsed) else missing for i in range(len(audio_paths))]
 
 
 @app.get("/health")
@@ -236,7 +305,8 @@ async def health():
 
     `model_resident: false` is not an error: the idle TTL released the weights
     and the next request reloads them. Returning non-200 for that would make an
-    idle container report unhealthy under Docker's `curl -f`.
+    idle container report unhealthy under Docker's `curl -f`. Whether the service
+    can take a request right now is /ready's question.
     """
     return {
         "status": "ok",
@@ -246,6 +316,39 @@ async def health():
         "active_requests": _model_slot.refs,
         "device": device,
     }
+
+
+@app.get("/ready")
+async def ready():
+    """Readiness: can this service take a request now?
+
+    200 when the model has loaded at least once (a later idle unload or one
+    failed reload does not flip it: the weights are proven loadable and the next
+    request retries) and while nothing is known to be wrong. 503 with a JSON
+    `reason` while the first load is running (`loading`, with `Retry-After`) and
+    when the last load failed and none ever succeeded (`load_failed`, `detail`
+    carries the error).
+
+    Like /health this only reads state and never triggers or waits for a load,
+    so polling it cannot keep the model resident.
+    """
+    state = _model_slot.readiness()
+    if _preload_pending and not state["ever_loaded"] and state["reason"] == "ok":
+        state = {**state, "ready": False, "reason": "loading"}
+    body = {
+        "ready": state["ready"],
+        "reason": state["reason"],
+        "model_resident": state["resident"],
+        "model_ever_loaded": state["ever_loaded"],
+        "current_model": MODEL_NAME,
+        "device": device,
+    }
+    if state["detail"]:
+        body["detail"] = state["detail"]
+    if state["ready"]:
+        return body
+    headers = {"Retry-After": "5"} if state["reason"] == "loading" else None
+    return JSONResponse(content=body, status_code=503, headers=headers)
 
 
 @app.post("/unload")
@@ -260,7 +363,9 @@ async def unload():
     since freeing memory a running forward pass still reads would crash the
     worker. Retry once `active_requests` reaches zero.
     """
-    result = _model_slot.try_unload()
+    # Off the loop: the release hook moves the weights off the GPU under the
+    # slot lock, which a synchronous call would make every other request wait for.
+    result = await _model_slot.try_unload_async()
     if result["reason"] == "busy":
         return JSONResponse(
             status_code=409,
@@ -282,6 +387,11 @@ async def status():
         "model_ttl_seconds": MODEL_TTL,
         "active_requests": _model_slot.refs,
         "current_model": MODEL_NAME,
+        "compute_dtype": compute_dtype,
+        "matmul_precision": MATMUL_PRECISION,
+        "max_upload_mb": MAX_UPLOAD_BYTES / MIB,
+        "max_audio_seconds": MAX_AUDIO_SECONDS,
+        "runtime": runtime_versions(torch),
     }
     if torch.cuda.is_available():
         status_info["gpu_name"] = torch.cuda.get_device_name(0)
@@ -298,20 +408,15 @@ async def transcribe_audio(
     """Transcribe an audio file (Parakeet auto-detects the language).
 
     Returns the project's `stt-form-v1` shape: text, segment timestamps,
-    detected language, and duration.
+    detected language, and duration. 413 for a file over MAX_UPLOAD_MB or longer
+    than NEMO_MAX_AUDIO_S.
     """
-    tmp_path = None
-    prepared_path = None
     try:
         start_time = time.time()
-        tmp_path, content = await _save_upload(audio)
-        prepared_path = await asyncio.to_thread(_prepare_audio, tmp_path)
-
-        file_size_mb = len(content) / (1024 * 1024)
-        logger.info(f"Transcribing: {audio.filename} ({file_size_mb:.1f}MB)")
-
-        duration = _audio_duration(prepared_path)
-        text, segments = await _asr(_run_transcription, prepared_path)
+        async with _prepared_upload(audio) as prepared:
+            logger.info(f"Transcribing: {audio.filename} ({prepared.size / MIB:.1f}MB)")
+            duration = prepared.duration
+            text, segments = await _asr(_run_transcription, prepared.path)
 
         if not segments and text:
             segments = [{"start": 0.0, "end": duration, "text": text}]
@@ -332,17 +437,11 @@ async def transcribe_audio(
             "model": MODEL_NAME,
         })
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Transcription error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        # prepared_path may equal tmp_path when ffmpeg is unavailable; a set dedupes
-        for path in {prepared_path, tmp_path}:
-            if path and os.path.exists(path):
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+        raise _server_error(e)
 
 
 @app.post("/v1/audio/transcriptions")
@@ -353,27 +452,20 @@ async def openai_transcriptions(
     response_format: str = Form("json"),
 ):
     """OpenAI-compatible transcription endpoint (`/v1/audio/transcriptions`)."""
-    tmp_path = None
-    prepared_path = None
     try:
-        tmp_path, _ = await _save_upload(file)
-        prepared_path = await asyncio.to_thread(_prepare_audio, tmp_path)
-        text, segments = await _asr(_run_transcription, prepared_path)
+        async with _prepared_upload(file) as prepared:
+            text, segments = await _asr(_run_transcription, prepared.path)
 
-        if response_format == "text":
-            return JSONResponse(content=text)
+        if (response_format or "").strip().lower() == "text":
+            # Raw text, not a JSON-quoted string: OpenAI clients return the body verbatim.
+            return PlainTextResponse(text)
         return JSONResponse(content={"text": text, "segments": segments})
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"OpenAI transcription error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        for path in {prepared_path, tmp_path}:
-            if path and os.path.exists(path):
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+        raise _server_error(e)
 
 
 @app.post("/detect_language")
@@ -383,14 +475,11 @@ async def detect_language(file: UploadFile = File(...)):
     Parakeet detects the language internally but does not surface a probability,
     so this returns a transcript sample for the UI without a confidence score.
     """
-    tmp_path = None
-    prepared_path = None
     try:
         start_time = time.time()
-        tmp_path, _ = await _save_upload(file)
-        prepared_path = await asyncio.to_thread(_prepare_audio, tmp_path)
-        duration = _audio_duration(prepared_path)
-        text, _ = await _asr(_run_transcription, prepared_path)
+        async with _prepared_upload(file) as prepared:
+            duration = prepared.duration
+            text, _ = await _asr(_run_transcription, prepared.path)
         return {
             "detected_language": None,
             "language_probability": None,
@@ -398,16 +487,15 @@ async def detect_language(file: UploadFile = File(...)):
             "processing_time": time.time() - start_time,
             "audio_duration": duration,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Language detection error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        for path in {prepared_path, tmp_path}:
-            if path and os.path.exists(path):
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+        raise _server_error(e)
+
+
+def _file_error(filename, detail, status_code: int) -> dict:
+    return {"filename": filename, "error": detail if isinstance(detail, str) else str(detail), "status": status_code}
 
 
 @app.post("/transcribe-batch")
@@ -419,56 +507,58 @@ async def transcribe_batch(
 
     Files are prepared (16 kHz mono) first; everything that converts cleanly is
     transcribed in one batched inference pass, which is markedly faster than one
-    request per file. Per-file failures are reported individually.
+    request per file. Per-file failures (too large, too long, unreadable, no
+    result from the model) are reported individually as `{filename, error,
+    status}`; the size and duration limits apply to each file.
     """
     results: list = [None] * len(audios)
-    entries: list = []  # (index, filename, prepared_path, duration)
-    cleanup: set = set()
+    entries: list = []  # (index, filename, PreparedAudio)
+    batch_time = None
     try:
-        for idx, audio_file in enumerate(audios):
-            try:
-                tmp_path, _ = await _save_upload(audio_file)
-                cleanup.add(tmp_path)
-                prepared_path = await asyncio.to_thread(_prepare_audio, tmp_path)
-                cleanup.add(prepared_path)
-                duration = _audio_duration(prepared_path)
-                entries.append((idx, audio_file.filename, prepared_path, duration))
-            except Exception as e:
-                results[idx] = {"filename": audio_file.filename, "error": str(e)}
-
-        if entries:
-            start_time = time.time()
-            # Must go through the same guard as the single-file path: this is the
-            # widest forward pass in the service, so leaving it outside the
-            # semaphore let it run concurrently with /transcribe on the same
-            # model — exactly the VRAM spike ASR_MAX_CONCURRENCY=1 exists to stop.
-            batch_out = await _asr(
-                _run_transcription_batch, [entry[2] for entry in entries]
-            )
-            batch_time = time.time() - start_time
-            for (idx, filename, _path, duration), parsed in zip(entries, batch_out):
-                text, segments = parsed
-                results[idx] = {
-                    "filename": filename,
-                    "text": text,
-                    "segments": segments,
-                    "duration": duration,
-                }
-
-        response = {"batch": True, "file_count": len(results), "results": results}
-        if entries:
-            # Reported once for the batch. Dividing it per file was wrong by
-            # construction — the files are transcribed in one batched forward
-            # pass, so any per-file latency measured through this API was fiction.
-            response["batch_processing_time"] = batch_time
-        return response
-    finally:
-        for path in cleanup:
-            if path and os.path.exists(path):
+        async with AsyncExitStack() as stack:
+            for idx, audio_file in enumerate(audios):
                 try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+                    prepared = await stack.enter_async_context(_prepared_upload(audio_file))
+                except HTTPException as e:
+                    results[idx] = _file_error(audio_file.filename, e.detail, e.status_code)
+                except Exception as e:
+                    results[idx] = _file_error(audio_file.filename, str(e), 500)
+                else:
+                    entries.append((idx, audio_file.filename, prepared))
+
+            if entries:
+                start_time = time.time()
+                # Must go through the same guard as the single-file path: this is the
+                # widest forward pass in the service, so leaving it outside the
+                # semaphore let it run concurrently with /transcribe on the same
+                # model — exactly the VRAM spike ASR_MAX_CONCURRENCY=1 exists to stop.
+                outputs = await _asr(_run_transcription_files, [entry[2].path for entry in entries])
+                batch_time = time.time() - start_time
+                for (idx, filename, prepared), output in zip(entries, outputs):
+                    if isinstance(output, Exception):
+                        error = _server_error(output)
+                        results[idx] = _file_error(filename, error.detail, error.status_code)
+                        continue
+                    text, segments = output
+                    results[idx] = {
+                        "filename": filename,
+                        "text": text,
+                        "segments": segments,
+                        "duration": prepared.duration,
+                    }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Batch transcription error: {e}", exc_info=True)
+        raise _server_error(e)
+
+    response = {"batch": True, "file_count": len(results), "results": results}
+    if batch_time is not None:
+        # Reported once for the batch. Dividing it per file was wrong by
+        # construction — the files are transcribed in one batched forward
+        # pass, so any per-file latency measured through this API was fiction.
+        response["batch_processing_time"] = batch_time
+    return response
 
 
 if __name__ == "__main__":

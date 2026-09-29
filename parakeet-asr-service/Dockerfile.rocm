@@ -18,9 +18,16 @@ RUN ln -sf /usr/bin/python3.11 /usr/bin/python3 && \
 
 RUN pip3 install --upgrade pip setuptools wheel
 
-# Install non-torch deps first (requirements.txt has no torch line)
+# Install non-torch deps first (requirements.txt has no torch line).
+# NEMO_TOOLKIT_SPEC replaces the nemo_toolkit line of requirements.txt. This image
+# stays on the 2.x line: the rocm6.2 index ends at torch 2.5.1, NeMo 3.0 declares
+# torch>=2.6 (its README says >=2.7), and 3.0 has not been tried on ROCm. The CUDA
+# images default to 3.0.x. (2.7 declares torch>=2.6 as well, so torch 2.5.1 is
+# already below the floor of this line; moving to a newer ROCm torch is the fix.)
 COPY requirements.txt .
-RUN pip3 install --no-cache-dir -r requirements.txt
+ARG NEMO_TOOLKIT_SPEC=">=2.7.3,<3"
+RUN grep -viE '^[[:space:]]*nemo[-_]toolkit' requirements.txt > requirements.app.txt && \
+    pip3 install --no-cache-dir "nemo_toolkit[asr]${NEMO_TOOLKIT_SPEC}" -r requirements.app.txt
 
 # Install ROCm-enabled PyTorch LAST so it is not overwritten by any dep
 RUN pip3 install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/rocm6.2
@@ -28,6 +35,7 @@ RUN pip3 install --no-cache-dir torch torchaudio --index-url https://download.py
 COPY app.py .
 COPY transcription.py .
 COPY model_lifecycle.py .
+COPY nemo_common.py .
 
 # Mirrors the CUDA Dockerfile: torch's TorchScript compiler segfaults scripting
 # NeMo's online_clustering.py at import. Latent here only because this image
@@ -39,4 +47,6 @@ EXPOSE 5005
 HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=3 \
     CMD curl -f http://localhost:5005/health || exit 1
 
-CMD ["python3", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "5005"]
+# 120 s keep-alive: the gateway pools connections, and uvicorn's 5 s default
+# closes them first, so pooled sockets came back dead.
+CMD ["python3", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "5005", "--timeout-keep-alive", "120"]

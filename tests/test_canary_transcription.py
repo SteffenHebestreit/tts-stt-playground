@@ -67,3 +67,52 @@ def test_parse_hypothesis_missing_text_attr():
     text, segments = tr.parse_hypothesis(hyp)
     assert text == ""
     assert segments == []
+
+
+# --- language tables ---------------------------------------------------------------
+#
+# Sources: NeMo's checkpoint table (docs/source/asr/asr_checkpoints.rst) lists
+# canary-180m-flash, canary-1b-flash and canary-1b as "EU4" and canary-1b-v2 as
+# "EU25". The exact 25 codes were not verifiable against the tokenizer (the
+# checkpoint is not downloadable here), see the comment in transcription.py.
+
+import pytest
+
+
+@pytest.mark.parametrize("model", [
+    "nvidia/canary-180m-flash", "nvidia/canary-1b-flash", "nvidia/canary-1b", "/models/my-finetune.nemo",
+    "", None,
+])
+def test_the_flash_models_and_unknown_names_decode_english_german_spanish_french(model):
+    assert tr.canary_supported_languages(model) == {"en", "de", "es", "fr"}
+
+
+@pytest.mark.parametrize("model", ["nvidia/canary-1b-v2", "NVIDIA/Canary-1B-V2", "/cache/canary-1b-v2.nemo"])
+def test_canary_1b_v2_decodes_the_25_european_languages(model):
+    languages = tr.canary_supported_languages(model)
+    assert len(languages) == 25
+    assert {"de", "en", "es", "fr", "it", "pl", "nl", "pt", "ru", "uk", "bg", "hr", "cs", "da", "et", "fi",
+            "el", "hu", "lv", "lt", "mt", "ro", "sk", "sl", "sv"} == set(languages)
+
+
+def test_the_override_wins_and_accepts_commas_spaces_and_locale_tags():
+    assert tr.canary_supported_languages("nvidia/canary-180m-flash", "de, PL;it-IT  nl") == {"de", "pl", "it", "nl"}
+
+
+@pytest.mark.parametrize("override", ["", "   ", ",,", "123", "de1"])
+def test_an_unusable_override_is_ignored(override):
+    assert tr.canary_supported_languages("nvidia/canary-1b-v2", override) == tr.CANARY_EU25_LANGUAGES
+
+
+@pytest.mark.parametrize("raw, code", [
+    ("de", "de"), ("DE", "de"), (" de-DE ", "de"), ("pt_BR", "pt"), ("zh-Hant-TW", "zh"), ("", ""), (None, ""),
+])
+def test_language_codes_reduce_to_their_primary_subtag(raw, code):
+    assert tr.normalize_language_code(raw) == code
+
+
+def test_known_models_are_recognised_by_name():
+    assert tr.is_known_canary_model("nvidia/canary-180m-flash")
+    assert tr.is_known_canary_model("nvidia/canary-1b-v2")
+    assert not tr.is_known_canary_model("/models/whatever.nemo")
+    assert not tr.is_known_canary_model("")

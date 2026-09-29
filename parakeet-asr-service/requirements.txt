@@ -1,9 +1,21 @@
 # Parakeet-ASR dependencies
 # torch and torchaudio are installed separately in the Dockerfile (CUDA/ROCm wheels)
-nemo_toolkit[asr]>=2.0.0
+
+# NeMo. The Dockerfile's NEMO_TOOLKIT_SPEC build argument replaces this line (its
+# default is the same spec), so moving between release lines is a build argument,
+# not an edit. 3.0 is a cleaned-up 2.7 for the ASR API these services call (same
+# transcribe() signature and Hypothesis fields); see the README before widening the range.
+nemo_toolkit[asr]>=3.0.0,<3.1
+# NeMo's CUDA-graph decoder imports these and picks its call signatures from their
+# major version, which has to match the CUDA of the installed torch (12.x). Unpinned,
+# NeMo resolves the newest release, 13.x.
+cuda-bindings>=12.8,<13
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
 python-multipart>=0.0.6
 librosa>=0.10.0
 soundfile>=0.12.0
-numpy>=1.24.0,<2.0.0
+# No upper bound: the <2.0.0 cap came from NeMo 2.3, whose own numpy requirement was
+# numpy<2.0.0. 2.4 and later, 2.7.3 and 3.0.0 accept numpy 2, and the ASR API used
+# here ran on numpy 2.4 with both of the last two.
+numpy>=1.24.0
