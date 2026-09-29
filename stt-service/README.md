@@ -94,7 +94,7 @@ between the two limits is accepted there and refused here.
 | `MAX_AUDIO_SECONDS` | `7200` | Longest single recording |
 | `FORCE_ACCELERATION` | unset | Force backend: `cuda`, `rocm`, or `cpu` |
 | `USE_CUDA` | `true` | Set to `false` to force CPU mode |
-| `ALLOWED_ORIGINS` | `*` | Comma-separated CORS origins |
+| `ALLOWED_ORIGINS` | *(empty)* | Comma-separated origins a browser page may call this service from. **Unset or empty: no CORS headers at all.** `*` opens it to every page and must be written down (it logs a warning). Independently of this, a state-changing request (anything but `GET`/`HEAD`/`OPTIONS`) or a `/ws/transcribe` handshake that carries an `Origin` header for another host than the one it was sent to is refused (`403`, WebSocket close `1008`) unless the origin is listed; requests without an `Origin` (the gateway, curl) are not affected |
 | `ALLOW_CREDENTIALS` | `false` | Enables CORS credentials when origins are explicit |
 
 Live-transcription tuning is documented with its reasoning in
@@ -152,7 +152,7 @@ consequences worth knowing:
 The model preloads in the background at start (not with `STT_MODEL_TTL=0`), so
 the port is open and `/health` answers during a first-time download. Use `/ready`
 to wait for it: `503` with `reason: "loading"` until the model is in, `200` after,
-and `503` with `reason: "load_failed"` and the error if every attempt failed.
+and `503` with `reason: "load_failed"` and a `detail` category if every attempt failed.
 `/ready` stays `200` for a model that was unloaded on purpose — it means "can
 serve", not "resident now". A request that arrives during the preload waits for
 it rather than loading a second copy.
@@ -162,6 +162,26 @@ the card), the service falls back — a smaller multilingual model, then CPU —
 `/health` reports what is actually running with `degraded: true`. The fallback is
 not permanent: every later load, including the one after an idle unload, starts
 again from the preferred device and model.
+
+### What the endpoints say when something fails
+
+The unauthenticated endpoints do not repeat exception text, which can hold file paths
+under the model cache, repo ids and URLs:
+
+- After a failed load `/health` answers `503` with `status: "error"`, `can_load: false`
+  and `startup_error` set to a short category, and `/ready` answers `503` with
+  `reason: "load_failed"` and the same category as `detail`: `model_files_unavailable`
+  (the checkpoint could not be downloaded, found or read: with `HF_HUB_OFFLINE` set it
+  must already be in the cache, or `WHISPER_MODEL_SIZE` a local path), `out_of_memory`,
+  `missing_dependency` or `load_error`. The exception is in the service log.
+  `/health` no longer reports `torch_version` (it is still in `/info`).
+- An unexpected failure of `/transcribe`, `/detect_language`, `/transcribe-stream` (as
+  its `error` event) or `/ws/transcribe` (as an `internal_error` or `decode_failed`
+  frame) says `... (internal error). Request id: <id>.`; the exception is in the log
+  under that id. An error the service wrote for the caller (`413`, `400`, `503 Model
+  not available: <category>`) is passed on as written.
+- `WHISPER_MODEL_SIZE` set to a local path is reported as its last component
+  (`model_size`, `current_model`); sizes and Hugging Face ids are shown as they are.
 
 ## Model Notes
 

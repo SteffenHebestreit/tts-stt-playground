@@ -15,16 +15,18 @@ Runs the **v3** multilingual checkpoint by default (`CHATTERBOX_T3_MODEL`); see 
 | GET | `/languages` | Supported language ids + default |
 | GET | `/status` | Device, GPU memory, model state, active checkpoint, package/ref, effective repetition penalty |
 | GET | `/health` | Liveness. Always 200 while the process is up, also while the model downloads or is unloaded (`model_resident`, `t3_model`) |
-| GET | `/ready` | Readiness. 200 once the weights have loaded at least once (a later idle unload does not change that); 503 `loading` during the first load, 503 `load_failed` (with the error) if it failed and never succeeded |
+| GET | `/ready` | Readiness. 200 once the weights have loaded at least once (a later idle unload does not change that); 503 `loading` during the first load, 503 `load_failed` if it failed and never succeeded. The body names a category only (`last_error: "load_failed"`); the exception is in the service log |
 | POST | `/unload` | Free the model and its VRAM now; 409 while a request (or a generation whose client already left) is still running |
 
 `language` accepts ISO codes (`de`, `en`, …) or English names (`German`); `auto` falls back to `CHATTERBOX_DEFAULT_LANGUAGE`.
+
+An unexpected failure is a `500` with a generic message and a request id (also in the `X-Request-ID` header); the exception text is in the service log under the same id. Text over `MAX_TEXT_CHARS` is a `413` whose message names the variable.
 
 ## Configuration
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CHATTERBOX_DEFAULT_LANGUAGE` | `de` | Language used when the request says `auto` |
+| `CHATTERBOX_DEFAULT_LANGUAGE` | `de` | Language used when the request says `auto`. A language id (`de`), a region tag (`de-DE`, `pt_BR`) or an English name (`German`), any case, surrounding blanks ignored; empty means `de`, anything the model does not know falls back to `de` with a warning in the log |
 | `CHATTERBOX_T3_MODEL` | `v3` | T3 checkpoint: `v3`, `v2`, `default` (the library default = v2) or a `.safetensors` filename. If the installed package cannot select a checkpoint, `v3` logs a WARNING and falls back to the default; `/health` `t3_model` says what really loaded |
 | `CHATTERBOX_REPETITION_PENALTY` | unset | Overrides `generate()`'s repetition penalty (must be >= 1). Unset = the library's own default: 2.0 in chatterbox-tts 0.1.7, 1.2 on GitHub master |
 | `CHATTERBOX_HF_REVISION` | `main` | Hugging Face revision (branch, tag or commit) of the `ResembleAI/chatterbox` weights. Applied by wrapping the library's download call; startup fails loudly if a future library version no longer allows that |
@@ -34,7 +36,9 @@ Runs the **v3** multilingual checkpoint by default (`CHATTERBOX_T3_MODEL`); see 
 | `MAX_UPLOAD_MB` | `20` | Largest accepted reference clip; larger uploads get HTTP 413 (declared sizes are refused before the body is read) |
 | `TTS_MODEL_TTL` / `MODEL_TTL` | `300` | Seconds idle before the model is unloaded; `0` = right after each request, `-1` = never |
 | `TTS_MAX_CONCURRENCY` | `1` | Generation slots. Calls into the model are serialised regardless: the library keeps the voice and decoder state on the shared model object |
-| `ALLOWED_ORIGINS` | `*` | Comma-separated CORS origins |
+| `TTS_QUEUE_TIMEOUT_S` | `60` | Longest a request waits for a generation slot; then `503` with `Retry-After`. Nothing is left behind (slot, model reference, staged reference clip) |
+| `TTS_MAX_QUEUE` | `4` × `TTS_MAX_CONCURRENCY` | Requests that may wait for a slot; the next is answered `503` at once, before its reference clip is decoded or a model reference is taken. The later chunks of a `/tts-stream` that has started may still queue (a stream is not cut off half way; the timeout applies) |
+| `ALLOWED_ORIGINS` | *(empty)* | Comma-separated origins a browser page may call this service from. **Unset or empty: no CORS headers at all.** `*` opens it to every page and must be written down (it logs a warning). Independently of this, a state-changing request (anything but `GET`/`HEAD`/`OPTIONS`) that carries an `Origin` header for another host than the one it was sent to is refused with `403` unless the origin is listed; requests without an `Origin` (the gateway, curl) are not affected |
 | `ALLOW_CREDENTIALS` | `false` | Enables CORS credentials when origins are explicit |
 
 Build arguments (see below): `TORCH_VERSION`, `TORCHAUDIO_VERSION`, `CHATTERBOX_REPO`, `CHATTERBOX_REF`.

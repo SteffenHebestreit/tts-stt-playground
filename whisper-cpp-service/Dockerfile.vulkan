@@ -13,6 +13,9 @@ FROM ubuntu:24.04 AS builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 
+# A failing wget must fail the build instead of feeding gpg an empty stream.
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
 # Ubuntu 24.04 ships Vulkan headers 1.3.275 (22.04 only has 1.3.204 — too old).
 # glslc is not in Ubuntu apt repos; install from LunarG's official Vulkan SDK PPA.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -47,7 +50,7 @@ RUN git clone --depth 1 --branch "${WHISPER_CPP_REF}" \
         -DBUILD_SHARED_LIBS=OFF \
         -DGGML_NATIVE=OFF \
         ${ARCH_FLAGS} && \
-    cmake --build build -j$(nproc) --target whisper-server
+    cmake --build build -j"$(nproc)" --target whisper-server
 
 # ── Runtime ──────────────────────────────────────────────────────────────────
 FROM ubuntu:24.04

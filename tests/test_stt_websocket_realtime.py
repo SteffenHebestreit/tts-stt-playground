@@ -344,13 +344,14 @@ def test_health_reports_503_only_when_loading_actually_failed(client, stt_app):
     original_loaded, original_error = stt_app.model_loaded, stt_app.startup_error
     try:
         stt_app.model_loaded = False
-        stt_app.startup_error = "simulated load failure"
+        stt_app.startup_error = "model_files_unavailable"
         response = client.get("/health")
         assert response.status_code == 503
         body = response.json()
         assert body["model_loaded"] is False
         assert body["can_load"] is False
-        assert body["startup_error"] == "simulated load failure"
+        assert body["status"] == "error"
+        assert body["startup_error"] == "model_files_unavailable"
     finally:
         stt_app.model_loaded, stt_app.startup_error = original_loaded, original_error
 

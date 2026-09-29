@@ -268,7 +268,9 @@ def test_ready_reports_a_failed_load_with_its_reason(monkeypatch):
 
     r = client(m).get("/ready")
     assert r.status_code == 503
-    assert r.json()["reason"] == "load_failed" and "huggingface.co" in r.json()["detail"]
+    assert r.json()["reason"] == "load_failed"
+    # unauthenticated: a category, not the exception text ("no route to huggingface.co")
+    assert "huggingface" not in r.text and "OSError" not in r.text
 
     # the next attempt succeeding clears it
     install_qwen_tts(monkeypatch, from_pretrained=lambda name, **kw: FakeQwenModel())
@@ -354,7 +356,8 @@ def test_a_failed_preload_leaves_the_service_up_and_reports_it(monkeypatch):
             time.sleep(0.02)
         assert c.get("/health").status_code == 200
         ready = c.get("/ready")
-        assert ready.status_code == 503 and "disk full" in ready.json()["detail"]
+        assert ready.status_code == 503 and ready.json()["reason"] == "load_failed"
+        assert "disk full" not in ready.text
 
 
 def test_ttl_zero_skips_the_preload_it_would_immediately_undo(monkeypatch):

@@ -323,7 +323,8 @@ def test_icl_needs_a_transcript_and_says_so_when_the_asr_service_is_down(lib, mo
     r = client(m).post("/voices/save", data={"name": "Anna", "mode": "icl"}, files=_audio())
 
     assert r.status_code == 502
-    assert "ref_text" in r.json()["detail"] and "ConnectError" in r.json()["detail"]
+    # names the way out, not the connection error (which carries the service's address)
+    assert "ref_text" in r.json()["detail"] and "ConnectError" not in r.json()["detail"]
     assert model.calls == [] and not voices.exists()
 
 

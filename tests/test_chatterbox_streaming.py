@@ -333,5 +333,6 @@ def test_a_model_that_cannot_load_is_an_http_error_for_the_stream_too(monkeypatc
 
     error = asyncio.run(main())
 
-    assert error.status_code == 500 and "no space left" in error.detail
+    assert error.status_code == 500 and "no space left" not in error.detail
+    assert error.headers["X-Request-ID"] in error.detail
     assert not app._GEN_SEM.locked()

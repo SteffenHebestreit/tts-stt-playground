@@ -188,7 +188,7 @@
     "/upload_model": {
       "post": {
         "summary": "Upload Custom Model",
-        "description": "Upload a custom-trained ONNX model and optional JSON config.",
+        "description": "Upload a custom-trained ONNX model and optional JSON config.\n\nThe model is validated (loads under ONNX Runtime in a separate process, takes\nthe `text`/`text_lengths` inputs, answers a test request in time) and the\nconfig checked before anything is published. Refused: the id of a built-in\nvoice (409), more than PIPER_MAX_CUSTOM_VOICES voices (409), more than\nPIPER_MAX_CUSTOM_MB of custom models in total (413), a second upload while one\nis running (503).",
         "operationId": "upload_custom_model_upload_model_post",
         "requestBody": {
           "content": {

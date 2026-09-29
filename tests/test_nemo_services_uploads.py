@@ -96,8 +96,13 @@ def test_a_declared_content_length_over_the_limit_is_refused_before_the_body_is_
 
 
 def test_the_early_413_still_carries_the_cors_headers(service, tmp_path, monkeypatch):
-    """The body-limit layer sits inside CORS, or a browser reads the refusal as a network error."""
-    module, model, _, _ = build(service, tmp_path, monkeypatch, MAX_UPLOAD_MB="0.05")
+    """The body-limit layer sits inside CORS, or a browser reads the refusal as a network error.
+
+    CORS is only there for an origin the operator listed: with ALLOWED_ORIGINS unset
+    no CORS header is sent at all (tests/test_origin_guard.py covers that).
+    """
+    module, model, _, _ = build(
+        service, tmp_path, monkeypatch, MAX_UPLOAD_MB="0.05", ALLOWED_ORIGINS="http://ui.example")
 
     async def scenario():
         async with make_client(module) as client:
@@ -108,7 +113,7 @@ def test_the_early_413_still_carries_the_cors_headers(service, tmp_path, monkeyp
     response = run(scenario())
 
     assert response.status_code == 413
-    assert response.headers["access-control-allow-origin"] == "*"
+    assert response.headers["access-control-allow-origin"] == "http://ui.example"
 
 
 def test_an_upload_under_the_limit_is_transcribed(service, tmp_path, monkeypatch):

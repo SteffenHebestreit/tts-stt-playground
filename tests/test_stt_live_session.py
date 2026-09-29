@@ -236,7 +236,10 @@ def test_repeated_interim_failures_are_reported_and_the_session_survives(client,
             session.send_audio(0.3)
         error = session.wait_type("error")
         assert error["code"] == "decode_failed"
-        assert "illegal memory access" in error["message"]
+        # The client is told it failed and which session to ask about; the CUDA
+        # error itself is in the log.
+        assert "illegal memory access" not in error["message"]
+        assert "Request id: " in error["message"]
 
         # Still open, and it recovers as soon as decoding does.
         client.fake_model.fail_with = None
@@ -275,7 +278,8 @@ def test_a_model_that_cannot_load_is_reported_at_the_handshake(client, stt_app, 
         closed = session.wait_closed()
 
     assert error["code"] == "model_unavailable"
-    assert "weights are corrupt" in error["message"]
+    assert error["message"] == "Model not available: load_error"
+    assert "weights are corrupt" not in error["message"]
     assert getattr(closed, "code", None) == 1011
     stt_app.startup_error = None
 

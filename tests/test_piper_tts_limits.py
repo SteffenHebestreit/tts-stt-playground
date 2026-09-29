@@ -60,14 +60,21 @@ def test_a_piper_that_hangs_is_killed_at_the_timeout(start):
     assert svc.speak().status_code == 200, "the timed-out request kept its slot"
 
 
-def test_a_failing_piper_reports_its_message_and_leaves_no_file(start):
+def test_a_failing_piper_is_reported_without_its_stderr_and_leaves_no_file(start, caplog):
     svc = start()
     svc.fake.mode = "fail"
 
-    r = svc.speak()
+    with caplog.at_level("ERROR"):
+        r = svc.speak()
 
     assert r.status_code == 500
-    assert "boom: model exploded" in r.json()["detail"]
+    detail = r.json()["detail"]
+    request_id = r.headers["X-Request-ID"]
+    assert "boom" not in detail and "exploded" not in detail, "piper's stderr reached the client"
+    assert request_id in detail
+    # ...and the operator can still find it, under the same id
+    assert any(request_id in record.getMessage() and "boom: model exploded" in record.getMessage()
+               for record in caplog.records)
     assert list(svc.out.iterdir()) == []
 
 
@@ -194,7 +201,7 @@ def test_audio_analysis_does_not_block_the_event_loop(start, monkeypatch):
     svc = start()
     threads = {}
 
-    def slow_load(path, sr=None):
+    def slow_load(path, sr=None, duration=None):
         threads["load"] = threading.get_ident()
         time.sleep(0.8)
         return np.zeros(100, dtype="float32"), 22050

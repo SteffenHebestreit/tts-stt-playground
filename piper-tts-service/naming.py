@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 # with fullmatch(): the old `^...$` + match() accepted a trailing newline
 # ("$" matches before it), which then ended up in a path and a response header.
 SAFE_NAME_RE = re.compile(r"[a-zA-Z0-9_\-]+")
+MAX_VOICE_NAME_LEN = 100
 
 # Piper's quality ladder, as it appears at the end of a voice id.
 VOICE_QUALITIES = ("x_low", "low", "medium", "high")
@@ -33,6 +34,13 @@ def sanitize_voice_name(name: str) -> str:
         raise HTTPException(
             status_code=400,
             detail=f"Invalid voice name '{name}': only alphanumeric, dash, and underscore allowed.",
+        )
+    if len(name) > MAX_VOICE_NAME_LEN:
+        # It becomes a directory and two file names; past the filesystem's limit that
+        # was an OSError, i.e. a 500 whose message carried the resolved path.
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid voice name: at most {MAX_VOICE_NAME_LEN} characters allowed.",
         )
     return name
 

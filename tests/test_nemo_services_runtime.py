@@ -113,7 +113,7 @@ def test_ready_is_503_loading_while_the_first_load_runs_and_health_stays_200(ser
 
 def test_ready_is_503_load_failed_after_a_failed_first_load_and_recovers(service, monkeypatch):
     module, loader = with_loader(service, monkeypatch)
-    loader.error = RuntimeError("huggingface.co unreachable")
+    loader.error = ConnectionError("huggingface.co unreachable: /root/.cache/huggingface/hub/models--nvidia")
 
     async def scenario():
         async with make_client(module) as client:
@@ -128,9 +128,12 @@ def test_ready_is_503_load_failed_after_a_failed_first_load_and_recovers(service
     first, failed, health, second, recovered = run(scenario())
 
     assert first.status_code == 500
+    assert "huggingface.co" not in first.text and "/root/" not in first.text
     assert failed.status_code == 503
     assert failed.json()["reason"] == "load_failed"
-    assert "huggingface.co unreachable" in failed.json()["detail"]
+    # A short category, not the exception: that carries the cache path and the host.
+    assert failed.json()["detail"] == "model_files_unavailable"
+    assert "huggingface" not in failed.text and "/root/" not in failed.text
     assert health.status_code == 200
     assert second.status_code == 200 and recovered.status_code == 200
 

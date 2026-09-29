@@ -471,6 +471,21 @@ class _AcquireProbe:
         slot._acquire = wrapped  # run_in_executor looks it up per call
 
 
+class _SubmitProbe:
+    """Counts the jobs a slot hands to its acquire worker, so a test can wait for
+    "this waiter has queued its acquire" instead of sleeping."""
+
+    def __init__(self, slot):
+        self.count = 0
+        real = slot._acquire_pool.submit
+
+        def counting(fn, *args, **kwargs):
+            self.count += 1
+            return real(fn, *args, **kwargs)
+
+        slot._acquire_pool.submit = counting
+
+
 def _cancel_while_loading(slot, loader, acquire):
     """Start `acquire(slot)` as a task, cancel it mid-load, let the load finish.
 
@@ -546,14 +561,14 @@ def test_a_cancelled_acquire_does_not_disturb_other_holders():
     loader = _BlockingLoader()
     slot, _ = _slot(-1, loader)
     probe = _AcquireProbe(slot)
+    submitted = _SubmitProbe(slot)
 
     async def main():
-        keeper = asyncio.create_task(slot.acquire_lease())
-        assert await asyncio.to_thread(loader.started.wait, WAIT)
         doomed = asyncio.create_task(_use_async(slot))
-        # Both worker threads are now inside _acquire (one loading, one queued
-        # on the lock), so the cancel cannot land before the doomed one dispatched.
-        assert await _await_until(lambda: len(probe.entered) == 2)
+        assert await asyncio.to_thread(loader.started.wait, WAIT)
+        keeper = asyncio.create_task(slot.acquire_lease())
+        # The doomed acquire is inside the load; the keeper's is queued behind it.
+        assert await _await_until(lambda: submitted.count == 2)
         doomed.cancel()
         with pytest.raises(asyncio.CancelledError):
             await doomed
@@ -1019,3 +1034,334 @@ def test_leases_from_the_async_and_sync_paths_share_one_load():
     assert slot.refs == 2
     lease.release()
     other.release()
+
+
+# --- A2: waiters behind a load must not empty the default executor ------------
+#
+# Every queued acquire used to park one default-executor thread on the slot lock.
+# With the 4-CPU default pool of 8 and 60 waiters during a 4 s load, an unrelated
+# asyncio.to_thread waited 3.7 s: uploads, /unload and every other user of the
+# default executor stalled for the length of the load.
+
+
+def _threads_named(prefix):
+    return [t for t in threading.enumerate() if t.name.startswith(prefix)]
+
+
+def test_sixty_waiters_during_a_load_leave_the_default_executor_free():
+    loader = _BlockingLoader()
+    slot = ml.ModelSlot(loader, ttl_seconds=-1, name="sixty waiters")
+    submitted = _SubmitProbe(slot)
+
+    async def main():
+        waiters = [asyncio.create_task(slot.acquire_lease()) for _ in range(60)]
+        try:
+            assert await asyncio.to_thread(loader.started.wait, WAIT), "load never started"
+            assert await _await_until(lambda: submitted.count == 60), "waiters never queued"
+
+            # The load is still stuck. Unrelated work on the default executor, which
+            # the parked waiters used to occupy completely, has to run now.
+            assert await asyncio.wait_for(asyncio.to_thread(lambda: "free"), 3) == "free", (
+                "an unrelated asyncio.to_thread waited behind the model load"
+            )
+            # So must /unload: it answers "busy" at once instead of queueing.
+            assert await asyncio.wait_for(slot.try_unload_async(), 3) == {
+                "unloaded": False, "reason": "busy", "refs": 0}
+            # One thread waits for the slot, not sixty.
+            assert len(_threads_named("sixty-waiters-acquire")) == 1
+        finally:
+            loader.proceed.set()  # a failure above must not leave the waiters stuck on the load
+
+        leases = await asyncio.gather(*waiters)
+        assert loader.calls == 1, "the waiters must share one load"
+        assert slot.refs == 60
+        await asyncio.gather(*(lease.release_async() for lease in leases))
+
+    asyncio.run(main())
+    assert slot.refs == 0
+
+
+def test_a_waiter_cancelled_before_its_acquire_started_takes_nothing():
+    """A queued acquire is withdrawn, not run for nobody.
+
+    Run for nobody it would retry a failing load (minutes of NeMo) or take a
+    reference only to hand it straight back.
+    """
+    loader = _BlockingLoader(error=RuntimeError("no VRAM"))
+    slot, timers = _slot(60.0, loader)
+    probe = _AcquireProbe(slot)
+    submitted = _SubmitProbe(slot)
+
+    async def main():
+        first = asyncio.create_task(slot.acquire_lease())
+        assert await asyncio.to_thread(loader.started.wait, WAIT)
+        second = asyncio.create_task(slot.acquire_lease())
+        assert await _await_until(lambda: submitted.count == 2)
+        second.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await second
+        loader.proceed.set()
+        with pytest.raises(RuntimeError, match="no VRAM"):
+            await first
+        # One worker, first in first out: once this returns, the second acquire
+        # would already have run had it not been withdrawn.
+        await asyncio.wrap_future(slot._acquire_pool.submit(lambda: None))
+
+    asyncio.run(main())
+    assert loader.calls == 1, "the withdrawn acquire retried the load"
+    assert len(probe.entered) == 1
+    assert slot.refs == 0 and timers.created == []
+
+
+def test_a_burst_of_cancelled_waiters_leaves_the_slot_usable():
+    loader = _BlockingLoader()
+    slot, timers = _slot(60.0, loader)
+    submitted = _SubmitProbe(slot)
+
+    async def main():
+        waiters = [asyncio.create_task(_use_async(slot)) for _ in range(30)]
+        assert await asyncio.to_thread(loader.started.wait, WAIT)
+        assert await _await_until(lambda: submitted.count == 30)
+        for waiter in waiters:
+            waiter.cancel()
+        await asyncio.gather(*waiters, return_exceptions=True)
+        loader.proceed.set()
+        # The slot still serves the next caller, which shares the one load.
+        async with asyncio.timeout(WAIT):
+            async with slot.acquire_async() as model:
+                assert model is not None
+        assert await _await_until(lambda: slot.refs == 0)
+
+    asyncio.run(main())
+    assert loader.calls == 1
+    assert _wait_until(lambda: len(timers.armed) == 1), "the reference of the started acquire leaked"
+
+
+# --- A3: what a failed load may say to an anonymous caller ---------------------
+
+
+@pytest.mark.parametrize("error, category", [
+    (MemoryError(), "out_of_memory"),
+    (RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB"), "out_of_memory"),
+    (type("OutOfMemoryError", (RuntimeError,), {})("nope"), "out_of_memory"),
+    (ModuleNotFoundError("No module named 'nemo'"), "missing_dependency"),
+    (FileNotFoundError("/root/.cache/huggingface/hub/models--x/snapshots/abc/model.bin"), "model_files_unavailable"),
+    (ConnectionError("HTTPSConnectionPool(host='huggingface.co', port=443)"), "model_files_unavailable"),
+    (PermissionError(13, "Permission denied", "/models/x.nemo"), "model_files_unavailable"),
+    (type("HFValidationError", (ValueError,), {})("Repo id must be in the form 'repo_name'"), "model_files_unavailable"),
+    (RuntimeError("weights are corrupt"), "load_error"),
+    (KeyError("layers.3"), "load_error"),
+])
+def test_error_category_names_the_failure_without_repeating_it(error, category):
+    assert ml.error_category(error) == category
+
+
+def test_error_category_survives_an_exception_whose_str_raises():
+    class Hostile(Exception):
+        def __str__(self):
+            raise RuntimeError("no str for you")
+
+    assert ml.error_category(Hostile()) == "load_error"
+
+
+def test_a_failed_load_publishes_a_path_free_category_next_to_the_raw_error():
+    leak = "/root/.cache/huggingface/hub/models--nvidia--parakeet/snapshots/abc123/model.nemo"
+
+    def loader():
+        raise FileNotFoundError(f"No such file: {leak}")
+
+    slot, _ = _slot(-1, loader)
+    with pytest.raises(FileNotFoundError):
+        slot.lease()
+
+    assert slot.last_error_category == "model_files_unavailable"
+    snapshot = slot.readiness()
+    assert snapshot["reason"] == "load_failed"
+    assert snapshot["error_category"] == "model_files_unavailable"
+    assert leak not in snapshot["error_category"]
+    # The raw text is still there for the log and for callers that authenticate.
+    assert leak in snapshot["detail"] and leak in snapshot["last_error"]
+
+
+def test_a_successful_load_clears_the_category_and_a_fresh_slot_has_none():
+    attempts = []
+
+    def flaky():
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RuntimeError("boom")
+        return _FakeModel()
+
+    slot, _ = _slot(-1, flaky)
+    assert slot.last_error_category is None and slot.readiness()["error_category"] is None
+    with pytest.raises(RuntimeError):
+        slot.lease()
+    assert slot.last_error_category == "load_error"
+    with slot.acquire():
+        pass
+    assert slot.last_error_category is None and slot.readiness()["error_category"] is None
+
+
+# --- A1: RequestGate ------------------------------------------------------------
+
+
+class _Refused(Exception):
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _gate(max_active=1, max_queue=1, timeout=0.05):
+    return ml.RequestGate(max_active, max_queue, timeout, busy=_Refused)
+
+
+def test_admit_refuses_beyond_active_plus_queue_at_once_and_frees_the_place_on_exit():
+    gate = _gate(max_active=2, max_queue=3)
+    with gate.admit(), gate.admit(), gate.admit(), gate.admit(), gate.admit():
+        assert gate.in_flight == 5
+        with pytest.raises(_Refused) as refused:
+            with gate.admit():
+                raise AssertionError("a sixth request must not get in")
+        assert refused.value.reason == "queue_full"
+        assert gate.in_flight == 5, "a refused request must not count"
+    assert gate.in_flight == 0
+    with gate.admit():
+        pass
+
+
+def test_admit_gives_the_place_back_when_the_body_raises():
+    gate = _gate(max_active=1, max_queue=0)
+    with pytest.raises(ValueError):
+        with gate.admit():
+            raise ValueError("boom")
+    assert gate.in_flight == 0
+    with gate.admit():
+        pass
+
+
+def test_max_queue_zero_means_nobody_waits():
+    gate = _gate(max_active=1, max_queue=0)
+    with gate.admit():
+        with pytest.raises(_Refused):
+            with gate.admit():
+                pass
+
+
+def test_the_default_refusal_is_a_gate_busy_carrying_the_reason():
+    gate = ml.RequestGate(1, 0, 0.05)
+    with gate.admit():
+        with pytest.raises(ml.GateBusy) as refused:
+            with gate.admit():
+                pass
+    assert refused.value.reason == "queue_full" and ml.GateBusy.retry_after_s > 0
+
+
+def test_a_waiter_that_outlasts_the_queue_timeout_is_refused_and_leaks_no_turn():
+    gate = _gate(max_active=1, max_queue=2, timeout=0.05)
+
+    async def main():
+        holding = asyncio.Event()
+        finish = asyncio.Event()
+
+        async def holder():
+            async with gate.turn():
+                holding.set()
+                await finish.wait()
+
+        first = asyncio.create_task(holder())
+        await holding.wait()
+        with pytest.raises(_Refused) as refused:
+            async with gate.turn():
+                raise AssertionError("the turn was taken while another request held it")
+        assert refused.value.reason == "queue_timeout"
+        assert gate.running == 1
+
+        finish.set()
+        await first
+        assert gate.running == 0
+        # The timed-out waiter must not have swallowed the turn on its way out.
+        async with asyncio.timeout(WAIT):
+            async with gate.turn():
+                assert gate.running == 1
+
+    asyncio.run(main())
+
+
+def test_turns_run_at_most_max_active_at_a_time_and_every_waiter_gets_one():
+    gate = _gate(max_active=2, max_queue=8, timeout=WAIT)
+    seen = {"now": 0, "peak": 0, "done": 0}
+
+    async def request():
+        with gate.admit():
+            async with gate.turn():
+                seen["now"] += 1
+                seen["peak"] = max(seen["peak"], seen["now"])
+                await asyncio.sleep(0.01)
+                seen["now"] -= 1
+                seen["done"] += 1
+
+    async def main():
+        await asyncio.gather(*(request() for _ in range(10)))
+
+    asyncio.run(main())
+    assert seen["peak"] == 2 and seen["done"] == 10
+    assert gate.in_flight == 0 and gate.running == 0
+
+
+def test_a_cancelled_waiter_is_dropped_from_the_queue_without_costing_a_turn():
+    gate = _gate(max_active=1, max_queue=5, timeout=WAIT)
+
+    async def main():
+        holding = asyncio.Event()
+        finish = asyncio.Event()
+
+        async def holder():
+            async with gate.turn():
+                holding.set()
+                await finish.wait()
+
+        async def waiter():
+            with gate.admit():
+                async with gate.turn():
+                    raise AssertionError("cancelled waiters must never run")
+
+        first = asyncio.create_task(holder())
+        await holding.wait()
+        waiters = [asyncio.create_task(waiter()) for _ in range(4)]
+        await _await_until(lambda: gate.in_flight == 4)
+        for task in waiters:
+            task.cancel()
+        await asyncio.gather(*waiters, return_exceptions=True)
+        assert gate.in_flight == 0 and gate.running == 1
+
+        finish.set()
+        await first
+        async with asyncio.timeout(WAIT):
+            async with gate.turn():
+                pass
+
+    asyncio.run(main())
+
+
+def test_a_timeout_of_zero_takes_a_free_turn_and_refuses_a_busy_gate_without_waiting():
+    gate = _gate(max_active=1, max_queue=1, timeout=0)
+
+    async def main():
+        async with gate.turn():
+            with pytest.raises(_Refused) as refused:
+                async with gate.turn():
+                    pass
+            assert refused.value.reason == "queue_timeout"
+        async with gate.turn():  # free again
+            pass
+
+    asyncio.run(main())
+
+
+def test_snapshot_reports_the_bounds_and_where_the_queue_stands():
+    gate = _gate(max_active=1, max_queue=4, timeout=60)
+    with gate.admit():
+        assert gate.snapshot() == {
+            "max_concurrency": 1, "max_queue": 4, "queue_timeout_seconds": 60,
+            "in_flight": 1, "running": 0, "waiting": 1,
+        }

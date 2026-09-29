@@ -167,17 +167,23 @@ def test_a_pinned_revision_reaches_the_download_and_is_undone_afterwards(monkeyp
     assert module.snapshot_download is original, "the library was left patched"
 
 
-def test_a_pinned_revision_the_library_cannot_honour_fails_loudly(monkeypatch):
+def test_a_pinned_revision_the_library_cannot_honour_fails_loudly(monkeypatch, caplog):
+    """Loudly for the operator (the log, under the request id); the client only gets the id."""
     install_chatterbox(monkeypatch)
     module = sys.modules["chatterbox.mtl_tts"]
     del module.snapshot_download
     app = load_app(CHATTERBOX_HF_REVISION="0123abcd")
     client = TestClient(app.app, raise_server_exceptions=False)
 
-    response = _warm(client)
+    with caplog.at_level(logging.ERROR):
+        response = _warm(client)
 
     assert response.status_code == 500
-    assert "CHATTERBOX_HF_REVISION" in response.json()["detail"]
+    request_id = response.headers["X-Request-ID"]
+    assert request_id in response.json()["detail"]
+    assert "CHATTERBOX_HF_REVISION" not in response.text and "snapshot_download" not in response.text
+    assert any(request_id in r.getMessage() and "CHATTERBOX_HF_REVISION" in r.getMessage()
+               for r in caplog.records)
 
 
 # --- /ready ------------------------------------------------------------------
@@ -241,7 +247,9 @@ def test_ready_reports_a_failed_first_load_and_recovers(monkeypatch):
 
     assert failed.status_code == 503
     assert failed.json()["reason"] == "load_failed"
-    assert "disk full" in failed.json()["detail"]
+    # unauthenticated: a category, not the exception ("disk full while downloading ...")
+    assert "disk full" not in failed.text and "OSError" not in failed.text
+    assert failed.json()["last_error"] == "load_failed"
     assert recovered.status_code == 200
 
 

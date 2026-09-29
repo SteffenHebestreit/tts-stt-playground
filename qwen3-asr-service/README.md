@@ -55,10 +55,24 @@ Timestamps are per piece. The forced aligner (word timestamps) is not loaded.
 | `MAX_AUDIO_SECONDS` | `7200` | Longest accepted recording; 413 above it, `0` disables |
 | `ASR_MODEL_TTL` | `300` | Seconds idle before the model is unloaded; `0` unloads after every request (and skips the start-up preload), `-1` never |
 | `ASR_MAX_CONCURRENCY` | `1` | Transcriptions running on the GPU at once |
-| `ALLOWED_ORIGINS` | `*` | Comma-separated CORS origins |
+| `ASR_MAX_QUEUE` | `4` x `ASR_MAX_CONCURRENCY` | How many requests may wait beyond the ones running. The next one is refused at once with `503` + `Retry-After: 5`, before its upload is copied or decoded. `0` = nobody waits. See [Queue](#queue) |
+| `ASR_QUEUE_TIMEOUT_S` | `60` | Longest a request waits for its turn before it is refused with `503` + `Retry-After: 5` (must be at least `0.1`) |
+| `ALLOWED_ORIGINS` | *(empty)* | Comma-separated origins a browser page may call this service from. **Unset or empty: no CORS headers at all.** `*` opens it to every page and must be written down (it logs a warning). Independently of this, a state-changing request (anything but `GET`/`HEAD`/`OPTIONS`) that carries an `Origin` header for another host than the one it was sent to is refused with `403` unless the origin is listed; requests without an `Origin` (the gateway, curl) are not affected |
 | `ALLOW_CREDENTIALS` | `false` | Enables CORS credentials when origins are explicit |
 
 The model preloads in the background at start-up, so the port opens at once and `/ready` answers 503 `loading` until the weights are in.
+
+`/ready` answers `503` with `reason` `load_failed` after a failed load; its `detail` is a short category (`model_files_unavailable`, `out_of_memory`, `missing_dependency`, `load_error`), never the exception text, which can hold paths: that is in the log.
+
+## Queue
+
+At most `ASR_MAX_CONCURRENCY` transcriptions run at once. Every request that got past that point used to have copied its upload to disk and decoded the audio into memory (a 2 h recording is about 460 MB of float32) and then waited for the ones ahead of it, with no limit on how many or how long, so a burst of uploads piled up temp files and RAM and held every client until the slowest one was done. Now a request is admitted only if fewer than `ASR_MAX_CONCURRENCY + ASR_MAX_QUEUE` are in progress (otherwise `503` + `Retry-After: 5` at once, having cost nothing), and one that waits more than `ASR_QUEUE_TIMEOUT_S` for its turn is refused the same way. Whichever way a request ends, refused, timed out, cancelled or done, its model reference is handed back. Requests that wait keep the model resident, so with `ASR_MODEL_TTL=0` a queue does not reload it once per request. `GET /status` reports `queue` (the limits, `in_flight`, `running`, `waiting`).
+
+`/transcribe-batch` holds one place for the whole request however many files it carries and transcribes them one after another. If a file cannot get a turn in time, the answer is `503` when nothing was done yet; otherwise the files already done are returned and the rest are reported as `503` (each would only wait as long again).
+
+## Errors
+
+An unexpected failure is a `500` whose `detail` says `Transcription failed (internal error). Request id: <id>.`; the exception (which can hold file paths and library internals) is in the service log under that id. A GPU out of memory is a `503` with advice, and an error the service wrote for the caller (`413`, `422`) is passed on as written. In `/transcribe-batch` a failed file carries the same message in its `error`.
 
 ## Requirements
 

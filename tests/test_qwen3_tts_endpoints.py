@@ -200,14 +200,18 @@ def test_tts_names_the_valid_speakers_when_the_one_asked_for_does_not_exist(cust
     assert model.calls == []
 
 
-def test_a_real_failure_in_tts_is_a_500_with_the_reason(custom_app):
+def test_a_real_failure_in_tts_is_a_500_with_an_id_but_not_the_reason(custom_app, caplog):
     m, model = custom_app
     model.fail_with = RuntimeError("CUDA out of memory")
 
-    r = client(m).post("/tts", json={"text": "Hallo.", "speaker": "Vivian"})
+    with caplog.at_level("ERROR"):
+        r = client(m).post("/tts", json={"text": "Hallo.", "speaker": "Vivian"})
 
     assert r.status_code == 500, "an internal failure must not look like a bad request"
-    assert "CUDA out of memory" in r.json()["detail"]
+    request_id = r.headers["X-Request-ID"]
+    assert request_id in r.json()["detail"] and "CUDA" not in r.text
+    assert any(request_id in rec.getMessage() and "CUDA out of memory" in rec.getMessage()
+               for rec in caplog.records), "the reason is not in the log under the id"
 
 
 @pytest.mark.parametrize("failure", [ValueError("shape mismatch"), OSError("disk"), KeyError("k")])
@@ -219,11 +223,17 @@ def test_no_unexpected_exception_is_reported_as_a_client_error(custom_app, failu
 
 
 @pytest.mark.parametrize("failure", [RuntimeError("boom"), ValueError("bad shape")])
-def test_a_generation_failure_in_clone_is_a_500(base_app, failure):
+def test_a_generation_failure_in_clone_is_a_500(base_app, failure, caplog):
     m, model = base_app
     model.fail_with = failure
-    r = client(m).post("/clone", data={"text": "Hallo.", "lang": "German"}, files=_audio())
-    assert r.status_code == 500 and str(failure.args[0]) in r.json()["detail"]
+    with caplog.at_level("ERROR"):
+        r = client(m).post("/clone", data={"text": "Hallo.", "lang": "German"}, files=_audio())
+    assert r.status_code == 500
+    assert str(failure.args[0]) not in r.json()["detail"], "the exception text reached the client"
+    request_id = r.headers["X-Request-ID"]
+    assert request_id in r.json()["detail"]
+    assert any(request_id in rec.getMessage() and str(failure.args[0]) in rec.getMessage()
+               for rec in caplog.records)
 
 
 # --- speakers -----------------------------------------------------------------

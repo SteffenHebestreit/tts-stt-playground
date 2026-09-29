@@ -137,3 +137,44 @@ def ttl_from_env(getenv: Callable[[str, str], str], *names: str, default: float 
         except ValueError:
             logger.warning("Ignoring non-numeric %s=%r", name, raw)
     return default
+
+
+# Names of the huggingface_hub failures that are not OSErrors (HFValidationError is
+# a ValueError: a repo id that is not one, or a path that does not exist).
+_MODEL_FILE_ERROR_NAMES = frozenset({
+    "HFValidationError", "RepositoryNotFoundError", "GatedRepoError", "EntryNotFoundError",
+    "RevisionNotFoundError", "LocalEntryNotFoundError", "OfflineModeIsEnabled", "HfHubHTTPError",
+})
+# Native libraries (CTranslate2 among them) report a missing file as a plain RuntimeError.
+_MODEL_FILE_MESSAGES = ("unable to open file", "no such file", "does not appear to have a file named")
+
+
+def error_category(exc: BaseException) -> str:
+    """A short, stable name for a failed model load; safe in an unauthenticated response.
+
+    ``str(exc)`` is written for the operator: it carries file paths under the
+    model cache, repo ids, URLs. This keeps only what a client or a probe may see,
+    and the full text stays in the log. One of ``out_of_memory``,
+    ``missing_dependency``, ``model_files_unavailable`` (the checkpoint could not
+    be downloaded, found or read) or ``load_error``.
+
+    Deliberately identical in behaviour to `model_lifecycle.error_category`, which
+    lives in the other images and cannot be shared with this one (its own test
+    holds the two to the same answers).
+    """
+    try:
+        text = str(exc).lower()
+    except Exception:  # a broken __str__ must not turn a failed load into a crash
+        text = ""
+    names = {cls.__name__ for cls in type(exc).__mro__}
+    if isinstance(exc, MemoryError) or "OutOfMemoryError" in names or "out of memory" in text:
+        return "out_of_memory"
+    if isinstance(exc, ImportError):
+        return "missing_dependency"
+    if (
+        isinstance(exc, OSError)
+        or names & _MODEL_FILE_ERROR_NAMES
+        or any(marker in text for marker in _MODEL_FILE_MESSAGES)
+    ):
+        return "model_files_unavailable"
+    return "load_error"

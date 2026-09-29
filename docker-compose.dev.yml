@@ -16,16 +16,18 @@ services:
   piper-tts-service:
     volumes:
       - "./piper-tts-service/app.py:/app/app.py"
+      - "./piper-tts-service/body_limit.py:/app/body_limit.py"
+      - "./piper-tts-service/origin_guard.py:/app/origin_guard.py"
       - "./piper-tts-service/naming.py:/app/naming.py"
       - "./piper-tts-service/requirements.txt:/app/requirements.txt"
 
   piper-training-service:
     volumes:
       - "./piper-training-service/app.py:/app/app.py"
-      - "./piper-training-service/audio_sources.py:/app/audio_sources.py"
       - "./piper-training-service/body_limit.py:/app/body_limit.py"
-      - "./piper-training-service/job_control.py:/app/job_control.py"
       - "./piper-training-service/origin_guard.py:/app/origin_guard.py"
+      - "./piper-training-service/audio_sources.py:/app/audio_sources.py"
+      - "./piper-training-service/job_control.py:/app/job_control.py"
       - "./piper-training-service/phonemization.py:/app/phonemization.py"
       - "./piper-training-service/training_pipeline.py:/app/training_pipeline.py"
       - "./piper-training-service/dataset.py:/app/dataset.py"
@@ -41,6 +43,8 @@ services:
   stt-service:
     volumes:
       - "./stt-service/app.py:/app/app.py"
+      - "./stt-service/body_limit.py:/app/body_limit.py"
+      - "./stt-service/origin_guard.py:/app/origin_guard.py"
       - "./stt-service/json_utils.py:/app/json_utils.py"
       - "./stt-service/local_agreement.py:/app/local_agreement.py"
       - "./stt-service/residency.py:/app/residency.py"
@@ -49,12 +53,16 @@ services:
   qwen3-asr-service:
     volumes:
       - "./qwen3-asr-service/app.py:/app/app.py"
+      - "./qwen3-asr-service/body_limit.py:/app/body_limit.py"
+      - "./qwen3-asr-service/origin_guard.py:/app/origin_guard.py"
       - "./qwen3-asr-service/audio_pipeline.py:/app/audio_pipeline.py"
       - "./qwen3-asr-service/model_lifecycle.py:/app/model_lifecycle.py"
 
   parakeet-asr-service:
     volumes:
       - "./parakeet-asr-service/app.py:/app/app.py"
+      - "./parakeet-asr-service/body_limit.py:/app/body_limit.py"
+      - "./parakeet-asr-service/origin_guard.py:/app/origin_guard.py"
       - "./parakeet-asr-service/nemo_common.py:/app/nemo_common.py"
       - "./parakeet-asr-service/transcription.py:/app/transcription.py"
       - "./parakeet-asr-service/model_lifecycle.py:/app/model_lifecycle.py"
@@ -62,6 +70,8 @@ services:
   canary-asr-service:
     volumes:
       - "./canary-asr-service/app.py:/app/app.py"
+      - "./canary-asr-service/body_limit.py:/app/body_limit.py"
+      - "./canary-asr-service/origin_guard.py:/app/origin_guard.py"
       - "./canary-asr-service/nemo_common.py:/app/nemo_common.py"
       - "./canary-asr-service/transcription.py:/app/transcription.py"
       - "./canary-asr-service/model_lifecycle.py:/app/model_lifecycle.py"
@@ -69,11 +79,15 @@ services:
   chatterbox-tts-service:
     volumes:
       - "./chatterbox-tts-service/app.py:/app/app.py"
+      - "./chatterbox-tts-service/body_limit.py:/app/body_limit.py"
+      - "./chatterbox-tts-service/origin_guard.py:/app/origin_guard.py"
       - "./chatterbox-tts-service/model_lifecycle.py:/app/model_lifecycle.py"
 
   qwen3-tts-service:
     volumes:
       - "./qwen3-tts-service/app.py:/app/app.py"
+      - "./qwen3-tts-service/body_limit.py:/app/body_limit.py"
+      - "./qwen3-tts-service/origin_guard.py:/app/origin_guard.py"
 
   frontend-service:
     volumes:

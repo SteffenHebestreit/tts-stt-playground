@@ -4,9 +4,11 @@ WORKDIR /app
 
 # See Dockerfile: PyAV bundles its own libav*, every requirement is a binary
 # wheel, so the -dev packages, git and wget are not needed.
+# Python 3.11 like every other image (see Dockerfile: the base's 3.10 is end of
+# life and held numpy, scipy, scikit-learn and onnxruntime back).
 RUN apt-get update && apt-get install -y \
-    python3 \
-    python3-dev \
+    python3.11 \
+    python3.11-dev \
     python3-pip \
     curl \
     ffmpeg \
@@ -15,13 +17,20 @@ RUN apt-get update && apt-get install -y \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-RUN ln -sf /usr/bin/python3 /usr/bin/python
+RUN ln -sf /usr/bin/python3.11 /usr/bin/python3 && \
+    ln -sf /usr/bin/python3.11 /usr/bin/python
 
 RUN mkdir -p /root/.cache/pip && chmod 777 /root/.cache/pip
 RUN pip3 install --no-cache-dir --upgrade pip wheel setuptools
 
-# Install ROCm-enabled PyTorch FIRST so ctranslate2 can detect HIP at install time
-RUN pip3 install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/rocm6.2
+# Install ROCm-enabled PyTorch FIRST so ctranslate2 can detect HIP at install time.
+# Pinned to 2.5.1, the newest release the rocm6.2 index serves (the other ROCm
+# images note the same); unpinned, a rebuild would take whatever that index serves.
+# Moving to a newer ROCm wheel index means changing these two together.
+ARG TORCH_VERSION=2.5.1
+ARG TORCHAUDIO_VERSION=2.5.1
+RUN pip3 install --no-cache-dir "torch==${TORCH_VERSION}" "torchaudio==${TORCHAUDIO_VERSION}" \
+        --index-url https://download.pytorch.org/whl/rocm6.2
 
 # Install non-torch deps from requirements (torch line is commented out there).
 # ctranslate2 comes from here, with the <5 cap requirements.txt puts on it.
@@ -47,6 +56,9 @@ COPY json_utils.py .
 COPY residency.py .
 # Imported by app.py at startup, like json_utils.py above.
 COPY local_agreement.py .
+# Request-body limit and cross-origin guard, imported by app.py at startup.
+COPY body_limit.py .
+COPY origin_guard.py .
 
 RUN mkdir -p /app/models && chmod 755 /app/models
 

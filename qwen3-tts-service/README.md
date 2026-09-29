@@ -94,7 +94,11 @@ their ISO codes (`de`, `de-DE`, ...).
 |-------|---------|--------|
 | Text (`text`, `ref_text`, `voice_description`, `instruct`) | 5000 characters (`MAX_TEXT_CHARS`) | `413` |
 | Reference upload | 20 MB (`MAX_UPLOAD_MB`) | `413`, also from `Content-Length` before the body is read |
-| Empty reference upload | | `400` |
+| Reference length | 60 s (`QWEN3_TTS_REF_MAX_SECONDS`) | `413`. The length comes from the file's header first and the decode itself stops at the limit, so a few MB of highly compressible audio cannot expand into hours of samples; the model is handed the original file |
+| Empty or undecodable reference | | `400` |
+| Requests waiting for the model | `TTS_MAX_QUEUE` (4 per concurrent generation), at most `TTS_QUEUE_TIMEOUT_S` (60 s) | `503` with `Retry-After` |
+
+An unexpected failure is a `500` with a generic message and a request id (also in the `X-Request-ID` header); the exception text is in the service log under the same id. A text over `MAX_TEXT_CHARS` is a `413` whose message names the variable.
 
 ## Configuration
 
@@ -105,12 +109,15 @@ their ISO codes (`de`, `de-DE`, ...).
 | `QWEN3_TTS_ATTN_IMPLEMENTATION` | `auto` | `auto` (FlashAttention-2 only if `flash_attn` imports on CUDA, else SDPA), `sdpa`, `eager` or `flash_attention_2`. The image ships no `flash-attn`, so `auto` means SDPA. |
 | `MAX_TEXT_CHARS` | `5000` | Longest accepted text field |
 | `MAX_UPLOAD_MB` | `20` | Largest accepted reference upload |
+| `QWEN3_TTS_REF_MAX_SECONDS` | `60` | Longest accepted reference clip (`413`) for `/clone`, `/clone-with-ref-text` and `/voices/save` |
 | `QWEN3_ASR_SERVICE_URL` | `http://qwen3-asr-service:5002` | ASR service used for transcribing and trimming reference audio |
 | `VOICES_DIR` | `/app/voices` | Persistent directory for saved voice profiles |
 | `TTS_MODEL_TTL` / `MODEL_TTL` | `300` | Seconds idle before the weights are released. `-1` pins them resident, `0` unloads as soon as idle (and skips the startup preload). A reload restores whichever model was last selected via `/load_model`, not the env default. |
 | `TTS_MAX_CONCURRENCY` | `1` | Concurrent generations against the shared model |
+| `TTS_QUEUE_TIMEOUT_S` | `60` | Longest a request waits for the model lock (a load or model switch holds it) or for a generation slot; then `503` with `Retry-After`. The in-flight accounting the idle reaper and `/unload` rely on is unchanged: a request that gives up owes nothing |
+| `TTS_MAX_QUEUE` | `4` × `TTS_MAX_CONCURRENCY` | Requests that may be queued behind the running ones (all of them hold a spooled upload). The next one is answered `503` at once, before its upload is copied |
 | `TTS_MAX_BATCH` | `8` | Sentences generated in one forward pass when a long text is chunked. Peak VRAM scales with it, so it bounds the cost of a long request rather than letting the caller's text length decide. |
-| `ALLOWED_ORIGINS` | `*` | Comma-separated CORS origins |
+| `ALLOWED_ORIGINS` | *(empty)* | Comma-separated origins a browser page may call this service from. **Unset or empty: no CORS headers at all.** `*` opens it to every page and must be written down (it logs a warning). Independently of this, a state-changing request (anything but `GET`/`HEAD`/`OPTIONS`) that carries an `Origin` header for another host than the one it was sent to is refused with `403` unless the origin is listed; requests without an `Origin` (the gateway, curl) are not affected |
 | `ALLOW_CREDENTIALS` | `false` | Enables CORS credentials when origins are explicit |
 
 ## Model variants and capabilities
@@ -139,8 +146,8 @@ An unexpected failure is a `500`, never a `400`.
 
 The model loads in the background, so the port is open and `/health` answers
 during a first-time download. `/ready` is `503 loading` until the model is in,
-`200` after, and `503 load_failed` (with the error) if the last attempt failed;
-the next request retries. It stays `200` for a model that was unloaded on
+`200` after, and `503 load_failed` if the last attempt failed (the body says so
+generically; the exception is in the service log); the next request retries. It stays `200` for a model that was unloaded on
 purpose. A request that arrives during the load waits for it rather than loading
 a second copy.
 

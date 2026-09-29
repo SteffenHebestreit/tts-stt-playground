@@ -21,6 +21,8 @@ librosa, ffmpeg and the qwen_asr model (see ``test_qwen3_asr_harness``).
 from __future__ import annotations
 
 import asyncio
+import logging
+import re
 import threading
 
 import pytest
@@ -283,11 +285,16 @@ def test_gpu_out_of_memory_is_a_503_that_says_what_to_change(tmp_path, monkeypat
     assert "QWEN3_ASR_BATCH_SIZE" in r.json()["detail"]
 
 
-def test_any_other_model_failure_is_a_500_with_the_message(tmp_path, monkeypatch):
-    module, *_ = build(tmp_path, monkeypatch, model_options={"error": RuntimeError("weights are corrupt")})
-    r = transcribe(module, encoded_wav(speech_levels(10)))
+def test_any_other_model_failure_is_a_500_that_keeps_the_message_in_the_log(tmp_path, monkeypatch, caplog):
+    error = RuntimeError("weights are corrupt: /models/qwen3/model.safetensors")
+    module, *_ = build(tmp_path, monkeypatch, model_options={"error": error})
+    with caplog.at_level(logging.ERROR):
+        r = transcribe(module, encoded_wav(speech_levels(10)))
     assert r.status_code == 500
-    assert "weights are corrupt" in r.json()["detail"]
+    detail = r.json()["detail"]
+    assert "weights are corrupt" not in detail and "/models/" not in detail
+    request_id = re.search(r"Request id: ([0-9a-f]{12})\.", detail).group(1)
+    assert request_id in caplog.text and "weights are corrupt: /models/qwen3/model.safetensors" in caplog.text
 
 
 # --- languages ----------------------------------------------------------------------------------
@@ -507,11 +514,11 @@ def test_ready_without_a_preload_is_200_and_does_not_load_the_model(tmp_path, mo
 
 def test_ready_reports_a_failed_first_load_with_the_reason(tmp_path, monkeypatch):
     module, factory, _, _ = build(tmp_path, monkeypatch)
-    factory.fail = RuntimeError("no such checkpoint")
+    factory.fail = FileNotFoundError("no such checkpoint: /models/qwen3-asr")
 
     async def scenario():
         async with make_client(module) as client:
-            with pytest.raises(RuntimeError):
+            with pytest.raises(FileNotFoundError):
                 await asyncio.to_thread(module.get_model)
             failed = await client.get("/ready")
             factory.fail = None
@@ -521,7 +528,8 @@ def test_ready_reports_a_failed_first_load_with_the_reason(tmp_path, monkeypatch
 
     failed, ok = run(scenario())
     assert failed.status_code == 503
-    assert failed.json()["reason"] == "load_failed" and "no such checkpoint" in failed.json()["detail"]
+    assert failed.json()["reason"] == "load_failed" and failed.json()["detail"] == "model_files_unavailable"
+    assert "checkpoint" not in failed.text and "/models/" not in failed.text
     assert ok.status_code == 200 and ok.json()["model_ever_loaded"] is True
 
 
@@ -588,4 +596,4 @@ def test_status_reports_the_limits_in_force(tmp_path, monkeypatch):
 
 def test_a_bad_concurrency_setting_cannot_stop_the_service_from_starting(tmp_path, monkeypatch):
     module, *_ = build(tmp_path, monkeypatch, ASR_MAX_CONCURRENCY="lots")
-    assert module._ASR_SEM._value == 1
+    assert module._gate.max_active == 1

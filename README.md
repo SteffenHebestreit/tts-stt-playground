@@ -431,7 +431,7 @@ the per-service limits; the ones most people touch:
 | `ALLOWED_ORIGINS` | (empty: same origin only) | Extra origins that may call the gateway from a browser; `*` opens it to any page. Behind a reverse proxy that rewrites `Host`, set `TRUSTED_ORIGINS` |
 | `API_KEY` | (empty: open) | Optional shared secret required as `Authorization: Bearer` on `/v1/*` and on state-changing `/api/*` calls |
 | `MAX_UPLOAD_MB`, `MAX_TTS_CHARS` | `512`, `20000` | Gateway limits; each backend has its own (`ASR_MAX_UPLOAD_MB`, `PIPER_MAX_UPLOAD_MB`, `CHATTERBOX_MAX_TEXT_CHARS`, ... see `.env.example`) |
-| `BACKEND_ALLOWED_ORIGINS` | `*` | CORS for the backends' own ports (only relevant with `BACKEND_BIND_ADDR=0.0.0.0` and browser callers) |
+| `BACKEND_ALLOWED_ORIGINS` | (empty: closed) | CORS for the backends' own ports. Empty means no CORS headers and foreign-Origin POST/DELETE requests are refused; `*` must be set explicitly (each service logs a warning) |
 | `ALLOW_CREDENTIALS` | `false` | Enables CORS credentials only when origins are explicit |
 | `STT_SERVICE_URL` | `http://stt-service:8000` | STT endpoint used by Piper Training for audio labelling |
 
