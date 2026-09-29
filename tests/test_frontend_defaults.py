@@ -85,6 +85,77 @@ def test_what_the_gateway_sends_is_what_qwen3_tts_resolves_to_its_own_default(mo
     assert service._resolve_language(_last_json(stub)["lang"]) == resolved
 
 
+# A language the model cannot speak used to become "English" here (Dutch was mapped to it
+# on purpose), so the service's 400 never fired and the caller got an English accent, HTTP
+# 200. The gateway now forwards it and the service refuses it, naming what it can speak.
+
+
+@pytest.mark.parametrize("language", ["nl", "pl", "zz", "Dutch"])
+def test_a_language_qwen3_cannot_speak_is_forwarded_and_refused_by_the_service(monkeypatch, language):
+    import qwen3_tts_loader
+    from fastapi import HTTPException
+
+    service = qwen3_tts_loader.load_app()
+    _, stub, client = _gateway(monkeypatch, _wav_response, {"DEFAULT_TTS_PROVIDER": "qwen3"})
+
+    client.post("/api/tts", json={"provider": "qwen3", "text": "Hallo", "language": language})
+    via_api = _last_json(stub)
+    client.post("/v1/audio/speech", json={"input": "Hallo", "response_format": "wav", "language": language})
+    via_v1 = _last_json(stub)
+
+    assert via_api["lang"] == via_v1["lang"] == language
+    assert via_api == via_v1
+    with pytest.raises(HTTPException) as refused:
+        service._resolve_language(via_api["lang"])
+    assert refused.value.status_code == 400
+
+
+def test_the_services_400_for_an_unsupported_language_reaches_the_caller(monkeypatch):
+    """The real service decides; whatever it says is what /api/tts and /v1 report."""
+    import qwen3_tts_loader
+    from fastapi import HTTPException
+
+    service = qwen3_tts_loader.load_app()
+
+    def like_the_service(method, url, kwargs):
+        try:
+            service._resolve_language(kwargs["json"]["lang"])
+        except HTTPException as exc:
+            return httpx.Response(exc.status_code, json={"detail": exc.detail})
+        return httpx.Response(200, content=wav_bytes(), headers={"content-type": "audio/wav"})
+
+    _, _, client = _gateway(monkeypatch, like_the_service, {"DEFAULT_TTS_PROVIDER": "qwen3"})
+
+    refused = client.post("/api/tts", json={"provider": "qwen3", "text": "Hallo", "language": "nl"})
+    assert refused.status_code == 400
+    detail = refused.json()["detail"]
+    assert "'nl' is not supported by Qwen3-TTS" in detail and "German" in detail
+
+    r = client.post("/v1/audio/speech", json={"input": "Hallo", "response_format": "wav", "language": "nl"})
+    assert r.status_code >= 400
+    assert detail in r.json()["error"]["message"]
+
+    ok = client.post("/api/tts", json={"provider": "qwen3", "text": "Hallo", "language": "de"})
+    assert ok.status_code == 200
+
+
+def test_qwen3_voice_design_without_a_language_leaves_it_to_the_service(monkeypatch):
+    _, stub, client = _gateway(monkeypatch, _wav_response)
+    r = client.post("/api/providers/qwen3/voice-design",
+                    json={"text": "Hallo", "voice_description": "warm narrator"})
+    assert r.status_code == 200
+    assert _last_json(stub)["lang"] == "auto"
+
+
+def test_the_qwen3_selector_opens_on_a_choice_that_defers_to_the_service():
+    """populateSelectOptions() falls back to the first option when the default is not among the
+    values, so a default missing from the list would send that first language on every request."""
+    settings = load_frontend_app().PROVIDER_REGISTRY["providers"]["qwen3"]["settings"]
+    values = [item["value"] for item in settings["languages"]]
+    assert settings["defaults"]["language"] == "auto"
+    assert "auto" in values
+
+
 # --- STT: "auto" means detect, absence means the service default --------------------------
 
 
@@ -409,3 +480,30 @@ def test_the_real_canary_service_status_is_what_the_gateway_understands(monkeypa
         assert sorted(canary.languages()) == sorted(reported["supported_languages"])
         assert len(canary.languages()) == expected
         assert canary.languages()[0] == reported["default_language"]
+
+
+def test_a_language_canary_refuses_reaches_the_caller_in_the_services_words(monkeypatch):
+    """The service answers 422 with the reason and the languages it does decode; the gateway
+    must neither filter on its own copy of that list nor swallow the text."""
+    refusal = ("Language 'xx' is not supported by nvidia/canary-1b-v2. Supported: "
+               + ", ".join(CANARY_25) + ". Send 'auto' to use the default ('de').")
+
+    def handler(method, url, kwargs):
+        if url.endswith("/status"):
+            return _status(CANARY_25)
+        return httpx.Response(422, json={"detail": refusal})
+
+    _, stub, client = _gateway(
+        monkeypatch, handler, {"ENABLE_CANARY_ASR": "true", "DEFAULT_STT_PROVIDER": "canary"})
+
+    r = client.post("/api/stt", data={"provider": "canary", "language": "xx"},
+                    files={"audio": ("a.wav", wav_bytes(), "audio/wav")})
+    assert r.status_code == 422
+    assert r.json()["detail"] == refusal
+    sent = [call for call in stub.calls if call[1].endswith("/transcribe")]
+    assert sent[-1][2]["data"]["language"] == "xx"
+
+    r = client.post("/v1/audio/transcriptions", data={"model": "whisper-1", "language": "xx"},
+                    files={"file": ("a.wav", wav_bytes(), "audio/wav")})
+    assert r.status_code >= 400
+    assert refusal in r.json()["error"]["message"]

@@ -101,6 +101,16 @@ def test_the_docs_page_only_links_specs_that_exist():
         assert (STATIC / name).is_file(), f"api_docs.html links /static/openapi/{name}, which does not exist"
 
 
+def test_the_docs_page_links_every_published_spec():
+    """The gateway's own spec (the /v1 and /api surface) was generated and served
+    but never linked, so the one API a client outside the network uses had no
+    entry on the page that documents the APIs."""
+    html = (REPO_ROOT / "frontend-service" / "static" / "api_docs.html").read_text(encoding="utf-8")
+    linked = set(re.findall(r'href="/static/openapi/([A-Za-z0-9_.-]+\.json)"', html))
+    published = {p.name for p in STATIC.glob("*.json")}
+    assert published - linked == set(), f"published but not linked from api_docs.html: {sorted(published - linked)}"
+
+
 # --- the specs against the apps ------------------------------------------------------------------
 
 

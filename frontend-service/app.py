@@ -832,10 +832,15 @@ def _build_provider_registry() -> dict:
             },
             "settings": {
                 "defaults": {
-                    "language": "English",
+                    # "auto" reaches qwen3-tts-service as-is and resolves there
+                    # to QWEN3_DEFAULT_LANGUAGE (German unless the operator says
+                    # otherwise). A language named here would override that
+                    # setting on every request the UI makes.
+                    "language": "auto",
                     "speaker": "Vivian",
                 },
                 "languages": [
+                    {"value": "auto", "label": "Automatic (service default)"},
                     {"value": "English", "label": "English"},
                     {"value": "German", "label": "German"},
                     {"value": "French", "label": "French"},
@@ -1609,16 +1614,18 @@ def _get_provider(provider_id: str, kind: Optional[str] = None) -> dict:
     return provider
 
 
-def _normalize_qwen3_language(language: str) -> str:
-    """Map common language codes to the English labels expected by Qwen3-TTS.
+def _normalize_qwen3_language(language: Optional[str]) -> str:
+    """The ``lang`` to send to qwen3-tts-service for a normalized request language.
 
-    "auto" and an empty value stay "auto": the service resolves that itself, to
-    QWEN3_DEFAULT_LANGUAGE (German unless the operator changed it). Answering
-    "English" here, as this used to, overrode the operator's choice on every
-    request that did not name a language.
+    Codes the model speaks become the labels it expects. "auto" and an empty
+    value stay "auto": the service resolves that itself, to QWEN3_DEFAULT_LANGUAGE
+    (German unless the operator changed it). Anything else is forwarded untouched,
+    so a language the model cannot speak reaches the service and comes back as its
+    400 naming the supported ones. Falling back to English here, as this used to
+    for "auto" and for languages the model lacks (Dutch among them), overrode the
+    operator's choice and spoke unsupported text with an English accent, HTTP 200.
     """
     language_map = {
-        "auto": "auto",
         "en": "English",
         "en_us": "English",
         "en_gb": "English",
@@ -1636,13 +1643,12 @@ def _normalize_qwen3_language(language: str) -> str:
         "ko": "Korean",
         "zh": "Chinese",
         "zh_cn": "Chinese",
-        # Qwen3-TTS has no Dutch support; fall back to English rather than erroring
-        "nl": "English",
     }
-    normalized = (language or "auto").strip().lower().replace("-", "_")
-    if not normalized:
+    requested = (language or "").strip()
+    normalized = requested.lower().replace("-", "_")
+    if not normalized or normalized == "auto":
         return "auto"
-    return language_map.get(normalized, language if language and language[:1].isupper() else "English")
+    return language_map.get(normalized, requested)
 
 
 def _normalize_piper_voice_catalog(payload: dict) -> list[dict]:
@@ -2393,7 +2399,8 @@ class ProviderVoiceDesignRequest(BaseModel):
 
     text: str = Field(max_length=MAX_TTS_CHARS)
     voice_description: str = Field(max_length=4000)
-    lang: str = Field(default="English", max_length=64)
+    # Forwarded verbatim; "auto" is resolved by the service (QWEN3_DEFAULT_LANGUAGE).
+    lang: str = Field(default="auto", max_length=64)
 
 
 async def _build_frontend_stt_payload(provider_id: str, form, contract: str) -> tuple[str, dict, list[tuple[str, tuple[str, bytes, str]]]]:

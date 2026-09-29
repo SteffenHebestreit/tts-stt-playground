@@ -833,9 +833,13 @@ def test_normalize_qwen3_language(frontend_module):
     fn = frontend_module._normalize_qwen3_language
     assert fn("de") == "German"
     assert fn("en_US") == "English"
-    assert fn("nl") == "English"          # Dutch unsupported -> English
+    assert fn("de-DE") == "German"
     assert fn("French") == "French"       # already a capitalized label
-    assert fn("zz") == "English"          # unknown lowercase -> English
+    # A language the model cannot speak is forwarded so the service can refuse it
+    # (400 naming the supported ones), never swapped for English.
+    assert fn("nl") == "nl"
+    assert fn("zz") == "zz"
+    assert fn("Dutch") == "Dutch"
 
 
 @pytest.mark.parametrize("value", ["auto", "AUTO", " Auto ", "", "   ", None])
