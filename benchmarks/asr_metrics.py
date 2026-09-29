@@ -1,8 +1,9 @@
 """Word/character error rates for German ASR, and whether a difference is real.
 
-Pure stdlib, no dependencies, no I/O — so it is testable offline with no audio,
-no model and no GPU. The runner that actually calls the API lives next door in
-run_german_eval.py.
+Pure stdlib, no I/O — so it is testable offline with no audio, no model and no
+GPU. ``rapidfuzz`` is used, if it happens to be installed, only to align very
+long inputs (a long-form character comparison); nothing needs it. The runner
+that actually calls the API lives next door in run_german_eval.py.
 
 WHAT THIS IS FOR
 ----------------
@@ -40,6 +41,7 @@ interval, never with the point estimate.
 
 from __future__ import annotations
 
+import os
 import random
 import re
 import unicodedata
@@ -150,13 +152,47 @@ class ErrorCounts:
         )
 
 
+# Above this many DP cells (after trimming) a pure-Python pass takes seconds per
+# utterance, which is where a long-form character comparison lives. rapidfuzz, if
+# it happens to be installed, does the same job in C. It is deliberately NOT used
+# below the threshold: it returns *an* optimal alignment, and when several tie the
+# substitution/deletion/insertion split can differ from the pure-Python one (the
+# error TOTAL never does). Keeping every ordinary utterance on one code path means
+# a saved report is the same on a machine with and without rapidfuzz.
+_RAPIDFUZZ_MIN_CELLS = 4_000_000
+_BAND_START = 32
+
+
+def _rapidfuzz_levenshtein():
+    """rapidfuzz's Levenshtein module, or None when unavailable or switched off."""
+    if os.getenv("ASR_METRICS_NO_RAPIDFUZZ", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return None
+    try:
+        from rapidfuzz.distance import Levenshtein
+    except ImportError:
+        return None
+    return Levenshtein
+
+
 def _levenshtein(reference: Sequence, hypothesis: Sequence) -> ErrorCounts:
     """Edit distance with an operation breakdown.
 
-    Two rows rather than a full matrix: a long-form reference can run to
-    thousands of tokens, and the full table is not needed since only the counts
-    are reported, not the alignment path. Each cell carries its own counts so
-    the breakdown follows whichever path the distance actually took.
+    Exactly the counts a plain full-matrix DP with the tie-break "substitute,
+    else delete, else insert" produces, computed much faster:
+
+    * A common prefix and suffix are cut off first. Both are provably neutral:
+      D(xu, xv) == D(u, v), and the DP cells along a matching tail just copy their
+      diagonal neighbour. Real ASR output is mostly identical to its reference, so
+      this alone removes most of a short utterance.
+    * The DP then runs inside a diagonal band. A path that strays k cells from the
+      diagonal already costs k, so once an alignment of cost c is known, nothing
+      outside a band of width c can beat it. A first pass with a narrow band gives
+      such a c, and a second pass with band c is exact. The result is identical to
+      the unbanded DP, including the tie-break, because the winning path never
+      leaves the band. The work is O(n * distance) instead of O(n * m), which is
+      what makes a long-form CER tractable.
+    * Each cell holds two plain ints (cost, and the three operation counts packed
+      into one) instead of a dataclass, which was the dominant cost.
     """
     n, m = len(reference), len(hypothesis)
     if n == 0:
@@ -164,39 +200,100 @@ def _levenshtein(reference: Sequence, hypothesis: Sequence) -> ErrorCounts:
     if m == 0:
         return ErrorCounts(deletions=n, reference_length=n)
 
-    # row[j] = (distance, ErrorCounts) for reference[:i] vs hypothesis[:j]
-    previous: list[tuple[int, ErrorCounts]] = [
-        (j, ErrorCounts(insertions=j)) for j in range(m + 1)
-    ]
+    start = 0
+    limit = min(n, m)
+    while start < limit and reference[start] == hypothesis[start]:
+        start += 1
+    end_r, end_h = n, m
+    while end_r > start and end_h > start and reference[end_r - 1] == hypothesis[end_h - 1]:
+        end_r -= 1
+        end_h -= 1
+    ref, hyp = reference[start:end_r], hypothesis[start:end_h]
+
+    counts = _trimmed_counts(ref, hyp)
+    return ErrorCounts(*counts, reference_length=n)
+
+
+def _trimmed_counts(ref: Sequence, hyp: Sequence) -> tuple[int, int, int]:
+    """(substitutions, deletions, insertions) between two sequences with no shared ends."""
+    n, m = len(ref), len(hyp)
+    if n == 0:
+        return 0, 0, m
+    if m == 0:
+        return 0, n, 0
+
+    if n * m >= _RAPIDFUZZ_MIN_CELLS:
+        fast = _rapidfuzz_levenshtein()
+        if fast is not None:
+            ops = fast.editops(ref, hyp)
+            tags = [op.tag for op in ops]
+            return tags.count("replace"), tags.count("delete"), tags.count("insert")
+
+    band = max(abs(n - m), _BAND_START)
+    cost, packed, width = _banded_dp(ref, hyp, band)
+    if cost > band:
+        # The first band was too narrow to be sure. `cost` is a real alignment, so
+        # the optimum is at most that, and a band of that width contains it.
+        cost, packed, width = _banded_dp(ref, hyp, cost)
+    mask = (1 << width) - 1
+    return packed >> (2 * width), (packed >> width) & mask, packed & mask
+
+
+def _banded_dp(ref: Sequence, hyp: Sequence, band: int) -> tuple[int, int, int]:
+    """Levenshtein DP restricted to |i - j| <= band. Returns (cost, packed counts, width).
+
+    Counts are packed as substitutions << 2w | deletions << w | insertions, w wide
+    enough that no field can overflow into its neighbour. Cells outside the band
+    are +infinity, so a value read from one is never chosen.
+    """
+    n, m = len(ref), len(hyp)
+    width = max(n, m).bit_length() + 1
+    sub_step, del_step = 1 << (2 * width), 1 << width
+    infinity = n + m + band + 2
+
+    last = min(m, band)
+    prev_cost = [0] * (m + 1)
+    prev_ops = [0] * (m + 1)
+    cur_cost = [0] * (m + 1)
+    cur_ops = [0] * (m + 1)
+    for j in range(last + 1):
+        prev_cost[j] = j
+        prev_ops[j] = j                      # j insertions
+    if last < m:
+        prev_cost[last + 1] = infinity
 
     for i in range(1, n + 1):
-        current: list[tuple[int, ErrorCounts]] = [(i, ErrorCounts(deletions=i))]
-        for j in range(1, m + 1):
-            if reference[i - 1] == hypothesis[j - 1]:
-                cost, counts = previous[j - 1]
-                current.append((cost, counts))
-                continue
-
-            sub_cost, sub_counts = previous[j - 1]
-            del_cost, del_counts = previous[j]
-            ins_cost, ins_counts = current[j - 1]
-
-            best = min(sub_cost, del_cost, ins_cost)
-            if best == sub_cost:
-                current.append((best + 1, ErrorCounts(
-                    sub_counts.substitutions + 1, sub_counts.deletions, sub_counts.insertions)))
-            elif best == del_cost:
-                current.append((best + 1, ErrorCounts(
-                    del_counts.substitutions, del_counts.deletions + 1, del_counts.insertions)))
+        ref_i = ref[i - 1]
+        lo = i - band if i - band > 1 else 1
+        hi = i + band if i + band < m else m
+        if i <= band:
+            cur_cost[0] = left_cost = i
+            cur_ops[0] = left_ops = i * del_step     # i deletions
+        else:
+            left_cost, left_ops = infinity, 0
+        for j in range(lo, hi + 1):
+            if ref_i == hyp[j - 1]:
+                left_cost = prev_cost[j - 1]
+                left_ops = prev_ops[j - 1]
             else:
-                current.append((best + 1, ErrorCounts(
-                    ins_counts.substitutions, ins_counts.deletions, ins_counts.insertions + 1)))
-        previous = current
+                diag, up = prev_cost[j - 1], prev_cost[j]
+                if diag <= up and diag <= left_cost:
+                    left_cost = diag + 1
+                    left_ops = prev_ops[j - 1] + sub_step
+                elif up <= left_cost:
+                    left_cost = up + 1
+                    left_ops = prev_ops[j] + del_step
+                else:
+                    left_cost += 1
+                    left_ops += 1
+            cur_cost[j] = left_cost
+            cur_ops[j] = left_ops
+        if hi < m:
+            cur_cost[hi + 1] = infinity
+        prev_cost, cur_cost = cur_cost, prev_cost
+        prev_ops, cur_ops = cur_ops, prev_ops
 
-    _, counts = previous[m]
-    return ErrorCounts(
-        counts.substitutions, counts.deletions, counts.insertions, reference_length=n
-    )
+    return prev_cost[m], prev_ops[m], width
 
 
 def word_errors(reference: str, hypothesis: str, *, fold_umlauts: bool = False) -> ErrorCounts:
@@ -264,8 +361,12 @@ class BootstrapResult:
         magnitude = f"{abs(self.delta) * 100:.2f} points"
         interval = f"[{self.ci_low * 100:+.2f}, {self.ci_high * 100:+.2f}]"
         if not self.significant:
+            # An exact tie reads as "0.00 points better" otherwise, which is
+            # neither true nor false enough to be worth printing.
+            change = (f"candidate is {magnitude} {direction}" if self.delta != 0
+                      else "candidate scores exactly the same")
             return (
-                f"NO SIGNIFICANT DIFFERENCE — candidate is {magnitude} {direction}, "
+                f"NO SIGNIFICANT DIFFERENCE — {change}, "
                 f"but the {self.confidence:.0%} CI {interval} includes zero "
                 f"on {self.samples} utterances. Do not decide on this."
             )
@@ -304,14 +405,27 @@ def paired_bootstrap(
     if not baseline:
         raise ValueError("nothing to compare: no utterances")
 
-    def rate(counts: Iterable[ErrorCounts]) -> float:
-        total = ErrorCounts()
-        for c in counts:
-            total = total + c
-        return total.rate
+    if resamples < 1:
+        raise ValueError(f"resamples must be at least 1, got {resamples}")
 
-    baseline_rate = rate(baseline)
-    candidate_rate = rate(candidate)
+    # Plain int columns instead of ErrorCounts: a resample sums n rows twice, and
+    # summing dataclasses (one allocation per addition) made a 2000-resample run
+    # over a few thousand utterances take minutes. The arithmetic is the same
+    # total-errors-over-total-reference-tokens as ErrorCounts.rate.
+    base_errors = [c.errors for c in baseline]
+    cand_errors = [c.errors for c in candidate]
+    lengths = [b.reference_length for b in baseline]
+    cand_lengths = [c.reference_length for c in candidate]
+    base_ins = [c.insertions for c in baseline]
+    cand_ins = [c.insertions for c in candidate]
+
+    def rate(errors: int, length: int, insertions: int) -> float:
+        if length == 0:
+            return 1.0 if insertions else 0.0
+        return errors / length
+
+    baseline_rate = rate(sum(base_errors), sum(lengths), sum(base_ins))
+    candidate_rate = rate(sum(cand_errors), sum(cand_lengths), sum(cand_ins))
     observed_delta = candidate_rate - baseline_rate
 
     rng = random.Random(seed)
@@ -320,8 +434,12 @@ def paired_bootstrap(
     worse = 0
     for _ in range(resamples):
         picks = [rng.randrange(n) for _ in range(n)]
-        b = rate(baseline[i] for i in picks)
-        c = rate(candidate[i] for i in picks)
+        b = rate(sum(map(base_errors.__getitem__, picks)),
+                 sum(map(lengths.__getitem__, picks)),
+                 sum(map(base_ins.__getitem__, picks)))
+        c = rate(sum(map(cand_errors.__getitem__, picks)),
+                 sum(map(cand_lengths.__getitem__, picks)),
+                 sum(map(cand_ins.__getitem__, picks)))
         d = c - b
         deltas.append(d)
         if d > 0:
