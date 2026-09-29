@@ -31,7 +31,7 @@ pyyaml>=6.0
 
 # stt-service WebSocket tests and the frontend /ws/stt relay client
 # (`additional_headers=` needs >=14).
-websockets>=14.0
+websockets>=17.1
 
 # Optional: benchmarks/asr_metrics.py uses it for long recordings, and
 # test_benchmarks_metrics.py compares it with the pure-Python edit distance. A
