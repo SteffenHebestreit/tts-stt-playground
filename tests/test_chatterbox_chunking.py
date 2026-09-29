@@ -8,6 +8,7 @@ The model stack is stubbed; these are pure-function tests.
 """
 
 import sys
+import time
 import types
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
@@ -166,3 +167,76 @@ def test_content_is_preserved(split):
 def test_single_short_sentence_is_one_chunk(split):
     text = "Guten Tag."
     assert split(text, FIRST, MIN, MAX) == ["Guten Tag."]
+
+
+# --- German sentence boundaries ----------------------------------------------
+#
+# Floors of 1 make every detected sentence its own chunk, so the result IS the
+# boundary decision. A false boundary is audible: the TTS reads "am 3." as "am
+# drei" and pauses, or ends a chunk on "z." / "Dr.".
+
+def _sentences(split, text):
+    return split(text, 1, 1, 400)
+
+
+@pytest.mark.parametrize("text", [
+    "Am 3. Mai kam Dr. Müller.",                                # ordinal + title
+    "Wir brauchen z. B. Äpfel und d. h. Obst.",                 # spaced multi-letter abbreviations
+    "Wir brauchen z.B. Äpfel und i.d.R. Obst.",                 # the same, unspaced
+    "Das dauert ca. 5 Minuten.",
+    "Bitte Nr. 7 wählen.",
+    "Prof. Dr. Meier hat u. a. dazu geforscht.",
+    "Im 21. Jahrhundert ist das anders.",
+    "Sie wohnt seit dem 1. Januar 2024 in Berlin.",
+    "Der Wert liegt bei 3,5 Prozent.",                          # decimal comma
+    "Das kostet 1.000 Euro.",                                   # thousands separator
+    "Äpfel, Birnen usw. sind gesund.",                          # ambiguous abbreviation, lower case follows
+])
+def test_german_periods_that_are_not_boundaries_do_not_split(split, text):
+    assert _sentences(split, text) == [text]
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("Er kam. Sie ging.", ["Er kam.", "Sie ging."]),
+    ("Wirklich? Ja! Gut.", ["Wirklich?", "Ja!", "Gut."]),
+    ("Um 10 Uhr kam er. Er ging um 11 Uhr.", ["Um 10 Uhr kam er.", "Er ging um 11 Uhr."]),
+    ("Das kostet 3,50 Euro. Das ist günstig.", ["Das kostet 3,50 Euro.", "Das ist günstig."]),
+    ("Im Jahr 2024. Danach kam 2025.", ["Im Jahr 2024.", "Danach kam 2025."]),
+    ("Es ist Version 3.5. Danach folgt 4.0.", ["Es ist Version 3.5.", "Danach folgt 4.0."]),
+    ("Äpfel, Birnen usw. Danach gingen wir.", ["Äpfel, Birnen usw.", "Danach gingen wir."]),
+    ("Prof. Dr. Meier sprach. Alle hörten zu.", ["Prof. Dr. Meier sprach.", "Alle hörten zu."]),
+    ("Am 3. Mai kam er. Am 4. Mai ging er.", ["Am 3. Mai kam er.", "Am 4. Mai ging er."]),
+    ("„Hallo.“ Er ging.", ["„Hallo.“", "Er ging."]),
+    ("Zeile eins\nZeile zwei", ["Zeile eins", "Zeile zwei"]),
+])
+def test_real_sentence_boundaries_still_split(split, text, expected):
+    assert _sentences(split, text) == expected
+
+
+def test_german_text_survives_splitting_at_realistic_floors(split):
+    """At the production floors an ordinal or abbreviation is never stranded at a chunk end."""
+    text = ("Wir treffen uns am 3. Mai um zehn Uhr im Büro und besprechen z. B. die Zahlen, "
+            "d. h. alles, was ca. 3,5 Prozent betrifft. Danach fahren wir zu Dr. Müller, "
+            "der in der Hauptstr. 5 wohnt und uns bis 18 Uhr erwartet. Es war der 1. Besuch.")
+    chunks = split(text, FIRST, MIN, MAX)
+    assert " ".join(chunks).split() == text.split()
+    for chunk in chunks:
+        last = chunk.split()[-1]
+        assert last not in {"3.", "z.", "B.", "d.", "h.", "ca.", "Dr.", "Hauptstr.", "1."}, chunk
+
+
+@pytest.mark.parametrize("text", [
+    "a" * 2500 + " b. c. d. e. " * 200,      # a long unbroken token, then many candidate periods
+    "." * 5000,                                # punctuation runs
+    ".!?;:" * 1000,
+    "a." + '"' * 4998,                         # closing quotes
+    "12. " * 1250,                             # ordinal candidates
+    "z. B. " * 830,
+])
+def test_the_splitter_is_linear_on_hostile_input(split, text):
+    """It runs on the event loop, on caller-controlled text. A regex that searched back over
+    the whole text for every period needed 23 s for the first input (5000 characters)."""
+    started = time.perf_counter()
+    chunks = split(text, FIRST, MIN, MAX)
+    assert time.perf_counter() - started < 3.0
+    assert chunks and max(len(c) for c in chunks) <= MAX

@@ -1,7 +1,46 @@
-# Chatterbox-TTS dependencies
-# torch and torchaudio are installed separately in the Dockerfile (CUDA wheels);
-# chatterbox-tts may re-resolve them — its PyPI torch builds are CUDA-enabled on Linux.
-chatterbox-tts>=0.1.2
+# Chatterbox-TTS service dependencies.
+#
+# NEITHER torch/torchaudio NOR chatterbox-tts itself belongs in this file.
+# The Dockerfile installs, in this order:
+#   1. torch + torchaudio from the cu128 index (the only builds with sm_120
+#      kernels, i.e. the RTX 5060 Ti / Blackwell)
+#   2. this file, with torch/torchaudio held by a constraint
+#   3. chatterbox-tts from GitHub with --no-deps (v3 is not on PyPI; see the
+#      CHATTERBOX_REF build arg)
+# chatterbox-tts hard-pins torch==2.6.0, torchaudio==2.6.0 (PyPI builds: cu124, no
+# sm_120), gradio==6.8.0 and transformers==5.2.0. Listing it here would make pip
+# downgrade the cu128 torch from step 1 with no error.
+#
+# So everything chatterbox needs at runtime is listed below instead. Source: its
+# pyproject.toml dependencies (0.1.7 wheel and GitHub master agree apart from the
+# resemble-perth line), minus torch, torchaudio and gradio (the Gradio demos are
+# not part of the importable package).
+
+numpy>=1.24.0,<2.0.0
+librosa==0.11.0
+s3tokenizer
+transformers==5.2.0
+diffusers==0.29.0
+# master installs this from git (Perth.git@master); the PyPI release is what the
+# 0.1.7 wheel asks for. It declares no dependencies of its own and swallows an
+# ImportError by setting PerthImplicitWatermarker = None, which then fails at model
+# construction: it needs torchaudio, librosa, scipy and pyyaml, all present here.
+resemble-perth>=1.0.0
+conformer==0.3.2
+safetensors==0.5.3
+spacy-pkuseg
+pykakasi==2.3.0
+pyloudnorm
+omegaconf
+# imported directly by chatterbox; only reaches it through conformer otherwise
+einops
+# resemble-perth 1.0.1 (latest on PyPI) does `from pkg_resources import ...`, and
+# setuptools 82 removed pkg_resources. Without this pin the watermarker import
+# fails silently (see above) and the first model load dies with "'NoneType' object
+# is not callable". Drop it once a resemble-perth release stops using pkg_resources.
+setuptools<82
+
+# Service
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
 python-multipart>=0.0.6
