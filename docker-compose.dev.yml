@@ -23,7 +23,9 @@ services:
     volumes:
       - "./piper-training-service/app.py:/app/app.py"
       - "./piper-training-service/audio_sources.py:/app/audio_sources.py"
+      - "./piper-training-service/body_limit.py:/app/body_limit.py"
       - "./piper-training-service/job_control.py:/app/job_control.py"
+      - "./piper-training-service/origin_guard.py:/app/origin_guard.py"
       - "./piper-training-service/phonemization.py:/app/phonemization.py"
       - "./piper-training-service/training_pipeline.py:/app/training_pipeline.py"
       - "./piper-training-service/dataset.py:/app/dataset.py"

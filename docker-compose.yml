@@ -189,7 +189,9 @@ services:
       # must stay larger, or Docker kills the container mid-checkpoint
       # (tests/test_env_wiring.py checks it).
       TRAINING_SHUTDOWN_GRACE_S: ${TRAINING_SHUTDOWN_GRACE_S:-30}
-      UVICORN_TIMEOUT_KEEP_ALIVE: ${UVICORN_TIMEOUT_KEEP_ALIVE:-75}
+      # Must stay >= the gateway's UPSTREAM_KEEPALIVE_EXPIRY, or the server closes
+      # first and pooled sockets come back dead. Same 120 as app.py's default.
+      UVICORN_TIMEOUT_KEEP_ALIVE: ${UVICORN_TIMEOUT_KEEP_ALIVE:-120}
       MAX_UPLOAD_MB: ${TRAINING_MAX_UPLOAD_MB:-500}
       MAX_TEXT_CHARS: ${TRAINING_MAX_TEXT_CHARS:-1000}
       ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-*}
