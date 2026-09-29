@@ -72,6 +72,32 @@ def espeak_voice(language: str) -> str:
     return _REGIONAL_VOICES.get(code) or PHONEMIZER_LANGUAGES[code]
 
 
+def exported_voice(language: Optional[str]) -> str:
+    """The espeak voice written into an exported bundle (``phonemizer_language``).
+
+    The runtime phonemises text with this, so it has to be the voice the dataset
+    was phonemised with: ``espeak_voice`` is that single source of truth. The
+    exporter used to keep its own closed table with an ``en-us`` fallback, which
+    exported a pt-BR voice (trained with ``pt-br``) as English, and fr-BE and
+    en-GB likewise.
+
+    A tag this service cannot phonemise can only come from a checkpoint trained
+    before unsupported languages were refused, when they were phonemised as
+    ``en-us`` (the old table's fallback). Its symbols ARE English phonemes, so
+    ``en-us`` is what matches them; the export goes ahead, loudly, rather than
+    stranding a finished checkpoint.
+    """
+    try:
+        return espeak_voice(language)
+    except ValueError:
+        logger.warning(
+            "Checkpoint language %r is not supported for phonemisation; exporting it with "
+            "phonemizer_language 'en-us', which is what older releases trained it with.",
+            language,
+        )
+        return "en-us"
+
+
 def stt_language(language: Optional[str]) -> str:
     """The language to ask the STT service for: the primary code, or "auto".
 

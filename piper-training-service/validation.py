@@ -18,24 +18,82 @@ from fastapi import HTTPException
 logger = logging.getLogger(__name__)
 
 
-def safe_name(value: str, field: str = "name") -> str:
-    """Validate a model name or job id used to build filesystem paths.
+# One alphabet for every name that becomes a path component or a URL segment: the
+# piper runtime (`SAFE_NAME_RE`), qwen3 and the gateway accept exactly these
+# characters, so a name this service lets through but they refuse is a voice that
+# trains fine and then cannot be deployed or listed. The old check only blocked
+# path separators and let CR, LF, ESC, spaces and `?#%` through: harmless for the
+# filesystem, but they landed in log lines, in `custom/<name>` and in upload URLs.
+# `.` is not in the set, which rules out `.` and `..` by construction.
+NAME_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
+NAME_RULE = "1-64 characters: letters, digits, '_' and '-'"
 
-    Rejects values that could escape the data/checkpoints/models roots
-    (path separators, ``..``, NUL bytes, absolute paths). Normal voice
-    names and UUID job ids pass through unchanged.
+
+def is_safe_name(value) -> bool:
+    """Is *value* exactly a valid model name / job id (no stripping, no coercion)?"""
+    return isinstance(value, str) and NAME_PATTERN.fullmatch(value) is not None
+
+
+def safe_name(value: str, field: str = "name") -> str:
+    """Validate a model name or job id taken from a request.
+
+    Surrounding whitespace is stripped (a pasted name with a trailing newline
+    still works); everything else must match ``[A-Za-z0-9_-]{1,64}``. UUID job
+    ids and every name the other services accept pass through unchanged.
     """
-    name = (value or "").strip()
-    if (
-        not name
-        or name in {".", ".."}
-        or "/" in name
-        or "\\" in name
-        or "\x00" in name
-        or os.path.basename(name) != name
-    ):
-        raise HTTPException(status_code=400, detail=f"Invalid {field}: {value!r}")
+    name = value.strip() if isinstance(value, str) else ""
+    if not is_safe_name(name):
+        # !r escapes control characters, so the detail cannot carry a log-forging
+        # payload back out either.
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid {field}: {value!r} (expected {NAME_RULE})",
+        )
     return name
+
+
+def stored_name(value) -> Optional[str]:
+    """A name read back from ``job_state.json`` or from memory, or ``None``.
+
+    Input is checked once, at the endpoint, but the same names come back from
+    disk after a restart, and a volume can be restored from a backup or edited by
+    hand. Nothing read from there is trusted to still be a name: a state file
+    saying ``"model_name": "../checkpoints"`` must not become
+    ``shutil.rmtree("data/../checkpoints")``. No stripping here, since our own
+    writer only ever stored validated names.
+    """
+    return value if is_safe_name(value) else None
+
+
+def confined_path(root, name: str) -> Path:
+    """``root/name``, after proving it is a direct child of *root*; else ``ValueError``.
+
+    The second guard in front of every ``rmtree`` and every path built from a
+    stored name. A valid-looking name must still not lead elsewhere: a
+    ``data/<name>`` that is a symlink to another directory resolves outside
+    *root*, and is refused rather than followed. The path returned is the plain
+    ``root/name`` (what the caller would have built anyway), not the resolved one.
+    """
+    if not is_safe_name(name):
+        raise ValueError(f"not a valid name: {name!r}")
+    base = Path(root).resolve()
+    resolved = (base / name).resolve()
+    if resolved.parent != base or not resolved.is_relative_to(base):
+        raise ValueError(f"{name!r} resolves to {str(resolved)!r}, outside {str(base)!r}")
+    return Path(root) / name
+
+
+def is_within(path, directory) -> bool:
+    """Does *path*, once symlinks and ``..`` are resolved, lie inside *directory*?
+
+    For paths that are read back from a state file rather than built from a name
+    (``latest_checkpoint``): what is loaded on resume must be one of the job's own
+    checkpoints, not whatever file the state names.
+    """
+    try:
+        return Path(path).resolve().is_relative_to(Path(directory).resolve())
+    except (OSError, RuntimeError, ValueError):
+        return False
 
 
 # The UI offers 100-5000, but the API enforced nothing. `epochs=0` produces a

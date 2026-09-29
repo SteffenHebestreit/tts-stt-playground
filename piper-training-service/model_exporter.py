@@ -9,8 +9,9 @@ import logging
 import warnings
 from datetime import datetime
 
+from phonemization import exported_voice
 from validation import (
-    phoneme_id_map_from_entries, validate_phoneme_id_map, vocab_for_checkpoint,
+    is_safe_name, phoneme_id_map_from_entries, validate_phoneme_id_map, vocab_for_checkpoint,
 )
 from training_utils import TRAINER_KIND, TRAINER_CAVEAT
 
@@ -225,12 +226,11 @@ class ModelExporter:
             onnx_path.unlink(missing_ok=True)
             raise
 
+        # The voice the runtime phonemises with. Not a table of its own: training
+        # phonemised with phonemization.espeak_voice(), and a second mapping here
+        # exported pt-BR (trained as 'pt-br') as English.
         lang = config.get('language', 'en')
-        lang_map = {
-            'de': 'de', 'en': 'en-us', 'fr': 'fr-fr', 'es': 'es',
-            'it': 'it', 'nl': 'nl', 'pt': 'pt', 'ru': 'ru',
-        }
-        phonemizer_lang = lang_map.get(lang, 'en-us')
+        phonemizer_lang = exported_voice(lang)
 
         # Save the vocabulary as a standalone file for debugging / manual inspection
         with open(export_path / "phonemes.json", 'w', encoding='utf-8') as f:
@@ -245,7 +245,7 @@ class ModelExporter:
                 "quality": config.get('quality', 'medium')
             },
             "espeak": {
-                "voice": lang
+                "voice": phonemizer_lang
             },
             "inference": {
                 "noise_scale": 0.667,
@@ -367,6 +367,11 @@ class ModelExporter:
         that voice's alphabet with this voice's weights.
         """
         model_name = (config or {}).get('speaker_name')
+        if model_name and not is_safe_name(model_name):
+            # Read back from the checkpoint, so not trusted to still be a name:
+            # data/<this> must stay a direct child of data/.
+            logger.warning("Ignoring speaker_name %r from the checkpoint config: not a valid name", model_name)
+            model_name = None
 
         candidates = []
         if model_name:

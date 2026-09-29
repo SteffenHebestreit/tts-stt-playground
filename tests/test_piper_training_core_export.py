@@ -44,7 +44,7 @@ TINY = dict(
     speaker_name="tiny", language="de", quality="medium",
 )
 VOCAB = {"<pad>": 0, "<unk>": 1, "<start>": 2, "<end>": 3, " ": 4, "a": 5, "b": 6}
-MODULES = ("vits_model", "validation", "dataset", "training_utils", "model_exporter")
+MODULES = ("vits_model", "validation", "phonemization", "dataset", "training_utils", "model_exporter")
 
 
 @pytest.fixture(scope="module")
@@ -291,4 +291,57 @@ def test_vocabulary_larger_than_the_embedding_is_refused(svc, tmp_path, monkeypa
     _write_final(tmp_path, "job", _tiny_model(svc), phoneme_to_id=too_big)
 
     with pytest.raises(ValueError, match="embedding"):
+        _export(svc, "job")
+
+
+# --- the language the bundle tells the runtime to phonemise in -----------------------------------
+
+
+@pytest.mark.parametrize("language, expected", [
+    ("pt-br", "pt-br"),      # trained with the espeak voice pt-br; used to be exported as en-us
+    ("fr-be", "fr-be"),
+    ("en-gb", "en-gb"),
+    ("en", "en-us"),
+    ("de", "de"),
+    ("sv", "en-us"),         # a tag this service cannot phonemise: an old checkpoint, trained as en-us
+])
+def test_the_bundle_names_the_voice_training_phonemised_with(svc, tmp_path, monkeypatch, language, expected):
+    """piper-tts phonemises with `phonemizer_language`; a pt-BR voice exported as en-us read
+    Portuguese as English."""
+    monkeypatch.chdir(tmp_path)
+    _write_final(tmp_path, "job", _tiny_model(svc), config=dict(TINY, language=language))
+
+    _export(svc, "job")
+
+    bundle = json.loads((tmp_path / "models" / "job" / "job.json").read_text())
+    assert bundle["phonemizer_language"] == expected
+    assert bundle["espeak"]["voice"] == expected, "the espeak voice and phonemizer_language must agree"
+    assert bundle["model_card"]["language"] == language, "the card still records what was asked for"
+    if language in ("pt-br", "fr-be", "en-gb", "en", "de"):
+        assert expected == svc.phonemization.espeak_voice(language), "not the voice the dataset was built with"
+
+
+def test_a_checkpoint_without_a_language_exports_as_english_like_before(svc, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    config = {k: v for k, v in TINY.items() if k != "language"}
+    _write_final(tmp_path, "job", _tiny_model(svc), config=config)
+
+    _export(svc, "job")
+
+    bundle = json.loads((tmp_path / "models" / "job" / "job.json").read_text())
+    assert bundle["phonemizer_language"] == "en-us"
+
+
+def test_a_speaker_name_read_from_the_checkpoint_cannot_point_the_legacy_lookup_elsewhere(svc, tmp_path, monkeypatch):
+    """A checkpoint without a vocabulary looks for data/<speaker_name>/train.json. The name comes
+    from the checkpoint, so `../other` must not be followed to some other directory's train.json."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "data").mkdir()
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "train.json").write_text(json.dumps([{"phonemes": "ab"}]))
+    _write_final(tmp_path, "job", _tiny_model(svc), phoneme_to_id=None,
+                 config=dict(TINY, speaker_name="../other"))
+
+    with pytest.raises(RuntimeError, match="vocabulary"):
         _export(svc, "job")
