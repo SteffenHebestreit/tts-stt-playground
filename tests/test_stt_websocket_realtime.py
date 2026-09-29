@@ -16,21 +16,17 @@ The Whisper model is stubbed, so nothing here needs a GPU or a downloaded model.
 torch/faster-whisper are stubbed too; numpy is genuinely required.
 """
 
-import os
-import sys
 import time
-import types
-from importlib.util import module_from_spec, spec_from_file_location
-from pathlib import Path
 
 import pytest
 
 pytest.importorskip("numpy", reason="stt-service app.py requires numpy")
 
 import numpy as np  # noqa: E402
+from fastapi import HTTPException  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-STT_DIR = Path(__file__).resolve().parents[1] / "stt-service"
+from test_stt_support import load_stt_app  # noqa: E402
 
 # Tight limits so tests exercise the boundaries without pushing real-time audio.
 TEST_ENV = {
@@ -79,43 +75,15 @@ class FakeWhisper:
         return iter(segments), _Info()
 
 
-def _install_stubs():
-    """Stub torch and faster_whisper so app.py imports without a GPU stack."""
-    if "torch" not in sys.modules:
-        torch = types.ModuleType("torch")
-        torch.__version__ = "0.0.0-stub"
-        cuda = types.SimpleNamespace(
-            is_available=lambda: False,
-            device_count=lambda: 0,
-            get_device_name=lambda i: "stub",
-        )
-        torch.cuda = cuda
-        torch.backends = types.SimpleNamespace(mps=types.SimpleNamespace(is_available=lambda: False))
-        sys.modules["torch"] = torch
-
-    if "faster_whisper" not in sys.modules:
-        fw = types.ModuleType("faster_whisper")
-        fw.WhisperModel = FakeWhisper
-        sys.modules["faster_whisper"] = fw
-
-
 def _load_app_module():
-    """Import stt-service/app.py under a stubbed environment."""
-    _install_stubs()
-    for key, value in TEST_ENV.items():
-        os.environ[key] = value
+    """Import stt-service/app.py under a stubbed environment.
 
-    # app.py does `from json_utils import ...`, which lives beside it.
-    sys.path.insert(0, str(STT_DIR))
-    try:
-        spec = spec_from_file_location("stt_app_under_test", STT_DIR / "app.py")
-        module = module_from_spec(spec)
-        assert spec.loader is not None
-        sys.modules["stt_app_under_test"] = module
-        spec.loader.exec_module(module)
-        return module
-    finally:
-        sys.path.remove(str(STT_DIR))
+    The shared harness (test_stt_support.py) installs the torch / faster-whisper
+    stand-ins and TEST_ENV only for the duration of the import and puts both back, so
+    nothing here outlives the module (they used to be written into sys.modules and
+    os.environ and never removed, which changed what every later module imported).
+    """
+    return load_stt_app(TEST_ENV, name="stt_app_under_test", model_cls=FakeWhisper)
 
 
 @pytest.fixture(scope="module")
@@ -344,13 +312,14 @@ def test_health_reports_503_only_when_loading_actually_failed(client, stt_app):
     original_loaded, original_error = stt_app.model_loaded, stt_app.startup_error
     try:
         stt_app.model_loaded = False
-        stt_app.startup_error = "simulated load failure"
+        stt_app.startup_error = "model_files_unavailable"
         response = client.get("/health")
         assert response.status_code == 503
         body = response.json()
         assert body["model_loaded"] is False
         assert body["can_load"] is False
-        assert body["startup_error"] == "simulated load failure"
+        assert body["status"] == "error"
+        assert body["startup_error"] == "model_files_unavailable"
     finally:
         stt_app.model_loaded, stt_app.startup_error = original_loaded, original_error
 
@@ -481,7 +450,7 @@ def test_translate_is_rejected_on_turbo_models(client, stt_app):
     original = stt_app.model_size_loaded
     try:
         stt_app.model_size_loaded = "large-v3-turbo"
-        with pytest.raises(Exception) as excinfo:
+        with pytest.raises(HTTPException) as excinfo:
             stt_app._reject_unsupported_translate("translate")
         assert excinfo.value.status_code == 400
         assert "does not support translation" in excinfo.value.detail

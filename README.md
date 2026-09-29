@@ -429,9 +429,13 @@ the per-service limits; the ones most people touch:
 | `QWEN3_DEFAULT_LANGUAGE`, `PIPER_DEFAULT_LANGUAGE` | `German`, `de` | Language TTS uses when a request names none |
 | `QWEN3_ASR_MODEL` | `Qwen/Qwen3-ASR-1.7B` | Qwen3 ASR model ID |
 | `ALLOWED_ORIGINS` | (empty: same origin only) | Extra origins that may call the gateway from a browser; `*` opens it to any page. Behind a reverse proxy that rewrites `Host`, set `TRUSTED_ORIGINS` |
-| `API_KEY` | (empty: open) | Optional shared secret required as `Authorization: Bearer` on `/v1/*` and on state-changing `/api/*` calls |
-| `MAX_UPLOAD_MB`, `MAX_TTS_CHARS` | `512`, `20000` | Gateway limits; each backend has its own (`ASR_MAX_UPLOAD_MB`, `PIPER_MAX_UPLOAD_MB`, `CHATTERBOX_MAX_TEXT_CHARS`, ... see `.env.example`) |
-| `BACKEND_ALLOWED_ORIGINS` | `*` | CORS for the backends' own ports (only relevant with `BACKEND_BIND_ADDR=0.0.0.0` and browser callers) |
+| `TRUSTED_HOSTS` | (empty) | Host names the gateway may be reached by, besides IP addresses, `localhost`, `*.local`, `*.lan`, `*.internal` and single-label names such as `truenas`, which need nothing. A real domain (reverse proxy) or a Tailscale name must be listed (`voice.example.com,*.tail1234.ts.net`), else every request is `403 host_not_allowed` (DNS-rebinding guard). `ALLOWED_HOSTS=*` switches the check off |
+| `API_KEY` | (empty: open) | Optional shared secret required as `Authorization: Bearer` on `/v1/*`, on state-changing `/api/*` calls and on the `/ws/stt` upgrade. No exemption for the web UI: it asks for the key once per browser tab |
+| `MAX_UPLOAD_MB`, `MAX_TTS_CHARS` | `512`, `5000` | Gateway limits (`5000` is what Qwen3-TTS and Chatterbox accept; a Piper-only setup can raise it). Each backend has its own (`ASR_MAX_UPLOAD_MB`, `PIPER_MAX_UPLOAD_MB`, `CHATTERBOX_MAX_TEXT_CHARS`, ... see `.env.example`) |
+| `MAX_CONCURRENT_UPLOADS`, `MAX_CONCURRENT_FFMPEG` | `4`, `4` | Per gateway worker: uploads forwarded at once and `ffmpeg` conversions for `/v1/audio/speech`; the next request gets `503` + `Retry-After` |
+| `ASR_MAX_QUEUE`, `ASR_QUEUE_TIMEOUT_S` | (empty: 4 x `ASR_MAX_CONCURRENCY`), `60` | Requests that may wait for the one inference slot of Qwen3-ASR, Parakeet and Canary (`0` = nobody waits) and how long; beyond either the answer is `503` + `Retry-After`. `TTS_MAX_QUEUE` and `TTS_QUEUE_TIMEOUT_S` do the same for Qwen3-TTS and Chatterbox |
+| `PIPER_MAX_CUSTOM_VOICES`, `PIPER_MAX_CUSTOM_MB` | `20`, `2048` | Most uploaded Piper voices (`0` = no upload; `409` beyond it) and their total size (`413`); a new voice must also load and answer a test request within `PIPER_ONNX_VALIDATE_TIMEOUT_S` (30) |
+| `BACKEND_ALLOWED_ORIGINS` | (empty: closed) | CORS for the backends' own ports. Empty means no CORS headers and foreign-Origin POST/DELETE requests are refused (`403`); `*` must be set explicitly (each service logs a warning) |
 | `ALLOW_CREDENTIALS` | `false` | Enables CORS credentials only when origins are explicit |
 | `STT_SERVICE_URL` | `http://stt-service:8000` | STT endpoint used by Piper Training for audio labelling |
 
@@ -560,9 +564,25 @@ Models are downloaded on first launch, in the background: containers are healthy
 Backend ports are published on `127.0.0.1` only. Use the UI or the API on port 3000, which proxies every
 backend; set `BACKEND_BIND_ADDR=0.0.0.0` only on a network you trust.
 
+**Every request answers `403 Host ... is not allowed` (`host_not_allowed`)**
+The gateway only answers to names that cannot be re-pointed by a third party: IP addresses, `localhost`,
+`*.local`, `*.lan`, `*.internal`, `*.home.arpa` and single-label names. A real domain in front of a reverse
+proxy, or a Tailscale MagicDNS name, has to be listed in `TRUSTED_HOSTS` (`TRUSTED_HOSTS=voice.example.com`).
+
 **Every button in the UI answers 403 behind a reverse proxy**
 The proxy rewrites the `Host` header, so the UI's requests look cross-origin. Add the public URL to
 `TRUSTED_ORIGINS` (and set `TRUST_PROXY_HEADERS=true` if the proxy overwrites `X-Forwarded-Host`).
+A proxy that passes `Host` through only needs its name in `TRUSTED_HOSTS`.
+
+**The UI asks for an API key, or answers 401**
+`API_KEY` is set on the gateway. The UI prompts once per browser tab and keeps the key in `sessionStorage`;
+scripts send `Authorization: Bearer <key>`. There is no exemption for the UI.
+
+**503 with `Retry-After`**
+The service is at its limit rather than broken: too many uploads or `ffmpeg` conversions at the gateway
+(`MAX_CONCURRENT_UPLOADS`, `MAX_CONCURRENT_FFMPEG`), or a full or timed-out queue at a model backend
+(`ASR_MAX_QUEUE`, `TTS_MAX_QUEUE`, `*_QUEUE_TIMEOUT_S`). Retry after the delay; raise the limit only if the
+hardware has room.
 
 **Out of memory**
 - Use a smaller model (`small`, `medium`)
@@ -663,8 +683,10 @@ instead, and an optional `diun` service sends notifications only. Details are in
   resident; optional services add more (Canary, Parakeet, Chatterbox, training). Every GPU model is
   freed after `MODEL_TTL` seconds idle (300), so the sum need not fit at once. Budget against what
   `nvidia-smi` reports for your card; the per-service table is in the guide.
-- Remote browser access needs nothing beyond port 3000 (`ALLOWED_ORIGINS` stays empty; behind a
-  proxy that rewrites `Host` set `TRUSTED_ORIGINS`). The microphone from another machine needs HTTPS.
+- Remote browser access needs nothing beyond port 3000 (`ALLOWED_ORIGINS` stays empty) as long as you
+  open it by IP address, `*.local` or a plain name such as `truenas`. A real domain or a reverse proxy
+  needs `TRUSTED_HOSTS` (and `TRUSTED_ORIGINS` if the proxy rewrites `Host`). The microphone from another
+  machine needs HTTPS.
 
 ### Cleanup (optional)
 

@@ -21,9 +21,11 @@ from __future__ import annotations
 
 import os
 import pickle
+import shutil
 import sys
 import tempfile
 import types
+import weakref
 from dataclasses import dataclass
 from importlib.util import module_from_spec, spec_from_file_location
 from itertools import count
@@ -31,6 +33,8 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+
+from stub_modules import is_stub, stubbed_modules
 
 REPO = Path(__file__).resolve().parents[1]
 SERVICE_DIR = Path(os.environ.get("QWEN3_TTS_SERVICE_DIR") or REPO / "qwen3-tts-service")
@@ -42,7 +46,8 @@ MANAGED_ENV = (
     "QWEN3_TTS_MODEL", "QWEN3_DEFAULT_LANGUAGE", "QWEN3_TTS_ATTN_IMPLEMENTATION",
     "MAX_TEXT_CHARS", "MAX_UPLOAD_MB", "TTS_MODEL_TTL", "MODEL_TTL",
     "TTS_MAX_CONCURRENCY", "TTS_MAX_BATCH", "VOICES_DIR", "QWEN3_ASR_SERVICE_URL",
-    "ALLOWED_ORIGINS", "ALLOW_CREDENTIALS",
+    "ALLOWED_ORIGINS", "ALLOW_CREDENTIALS", "QWEN3_TTS_REF_MAX_SECONDS",
+    "TTS_QUEUE_TIMEOUT_S", "TTS_MAX_QUEUE",
 )
 
 BASE_06 = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
@@ -62,10 +67,6 @@ CUSTOM_VOICE_SPEAKERS = [
 ]
 
 
-def _is_stub(module) -> bool:
-    return getattr(module, "__file__", None) is None
-
-
 def _pickle_save(obj, path, *args, **kwargs):
     with open(path, "wb") as fh:
         pickle.dump(obj, fh)
@@ -76,61 +77,60 @@ def _pickle_load(path, *args, **kwargs):
         return pickle.load(fh)
 
 
-def install_stubs() -> None:
-    """torch / soundfile / uvicorn stand-ins, only where the real package is absent.
+def _torch_stub() -> types.ModuleType:
+    torch = types.ModuleType("torch")
+    torch.__version__ = "0.0.0-stub"
+    torch.bfloat16 = "bfloat16"
+    torch.float32 = "float32"
+    torch.is_tensor = lambda x: False
+    torch.tensor = lambda x: x
+    torch.save = _pickle_save
+    torch.load = _pickle_load
+    torch.cuda = types.SimpleNamespace(
+        is_available=lambda: False,
+        empty_cache=lambda: None,
+        ipc_collect=lambda: None,
+        get_device_name=lambda i: "stub",
+        memory_allocated=lambda: 0,
+        get_device_properties=lambda i: types.SimpleNamespace(total_memory=0),
+        is_bf16_supported=lambda: False,
+    )
+    return torch
 
-    Other test modules install a torch stub of their own with fewer attributes,
-    so the ones this service needs are filled in on whichever stub is present.
+
+def _soundfile_stub() -> types.ModuleType:
+    sf = types.ModuleType("soundfile")
+    sf.write = lambda *a, **k: None
+    sf.info = lambda p: types.SimpleNamespace(format="WAV", samplerate=16000, channels=1, frames=0)
+    return sf
+
+
+def _uvicorn_stub() -> types.ModuleType:
+    uv = types.ModuleType("uvicorn")
+    uv.run = lambda *a, **k: None
+    return uv
+
+
+def stubbed_imports():
+    """torch / soundfile / uvicorn stand-ins for the duration of an import, then gone.
+
+    Left in ``sys.modules`` they made every later ``import uvicorn`` in the suite succeed
+    for the wrong reason (see tests/stub_modules.py). A real package that was imported
+    earlier is used as it is; otherwise the app gets these, and keeps them as the names
+    it bound at import (``m.torch``, ``m.sf``).
     """
-    if "torch" not in sys.modules:
-        sys.modules["torch"] = types.ModuleType("torch")
-    torch = sys.modules["torch"]
-    if _is_stub(torch):
-        defaults = {
-            "__version__": "0.0.0-stub",
-            "bfloat16": "bfloat16",
-            "float32": "float32",
-            "is_tensor": lambda x: False,
-            "tensor": lambda x: x,
-            "save": _pickle_save,
-            "load": _pickle_load,
-        }
-        for name, value in defaults.items():
-            if not hasattr(torch, name):
-                setattr(torch, name, value)
-        if not hasattr(torch, "cuda"):
-            torch.cuda = types.SimpleNamespace()
-        cuda_defaults = {
-            "is_available": lambda: False,
-            "empty_cache": lambda: None,
-            "ipc_collect": lambda: None,
-            "get_device_name": lambda i: "stub",
-            "memory_allocated": lambda: 0,
-            "get_device_properties": lambda i: types.SimpleNamespace(total_memory=0),
-            "is_bf16_supported": lambda: False,
-        }
-        for name, value in cuda_defaults.items():
-            if not hasattr(torch.cuda, name):
-                setattr(torch.cuda, name, value)
-
-    if "soundfile" not in sys.modules:
-        sf = types.ModuleType("soundfile")
-        sf.write = lambda *a, **k: None
-        sf.info = lambda p: types.SimpleNamespace(
-            format="WAV", samplerate=16000, channels=1, frames=0)
-        sys.modules["soundfile"] = sf
-
-    if "uvicorn" not in sys.modules:
-        uv = types.ModuleType("uvicorn")
-        uv.run = lambda *a, **k: None
-        sys.modules["uvicorn"] = uv
+    return stubbed_modules({"torch": _torch_stub, "soundfile": _soundfile_stub, "uvicorn": _uvicorn_stub})
 
 
 def make_tensor(values):
     """A real tensor when torch is real (so `weights_only` loading is exercised), else the values."""
-    import torch
-
-    return values if _is_stub(torch) else torch.tensor(values)
+    torch = sys.modules.get("torch")
+    if torch is None:
+        try:
+            import torch
+        except ImportError:
+            return values
+    return values if is_stub(torch) else torch.tensor(values)
 
 
 _counter = count()
@@ -138,21 +138,33 @@ _counter = count()
 
 def load_app(voices_dir: Optional[str] = None, **env):
     """Import a fresh copy of the service with *env* as its whole configuration."""
-    install_stubs()
     previous = {key: os.environ.get(key) for key in MANAGED_ENV}
     for key in MANAGED_ENV:
         os.environ.pop(key, None)
-    os.environ["VOICES_DIR"] = voices_dir or tempfile.mkdtemp(prefix="qwen3-tts-voices-")
+    # A voice library nobody supplied is ours to remove again: one per load, so a long
+    # run (or every run, over months) left thousands of qwen3-tts-voices-* directories.
+    scratch_voices = None if voices_dir else tempfile.mkdtemp(prefix="qwen3-tts-voices-")
+    os.environ["VOICES_DIR"] = voices_dir or scratch_voices
     os.environ.update({key: str(value) for key, value in env.items()})
     name = f"qwen3_tts_under_test_{next(_counter)}"
     sys.path.insert(0, str(SERVICE_DIR))
     try:
-        spec = spec_from_file_location(name, SERVICE_DIR / "app.py")
-        module = module_from_spec(spec)
-        assert spec.loader is not None
-        sys.modules[name] = module
-        spec.loader.exec_module(module)
+        with stubbed_imports():
+            spec = spec_from_file_location(name, SERVICE_DIR / "app.py")
+            module = module_from_spec(spec)
+            assert spec.loader is not None
+            sys.modules[name] = module
+            spec.loader.exec_module(module)
+        _stand_in_for_the_reference_decoder(module)
+        if scratch_voices:
+            # The module stays in sys.modules, so this runs when the interpreter exits
+            # (weakref.finalize is atexit-safe); tests keep using the directory until then.
+            weakref.finalize(module, shutil.rmtree, scratch_voices, True)
         return module
+    except BaseException:
+        if scratch_voices:
+            shutil.rmtree(scratch_voices, ignore_errors=True)
+        raise
     finally:
         sys.path.remove(str(SERVICE_DIR))
         for key, value in previous.items():
@@ -160,6 +172,20 @@ def load_app(voices_dir: Optional[str] = None, **env):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+
+
+def _stand_in_for_the_reference_decoder(module) -> None:
+    """Reference clips in these tests are placeholder bytes, not audio.
+
+    The service measures every reference clip (soundfile, else librosa) before it
+    uses it. The default here says "one second long"; a test of that check puts the
+    real function back with ``module._measure_reference = module._real_measure_reference``
+    (the pre-fix service has no such function, and nothing happens).
+    """
+    real = getattr(module, "_measure_reference", None)
+    if real is not None:
+        module._real_measure_reference = real
+        module._measure_reference = lambda path, cap: (1.0, True)
 
 
 @dataclass

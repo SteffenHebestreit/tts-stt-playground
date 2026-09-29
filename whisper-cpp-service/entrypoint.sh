@@ -34,6 +34,8 @@ if [ -n "${GGML_VULKAN_DEVICE+x}" ]; then
     VULKAN_ARGS="--device ${GGML_VULKAN_DEVICE}"
 fi
 
+# ${VULKAN_ARGS} and ${EXTRA_ARGS} are argument lists on purpose: they must split into words.
+# shellcheck disable=SC2086
 exec whisper-server \
     --model "$MODEL_FILE" \
     --host 0.0.0.0 \

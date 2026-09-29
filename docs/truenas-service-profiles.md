@@ -63,5 +63,7 @@ docker compose --env-file .env -f docker-compose.yml -f docker-compose.truenas.y
 
 The browser talks only to the frontend on port 3000, which proxies everything else internally
 (`/api/*`, `/api/health`, `/ws/stt`). Leave `ALLOWED_ORIGINS` empty: it is only for scripts in
-other web pages. The microphone from another machine needs HTTPS
+other web pages. Open the UI by IP address, `*.local` or a plain name; a real domain or a
+Tailscale name must be listed in `TRUSTED_HOSTS` (`403 host_not_allowed` otherwise). The microphone
+from another machine needs HTTPS
 ([reverse proxy](./truenas-installation-guide.md#8-reverse-proxy-and-https)).

@@ -25,6 +25,7 @@ import re
 import copy
 import math
 import time
+import uuid
 import struct
 import asyncio
 import inspect
@@ -49,7 +50,9 @@ from typing import Optional
 from pydantic import BaseModel
 import uvicorn
 
+from body_limit import BodyLimitMiddleware
 from model_lifecycle import ModelSlot, ttl_from_env
+from origin_guard import OriginGuardMiddleware, parse_allowed_origins
 
 
 def _number(raw, name, default, cast=int, minimum=None):
@@ -70,10 +73,78 @@ def _number(raw, name, default, cast=int, minimum=None):
     return value
 
 
+def _failure(status_code: int, public: str, detail: object = None, *, exc_info: bool = False) -> HTTPException:
+    """An error for the client that says *public* and a request id, nothing else.
+
+    The exception text (library messages carry paths, URLs and shapes) is written to
+    the log under the same id, so an operator can find it and a caller cannot read
+    the container's internals out of an unauthenticated response. Call with
+    ``exc_info=True`` from an ``except`` block.
+    """
+    request_id = uuid.uuid4().hex[:12]
+    logger.error("[request %s] %s: %s", request_id, public, detail, exc_info=exc_info)
+    return HTTPException(
+        status_code=status_code,
+        detail=f"{public} (request id {request_id}).",
+        headers={"X-Request-ID": request_id},
+    )
+
+
+class _ExplainedError(RuntimeError):
+    """A failure whose message was written for the caller: it names the fix and nothing internal."""
+
+
+def _server_error(exc: Exception, public: str) -> HTTPException:
+    """The 500 for an unexpected exception: generic, unless the message was written for the caller."""
+    if isinstance(exc, _ExplainedError):
+        logger.warning("%s: %s", public, exc)
+        return HTTPException(status_code=500, detail=str(exc))
+    return _failure(500, public, exc, exc_info=True)
+
+
 # --- Configuration -----------------------------------------------------------
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-DEFAULT_LANGUAGE = os.getenv("CHATTERBOX_DEFAULT_LANGUAGE", "de")
+
+# Chatterbox Multilingual language ids, by the names and codes a caller or an operator
+# is likely to write. The ids are what generate(language_id=) accepts.
+_LANGUAGE_NAMES = {
+    "english": "en", "german": "de", "french": "fr", "spanish": "es",
+    "italian": "it", "portuguese": "pt", "russian": "ru", "japanese": "ja",
+    "korean": "ko", "chinese": "zh", "dutch": "nl", "polish": "pl",
+    "turkish": "tr", "swedish": "sv", "danish": "da", "norwegian": "no",
+    "finnish": "fi", "greek": "el", "hebrew": "he", "hindi": "hi",
+    "arabic": "ar", "malay": "ms", "swahili": "sw",
+}
+_LANGUAGE_IDS = frozenset(_LANGUAGE_NAMES.values())
+
+
+def _configured_default_language(raw) -> str:
+    """CHATTERBOX_DEFAULT_LANGUAGE as a language id the library accepts; German otherwise.
+
+    Case, surrounding blanks, region tags ("de-DE", "pt_BR") and language names
+    ("German") are all fine. What used to be returned as written ("", "de-DE",
+    "German", " de ") was handed to every request that asked for "auto", and the
+    library rejects all of those. Anything unknown falls back to "de" with a warning.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return "de"
+    key = text.lower().replace("-", "_")
+    language = _LANGUAGE_NAMES.get(key) or _LANGUAGE_NAMES.get(key.split("_")[0])
+    if language is None:
+        primary = key.split("_")[0]
+        language = primary if primary in _LANGUAGE_IDS else None
+    if language is None:
+        logger.warning(
+            "Ignoring unsupported CHATTERBOX_DEFAULT_LANGUAGE=%r; using de. Supported: %s",
+            raw, ", ".join(sorted(_LANGUAGE_IDS)),
+        )
+        return "de"
+    return language
+
+
+DEFAULT_LANGUAGE = _configured_default_language(os.getenv("CHATTERBOX_DEFAULT_LANGUAGE"))
 
 # Which T3 (text-to-speech-token) checkpoint to load. "v3" needs a chatterbox
 # build that accepts `t3_model` (GitHub master, not PyPI 0.1.7); on an older
@@ -123,23 +194,25 @@ _active_t3_model: Optional[str] = None
 # One process-global model on one GPU: overlapping generations thrash VRAM and
 # make every request slower than running them back to back. Released by the
 # worker thread's completion (see _run_generation), not by request cancellation.
-_GEN_SEM = asyncio.Semaphore(_number(os.getenv("TTS_MAX_CONCURRENCY"), "TTS_MAX_CONCURRENCY", 1, int, minimum=1))
+_GEN_CONCURRENCY = _number(os.getenv("TTS_MAX_CONCURRENCY"), "TTS_MAX_CONCURRENCY", 1, int, minimum=1)
+_GEN_SEM = asyncio.Semaphore(_GEN_CONCURRENCY)
+
+# Waiting for that permit used to be unbounded: every waiter holds its request (and,
+# for /clone, a spooled upload) for as long as generations ahead of it take, so a burst
+# of requests was a queue of unbounded length and unbounded wait. A request now waits
+# at most TTS_QUEUE_TIMEOUT_S, and when TTS_MAX_QUEUE are already waiting the next
+# one is turned away at once; both answer 503 with Retry-After.
+QUEUE_TIMEOUT_S = _number(os.getenv("TTS_QUEUE_TIMEOUT_S"), "TTS_QUEUE_TIMEOUT_S", 60.0, float, minimum=0.1)
+MAX_QUEUE = _number(os.getenv("TTS_MAX_QUEUE"), "TTS_MAX_QUEUE", 4 * _GEN_CONCURRENCY, int, minimum=0)
+_waiting = 0  # requests inside _acquire_generation_slot's wait (the event loop is the only writer)
 
 # `model.conds` and T3's per-call backend are instance state, so two generate()
 # calls on one model must never overlap, whatever TTS_MAX_CONCURRENCY says. The
 # semaphore normally makes this uncontended; it is the guarantee, not the queue.
 _MODEL_LOCK = threading.Lock()
 
-# Chatterbox Multilingual language ids (subset map for common request values).
-LANGUAGE_ALIASES = {
-    "auto": DEFAULT_LANGUAGE,
-    "english": "en", "german": "de", "french": "fr", "spanish": "es",
-    "italian": "it", "portuguese": "pt", "russian": "ru", "japanese": "ja",
-    "korean": "ko", "chinese": "zh", "dutch": "nl", "polish": "pl",
-    "turkish": "tr", "swedish": "sv", "danish": "da", "norwegian": "no",
-    "finnish": "fi", "greek": "el", "hebrew": "he", "hindi": "hi",
-    "arabic": "ar", "malay": "ms", "swahili": "sw",
-}
+# Request values that are not already a language id ("auto" is the validated default).
+LANGUAGE_ALIASES = {"auto": DEFAULT_LANGUAGE, **_LANGUAGE_NAMES}
 
 
 # --- Model loading -----------------------------------------------------------
@@ -309,7 +382,7 @@ _UPLOAD_PATHS = {"/clone", "/clone-with-ref-text"}
 
 
 def _body_limit(path: str) -> int:
-    """Largest request body (bytes) accepted at *path*, by declared Content-Length."""
+    """Largest request body (bytes) accepted at *path*."""
     # 12 bytes per character is the worst case, a JSON-escaped astral character.
     text = MAX_TEXT_CHARS * 12 * 2 + 64 * 1024
     if path in _UPLOAD_PATHS:
@@ -317,47 +390,33 @@ def _body_limit(path: str) -> int:
     return text
 
 
-class _BodyLimitMiddleware:
-    """Answer 413 from the Content-Length header, before anything is buffered.
-
-    FastAPI parses the whole body (multipart parts are spooled to disk, JSON is
-    held in memory) before a handler runs, so a size check inside the handler
-    comes after the cost was paid. Clients that send no Content-Length (chunked)
-    are still bounded per field by the handlers.
-    """
-
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] == "http" and scope["method"] in ("POST", "PUT"):
-            declared = dict(scope["headers"]).get(b"content-length", b"")
-            limit = _body_limit(scope["path"])
-            if declared.isdigit() and int(declared) > limit:
-                response = JSONResponse(
-                    status_code=413,
-                    content={"detail": f"Request body is larger than {limit / _MIB:.3g} MB."},
-                )
-                await response(scope, receive, send)
-                return
-        await self.app(scope, receive, send)
-
-
-allowed_origins_str = os.getenv("ALLOWED_ORIGINS", "*")
-allowed_origins = [origin.strip() for origin in allowed_origins_str.split(",")] if allowed_origins_str else ["*"]
+# Unset or empty ALLOWED_ORIGINS means no CORS headers at all (it used to mean
+# "*"); "*" only when it is written down (and logged); otherwise an explicit list.
+allowed_origins = parse_allowed_origins(os.getenv("ALLOWED_ORIGINS", ""))
 allow_credentials = os.getenv("ALLOW_CREDENTIALS", "false").strip().lower() in {"1", "true", "yes", "on"}
 if "*" in allowed_origins and allow_credentials:
     allow_credentials = False
 
-# Added before CORS so CORS is the outer layer and a 413 still carries its headers.
-app.add_middleware(_BodyLimitMiddleware)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=allow_credentials,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# FastAPI parses the whole body (multipart parts are spooled to disk, JSON is held
+# in memory) before a handler runs, so a size check inside the handler comes after
+# the cost was paid. body_limit.py checks the declared Content-Length AND counts
+# the bytes that arrive, so a chunked upload is cut off at the limit too.
+#
+# Each add_middleware wraps what was added before it: the body limit is innermost,
+# the origin guard (403 for a state-changing request with a foreign Origin header;
+# no Origin, e.g. the gateway or curl, is not affected) comes next, and CORS is
+# outermost so a 403/413 still carries the CORS headers a listed origin needs in
+# order to read it. CORS is only added when origins are configured.
+app.add_middleware(BodyLimitMiddleware, limit_for=_body_limit)
+app.add_middleware(OriginGuardMiddleware, allowed_origins=allowed_origins)
+if allowed_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins,
+        allow_credentials=allow_credentials,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
 def _supported_language_ids(model) -> list:
@@ -385,7 +444,7 @@ def _require_text(text: Optional[str], field: str = "Text") -> str:
     if len(text) > MAX_TEXT_CHARS:
         raise HTTPException(
             status_code=413,
-            detail=f"{field} is {len(text)} characters; the limit is {MAX_TEXT_CHARS} (MAX_TEXT_CHARS).",
+            detail=f"{field} is {len(text)} characters; the limit is {MAX_TEXT_CHARS} (raise it with MAX_TEXT_CHARS).",
         )
     return text
 
@@ -458,7 +517,7 @@ def _generate_text(model, default_conds, chunks, language_id, *, prompt_path=Non
     a clone can never speak in a later /tts or /tts-stream.
     """
     if prompt_path is None and default_conds is None:
-        raise RuntimeError(
+        raise _ExplainedError(
             "This checkpoint ships no built-in voice (no conds.pt); send a reference clip to /clone instead."
         )
     gap_ms = CHUNK_GAP_MS if gap_ms is None else gap_ms
@@ -506,8 +565,52 @@ def _generation_finished(lease, cleanup, fut) -> None:
         fut.exception()  # mark retrieved: the awaiting request may be long gone
 
 
+def _busy(message: str) -> HTTPException:
+    """503 telling the caller to come back: the generation queue is full or too slow."""
+    return HTTPException(
+        status_code=503, detail=message,
+        headers={"Retry-After": str(max(1, int(QUEUE_TIMEOUT_S // 4)))},
+    )
+
+
+def _shed_if_saturated() -> None:
+    """503 at once when a permit is not free and TTS_MAX_QUEUE requests already wait for one.
+
+    Call this before a request costs anything (decoding its upload, taking a model
+    reference): `_acquire_generation_slot` applies the same rule again, but by then
+    the work that made the request expensive is done.
+    """
+    if _GEN_SEM.locked() and _waiting >= MAX_QUEUE:
+        raise _busy(f"The generation queue is full ({MAX_QUEUE} waiting, TTS_MAX_QUEUE); retry shortly.")
+
+
+async def _acquire_generation_slot(*, continuation: bool = False) -> None:
+    """Take a generation permit: waits at most TTS_QUEUE_TIMEOUT_S, and never more than TTS_MAX_QUEUE deep.
+
+    Nothing is held on any way out of the wait (timeout, cancellation, a full
+    queue), so callers have nothing to give back unless this returns.
+    *continuation* is a later chunk of a stream that has already started: it may
+    join a full queue (a request that began is not cut off half way; the timeout
+    still applies), where a new request is turned away.
+    """
+    global _waiting
+    if not _GEN_SEM.locked():
+        await _GEN_SEM.acquire()  # a free permit: takes it without waiting
+        return
+    if not continuation and _waiting >= MAX_QUEUE:
+        raise _busy(f"The generation queue is full ({MAX_QUEUE} waiting, TTS_MAX_QUEUE); retry shortly.")
+    _waiting += 1
+    try:
+        await asyncio.wait_for(_GEN_SEM.acquire(), timeout=QUEUE_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        raise _busy(
+            f"No generation slot became free within {QUEUE_TIMEOUT_S:g}s (TTS_QUEUE_TIMEOUT_S); retry shortly.")
+    finally:
+        _waiting -= 1
+
+
 async def _run_generation(chunks, language_id, *, prompt_path=None, exaggeration=None,
-                          cfg_weight=None, gap_ms=None, cleanup=()):
+                          cfg_weight=None, gap_ms=None, cleanup=(), continuation=False):
     """Generate *chunks* on the worker pool; returns ``(audio, sample_rate)``.
 
     Takes the generation slot and its OWN model reference, and gives both back
@@ -516,11 +619,16 @@ async def _run_generation(chunks, language_id, *, prompt_path=None, exaggeration
     running one, and cannot let a TTL or /unload free weights the thread is still
     reading. The thread is told to stop after its current chunk.
 
+    The wait for the slot is bounded (TTS_QUEUE_TIMEOUT_S, and TTS_MAX_QUEUE deep):
+    503 with Retry-After, with nothing taken yet, so there is nothing to give back.
+    *continuation* marks a later chunk of a stream that has started (see
+    `_acquire_generation_slot`).
+
     *cleanup* (temp files) is owned from the moment of the call.
     """
     cancel = threading.Event()
     try:
-        await _GEN_SEM.acquire()
+        await _acquire_generation_slot(continuation=continuation)
     except BaseException:
         _unlink(*cleanup)
         raise
@@ -749,9 +857,16 @@ async def ready():
     200 once a load has ever succeeded — a later TTL unload does not make the
     service unready — and also while nothing is known to be wrong; 503 while the
     first load runs (`reason: loading`) or when it failed and never succeeded
-    (`reason: load_failed`, with the error). Never loads a model itself.
+    (`reason: load_failed`). Never loads a model itself.
+
+    Unauthenticated, so a failed load is reported as a category only: the
+    exception text (download URLs, cache paths) is in the service log, written
+    when the load failed.
     """
     state = _model_slot.readiness()
+    if state.get("last_error"):
+        state = {**state, "last_error": "load_failed",
+                 "detail": "The model failed to load; see the service log." if state.get("detail") else None}
     body = {
         "status": "ready" if state["ready"] else "not_ready",
         **state,
@@ -840,6 +955,7 @@ async def text_to_speech(request: TTSRequest):
     """
     text = _require_text(request.text)
     _check_tuning(request.exaggeration, request.cfg_weight)
+    _shed_if_saturated()
 
     try:
         language_id = _resolve_language(request.language)
@@ -858,8 +974,7 @@ async def text_to_speech(request: TTSRequest):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"TTS error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _server_error(e, "Speech generation failed")
 
 
 def _streaming_wav_header(sample_rate: int) -> bytes:
@@ -890,6 +1005,7 @@ async def text_to_speech_stream(request: TTSRequest):
     """
     text = _require_text(request.text)
     _check_tuning(request.exaggeration, request.cfg_weight)
+    _shed_if_saturated()
     language_id = _resolve_language(request.language)
     sentences = _split_sentences(text)
 
@@ -903,8 +1019,7 @@ async def text_to_speech_stream(request: TTSRequest):
     try:
         lease = await _model_slot.acquire_lease()
     except Exception as e:
-        logger.error(f"TTS stream could not load the model: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _failure(500, "The speech model could not be loaded", e, exc_info=True)
     try:
         sample_rate = lease.model.sr
 
@@ -925,8 +1040,7 @@ async def text_to_speech_stream(request: TTSRequest):
         # Nothing will consume the generator, so give the reference back here.
         await lease.release_async()
         if isinstance(e, Exception) and not isinstance(e, HTTPException):
-            logger.error(f"TTS stream error: {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _server_error(e, "Speech generation failed")
         raise
 
     gap_pcm = _to_pcm16(np.zeros(int(sample_rate * CHUNK_GAP_MS / 1000), dtype=np.float32))
@@ -940,6 +1054,7 @@ async def text_to_speech_stream(request: TTSRequest):
                     audio, _sr = await _run_generation(
                         [sentence], language_id,
                         exaggeration=request.exaggeration, cfg_weight=request.cfg_weight,
+                        continuation=True,
                     )
                 except Exception as e:
                     logger.error(f"Streaming TTS failed at chunk {index}/{len(sentences)}: {e}", exc_info=True)
@@ -1056,6 +1171,7 @@ async def _clone(text: str, lang: str, file: UploadFile,
     """Shared implementation for the clone endpoints."""
     text = _require_text(text)
     _check_tuning(exaggeration, cfg_weight)
+    _shed_if_saturated()
 
     try:
         language_id = _resolve_language(lang)
@@ -1078,8 +1194,7 @@ async def _clone(text: str, lang: str, file: UploadFile,
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Voice clone error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _server_error(e, "Voice cloning failed")
 
 
 @app.post("/clone")

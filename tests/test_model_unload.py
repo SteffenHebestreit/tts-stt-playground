@@ -307,24 +307,10 @@ def test_stt_transcribe_paths_never_read_the_global_model():
     )
 
 
-def test_stt_unload_refuses_while_referenced():
-    """unload_model() must report busy rather than dropping a referenced model."""
-    source = (REPO_ROOT / "stt-service" / "app.py").read_text(encoding="utf-8")
-    tree = ast.parse(source)
-
-    func = next(
-        n for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef) and n.name == "unload_model"
-    )
-    body = ast.unparse(func)
-    assert "_model_refs > 0" in body, "unload_model does not check the reference count"
-    assert "'busy'" in body or '"busy"' in body, "unload_model does not report busy"
-
-
-def test_stt_health_exposes_the_reference_count():
-    """Callers need to know when a retry is worthwhile."""
-    source = (REPO_ROOT / "stt-service" / "app.py").read_text(encoding="utf-8")
-    assert '"model_refs": _model_refs' in source
+# The other two guarantees that used to be checked here by reading app.py (unload_model
+# reports "busy" while a reference is held, /health exposes the reference count) are
+# behavioural tests now: test_stt_idle_unload.py::test_unload_refuses_while_a_decode_holds_the_model
+# and test_stt_error_hygiene.py::test_health_keeps_the_fields_the_gateway_and_the_probes_read.
 
 
 # --- live transcription capability -------------------------------------------

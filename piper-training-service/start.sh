@@ -80,8 +80,9 @@ else
     echo "⚠️ No GPU acceleration available, using CPU"
     echo "💡 Training will be slower but still functional"
     # Optimize CPU usage
-    export OMP_NUM_THREADS=$(nproc)
-    export MKL_NUM_THREADS=$(nproc)
+    OMP_NUM_THREADS=$(nproc)
+    MKL_NUM_THREADS=$(nproc)
+    export OMP_NUM_THREADS MKL_NUM_THREADS
 fi
 
 # Set device type for the training service

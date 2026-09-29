@@ -96,8 +96,13 @@ def test_a_declared_content_length_over_the_limit_is_refused_before_the_body_is_
 
 
 def test_the_early_413_still_carries_the_cors_headers(service, tmp_path, monkeypatch):
-    """The body-limit layer sits inside CORS, or a browser reads the refusal as a network error."""
-    module, model, _, _ = build(service, tmp_path, monkeypatch, MAX_UPLOAD_MB="0.05")
+    """The body-limit layer sits inside CORS, or a browser reads the refusal as a network error.
+
+    CORS is only there for an origin the operator listed: with ALLOWED_ORIGINS unset
+    no CORS header is sent at all (tests/test_origin_guard.py covers that).
+    """
+    module, model, _, _ = build(
+        service, tmp_path, monkeypatch, MAX_UPLOAD_MB="0.05", ALLOWED_ORIGINS="http://ui.example")
 
     async def scenario():
         async with make_client(module) as client:
@@ -108,7 +113,7 @@ def test_the_early_413_still_carries_the_cors_headers(service, tmp_path, monkeyp
     response = run(scenario())
 
     assert response.status_code == 413
-    assert response.headers["access-control-allow-origin"] == "*"
+    assert response.headers["access-control-allow-origin"] == "http://ui.example"
 
 
 def test_an_upload_under_the_limit_is_transcribed(service, tmp_path, monkeypatch):
@@ -409,10 +414,16 @@ def test_a_transcode_that_outlives_its_timeout_is_killed_and_the_original_is_use
     async def scenario():
         upload = UploadFile(file=io.BytesIO(payload), filename="clip.wav")
         async with nc.prepared_upload(
-            upload, max_bytes=10**9, max_seconds=100.0, ffmpeg=str(fake.path), convert_timeout=0.3,
+            # The timeout is what is under test, but it must not fire before the fake has
+            # started and published its pid, or there is nothing to check afterwards: a
+            # Python interpreter needs ~30 ms to get there, several times that on a loaded
+            # runner. 0.3 s missed it (TypeError from process_alive(None)); 2 s is ~50x.
+            upload, max_bytes=10**9, max_seconds=100.0, ffmpeg=str(fake.path), convert_timeout=2.0,
         ) as prepared:
             path = prepared.path
-        await wait_for(lambda: not process_alive(fake.hung_pid()), "the hung ffmpeg to be killed")
+        pid = fake.hung_pid()
+        assert pid is not None, "the timeout fired before the fake ffmpeg started: raise convert_timeout"
+        await wait_for(lambda: not process_alive(pid), "the hung ffmpeg to be killed")
         return path
 
     path = run(scenario())
@@ -452,3 +463,28 @@ def test_unload_does_not_block_the_event_loop_while_the_weights_move_off_the_gpu
     assert health.status_code == 200
     assert unloaded.status_code == 200
     assert unloaded.json()["unloaded"] is True
+
+
+def test_unload_moves_the_weights_off_the_gpu_and_clears_the_loaded_flag(service, tmp_path, monkeypatch):
+    """`empty_cache()` frees only unreferenced blocks, and NeMo keeps its own reference to the
+    module, so an unload that merely drops ours frees nothing: the hook has to `.cpu()` the
+    weights. And `/health` must stop reporting a model that is gone."""
+    module, model, _, _ = build(service, tmp_path, monkeypatch)
+    with module._model_slot.acquire():
+        pass  # resident, no references
+    module.model_loaded = True
+    moved = []
+    model.cpu = lambda: moved.append(True) or model
+
+    async def scenario():
+        async with make_client(module) as client:
+            return await client.post("/unload"), await client.get("/health")
+
+    unloaded, health = run(scenario())
+
+    assert unloaded.status_code == 200 and unloaded.json()["unloaded"] is True
+    assert moved == [True], "the weights were dropped without being moved off the GPU"
+    assert module.model_loaded is False
+    body = health.json()
+    assert body["model_resident"] is False, "/health keeps reporting a model that was unloaded"
+    assert {"model_resident", "model_ttl_seconds", "active_requests"} <= set(body)

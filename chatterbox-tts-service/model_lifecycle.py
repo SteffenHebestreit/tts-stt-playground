@@ -69,8 +69,33 @@ original surface and its behaviour is unchanged):
     slot.ever_loaded    True once any load has succeeded (sticky)
     slot.loading        a load is running right now
     slot.last_error     "Type: message" of the most recent failed load, else None
+    slot.last_error_category
+                        error_category() of that failure, else None: a short,
+                        path-free token for an unauthenticated response body
     slot.readiness()    {"ready", "reason", "detail", "resident", "ever_loaded",
-                         "loading", "last_error"}
+                         "loading", "last_error", "error_category"}
+
+    ``last_error`` and ``detail`` carry the exception text (which can hold file
+    paths and URLs): they are for logs and for callers that authenticate. A
+    handler that answers anonymous requests puts ``error_category`` in the body.
+
+    Threads. The async entry points never use the event loop's default executor.
+    A load holds the slot lock for seconds to minutes, and every waiter used to
+    park one default-executor thread on it: with a few dozen waiters the pool was
+    full and everything else that uses it (uploads, /unload, ffmpeg probes)
+    stalled until the load finished. Acquisition now goes through one dedicated
+    worker per slot (the acquires are serialised by the lock anyway, so a second
+    thread could only wait), and release / unload through a second one, so a
+    release is never queued behind a load. A caller cancelled while its acquire is
+    still queued withdraws it; one cancelled mid-acquire is handed back (below).
+
+    Admission, separate from residency:
+    gate = RequestGate(max_active, max_queue, queue_timeout_s, busy=make_error)
+    with gate.admit():            reserve a place before any per-request work
+    async with gate.turn():       wait (bounded) for one of max_active compute turns
+    Both refuse with ``busy(reason)`` (``"queue_full"`` at once, ``"queue_timeout"``
+    after the wait), so a burst of uploads cannot pile up spooled files without
+    bound. See the class.
 
 Intended /ready contract (kept separate from /health, which must stay 200 while
 a model is merely idle or loading so Docker never restarts a service that is
@@ -93,6 +118,7 @@ import gc
 import logging
 import threading
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
 from typing import Callable, Optional
 
@@ -105,6 +131,43 @@ _MAX_ERROR_CHARS = 500
 def _describe_error(exc: BaseException) -> str:
     text = f"{type(exc).__name__}: {exc}"
     return text if len(text) <= _MAX_ERROR_CHARS else text[: _MAX_ERROR_CHARS - 3] + "..."
+
+
+# Names of the huggingface_hub failures that are not OSErrors (HFValidationError is
+# a ValueError: a repo id that is not one, or a path that does not exist).
+_MODEL_FILE_ERROR_NAMES = frozenset({
+    "HFValidationError", "RepositoryNotFoundError", "GatedRepoError", "EntryNotFoundError",
+    "RevisionNotFoundError", "LocalEntryNotFoundError", "OfflineModeIsEnabled", "HfHubHTTPError",
+})
+# Native libraries (CTranslate2 among them) report a missing file as a plain RuntimeError.
+_MODEL_FILE_MESSAGES = ("unable to open file", "no such file", "does not appear to have a file named")
+
+
+def error_category(exc: BaseException) -> str:
+    """A short, stable name for a failed model load; safe in an unauthenticated response.
+
+    ``str(exc)`` is written for the operator: it carries file paths under the
+    model cache, repo ids, URLs. This keeps only what a client or a probe may see,
+    and the full text stays in the log. One of ``out_of_memory``,
+    ``missing_dependency``, ``model_files_unavailable`` (the checkpoint could not
+    be downloaded, found or read) or ``load_error``.
+    """
+    try:
+        text = str(exc).lower()
+    except Exception:  # a broken __str__ must not turn a failed load into a crash
+        text = ""
+    names = {cls.__name__ for cls in type(exc).__mro__}
+    if isinstance(exc, MemoryError) or "OutOfMemoryError" in names or "out of memory" in text:
+        return "out_of_memory"
+    if isinstance(exc, ImportError):
+        return "missing_dependency"
+    if (
+        isinstance(exc, OSError)
+        or names & _MODEL_FILE_ERROR_NAMES
+        or any(marker in text for marker in _MODEL_FILE_MESSAGES)
+    ):
+        return "model_files_unavailable"
+    return "load_error"
 
 
 class ModelSlot:
@@ -141,6 +204,17 @@ class ModelSlot:
         self._loading = False
         self._ever_loaded = False
         self._last_error: Optional[str] = None
+        self._last_error_category: Optional[str] = None
+
+        # The async entry points run their lock-taking work here instead of on the
+        # loop's default executor (see "Threads" in the module docstring). One
+        # worker each: every job serialises on ``_lock`` anyway, so more threads
+        # could only park. Two, so that a release or an unload is never queued
+        # behind the acquires that a load is holding up. ThreadPoolExecutor starts
+        # its thread on first use and lets it go with the slot.
+        prefix = self._name.replace(" ", "-")
+        self._acquire_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"{prefix}-acquire")
+        self._control_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"{prefix}-control")
 
     # --- state ---------------------------------------------------------------
 
@@ -179,17 +253,29 @@ class ModelSlot:
 
     @property
     def last_error(self) -> Optional[str]:
-        """``"Type: message"`` of the most recent failed load; cleared by a success."""
+        """``"Type: message"`` of the most recent failed load; cleared by a success.
+
+        The exception text can hold file paths and URLs: for logs and authenticated
+        callers, not for a response to an anonymous one (use ``last_error_category``).
+        """
         return self._last_error
+
+    @property
+    def last_error_category(self) -> Optional[str]:
+        """``error_category()`` of the most recent failed load; cleared by a success."""
+        return self._last_error_category
 
     def readiness(self) -> dict:
         """Snapshot for a /ready endpoint; see the contract in the module docstring.
 
         ``ready`` maps to HTTP 200 / 503. ``reason`` is ``"ok"``, ``"loading"``
-        or ``"load_failed"``; ``detail`` is the load error for the latter.
+        or ``"load_failed"``; ``detail`` is the load error for the latter, with the
+        exception text. ``error_category`` is the same failure as a short token
+        that is safe to show to anyone.
         """
         # Read once each: the flags change from worker threads.
         ever_loaded, loading, error = self._ever_loaded, self._loading, self._last_error
+        category = self._last_error_category
         if ever_loaded:
             ready, reason, detail = True, "ok", None
         elif loading:
@@ -206,6 +292,7 @@ class ModelSlot:
             "ever_loaded": ever_loaded,
             "loading": loading,
             "last_error": error,
+            "error_category": category,
         }
 
     # --- use -----------------------------------------------------------------
@@ -253,11 +340,13 @@ class ModelSlot:
                     # Order matters for the lock-free readers: publish the error
                     # before dropping `loading`, or /ready could observe "not
                     # loading, no error" and report a broken model as loadable.
+                    self._last_error_category = error_category(e)
                     self._last_error = _describe_error(e)
                     self._loading = False
                     raise
                 self._model = model
                 self._last_error = None
+                self._last_error_category = None
                 self._ever_loaded = True
                 self._loading = False
                 logger.info("%s loaded", self._name)
@@ -273,13 +362,25 @@ class ModelSlot:
         forever (idle TTL never arms, /unload answers 409). So the thread's
         future is shielded from the cancellation, and when the caller is cancelled
         a done-callback hands the reference back once the thread finishes.
+
+        The work runs on the slot's own single-worker pool, not the loop's default
+        executor: while a load holds the lock every queued acquire would otherwise
+        park a default-executor thread, and a few dozen waiters emptied the pool
+        for everybody (an unrelated ``asyncio.to_thread`` waited out the whole
+        load). Here the waiters are queue entries, not threads. A caller that is
+        cancelled while its job is still queued withdraws it (``Future.cancel``
+        succeeds only for a job that has not started, atomically), so nothing is
+        loaded, retried or handed back on its behalf.
         """
-        fut = asyncio.get_running_loop().run_in_executor(None, self._acquire)
+        job = self._acquire_pool.submit(self._acquire)
+        fut = asyncio.wrap_future(job)
         try:
             return await asyncio.shield(fut)
         except asyncio.CancelledError:
-            # Covers both "still running" and "finished but the caller was
-            # cancelled before it could take the result".
+            if job.cancel():
+                raise  # never started: no reference exists to give back
+            # Running, or finished but the caller was cancelled before it could
+            # take the result: the reference exists, hand it back when it lands.
             fut.add_done_callback(self._hand_back_abandoned)
             raise
 
@@ -327,9 +428,10 @@ class ModelSlot:
 
         Shielded, so a task cancelled while waiting here cannot abandon the
         release: the thread still runs it. (Plain ``to_thread`` would drop a
-        release that had not started yet.)
+        release that had not started yet.) On the control pool, so it is neither
+        stuck behind queued acquires nor one more thread parked on the lock.
         """
-        fut = asyncio.get_running_loop().run_in_executor(None, self._release)
+        fut = asyncio.wrap_future(self._control_pool.submit(self._release))
         await asyncio.shield(fut)
 
     async def acquire_ref(self) -> object:
@@ -400,7 +502,7 @@ class ModelSlot:
 
     async def try_unload_async(self) -> dict:
         """Event-loop-safe ``try_unload``: the unload itself can take seconds."""
-        return await asyncio.to_thread(self.try_unload)
+        return await asyncio.wrap_future(self._control_pool.submit(self.try_unload))
 
     async def unload_async(self) -> bool:
         """Event-loop-safe ``unload``."""
@@ -553,6 +655,127 @@ class ModelLease:
                 self.release_soon()
         except Exception:  # pragma: no cover - interpreter teardown
             pass
+
+
+class GateBusy(Exception):
+    """A request the gate would not take (the default ``busy`` answer of a RequestGate).
+
+    ``reason`` is ``"queue_full"`` (refused at once: too many requests are already
+    waiting) or ``"queue_timeout"`` (it waited its whole allowance for a turn).
+    A service passes its own ``busy`` factory to get an HTTP error instead.
+    """
+
+    retry_after_s = 5
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+class RequestGate:
+    """Bounded admission in front of one shared model: how many run, how many may wait, for how long.
+
+    Without it the only bound was the semaphore that serialises the forward pass,
+    and it bounded nothing that mattered here: every request that reached it had
+    already spooled its upload to disk and converted (or decoded) the audio, then
+    waited for as long as the ones ahead of it took. A burst of uploads, or one
+    slow file, therefore piled up temp files and decoded audio without limit and
+    kept every client hanging.
+
+    Two separate checks, made at two different points of a request:
+
+    ``with gate.admit():`` at the top of the handler, before anything is spooled or
+    converted. At most ``max_active + max_queue`` requests are admitted at once;
+    the next one is refused immediately, having cost nothing. ``max_queue`` is how
+    many may wait beyond the ``max_active`` that run (0: none wait).
+
+    ``async with gate.turn():`` around the model call. It waits at most
+    ``queue_timeout_s`` for one of ``max_active`` turns (``None``: forever) and
+    refuses with ``busy("queue_timeout")`` after that. The turn is released when
+    the block ends, on every path, including a cancelled waiter (which is simply
+    dropped from the queue) and a refused one; ``admit`` is released the same way.
+
+    Both raise ``busy(reason)``, which is ``GateBusy`` unless the service supplies
+    a factory (its HTTP 503 with ``Retry-After``). Everything runs on the event
+    loop, so the counters need no lock.
+    """
+
+    def __init__(
+        self,
+        max_active: int = 1,
+        max_queue: int = 4,
+        queue_timeout_s: Optional[float] = 60.0,
+        busy: Optional[Callable[[str], BaseException]] = None,
+    ):
+        self.max_active = max(1, int(max_active))
+        self.max_queue = max(0, int(max_queue))
+        self.queue_timeout_s = queue_timeout_s
+        self._busy = busy or GateBusy
+        self._turns = asyncio.Semaphore(self.max_active)
+        self._admitted = 0
+        self._running = 0
+
+    @property
+    def in_flight(self) -> int:
+        """Requests admitted and not yet finished (running plus waiting)."""
+        return self._admitted
+
+    @property
+    def running(self) -> int:
+        """Requests holding a turn right now."""
+        return self._running
+
+    @property
+    def waiting(self) -> int:
+        """Admitted requests without a turn: still preparing their audio, or queued for one."""
+        return self._admitted - self._running
+
+    def snapshot(self) -> dict:
+        """For a /status body: the configured bounds and where the queue stands."""
+        return {
+            "max_concurrency": self.max_active,
+            "max_queue": self.max_queue,
+            "queue_timeout_seconds": self.queue_timeout_s,
+            "in_flight": self.in_flight,
+            "running": self.running,
+            "waiting": self.waiting,
+        }
+
+    @contextmanager
+    def admit(self):
+        """Reserve a place for one request, or refuse at once with ``busy("queue_full")``."""
+        if self._admitted >= self.max_active + self.max_queue:
+            raise self._busy("queue_full")
+        self._admitted += 1
+        try:
+            yield
+        finally:
+            self._admitted -= 1
+
+    @asynccontextmanager
+    async def turn(self):
+        """Wait for a compute turn and hold it for the block; ``busy("queue_timeout")`` if none frees up in time.
+
+        A timeout of zero or less means "do not wait": a free turn is taken, a
+        busy gate refuses. (``wait_for`` with such a timeout would refuse even a
+        free one.)
+        """
+        timeout = self.queue_timeout_s
+        try:
+            if timeout is not None and timeout <= 0:
+                if self._turns.locked():
+                    raise asyncio.TimeoutError
+                await self._turns.acquire()  # free, so it does not wait
+            else:
+                await asyncio.wait_for(self._turns.acquire(), timeout)
+        except asyncio.TimeoutError:
+            raise self._busy("queue_timeout") from None
+        self._running += 1
+        try:
+            yield
+        finally:
+            self._running -= 1
+            self._turns.release()
 
 
 def _release_gpu_cache() -> None:

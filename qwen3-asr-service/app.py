@@ -13,6 +13,7 @@ are per piece, not per word, and segments carry no confidence.
 
 import os
 import time
+import uuid
 import shutil
 import asyncio
 import logging
@@ -30,10 +31,12 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
 from audio_pipeline import (
-    MIB, MULTIPART_SLACK, SAMPLE_RATE, BodyLimitMiddleware, env_number, join_texts,
+    MIB, MULTIPART_SLACK, SAMPLE_RATE, env_number, join_texts,
     load_upload, model_input, plan_chunks,
 )
-from model_lifecycle import ModelSlot, ttl_from_env
+from body_limit import BodyLimitMiddleware
+from model_lifecycle import ModelSlot, RequestGate, ttl_from_env
+from origin_guard import OriginGuardMiddleware, parse_allowed_origins
 
 # Upload bounds. The gateway limits what it forwards, but a direct caller must not
 # be able to fill the disk or the host's memory with an arbitrarily long file.
@@ -113,28 +116,51 @@ app = FastAPI(
     lifespan=_lifespan,
 )
 
-allowed_origins_str = os.getenv("ALLOWED_ORIGINS", "*")
-allowed_origins = [origin.strip() for origin in allowed_origins_str.split(",")] if allowed_origins_str else ["*"]
+# Unset or empty means no CORS headers at all (it used to mean "*"); "*" only when
+# it is written down (and logged); otherwise an explicit list. origin_guard.py.
+allowed_origins = parse_allowed_origins(os.getenv("ALLOWED_ORIGINS", ""))
 allow_credentials = os.getenv("ALLOW_CREDENTIALS", "false").strip().lower() in {"1", "true", "yes", "on"}
 if "*" in allowed_origins and allow_credentials:
     allow_credentials = False
 
-# Single-file routes only: a batch legitimately carries many files, each of which
-# is bounded on its own. 64 KiB covers the small text fields.
-_single_upload_limit = MAX_UPLOAD_BYTES + MULTIPART_SLACK + 64 * 1024
-# Added before CORS so CORS is the outer layer and a 413 still carries its headers.
+# Request-body limits (body_limit.py): the declared Content-Length AND the bytes
+# that actually arrive are checked, so a chunked upload is cut off at the limit too,
+# before Starlette has spooled it to disk. A single-file route carries one upload
+# plus the small text fields (64 KiB of slack); the batch route carries up to
+# _BATCH_BODY_FILES uploads, each of which is still bounded on its own by
+# spool_upload; no other route takes a body of any size.
+_SINGLE_UPLOAD_PATHS = frozenset({"/transcribe", "/detect_language"})
+_BATCH_BODY_FILES = 8
+
+
+def _body_limit(path: str) -> int:
+    """Largest request body (bytes) accepted at *path*."""
+    if path in _SINGLE_UPLOAD_PATHS:
+        return MAX_UPLOAD_BYTES + MULTIPART_SLACK + 64 * 1024
+    if path == "/transcribe-batch":
+        return _BATCH_BODY_FILES * (MAX_UPLOAD_BYTES + 64 * 1024) + MULTIPART_SLACK
+    return MIB
+
+
+# Each add_middleware wraps what was added before it: the body limit is innermost,
+# the origin guard (403 for a state-changing request with a foreign Origin header;
+# no Origin, e.g. the gateway or curl, is not affected) comes next, and CORS is
+# outermost so a 403/413 still carries the CORS headers a listed origin needs in
+# order to read it. CORS is only added when origins are configured.
 app.add_middleware(
     BodyLimitMiddleware,
-    limits={"/transcribe": _single_upload_limit, "/detect_language": _single_upload_limit},
-    detail=f"Request body is larger than the upload limit of {MAX_UPLOAD_BYTES / MIB:g} MB (MAX_UPLOAD_MB).",
+    limit_for=_body_limit,
+    hint=f"The upload limit is {MAX_UPLOAD_BYTES / MIB:.3g} MB per file (MAX_UPLOAD_MB).",
 )
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=allow_credentials,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(OriginGuardMiddleware, allowed_origins=allowed_origins)
+if allowed_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins,
+        allow_credentials=allow_credentials,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 # Global model state
 # Check CUDA first, then ROCm/HIP (also reports as cuda in PyTorch), then CPU
@@ -151,16 +177,19 @@ model_loaded = False
 # One process-global 1.7B model on one GPU: without a bound, concurrent requests
 # dispatched onto the default thread pool all enter the model at once and
 # multiply peak VRAM while making each individual request slower.
-def _max_concurrency() -> int:
-    raw = os.getenv("ASR_MAX_CONCURRENCY", "1")
-    try:
-        return max(1, int(raw))
-    except ValueError:
-        logger.warning("Ignoring invalid ASR_MAX_CONCURRENCY=%r; using 1", raw)
-        return 1
-
-
-_ASR_SEM = asyncio.Semaphore(_max_concurrency())
+#
+# Admission (model_lifecycle.RequestGate). ASR_MAX_CONCURRENCY forward passes run at
+# once. Every request that got past this point used to have spooled its upload and
+# decoded the audio into memory (a 2 h recording is ~460 MB of float32), and then
+# waited for the ones ahead of it with no limit on either the number or the time, so
+# a burst of uploads piled up temp files and RAM and every client hung. Now at most
+# ASR_MAX_CONCURRENCY + ASR_MAX_QUEUE requests are admitted (the next one is refused
+# at once, before any work), and one that waits longer than ASR_QUEUE_TIMEOUT_S for
+# its turn is refused too. Both answer 503 + Retry-After.
+_ASR_CONCURRENCY = env_number("ASR_MAX_CONCURRENCY", 1, cast=int, minimum=1)
+_ASR_MAX_QUEUE = env_number("ASR_MAX_QUEUE", 4 * _ASR_CONCURRENCY, cast=int, minimum=0)
+_ASR_QUEUE_TIMEOUT_S = env_number("ASR_QUEUE_TIMEOUT_S", 60.0, minimum=0.1)
+_RETRY_AFTER_S = 5
 
 _OOM_DETAIL = (
     "GPU out of memory while transcribing. Send a shorter file, lower QWEN3_ASR_BATCH_SIZE, "
@@ -168,15 +197,45 @@ _OOM_DETAIL = (
 )
 
 
+class _Busy(HTTPException):
+    """The 503 the gate answers with. The batch route tells it from a per-file failure."""
+
+
+def _busy(reason: str) -> _Busy:
+    if reason == "queue_timeout":
+        detail = (
+            f"The service is busy: this request waited {_ASR_QUEUE_TIMEOUT_S:g} s for its turn "
+            f"(ASR_QUEUE_TIMEOUT_S). Retry shortly."
+        )
+    else:
+        detail = (
+            f"The service is busy: {_gate.max_active + _gate.max_queue} requests are already "
+            f"in progress or waiting (ASR_MAX_CONCURRENCY + ASR_MAX_QUEUE). Retry shortly."
+        )
+    return _Busy(status_code=503, detail=detail, headers={"Retry-After": str(_RETRY_AFTER_S)})
+
+
+_gate = RequestGate(_ASR_CONCURRENCY, _ASR_MAX_QUEUE, _ASR_QUEUE_TIMEOUT_S, busy=_busy)
+
+
+def _request_id() -> str:
+    """Names one request in the log and in the error it returns, so the two can be matched."""
+    return uuid.uuid4().hex[:12]
+
+
 async def _asr(fn, *args, **kwargs):
-    """Run ``fn(model, *args)`` off the event loop, bounded by _ASR_SEM.
+    """Run ``fn(model, *args)`` off the event loop: the model pinned, one of the gate's turns held.
 
     This function owns the model reference: the slot is acquired here and held
     across the await, so the idle timer cannot unload the weights while a worker
-    thread is using them.
+    thread is using them. It is taken before the turn on purpose: requests waiting
+    for a turn keep the model resident, so with ASR_MODEL_TTL=0 a queue does not
+    unload and reload it once per request. A wait that times out leaves the
+    ``async with`` like any other exit, so the reference goes back.
     """
-    async with _model_slot.acquire_async() as model, _ASR_SEM:
-        return await asyncio.to_thread(fn, model, *args, **kwargs)
+    async with _model_slot.acquire_async() as model:
+        async with _gate.turn():
+            return await asyncio.to_thread(fn, model, *args, **kwargs)
 
 
 # qwen_asr expects English language names, not ISO codes ("German", not "de"),
@@ -194,6 +253,20 @@ LANGUAGE_NAME_MAP = {
 }
 SUPPORTED_LANGUAGE_NAMES = frozenset(LANGUAGE_NAME_MAP.values())
 _NAME_LOOKUP = {name.lower(): name for name in SUPPORTED_LANGUAGE_NAMES}
+
+
+def _public_model_name(name: str) -> str:
+    """A model name as an unauthenticated response may show it.
+
+    ``QWEN3_ASR_MODEL`` also takes the path of a checkpoint directory on a mounted
+    volume; the directory layout is not for callers, so such a value is shown as its
+    last component. Hugging Face ids (``org/name``) are returned unchanged.
+    """
+    if not name:
+        return name
+    if os.path.isabs(name) or name.startswith(("./", "../", "~")):
+        return os.path.basename(os.path.normpath(name)) or name
+    return name
 
 
 def _is_auto(language) -> bool:
@@ -295,11 +368,18 @@ def get_model():
         return model
 
 
-def _server_error(exc: Exception) -> HTTPException:
-    """The HTTP failure for an unexpected exception; out-of-memory is not a 500."""
+def _server_error(exc: Exception, request_id: str) -> HTTPException:
+    """The HTTP failure for an unexpected exception; out-of-memory is not a 500.
+
+    ``str(exc)`` is written for the operator and can hold temp-file and model
+    paths or library internals, so a 500 says only that it failed and under which
+    request id. The caller has logged the exception itself under the same id.
+    """
     if type(exc).__name__ == "OutOfMemoryError" or "out of memory" in str(exc).lower():
         return HTTPException(status_code=503, detail=_OOM_DETAIL)
-    return HTTPException(status_code=500, detail=str(exc))
+    return HTTPException(
+        status_code=500, detail=f"Transcription failed (internal error). Request id: {request_id}.",
+    )
 
 
 # --- inference -----------------------------------------------------------------
@@ -450,8 +530,9 @@ async def ready():
     failed reload does not flip it: the weights are proven loadable and the next
     request retries) and while nothing is known to be wrong. 503 with a JSON
     `reason` while the first load is running (`loading`, with `Retry-After`) and
-    when the last load failed and none ever succeeded (`load_failed`, `detail`
-    carries the error).
+    when the last load failed and none ever succeeded (`load_failed`; `detail` is a
+    short category such as `model_files_unavailable`, never the exception text,
+    which can hold paths: that is in the log).
 
     Like /health this only reads state and never triggers or waits for a load,
     so polling it cannot keep the model resident.
@@ -464,11 +545,11 @@ async def ready():
         "reason": state["reason"],
         "model_resident": state["resident"],
         "model_ever_loaded": state["ever_loaded"],
-        "current_model": MODEL_NAME,
+        "current_model": _public_model_name(MODEL_NAME),
         "device": device,
     }
     if state["detail"]:
-        body["detail"] = state["detail"]
+        body["detail"] = state["error_category"] or "load_error"
     if state["ready"]:
         return body
     headers = {"Retry-After": "5"} if state["reason"] == "loading" else None
@@ -510,12 +591,13 @@ async def status():
         "model_resident": _model_slot.resident,
         "model_ttl_seconds": MODEL_TTL,
         "active_requests": _model_slot.refs,
-        "current_model": MODEL_NAME,
+        "current_model": _public_model_name(MODEL_NAME),
         "chunk_seconds": CHUNK_S,
         "batch_size": BATCH_SIZE,
         "max_new_tokens": MAX_NEW_TOKENS,
         "max_upload_mb": MAX_UPLOAD_BYTES / MIB,
         "max_audio_seconds": MAX_AUDIO_SECONDS,
+        "queue": _gate.snapshot(),
     }
     if torch.cuda.is_available():
         status_info["gpu_name"] = torch.cuda.get_device_name(0)
@@ -534,14 +616,17 @@ async def transcribe_audio(
     Returns text, the language, and one segment per audio piece with its start
     and end. 413 for a file over MAX_UPLOAD_MB or longer than MAX_AUDIO_SECONDS.
     `truncated` and `warnings` say when the model's output limit cut a piece off.
+    503 + Retry-After when the service has no room for the request.
     """
+    req_id = _request_id()
     try:
-        return JSONResponse(content=await _transcribe_upload(audio, language))
+        with _gate.admit():
+            return JSONResponse(content=await _transcribe_upload(audio, language))
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Transcription error: {e}", exc_info=True)
-        raise _server_error(e)
+        logger.error("[%s] Transcription error: %s", req_id, e, exc_info=True)
+        raise _server_error(e, req_id)
 
 
 @app.post("/detect_language")
@@ -554,13 +639,15 @@ async def detect_language(
     language is decided in the first few seconds, and transcribing a whole
     recording to find it out was minutes of GPU time for nothing.
     """
+    req_id = _request_id()
     try:
         started = time.time()
-        audio = await load_upload(
-            file, max_bytes=MAX_UPLOAD_BYTES, max_seconds=MAX_AUDIO_SECONDS, ffmpeg=_FFMPEG,
-            decode_seconds=CHUNK_S,
-        )
-        outputs = await _asr(_run_model, [model_input(audio.samples)], None)
+        with _gate.admit():
+            audio = await load_upload(
+                file, max_bytes=MAX_UPLOAD_BYTES, max_seconds=MAX_AUDIO_SECONDS, ffmpeg=_FFMPEG,
+                decode_seconds=CHUNK_S,
+            )
+            outputs = await _asr(_run_model, [model_input(audio.samples)], None)
         output = outputs[0]
 
         # The header knows the whole length; without one, a short prefix means the
@@ -580,8 +667,8 @@ async def detect_language(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Language detection error: {e}", exc_info=True)
-        raise _server_error(e)
+        logger.error("[%s] Language detection error: %s", req_id, e, exc_info=True)
+        raise _server_error(e, req_id)
 
 
 @app.post("/transcribe-batch")
@@ -594,18 +681,36 @@ async def transcribe_batch(
     Files are processed one after another. A per-file failure (too large, too
     long, unreadable, model error) is reported as `{filename, error, status}`
     without failing the others.
+
+    The request as a whole holds one place in the queue. When the service has
+    none, or a file waits longer than ASR_QUEUE_TIMEOUT_S for its turn, the answer
+    is 503 + Retry-After; if some files were already done, those are returned and
+    the rest are reported as 503 (they would each wait as long again).
     """
+    req_id = _request_id()
     results = []
-    for audio_file in audios:
-        try:
-            body = await _transcribe_upload(audio_file, language)
-            results.append({"filename": audio_file.filename, **body})
-        except HTTPException as e:
-            results.append({"filename": audio_file.filename, "error": str(e.detail), "status": e.status_code})
-        except Exception as e:
-            logger.error(f"Batch item {audio_file.filename} failed: {e}", exc_info=True)
-            error = _server_error(e)
-            results.append({"filename": audio_file.filename, "error": str(error.detail), "status": error.status_code})
+    served = False
+    shed = None
+    with _gate.admit():
+        for audio_file in audios:
+            if shed is not None:
+                results.append({"filename": audio_file.filename, "error": str(shed.detail), "status": shed.status_code})
+                continue
+            try:
+                body = await _transcribe_upload(audio_file, language)
+                results.append({"filename": audio_file.filename, **body})
+                served = True
+            except _Busy as e:
+                if not served:
+                    raise  # nothing was served: a plain 503 with Retry-After
+                shed = e
+                results.append({"filename": audio_file.filename, "error": str(e.detail), "status": e.status_code})
+            except HTTPException as e:
+                results.append({"filename": audio_file.filename, "error": str(e.detail), "status": e.status_code})
+            except Exception as e:
+                logger.error("[%s] Batch item %r failed: %s", req_id, audio_file.filename, e, exc_info=True)
+                error = _server_error(e, req_id)
+                results.append({"filename": audio_file.filename, "error": str(error.detail), "status": error.status_code})
 
     return {
         "batch": True,

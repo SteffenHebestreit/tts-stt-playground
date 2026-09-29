@@ -39,8 +39,10 @@ from json_utils import (
     ENGLISH_ONLY_MODELS,
     WHISPER_LANGUAGES,
 )
+from body_limit import BodyLimitMiddleware
 from local_agreement import LocalAgreement, UNSPACED_LANGUAGES, words_from_segments
-from residency import IdleUnloader, ttl_from_env
+from origin_guard import OriginGuardMiddleware, parse_allowed_origins
+from residency import IdleUnloader, error_category, ttl_from_env
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -97,6 +99,7 @@ async def _lifespan(_app: FastAPI):
     _idle_unloader.cancel()
     rt_executor.shutdown(wait=False)
     executor.shutdown(wait=False)
+    _acquire_executor.shutdown(wait=False)
 
 
 app = FastAPI(
@@ -105,21 +108,15 @@ app = FastAPI(
     lifespan=_lifespan,
 )
 
-# Add CORS middleware (env-configurable)
-allowed_origins_str = os.getenv("ALLOWED_ORIGINS", "*")
-allowed_origins = [o.strip() for o in allowed_origins_str.split(",")] if allowed_origins_str else ["*"]
+# CORS (env-configurable). Unset or empty ALLOWED_ORIGINS means no CORS headers at
+# all (it used to mean "*"); "*" only when it is written down (and logged);
+# otherwise an explicit list. The middleware stack itself is assembled below, next
+# to the upload limits it needs.
+allowed_origins = parse_allowed_origins(os.getenv("ALLOWED_ORIGINS", ""))
 allow_credentials = os.getenv("ALLOW_CREDENTIALS", "false").strip().lower() in {"1", "true", "yes", "on"}
 if "*" in allowed_origins and allow_credentials:
     logger.warning("ALLOW_CREDENTIALS=true with ALLOWED_ORIGINS='*' is not permitted by CORS spec; disabling credentials.")
     allow_credentials = False
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allowed_origins,  # Allows configured origins
-    allow_credentials=allow_credentials,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
-)
 
 
 def _number(raw: str, default, cast, name: str):
@@ -136,6 +133,36 @@ def _number(raw: str, default, cast, name: str):
 
 def _flag(raw: str) -> bool:
     return (raw or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _request_id() -> str:
+    """Names one request in the log and in the error it returns, so the two can be matched."""
+    return uuid.uuid4().hex[:12]
+
+
+def _internal_error(what: str, request_id: str) -> str:
+    """What a client is told about an unexpected failure.
+
+    ``str(exc)`` is written for the operator and can hold temp-file and model
+    paths or library internals, so the client gets this and the request id; the
+    caller has logged the exception under the same id.
+    """
+    return f"{what} (internal error). Request id: {request_id}."
+
+
+def _public_model_name(name):
+    """A model name as an unauthenticated response may show it.
+
+    ``WHISPER_MODEL_SIZE`` also takes a local path (a CTranslate2 export on a
+    mounted volume); the directory layout is not for callers, so such a value is
+    shown as its last component. Sizes and Hugging Face ids (``org/name``) are
+    returned unchanged.
+    """
+    if not name or not isinstance(name, str):
+        return name
+    if os.path.isabs(name) or name.startswith(("./", "../", "~")):
+        return os.path.basename(os.path.normpath(name)) or name
+    return name
 
 
 # Two pools so a long batch upload cannot starve live sessions of a worker.
@@ -158,13 +185,60 @@ _BATCH_WORKERS = max(1, _number(
     os.getenv("STT_BATCH_WORKERS", ""), min(4, os.cpu_count() or 4), int, "STT_BATCH_WORKERS"
 ))
 executor = ThreadPoolExecutor(max_workers=_BATCH_WORKERS, thread_name_prefix="whisper-batch")
+# The streaming and WebSocket routes take their model reference here (see
+# _hold_model_async), not on the loop's default executor: a cold load holds the
+# reference lock for seconds to minutes, and every waiter used to park a default
+# executor thread on it, which starves everything else that uses that pool (uploads,
+# /unload). The acquires serialise on the lock anyway, so one thread is all they need.
+_acquire_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="whisper-acquire")
 
-# Upload limits. The multipart parser has already spooled the request to disk by
-# the time a handler runs, so these bound what is copied and decoded, not the
-# bytes on the wire. <= 0 disables a limit.
+# Upload limits. MAX_UPLOAD_MB is per file, checked while the file is copied out of
+# the spooled request; the request body as a whole is bounded by the middleware
+# below (body_limit.py), so the wire is bounded too and not only what is decoded.
+# <= 0 disables a limit.
 MAX_UPLOAD_BYTES = int(_number(os.getenv("MAX_UPLOAD_MB", "200"), 200.0, float, "MAX_UPLOAD_MB") * 1024 * 1024)
 # An abuse guard, not a tuning knob: 2 h is far beyond anything the UI produces.
 MAX_AUDIO_SECONDS = _number(os.getenv("MAX_AUDIO_SECONDS", "7200"), 7200.0, float, "MAX_AUDIO_SECONDS")
+
+_MIB = 1024 * 1024
+# multipart boundaries and part headers, and the small text fields, on top of the file bytes
+_MULTIPART_SLACK = _MIB
+_FORM_FIELDS_SLACK = 64 * 1024
+# /transcribe takes one file (`audio`) or several (`audios`), each bounded on its own
+# by MAX_UPLOAD_MB; the request as a whole may carry this many files' worth.
+_BATCH_BODY_FILES = 8
+_UPLOAD_ROUTES = frozenset({"/transcribe", "/transcribe-stream", "/detect_language"})
+
+
+def _body_limit(path: str):
+    """Largest request body (bytes) accepted at *path*; None means unlimited."""
+    if path in _UPLOAD_ROUTES:
+        if MAX_UPLOAD_BYTES <= 0:
+            return None
+        files = _BATCH_BODY_FILES if path == "/transcribe" else 1
+        return files * (MAX_UPLOAD_BYTES + _FORM_FIELDS_SLACK) + _MULTIPART_SLACK
+    return _MIB  # nothing else takes a body of any size
+
+
+# Each add_middleware wraps what was added before it: the body limit is innermost,
+# the origin guard (403 for a state-changing request or a WebSocket handshake with a
+# foreign Origin header; no Origin, e.g. the gateway or curl, is not affected) comes
+# next, and CORS is outermost so a 403/413 still carries the CORS headers a listed
+# origin needs in order to read it. CORS is only added when origins are configured.
+app.add_middleware(
+    BodyLimitMiddleware,
+    limit_for=_body_limit,
+    hint=f"The upload limit is {MAX_UPLOAD_BYTES / _MIB:.3g} MB per file (MAX_UPLOAD_MB).",
+)
+app.add_middleware(OriginGuardMiddleware, allowed_origins=allowed_origins)
+if allowed_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins,
+        allow_credentials=allow_credentials,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 # Opt-in: the batched pipeline decodes VAD chunks in parallel, which is much
 # faster on long files but drops temperature fallback and previous-text
@@ -379,6 +453,9 @@ whisper_model = None
 model_loaded = False
 model_size_loaded = None
 model_warmed = False
+# Why the last load failed, as a short category (residency.error_category): what
+# /health, /ready and the 503s may say to anyone. The exception itself (paths, repo
+# ids, URLs) is in the log. None while nothing is known to be wrong.
 startup_error = None
 # True while load_model() runs; read lock-free by /ready, which must never wait
 # on the very lock the loader holds.
@@ -501,10 +578,14 @@ async def _hold_model_async() -> _ModelHold:
     reference nobody will release; hand it back as soon as it lands.
     """
     loop = asyncio.get_running_loop()
-    pending = loop.run_in_executor(None, acquire_model)
+    job = _acquire_executor.submit(acquire_model)
+    pending = asyncio.wrap_future(job)
     try:
         return _ModelHold(await asyncio.shield(pending))
     except asyncio.CancelledError:
+        if job.cancel():
+            raise  # still queued behind another acquire: it never ran, no reference exists
+
         def _give_back(fut):
             if not fut.cancelled() and fut.exception() is None:
                 _ModelHold(fut.result()).release()
@@ -682,13 +763,19 @@ def load_model():
                 logger.error(f"Failed to load {model_size} on {dev}/{ctype}: {e}")
 
         model_loaded = False
-        startup_error = str(last_error)
+        # The category is what a probe may see; the exception (paths, repo ids) and the
+        # hint below are for the operator, who has the log.
+        startup_error = error_category(last_error)
+        hint = ""
         if _flag(os.getenv("HF_HUB_OFFLINE", "")):
-            startup_error += (
+            hint = (
                 " (HF_HUB_OFFLINE is set: the model must already be in the cache, "
                 "or WHISPER_MODEL_SIZE must be a local path)"
             )
-        logger.error(f"All model load attempts failed; service is unhealthy: {last_error}")
+        logger.error(
+            "All model load attempts failed (%s); service is unhealthy: %s%s",
+            startup_error, last_error, hint,
+        )
     finally:
         _loading = False
 
@@ -1065,8 +1152,9 @@ async def transcribe_audio(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Transcription error: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+        req_id = _request_id()
+        logger.error("[%s] Transcription error: %s", req_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=_internal_error("Transcription failed", req_id))
     finally:
         for path in temp_paths:
             _unlink_quiet(path)
@@ -1125,7 +1213,7 @@ async def transcribe_audio_stream(
     # falls back to STT_DEFAULT_LANGUAGE. faster-whisper rejects "auto" itself.
     language = _request_language(language)
 
-    req_id = uuid.uuid4().hex[:8]
+    req_id = _request_id()
 
     # Spool the upload to disk in chunks. The bytes used to be read whole and
     # then stayed referenced by the generator for the entire stream.
@@ -1262,9 +1350,12 @@ async def transcribe_audio_stream(
             yield f"data: {json.dumps(final_result)}\n\n"
 
         except Exception as e:
-            logger.error(f"[{req_id}] Streaming transcription error: {e}", exc_info=True)
-            detail = e.detail if isinstance(e, HTTPException) else str(e)
-            error_data = {"error": f"Transcription failed: {detail}", "status": "error"}
+            logger.error("[%s] Streaming transcription error: %s", req_id, e, exc_info=True)
+            if isinstance(e, HTTPException):
+                message = f"Transcription failed: {e.detail}"  # written for the client
+            else:
+                message = _internal_error("Transcription failed", req_id)
+            error_data = {"error": message, "status": "error"}
             yield f"data: {json.dumps(error_data)}\n\n"
         finally:
             # A client that disconnects mid-stream cancels this generator while a
@@ -1445,14 +1536,13 @@ async def websocket_transcribe(websocket: WebSocket):
     """
     global _live_sessions
 
-    # Starlette's CORSMiddleware does not run on WebSocket routes, so the origin
-    # allow-list has to be applied by hand here or this endpoint is the one hole
-    # in an otherwise restricted deployment.
-    origin = websocket.headers.get("origin")
-    if "*" not in allowed_origins and origin and origin not in allowed_origins:
-        await websocket.close(code=1008)  # policy violation
-        return
+    # Names this session in the log and in the errors it sends (see _internal_error).
+    session_id = _request_id()
 
+    # Browsers do not apply the same-origin policy to WebSockets and Starlette's
+    # CORSMiddleware does not run on them, so the origin check for this endpoint is
+    # OriginGuardMiddleware: a handshake carrying a foreign Origin never reaches this
+    # function (it is closed with 1008 before accept()).
     await websocket.accept()
 
     # Before touching the model: a refused session must not trigger a load. No
@@ -1530,8 +1620,16 @@ async def websocket_transcribe(websocket: WebSocket):
             raise
         except Exception as decode_err:
             consecutive_errors += 1
-            detail = decode_err.detail if isinstance(decode_err, HTTPException) else str(decode_err)
-            logger.warning(f"WS interim decode failed ({consecutive_errors} in a row): {detail}")
+            logger.warning(
+                "[%s] WS interim decode failed (%d in a row): %s", session_id, consecutive_errors, decode_err,
+                exc_info=not isinstance(decode_err, HTTPException),
+            )
+            # What the client may see: an HTTPException's detail was written for it,
+            # anything else is internal and stays in the log under the session id.
+            if isinstance(decode_err, HTTPException):
+                detail = decode_err.detail
+            else:
+                detail = f"internal error. Request id: {session_id}."
             # Once per streak, not per tick: a persistent failure would otherwise
             # flood the client every half second.
             if consecutive_errors == WS_MAX_INTERIM_ERRORS:
@@ -1719,9 +1817,9 @@ async def websocket_transcribe(websocket: WebSocket):
     except WebSocketDisconnect:
         pass
     except Exception as e:
-        logger.error(f"WebSocket transcription error: {e}", exc_info=True)
+        logger.error("[%s] WebSocket transcription error: %s", session_id, e, exc_info=True)
         try:
-            await _send(_error_frame("internal_error", str(e)))
+            await _send(_error_frame("internal_error", _internal_error("The live session failed", session_id)))
             await websocket.close(code=1011)
         except Exception:
             pass
@@ -1773,14 +1871,13 @@ async def health_check():
             (active_device, active_compute_type) != (device, compute_type)
             or model_size_loaded != configured_model_size()
         )),
-        "model_size": current_model,
+        "model_size": _public_model_name(current_model),
         "multilingual": is_multilingual(current_model),
         "live_sessions": _live_sessions,
         # Outstanding references. POST /unload refuses while this is non-zero.
         "model_refs": _model_refs,
         # Seconds idle before the model is released (0 = immediately, -1 = never).
         "model_ttl_seconds": MODEL_TTL,
-        "torch_version": torch.__version__,
         "cuda_available": torch.cuda.is_available()
     }
     if startup_error:
@@ -1806,7 +1903,7 @@ async def ready():
         "ready": True,
         "reason": "resident",
         "model_resident": resident,
-        "model_size": model_size_loaded or configured_model_size(),
+        "model_size": _public_model_name(model_size_loaded or configured_model_size()),
         "device": active_device or device,
     }
     if _loading or (_preload_pending and not resident):
@@ -1828,7 +1925,7 @@ async def service_info():
         "device": active_device or device,
         "compute_type": active_compute_type or compute_type,
         "model_loaded": model_loaded,
-        "model_size": model_size_loaded or configured_model_size(),
+        "model_size": _public_model_name(model_size_loaded or configured_model_size()),
         "torch_version": torch.__version__,
         "cuda_available": torch.cuda.is_available(),
         "gpu_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
@@ -1887,7 +1984,7 @@ async def available_models():
             {"name": "distil-large-v3", "multilingual": False, "size_mb": 1500, "note": "English-only, fastest"},
             {"name": "distil-large-v3.5", "multilingual": False, "size_mb": 1500, "note": "English-only; needs faster-whisper >= 1.2"},
         ],
-        "current_model": model_size_loaded or configured_model_size(),
+        "current_model": _public_model_name(model_size_loaded or configured_model_size()),
         "supported_languages": list(WHISPER_LANGUAGES),
         # WHISPER_MODEL_SIZE also takes a Hugging Face repo id or a local path
         # of a CTranslate2 export, e.g. a German fine-tune (see README).
@@ -2024,8 +2121,9 @@ async def detect_language(
         # would relabel "no model available" as an internal error.
         raise
     except Exception as e:
-        logger.error(f"Language detection failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Language detection failed: {str(e)}")
+        req_id = _request_id()
+        logger.error("[%s] Language detection failed: %s", req_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=_internal_error("Language detection failed", req_id))
     finally:
         if temp_audio_path:
             _unlink_quiet(temp_audio_path)

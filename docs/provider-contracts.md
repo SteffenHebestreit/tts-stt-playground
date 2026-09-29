@@ -333,8 +333,12 @@ backend (only the implicit default of `POST /v1/audio/transcriptions` does, and 
 
 The gateway relays the browser's microphone stream to a provider that declares `live_transcribe`
 (today `whisper`, selected with `?provider=`); any other provider is refused with close code 1008 and a
-reason. The same origin rule as the REST API applies, and `API_KEY` does not (browsers cannot send an
-`Authorization` header on a WebSocket). The backend's frames pass through unchanged:
+reason. The same Host and origin rules as the REST API apply (`403` before the upgrade, see
+[`api.md`](./api.md#network-exposure-and-access-control)), and so does `API_KEY`. Browsers cannot send
+an `Authorization` header on a WebSocket, so the key travels as a subprotocol next to the real one:
+`new WebSocket(url, ["tts-stt.v1", "bearer." + base64url(key)])`, and the gateway echoes back only
+`tts-stt.v1`. A socket without a valid key is accepted and closed at once with code 1008 and the reason
+`A valid API key is required`. The backend's frames pass through unchanged:
 `{"type": "partial", "confirmed": …, "pending": …}` where `confirmed` is the whole session's
 committed text so far (it only grows), `{"type": "final", …}`, and `{"type": "error", "code": …,
 "message": …, "error": …}`. A live socket that sends nothing for `WS_IDLE_TIMEOUT_S` (60) is closed
@@ -405,8 +409,10 @@ Response:
 Status codes every implementation shares: **400** for an empty file or an unknown `language`/`task`,
 **413** when the upload exceeds the service's `MAX_UPLOAD_MB` or the recording its length limit,
 **422** for audio that cannot be decoded (and, on Canary, for a language its model cannot decode),
-**503** while the model cannot be loaded or the GPU is out of memory. `GET /ready` (see
-[`api.md`](./api.md#health-versus-ready-on-the-backends)) never blocks on a load.
+**503** while the model cannot be loaded or the GPU is out of memory, and, on `qwen3-asr`, `parakeet`
+and `canary`, when the service is busy: `ASR_MAX_CONCURRENCY + ASR_MAX_QUEUE` requests are already
+admitted, or this one waited `ASR_QUEUE_TIMEOUT_S` for its turn (always with `Retry-After`).
+`GET /ready` (see [`api.md`](./api.md#health-versus-ready-on-the-backends)) never blocks on a load.
 
 Per-service differences worth knowing:
 
@@ -465,6 +471,8 @@ Request:
 Notes:
 
 - Every TTS backend exposes `GET /health` (liveness) and `GET /ready` (Piper: 503 without an installed voice; the model backends: 503 while the first load runs or after it failed).
+- Busy is **503 + `Retry-After`**, never a hang: `qwen3` and `chatterbox` admit `TTS_MAX_CONCURRENCY + TTS_MAX_QUEUE` requests and refuse the next at once, and refuse one that waited `TTS_QUEUE_TIMEOUT_S`; Piper refuses a request when no synthesis slot frees up within `PIPER_TIMEOUT_S`.
+- An unexpected failure is a `500` with a generic message and a request id (also in an `X-Request-ID` header on Piper, Qwen3-TTS and Chatterbox); the detail is in the service log under that id.
 - Qwen3 does not natively expose this exact payload. The frontend adapter translates the shared fields into the provider's native `lang`, `speaker`, and `instruct` request schema for basic TTS.
 
 Response:
@@ -535,6 +543,7 @@ Notes:
 
 - accepts multipart voice-cloning inputs and returns synthesized audio
 - the frontend selects the provider-native backend path based on whether reference text was supplied
+- a reference clip that decodes to more than `QWEN3_TTS_REF_MAX_SECONDS` (60) is **413**, whatever its file size; one that cannot be decoded, or is empty, is **400**
 
 ### `voice-design-tts-v1`
 
@@ -556,6 +565,8 @@ Notes:
 
 - exposes provider-managed custom voice lifecycle operations separate from the generic voice catalog
 - the frontend currently uses this for listing and deleting trained Piper voices without direct browser calls to the Piper service
+- `POST /upload_model` validates a voice before publishing it: the model loads and answers a test request in a throw-away child process (`PIPER_ONNX_VALIDATE_TIMEOUT_S`, 30 s), otherwise **400**. It is refused with **409** for the id of a built-in voice or when `PIPER_MAX_CUSTOM_VOICES` (20; `0` = no new upload) voices are installed, **413** when the custom voices would exceed `PIPER_MAX_CUSTOM_MB` (2048) in total, and **503** with `Retry-After` while another upload is running
+- `POST /analyze_audio` refuses a recording that decodes to more than `PIPER_ANALYZE_MAX_SECONDS` (600) with **413**, whatever its file size
 
 ### `voice-training-job-v1`
 
@@ -571,6 +582,27 @@ Notes:
 - one job runs at a time by default (`TRAINING_MAX_CONCURRENT`); a second `POST /train`, `/train-from-dataset`, `/retrain-from-segments` or `/resume-training` is **409** naming the running job
 - job status carries `trainer_kind` and `trainer_caveat`, and `GET /ready` reports `accepting_jobs`, `active_jobs`, storage and device checks
 - `/prepare-dataset` reads audio only from `data/` plus `TRAINING_ALLOWED_AUDIO_DIRS` and downloads only from `TRAINING_ALLOWED_URL_HOSTS`; without an allowed host a URL is refused
+
+## Behaviour every backend shares
+
+These hold for all eight backend services (`stt-service`, `qwen3-asr`, `parakeet`, `canary`,
+`piper-tts`, `qwen3-tts`, `chatterbox`, `piper-training`), independent of the contract they
+implement. `whisper-cpp` is the unmodified upstream server and has none of them.
+
+- **Closed to browsers by default.** `ALLOWED_ORIGINS` (compose: `BACKEND_ALLOWED_ORIGINS`) is empty
+  = no CORS headers, and a state-changing request (anything but `GET`, `HEAD`, `OPTIONS`, and a
+  WebSocket handshake) that carries an `Origin` header naming a different host than its `Host` is
+  **403**. Requests without an `Origin` (the gateway, `curl`, benchmarks) are unaffected. `*` must be
+  written down and is logged as a warning. It is a check against browser-borne requests, not
+  authentication.
+- **Request bodies are bounded while they arrive.** A declared `Content-Length` over the limit is
+  **413** before a byte is read, and the bytes actually received are counted too, so a chunked upload
+  or a lying header cannot get past it. Nothing beyond the limit is spooled or buffered.
+- **Busy is 503 + `Retry-After`,** conflicts (a built-in voice, a limit of stored items, an in-flight
+  request on `/unload`) are **409**, and over-limit input is **413**. The variables that set them
+  are in [`api.md`](./api.md#limits-per-service).
+- **Errors do not leak.** An unexpected failure is a generic message with a request id; the detail is
+  logged under that id, and the TTS backends also send it in `X-Request-ID`.
 
 ## Capability Guidelines
 

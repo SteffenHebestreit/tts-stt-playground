@@ -82,6 +82,9 @@ RUN python3 -c "import inspect, perth; assert perth.PerthImplicitWatermarker is 
 # Copy application code
 COPY app.py .
 COPY model_lifecycle.py .
+# Request-body limit and cross-origin guard, imported by app.py at startup.
+COPY body_limit.py .
+COPY origin_guard.py .
 
 # Reported by /status, since the package version does not change between refs.
 ENV CHATTERBOX_REF=${CHATTERBOX_REF}

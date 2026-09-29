@@ -6,6 +6,8 @@ the Piper binary; custom VITS models use direct ONNX Runtime inference.
 """
 
 import os
+import re
+import sys
 import uuid
 import tempfile
 import json
@@ -28,11 +30,13 @@ from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.background import BackgroundTask
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 import uvicorn
 import librosa
 import io
 
+from body_limit import BodyLimitMiddleware
+from origin_guard import OriginGuardMiddleware, parse_allowed_origins
 from naming import (
     sanitize_voice_name,
     base_language,
@@ -69,10 +73,28 @@ def _flag(raw, default: bool = False) -> bool:
     return default if not raw else raw in {"1", "true", "yes", "on"}
 
 
+def _failure(status_code: int, public: str, detail: object = None, *, exc_info: bool = False) -> HTTPException:
+    """An error for the client that says *public* and a request id, nothing else.
+
+    What actually went wrong (the piper process's stderr, an exception with a
+    resolved path in it, a traceback) is written to the log under the same id, so
+    an operator can find it and a caller cannot read the container's layout out of
+    an unauthenticated response. Call with ``exc_info=True`` from an ``except``.
+    """
+    request_id = uuid.uuid4().hex[:12]
+    logger.error("[request %s] %s: %s", request_id, public, detail, exc_info=exc_info)
+    return HTTPException(
+        status_code=status_code,
+        detail=f"{public} (request id {request_id}).",
+        headers={"X-Request-ID": request_id},
+    )
+
+
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     """Register the installed voices on startup and sweep old outputs on a timer."""
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    await asyncio.to_thread(_sweep_stale_uploads)
     await asyncio.to_thread(_refresh_default_voices)
     await load_custom_voices()
     _log_voice_summary()
@@ -106,8 +128,9 @@ app = FastAPI(
     lifespan=_lifespan,
 )
 
-allowed_origins_str = os.getenv("ALLOWED_ORIGINS", "*")
-allowed_origins = [origin.strip() for origin in allowed_origins_str.split(",")] if allowed_origins_str else ["*"]
+# Unset or empty means no CORS headers at all (it used to mean "*"); "*" only when
+# it is written down (and logged); otherwise an explicit list. origin_guard.py.
+allowed_origins = parse_allowed_origins(os.getenv("ALLOWED_ORIGINS", ""))
 allow_credentials = os.getenv("ALLOW_CREDENTIALS", "false").strip().lower() in {"1", "true", "yes", "on"}
 if "*" in allowed_origins and allow_credentials:
     allow_credentials = False
@@ -160,12 +183,29 @@ MAX_ANALYZE_BYTES = int(
 # Piper configs are a few tens of KB (the phoneme map); anything near this is not one.
 MAX_CONFIG_BYTES = 5 * _MIB
 _UPLOAD_CHUNK = 1024 * 1024
+
+# /analyze_audio decodes the whole file and runs FFTs over it. The byte limit does
+# not bound that: a few MB of silent FLAC or low-bitrate Opus decode to hours of
+# samples. The duration is read from the header first and the decode itself is
+# limited, because a header can lie.
+ANALYZE_MAX_SECONDS = _number(
+    os.getenv("PIPER_ANALYZE_MAX_SECONDS"), "PIPER_ANALYZE_MAX_SECONDS", 600.0, float, minimum=1.0)
+
+# Uploaded voices are models that run in this process (ONNX Runtime), unauthenticated
+# and unbounded until now. How many there may be, how much disk they may use in
+# total, and how long a candidate gets to load and answer one test request in its
+# own throw-away process before it is published.
+MAX_CUSTOM_VOICES = _number(os.getenv("PIPER_MAX_CUSTOM_VOICES"), "PIPER_MAX_CUSTOM_VOICES", 20, int, minimum=0)
+MAX_CUSTOM_BYTES = int(
+    _number(os.getenv("PIPER_MAX_CUSTOM_MB"), "PIPER_MAX_CUSTOM_MB", 2048.0, float, minimum=0.001) * _MIB)
+ONNX_VALIDATE_TIMEOUT_S = _number(
+    os.getenv("PIPER_ONNX_VALIDATE_TIMEOUT_S"), "PIPER_ONNX_VALIDATE_TIMEOUT_S", 30.0, float, minimum=1.0)
 # multipart boundaries and part headers on top of the file bytes
 _MULTIPART_SLACK = _MIB
 
 
 def _body_limit(path: str) -> int:
-    """Largest request body (bytes) accepted at *path*, by declared Content-Length."""
+    """Largest request body (bytes) accepted at *path*."""
     if path == "/upload_model":
         return MAX_UPLOAD_BYTES + MAX_CONFIG_BYTES + _MULTIPART_SLACK
     if path == "/analyze_audio":
@@ -174,41 +214,26 @@ def _body_limit(path: str) -> int:
     return MAX_TEXT_CHARS * 4 + 64 * 1024
 
 
-class _BodyLimitMiddleware:
-    """Answer 413 from the Content-Length header, before anything is buffered.
-
-    FastAPI parses the whole body (multipart parts are spooled to disk, JSON is
-    held in memory) before a handler runs, so a size check inside the handler
-    comes after the cost was paid. Clients that send no Content-Length (chunked)
-    are still bounded per file by the handlers.
-    """
-
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] == "http" and scope["method"] in ("POST", "PUT"):
-            declared = dict(scope["headers"]).get(b"content-length", b"")
-            limit = _body_limit(scope["path"])
-            if declared.isdigit() and int(declared) > limit:
-                response = JSONResponse(
-                    status_code=413,
-                    content={"detail": f"Request body is larger than {limit // _MIB} MB."},
-                )
-                await response(scope, receive, send)
-                return
-        await self.app(scope, receive, send)
-
-
-# Added before CORS so CORS is the outer layer and a 413 still carries its headers.
-app.add_middleware(_BodyLimitMiddleware)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=allow_credentials,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# FastAPI parses the whole body (multipart parts are spooled to disk, JSON is held
+# in memory) before a handler runs, so a size check inside the handler comes after
+# the cost was paid. body_limit.py checks the declared Content-Length AND counts the
+# bytes that arrive, so a chunked upload is cut off at the limit too.
+#
+# Each add_middleware wraps what was added before it: the body limit is innermost,
+# the origin guard refuses foreign browser origins before a byte of body is
+# counted, and CORS is outermost so a 403/413 still carries the CORS headers a
+# listed origin needs in order to read it. CORS is only there when origins are
+# configured; with none, no CORS header is ever sent.
+app.add_middleware(BodyLimitMiddleware, limit_for=_body_limit)
+app.add_middleware(OriginGuardMiddleware, allowed_origins=allowed_origins)
+if allowed_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins,
+        allow_credentials=allow_credentials,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
 def _prune_old_outputs() -> None:
@@ -226,10 +251,23 @@ def _unlink_quiet(path) -> None:
         os.unlink(path)
 
 
+def _bounded_text(text):
+    """The over-long-text error names the setting that raises the limit.
+
+    Runs before the field's own ``max_length`` (which stays, so the OpenAPI schema
+    still documents the limit) and replaces its generic message.
+    """
+    if isinstance(text, str) and len(text) > MAX_TEXT_CHARS:
+        raise ValueError(
+            f"text is {len(text)} characters; the limit is {MAX_TEXT_CHARS} (raise it with MAX_TEXT_CHARS)")
+    return text
+
+
 class TTSRequest(BaseModel):
     """Request body for standard Piper text-to-speech synthesis."""
 
     text: str = Field(max_length=MAX_TEXT_CHARS)
+    _limit_text = field_validator("text", mode="before")(_bounded_text)
     voice: Optional[str] = Field(None, max_length=128)
     # None/"auto": the service decides (guessed from the text, else PIPER_DEFAULT_LANGUAGE).
     language: Optional[str] = Field(None, max_length=32)
@@ -255,6 +293,7 @@ class VoiceCloneRequest(BaseModel):
     """Request body for synthesis with a named custom voice."""
 
     text: str = Field(max_length=MAX_TEXT_CHARS)
+    _limit_text = field_validator("text", mode="before")(_bounded_text)
     voice_name: str
     reference_audio: Optional[str] = None
     # gt=0 guards the `1.0 / speed` length-scale conversion, which turned
@@ -394,8 +433,24 @@ def _default_voices() -> Dict[str, VoiceInfo]:
 
 
 def _all_voices() -> Dict[str, VoiceInfo]:
-    """Default and custom voices; a custom voice shadows a default one with the same id."""
-    return {**_default_voices(), **CUSTOM_VOICES}
+    """Default and custom voices. A built-in voice always wins over a custom one with its id.
+
+    It used to be the other way round, which let an upload named
+    ``de_DE-thorsten-medium`` silently replace the built-in voice for everybody.
+    Uploads with such an id are refused now; a custom voice already on disk under
+    one stays reachable through /synthesize and DELETE /voice/{name} but is not
+    offered for /tts.
+    """
+    voices = dict(_default_voices())
+    for voice_id, info in CUSTOM_VOICES.items():
+        voices.setdefault(voice_id, info)
+    return voices
+
+
+def _is_builtin_voice_id(voice_id: str) -> bool:
+    """Whether *voice_id* names an installed or catalogued built-in voice (case-insensitive)."""
+    wanted = voice_id.lower()
+    return any(name.lower() == wanted for name in (*DEFAULT_VOICES, *_default_voices()))
 
 
 def _log_voice_summary() -> None:
@@ -487,12 +542,14 @@ async def ready():
     default_voices = _default_voices()
     problems = []
     installed_default = 0 if _CATALOG_ONLY else len(default_voices)
+    # Unauthenticated: the reasons name the setting to look at, never a resolved path
+    # (the paths are in the startup log).
     if installed_default == 0 and not CUSTOM_VOICES:
-        problems.append(f"no voice models installed in {DEFAULT_MODELS_DIR} or {CUSTOM_MODELS_DIR}")
+        problems.append("no voice models installed (default or custom; see PIPER_DATA_DIR)")
     if installed_default and shutil.which("piper") is None:
         problems.append("the piper binary is not on PATH")
     if not (os.path.isdir(OUTPUT_DIR) and os.access(OUTPUT_DIR, os.W_OK)):
-        problems.append(f"output directory {OUTPUT_DIR} is not writable")
+        problems.append("the output directory is not writable (see PIPER_OUTPUT_DIR)")
     body = {
         "status": "not_ready" if problems else "ready",
         "default_voices": installed_default,
@@ -592,8 +649,10 @@ async def analyze_audio_with_ffmpeg(file_path: str) -> Dict:
             return {"error": f"ffprobe timed out after {FFPROBE_TIMEOUT_S}s"}
 
         if process.returncode != 0:
-            return {"error": f"FFmpeg analysis failed: {stderr.decode()}"}
-        
+            # ffprobe's own message names the temp file it was given.
+            logger.warning("ffprobe rejected an uploaded file: %s", stderr.decode(errors="replace").strip()[-500:])
+            return {"error": "The file could not be read as audio."}
+
         ffprobe_data = json.loads(stdout.decode())
         
         # Extract audio stream info
@@ -625,9 +684,10 @@ async def analyze_audio_with_ffmpeg(file_path: str) -> Dict:
             analysis["quality_assessment"] = "poor"
         
         return analysis
-        
+
     except Exception as e:
-        return {"error": f"Audio analysis failed: {str(e)}"}
+        logger.warning("ffprobe analysis failed: %s", e, exc_info=True)
+        return {"error": "The file could not be analysed."}
 
 # --- bounded work: concurrency slots, upload spooling -------------------------
 
@@ -662,12 +722,18 @@ async def _acquire_slot() -> asyncio.Semaphore:
     return slots
 
 
-async def _run_in_slot(func, *args):
+async def _run_in_slot(func, *args, stop=None):
     """Run blocking *func* in a worker thread inside a slot, bounded by PIPER_TIMEOUT_S.
 
     A thread cannot be killed, so on timeout the request is answered 504 at once
     but the slot stays taken until the thread really finishes: the limit counts
-    running work, not answered requests.
+    running work, not answered requests. That is only safe if the work does finish.
+    A native call that never returns (a crafted model looping inside ONNX Runtime)
+    would take the slot for good, and PIPER_MAX_CONCURRENCY of them would end
+    synthesis for everybody. *stop* is called on timeout (and when the request is
+    cancelled) and must make the work end soon: for a model run it sets the
+    ``terminate`` flag of that run's ``RunOptions``, which ONNX Runtime checks
+    between operators, loop iterations included.
     """
     slots = await _acquire_slot()
 
@@ -684,7 +750,14 @@ async def _run_in_slot(func, *args):
     task.add_done_callback(_release)
     try:
         return await asyncio.wait_for(asyncio.shield(task), timeout=SYNTH_TIMEOUT_S)
-    except asyncio.TimeoutError:
+    except (asyncio.TimeoutError, asyncio.CancelledError) as gone:
+        if stop is not None:
+            try:
+                stop()
+            except Exception:
+                logger.warning("Could not stop the abandoned work", exc_info=True)
+        if isinstance(gone, asyncio.CancelledError):
+            raise
         raise HTTPException(
             status_code=504,
             detail=f"Synthesis timed out after {SYNTH_TIMEOUT_S:g}s (PIPER_TIMEOUT_S).",
@@ -723,9 +796,24 @@ async def _spool_upload(upload: UploadFile, dest, limit: int, what: str) -> int:
         raise
 
 
-def _librosa_summary(path: str) -> Dict:
-    """Signal statistics for an audio file (CPU-bound: call from a worker thread)."""
-    audio_data, sr = librosa.load(path, sr=None)
+class _AudioTooLong(Exception):
+    """The decoded audio is longer than PIPER_ANALYZE_MAX_SECONDS."""
+
+
+def _too_long_detail(seconds: Optional[float] = None) -> str:
+    length = f"{seconds:.0f} s long; the" if seconds is not None else "longer than the"
+    return f"Audio is {length} limit is {ANALYZE_MAX_SECONDS:g} s (raise it with PIPER_ANALYZE_MAX_SECONDS)."
+
+
+def _librosa_summary(path: str, max_seconds: float = ANALYZE_MAX_SECONDS) -> Dict:
+    """Signal statistics for an audio file (CPU-bound: call from a worker thread).
+
+    At most *max_seconds* (plus a second, to tell "exactly at the limit" from "over
+    it") are decoded, so the work is bounded whatever the file's header claims.
+    """
+    audio_data, sr = librosa.load(path, sr=None, duration=max_seconds + 1.0)
+    if len(audio_data) / sr > max_seconds:
+        raise _AudioTooLong()
     return {
         "duration": len(audio_data) / sr,
         "sample_rate": sr,
@@ -746,6 +834,12 @@ async def analyze_audio(audio_file: UploadFile = File(...)):
         # Analyze with ffmpeg
         analysis = await analyze_audio_with_ffmpeg(temp_path)
 
+        # The header's duration is the cheap first look. ffprobe reads no samples, so
+        # a file that would decode to hours is refused before anything decodes it.
+        declared = analysis.get("duration")
+        if isinstance(declared, (int, float)) and declared > ANALYZE_MAX_SECONDS:
+            raise HTTPException(status_code=413, detail=_too_long_detail(declared))
+
         # Add librosa analysis for more details. It decodes and runs FFTs over the
         # whole file, so it goes to a worker thread (the loop also serves /tts) and
         # takes a slot like any other CPU-heavy job.
@@ -753,20 +847,48 @@ async def analyze_audio(audio_file: UploadFile = File(...)):
             analysis["librosa"] = await _run_in_slot(_librosa_summary, temp_path)
         except HTTPException:
             raise
+        except _AudioTooLong:
+            raise HTTPException(status_code=413, detail=_too_long_detail())
         except Exception as e:
-            analysis["librosa_error"] = str(e)
+            failure = _failure(500, "Signal analysis failed", e, exc_info=True)
+            analysis["librosa_error"] = failure.detail
 
         return analysis
 
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Audio analysis failed: {str(e)}")
+        raise _failure(500, "Audio analysis failed", e, exc_info=True)
     finally:
         # Always clean up the temp file, even on failure
         _unlink_quiet(temp_path)
 
-def _custom_onnx_infer(model_path: str, text: str, voice_name: str, speed: float = 1.0) -> bytes:
+def _new_run_options():
+    """A fresh ONNX Runtime ``RunOptions`` for one synthesis, or None without onnxruntime.
+
+    Its ``terminate`` flag is how the event loop stops a run that overran its
+    time budget (see `_run_in_slot`).
+    """
+    try:
+        import onnxruntime as ort
+        return ort.RunOptions()
+    except Exception:
+        return None
+
+
+def _terminator(run_options):
+    """The `stop` callback for `_run_in_slot`: ends the run that uses *run_options*."""
+    if run_options is None:
+        return None
+
+    def stop():
+        run_options.terminate = True
+
+    return stop
+
+
+def _custom_onnx_infer(model_path: str, text: str, voice_name: str, speed: float = 1.0,
+                       run_options=None) -> bytes:
     """Run direct ONNX inference for custom-trained VITS models.
 
     Custom models were trained with a character-level IPA phoneme vocab
@@ -844,6 +966,7 @@ def _custom_onnx_infer(model_path: str, text: str, voice_name: str, speed: float
     outputs = session.run(
         None,
         {"text": text_tensor, "text_lengths": length_tensor},
+        **({"run_options": run_options} if run_options is not None else {}),
     )
     audio = outputs[0]  # shape: (batch, time) or (time,)
     if audio.ndim > 1:
@@ -891,7 +1014,7 @@ async def _run_piper(cmd: list, text: str, http_request: Request) -> None:
                 stderr=asyncio.subprocess.PIPE,
             )
         except FileNotFoundError:
-            raise HTTPException(status_code=500, detail="TTS generation failed: the piper binary is not installed.")
+            raise _failure(500, "Speech synthesis is unavailable on this instance", "the piper binary is not installed")
         talk = asyncio.ensure_future(process.communicate(input=text.encode()))
         gone = asyncio.ensure_future(_client_gone(http_request))
         try:
@@ -900,8 +1023,10 @@ async def _run_piper(cmd: list, text: str, http_request: Request) -> None:
             if talk in done:
                 _, stderr = talk.result()
                 if process.returncode != 0:
+                    # piper's stderr carries model paths and tracebacks: it goes to the
+                    # log, under the id the client is given, and not into the response.
                     message = stderr.decode(errors="replace").strip()[-2000:] or "Unknown error"
-                    raise HTTPException(status_code=500, detail=f"TTS generation failed: {message}")
+                    raise _failure(500, "Speech synthesis failed", f"piper exited with {process.returncode}: {message}")
                 return
             timed_out = gone not in done
         finally:
@@ -1014,8 +1139,10 @@ async def text_to_speech(request: TTSRequest, http_request: Request):
 
         # Custom VITS models use a character-level IPA vocab — route to direct ONNX inference
         if voice_info.model_type == "custom":
+            run_options = _new_run_options()
             wav_bytes = await _run_in_slot(
-                _custom_onnx_infer, model_path, request.text, voice_id, request.speed
+                _custom_onnx_infer, model_path, request.text, voice_id, request.speed, run_options,
+                stop=_terminator(run_options),
             )
             return StreamingResponse(io.BytesIO(wav_bytes), media_type="audio/wav", headers=headers)
 
@@ -1056,7 +1183,7 @@ async def text_to_speech(request: TTSRequest, http_request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _failure(500, "Speech synthesis failed", e, exc_info=True)
     finally:
         # A killed, failed or timed-out piper leaves a partial WAV behind.
         if output_path:
@@ -1078,8 +1205,10 @@ async def synthesize_with_custom_voice(request: VoiceCloneRequest):
         raise HTTPException(status_code=404, detail=f"Custom model file not found for '{voice_name}'")
 
     try:
+        run_options = _new_run_options()
         wav_bytes = await _run_in_slot(
-            _custom_onnx_infer, model_path, request.text, voice_name, request.speed
+            _custom_onnx_infer, model_path, request.text, voice_name, request.speed, run_options,
+            stop=_terminator(run_options),
         )
         return StreamingResponse(
             io.BytesIO(wav_bytes),
@@ -1089,7 +1218,7 @@ async def synthesize_with_custom_voice(request: VoiceCloneRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _failure(500, "Speech synthesis failed", e, exc_info=True)
 
 
 def _custom_voice_info(voice_name: str, config: dict) -> VoiceInfo:
@@ -1106,6 +1235,186 @@ def _custom_voice_info(voice_name: str, config: dict) -> VoiceInfo:
     )
 
 
+# A model the service is asked to run comes from whoever can reach /upload_model, so
+# it is loaded and asked for one test synthesis in a separate, killable process
+# before it is published: a file that is not a model, has the wrong interface, or
+# never finishes is refused there instead of hanging or crashing this process.
+# The verdict is a JSON line; the reasons are codes, never the library's own text.
+_ONNX_CHECK_SCRIPT = r'''
+import json, sys
+request = json.load(sys.stdin)
+
+
+def verdict(**fields):
+    sys.stdout.write(json.dumps(fields))
+    sys.stdout.flush()
+    sys.exit(0)
+
+
+try:
+    import numpy as np
+    import onnxruntime as ort
+except ImportError:
+    verdict(ok=False, code="runtime_missing")
+try:
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = 1
+    options.inter_op_num_threads = 1
+    options.log_severity_level = 3
+    session = ort.InferenceSession(request["model"], sess_options=options, providers=["CPUExecutionProvider"])
+except Exception:
+    verdict(ok=False, code="not_loadable")
+if {i.name for i in session.get_inputs()} != {"text", "text_lengths"}:
+    verdict(ok=False, code="wrong_inputs")
+ids = request["ids"]
+try:
+    outputs = session.run(
+        None, {"text": np.array([ids], dtype=np.int64), "text_lengths": np.array([len(ids)], dtype=np.int64)})
+except Exception:
+    verdict(ok=False, code="inference_failed")
+audio = outputs[0] if outputs else None
+if audio is None or getattr(audio, "dtype", None) is None or audio.dtype.kind != "f" or audio.ndim not in (1, 2) or audio.size == 0:
+    verdict(ok=False, code="bad_output")
+verdict(ok=True)
+'''
+# A list so a test can substitute the checker; the script needs onnxruntime, which the image has.
+_ONNX_CHECK_COMMAND = [sys.executable, "-I", "-c", _ONNX_CHECK_SCRIPT]
+
+_ONNX_VERDICTS = {
+    "not_loadable": (400, "The model file is not a loadable ONNX model."),
+    "wrong_inputs": (400, "The model must take exactly the inputs 'text' and 'text_lengths' "
+                          "(the export of the Piper training service does)."),
+    "inference_failed": (400, "The model failed a test synthesis."),
+    "bad_output": (400, "The model's output is not audio (expected float samples of rank 1 or 2)."),
+    "runtime_missing": (503, "Model validation is not available on this instance."),
+}
+
+_SAFE_LANGUAGE_RE = re.compile(r"[A-Za-z0-9_\-]{1,32}")
+_MAX_PHONEME_ENTRIES = 5000
+_MAX_PHONEME_ID = 65535
+
+
+def _check_upload_config(config: dict) -> None:
+    """400 for a config whose values the service would later trip over.
+
+    The shape ``_custom_onnx_infer`` reads: ``audio.sample_rate``,
+    ``model_card.language``, ``phonemizer_language`` (handed to espeak, so plain
+    language-code characters only) and a ``phoneme_id_map`` of phoneme -> id (or
+    list of ids). A map is required: without one the voice can never synthesise.
+    """
+    def bad(reason: str):
+        return HTTPException(status_code=400, detail=f"Config file is not usable: {reason}.")
+
+    for key in ("audio", "model_card", "limits"):
+        if key in config and not isinstance(config[key], dict):
+            raise bad(f"'{key}' must be an object")
+    audio = config.get("audio") or {}
+    rate = audio.get("sample_rate", 22050)
+    if isinstance(rate, bool) or not isinstance(rate, int) or not 8000 <= rate <= 96000:
+        raise bad("'audio.sample_rate' must be an integer between 8000 and 96000")
+    for where, values in (("model_card", config.get("model_card") or {}), ("audio", audio)):
+        for key in ("language", "speaker", "quality"):
+            value = values.get(key)
+            if value is not None and (not isinstance(value, str) or not 0 < len(value) <= 128):
+                raise bad(f"'{where}.{key}' must be a short string")
+    language = config.get("phonemizer_language")
+    if language is not None and not (isinstance(language, str) and _SAFE_LANGUAGE_RE.fullmatch(language)):
+        raise bad("'phonemizer_language' must be a language code such as 'de' or 'en-us'")
+    phonemes = config.get("phoneme_id_map")
+    if not isinstance(phonemes, dict) or not phonemes:
+        raise bad("'phoneme_id_map' is required (phoneme -> id)")
+    if len(phonemes) > _MAX_PHONEME_ENTRIES:
+        raise bad(f"'phoneme_id_map' has more than {_MAX_PHONEME_ENTRIES} entries")
+    ids = normalize_phoneme_id_map(phonemes)
+    if not ids:
+        raise bad("'phoneme_id_map' contains no usable integer ids")
+    if any(not 0 <= i <= _MAX_PHONEME_ID for i in ids.values()):
+        raise bad(f"'phoneme_id_map' ids must be between 0 and {_MAX_PHONEME_ID}")
+    limit = (config.get("limits") or {}).get("max_input_symbols")
+    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
+        raise bad("'limits.max_input_symbols' must be a positive integer")
+
+
+def _smoke_test_ids(config: dict) -> list:
+    """A short input made of ids the config defines, for the validation run."""
+    ids = sorted(set(normalize_phoneme_id_map(config.get("phoneme_id_map") or {}).values()))
+    limit = (config.get("limits") or {}).get("max_input_symbols")
+    return ids[: min(16, limit) if isinstance(limit, int) and limit > 0 else 16] or [0]
+
+
+async def _validate_onnx(model_path: Path, config: dict) -> None:
+    """Refuse a model that does not load, has the wrong interface or does not answer in time.
+
+    Runs `_ONNX_CHECK_SCRIPT` in a child process (cwd: the upload's private
+    staging directory, so nothing beside the model can be read by an external-data
+    reference) under PIPER_ONNX_VALIDATE_TIMEOUT_S; the child is killed when that
+    runs out or when this request is cancelled.
+    """
+    payload = json.dumps({"model": str(model_path), "ids": _smoke_test_ids(config)}).encode()
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *_ONNX_CHECK_COMMAND,
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            cwd=str(model_path.parent),
+        )
+    except OSError as e:
+        raise _failure(500, "Model validation could not be started", e, exc_info=True)
+    try:
+        try:
+            stdout, _ = await asyncio.wait_for(process.communicate(payload), timeout=ONNX_VALIDATE_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            raise HTTPException(
+                status_code=400,
+                detail=f"The model did not finish a test synthesis within {ONNX_VALIDATE_TIMEOUT_S:g}s "
+                       "(PIPER_ONNX_VALIDATE_TIMEOUT_S).",
+            )
+    finally:
+        if process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+            await process.wait()
+    try:
+        verdict = json.loads(stdout.decode("utf-8", errors="replace"))
+        ok, code = bool(verdict.get("ok")), str(verdict.get("code", ""))
+    except (ValueError, AttributeError):
+        # No verdict at all: the process died (a crash in the native library, the
+        # kernel's OOM killer). The model is not published.
+        logger.warning("Model validation ended without a verdict (exit code %s)", process.returncode)
+        raise HTTPException(status_code=400, detail="The model could not be loaded safely.")
+    if ok:
+        return
+    status_code, message = _ONNX_VERDICTS.get(code, (400, "The model failed validation."))
+    if status_code >= 500:
+        logger.error("Model validation is unavailable: %s", code)
+    raise HTTPException(status_code=status_code, detail=message)
+
+
+def _tree_bytes(root: Path) -> int:
+    """Total size of the files under *root* (0 when it does not exist)."""
+    total = 0
+    for directory, _dirs, files in os.walk(root):
+        for name in files:
+            with contextlib.suppress(OSError):
+                total += os.path.getsize(os.path.join(directory, name))
+    return total
+
+
+def _reject_reserved_voice(voice_id: str) -> None:
+    """409 for an id that is (or differs only in case from) a built-in voice."""
+    if _is_builtin_voice_id(voice_id):
+        raise HTTPException(
+            status_code=409,
+            detail=f"'{voice_id}' is the name of a built-in voice; choose another name for the custom voice.",
+        )
+
+
+# Only one upload is worked on at a time, and a second one is turned away instead of
+# queued (each waiter would hold its spooled files). That keeps the count and disk
+# limits below exact, and the validation processes to one. Plain flag: the handler
+# checks and sets it without an await in between, on one event loop.
+_UPLOAD_BUSY = False
+
+
 @app.post("/upload_model")
 async def upload_custom_model(
     model_file: UploadFile = File(...),
@@ -1113,25 +1422,58 @@ async def upload_custom_model(
     voice_name: str = Form(...),
     model_name: str = Form(None),
 ):
-    """Upload a custom-trained ONNX model and optional JSON config."""
-    part_paths = []
-    created_dir = False
+    """Upload a custom-trained ONNX model and optional JSON config.
+
+    The model is validated (loads under ONNX Runtime in a separate process, takes
+    the `text`/`text_lengths` inputs, answers a test request in time) and the
+    config checked before anything is published. Refused: the id of a built-in
+    voice (409), more than PIPER_MAX_CUSTOM_VOICES voices (409), more than
+    PIPER_MAX_CUSTOM_MB of custom models in total (413), a second upload while one
+    is running (503).
+    """
+    global _UPLOAD_BUSY
+    final_voice_name = _sanitize_voice_name(model_name or voice_name)
+    _reject_reserved_voice(final_voice_name)
+    if _UPLOAD_BUSY:
+        raise HTTPException(
+            status_code=503, detail="Another model upload is in progress; retry shortly.",
+            headers={"Retry-After": "5"},
+        )
+    _UPLOAD_BUSY = True
+    stage = None
     try:
-        final_voice_name = _sanitize_voice_name(model_name or voice_name)
-
         voice_dir = CUSTOM_MODELS_DIR / final_voice_name
-        created_dir = not voice_dir.exists()
-        voice_dir.mkdir(parents=True, exist_ok=True)
-        model_path = voice_dir / f"{final_voice_name}.onnx"
-        config_path = voice_dir / f"{final_voice_name}.json"
+        replacing = final_voice_name in CUSTOM_VOICES or voice_dir.exists()
+        if not replacing and len(CUSTOM_VOICES) >= MAX_CUSTOM_VOICES:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{len(CUSTOM_VOICES)} custom voices are installed, the limit is {MAX_CUSTOM_VOICES} "
+                       "(PIPER_MAX_CUSTOM_VOICES). Delete one first.",
+            )
+        CUSTOM_MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        others_bytes = (
+            await asyncio.to_thread(_tree_bytes, CUSTOM_MODELS_DIR)
+            - (await asyncio.to_thread(_tree_bytes, voice_dir) if replacing else 0)
+        )
 
-        # Everything is written beside its final name and moved into place only
-        # once the whole upload checked out. Writing straight to the final path
-        # truncated a working voice at the first byte of a re-upload, and a bad
-        # config left a model without one.
-        model_part = voice_dir / f".{final_voice_name}.onnx.part"
-        config_part = voice_dir / f".{final_voice_name}.json.part"
-        part_paths = [model_part, config_part]
+        def over_budget(extra: int) -> HTTPException:
+            return HTTPException(
+                status_code=413,
+                detail=f"Custom voices would use {(others_bytes + extra) / _MIB:.0f} MB; the limit is "
+                       f"{MAX_CUSTOM_BYTES / _MIB:.0f} MB (PIPER_MAX_CUSTOM_MB). Delete a voice first.",
+            )
+
+        if others_bytes >= MAX_CUSTOM_BYTES:
+            raise over_budget(0)
+
+        # Everything is written to a private staging directory (on the same
+        # filesystem, so publishing is a rename) and moved into place only once the
+        # whole upload checked out. Writing straight to the final path truncated a
+        # working voice at the first byte of a re-upload, a bad config left a model
+        # without one, and the model is validated with nothing else around it.
+        stage = Path(await asyncio.to_thread(tempfile.mkdtemp, prefix=".upload-", dir=CUSTOM_MODELS_DIR))
+        model_part = stage / "model.onnx"
+        config_part = stage / "config.json"
 
         await _spool_upload(model_file, model_part, MAX_UPLOAD_BYTES, "Model file")
 
@@ -1139,8 +1481,12 @@ async def upload_custom_model(
             await _spool_upload(config_file, config_part, MAX_CONFIG_BYTES, "Config file")
             try:
                 config = json.loads(await asyncio.to_thread(config_part.read_text, "utf-8"))
-            except ValueError as e:
-                raise HTTPException(status_code=400, detail=f"Config file is not valid JSON: {e}")
+            except json.JSONDecodeError as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Config file is not valid JSON: {e.msg} (line {e.lineno}, column {e.colno}).")
+            except (ValueError, RecursionError):
+                raise HTTPException(status_code=400, detail="Config file is not valid JSON.")
             if not isinstance(config, dict):
                 raise HTTPException(status_code=400, detail="Config file must contain a JSON object.")
         else:
@@ -1172,14 +1518,29 @@ async def upload_custom_model(
             }
             await asyncio.to_thread(config_part.write_text, json.dumps(config, indent=2), "utf-8")
 
+        _check_upload_config(config)
         try:
             voice_info = _custom_voice_info(final_voice_name, config)
         except ValidationError as e:
             raise HTTPException(status_code=400, detail=f"Config file has unusable voice metadata: {e.errors()[0]['msg']}")
 
-        os.replace(model_part, model_path)
-        os.replace(config_part, config_path)
-        created_dir = False
+        # The size check needs the real sizes, so it comes after the upload was
+        # spooled; the validation process is the expensive step, so it comes after
+        # the cheap refusals.
+        staged_bytes = sum(os.path.getsize(part) for part in (model_part, config_part))
+        if others_bytes + staged_bytes > MAX_CUSTOM_BYTES:
+            raise over_budget(staged_bytes)
+        await _validate_onnx(model_part, config)
+
+        created_dir = not voice_dir.exists()
+        voice_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.replace(model_part, voice_dir / f"{final_voice_name}.onnx")
+            os.replace(config_part, voice_dir / f"{final_voice_name}.json")
+        except BaseException:
+            if created_dir:
+                shutil.rmtree(voice_dir, ignore_errors=True)
+            raise
 
         CUSTOM_VOICES[final_voice_name] = voice_info
 
@@ -1192,13 +1553,11 @@ async def upload_custom_model(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Model upload failed: {str(e)}")
+        raise _failure(500, "Model upload failed", e, exc_info=True)
     finally:
-        for part in part_paths:
-            _unlink_quiet(part)
-        if created_dir:
-            with contextlib.suppress(OSError):
-                voice_dir.rmdir()
+        _UPLOAD_BUSY = False
+        if stage is not None:
+            shutil.rmtree(stage, ignore_errors=True)
 
 @app.delete("/voice/{voice_name}")
 async def delete_custom_voice(voice_name: str):
@@ -1225,7 +1584,7 @@ async def delete_custom_voice(voice_name: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _failure(500, "Could not delete the voice", e, exc_info=True)
 
 @app.get("/voice/{voice_name}")
 async def get_voice_info(voice_name: str):
@@ -1236,6 +1595,15 @@ async def get_voice_info(voice_name: str):
     
     return all_voices[voice_name]
 
+def _sweep_stale_uploads() -> None:
+    """Remove the staging directories of uploads a crash cut short (run before serving)."""
+    if not CUSTOM_MODELS_DIR.is_dir():
+        return
+    for entry in CUSTOM_MODELS_DIR.iterdir():
+        if entry.is_dir() and entry.name.startswith(".upload-"):
+            shutil.rmtree(entry, ignore_errors=True)
+
+
 def _scan_custom_voices() -> Dict[str, VoiceInfo]:
     """Read every valid custom voice under ``CUSTOM_MODELS_DIR`` (blocking file IO)."""
     found: Dict[str, VoiceInfo] = {}
@@ -1243,7 +1611,8 @@ def _scan_custom_voices() -> Dict[str, VoiceInfo]:
         return found
 
     for voice_dir in sorted(CUSTOM_MODELS_DIR.iterdir()):
-        if voice_dir.is_dir():
+        # ".upload-*" is an upload in progress (or one a crash left behind, see the lifespan).
+        if voice_dir.is_dir() and not voice_dir.name.startswith("."):
             voice_name = voice_dir.name
             config_path = voice_dir / f"{voice_name}.json"
             model_path = voice_dir / f"{voice_name}.onnx"
@@ -1255,6 +1624,11 @@ def _scan_custom_voices() -> Dict[str, VoiceInfo]:
 
                     found[voice_name] = _custom_voice_info(voice_name, config)
                     logger.info(f"Loaded custom voice: {voice_name}")
+                    if _is_builtin_voice_id(voice_name):
+                        logger.warning(
+                            "Custom voice '%s' has the id of a built-in voice and is not offered for /tts "
+                            "(the built-in voice wins). It still answers /synthesize; rename or delete it.",
+                            voice_name)
 
                 except Exception as e:
                     logger.warning(f"Failed to load custom voice {voice_name}: {e}")

@@ -8,7 +8,8 @@ weights, exported to ONNX and deployed as a voice. Checkpoints were never pruned
 and the vocabulary was rebuilt from whatever ``train.json`` held at the moment.
 
 These run a real (tiny) model on CPU with synthetic mels; no audio, no GPU, no
-downloads. They skip where torch is not installed. ``PIPER_TRAINING_SERVICE_DIR``
+downloads. They skip where torch is not installed (an error with REQUIRE_TORCH_TESTS=1, set by
+the CI training job). ``PIPER_TRAINING_SERVICE_DIR``
 points them at another checkout of the service, which is how they were run
 against the pre-fix code to show they fail there.
 """
@@ -24,9 +25,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from optional_deps import importorskip_unless_required as _need
 
-torch = pytest.importorskip("torch")
-np = pytest.importorskip("numpy")
+# Skips where torch is missing, except with REQUIRE_TORCH_TESTS=1 (the CI training
+# job), where that is an error: see tests/optional_deps.py.
+torch = _need("torch")
+np = _need("numpy")
 
 REPO = Path(__file__).resolve().parents[1]
 SERVICE_DIR = Path(os.environ.get("PIPER_TRAINING_SERVICE_DIR") or REPO / "piper-training-service")

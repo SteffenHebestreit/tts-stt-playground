@@ -37,7 +37,7 @@ RUN git clone --depth 1 --branch "${WHISPER_CPP_REF}" \
         -DBUILD_SHARED_LIBS=OFF \
         -DGGML_NATIVE=OFF \
         ${ARCH_FLAGS} && \
-    cmake --build build -j$(nproc) --target whisper-server
+    cmake --build build -j"$(nproc)" --target whisper-server
 
 # ── Runtime ──────────────────────────────────────────────────────────────────
 FROM ubuntu:22.04

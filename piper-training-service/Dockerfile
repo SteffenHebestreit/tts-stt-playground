@@ -34,7 +34,7 @@ RUN ln -sf /usr/bin/python3.11 /usr/bin/python3 && \
 WORKDIR /app
 
 # Upgrade pip and install basic build tools
-RUN pip3 install --upgrade pip setuptools wheel
+RUN pip3 install --no-cache-dir --upgrade pip setuptools wheel
 
 # Install PyTorch first, with CUDA 12.8 support (Blackwell / RTX 50 series, sm_120).
 # It comes BEFORE `COPY requirements.txt`: a COPY whose file changed invalidates

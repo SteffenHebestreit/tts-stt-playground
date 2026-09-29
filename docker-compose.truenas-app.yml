@@ -152,10 +152,21 @@ services:
       # https://voice.example.com. Symptom when missing: 403 on every button.
       TRUSTED_ORIGINS: ${TRUSTED_ORIGINS:-}
       TRUST_PROXY_HEADERS: ${TRUST_PROXY_HEADERS:-false}
-      # Optional shared secret for /v1/* and mutating /api/*; empty = open (LAN).
+      # Hostnames other than an IP address, localhost, *.local, *.lan, *.internal or a
+      # single-label name (truenas) must be listed, e.g. voice.example.com or
+      # *.tail1234.ts.net, else every request is 403 host_not_allowed (a reverse
+      # proxy that passes Host through needs this). ALLOWED_HOSTS reads only `*`
+      # (check off; not recommended).
+      TRUSTED_HOSTS: ${TRUSTED_HOSTS:-}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:-}
+      # Optional shared secret for /v1/*, mutating /api/* and /ws/stt; empty = open
+      # (LAN). No exemption for the web UI: it asks for the key once.
       API_KEY: ${API_KEY:-}
       MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-512}
-      MAX_TTS_CHARS: ${MAX_TTS_CHARS:-20000}
+      MAX_TTS_CHARS: ${MAX_TTS_CHARS:-5000}
+      # Per worker: uploads in flight and ffmpeg conversions; the next request gets 503.
+      MAX_CONCURRENT_UPLOADS: ${MAX_CONCURRENT_UPLOADS:-4}
+      MAX_CONCURRENT_FFMPEG: ${MAX_CONCURRENT_FFMPEG:-4}
       HEALTH_CACHE_TTL: ${HEALTH_CACHE_TTL:-2}
       FRONTEND_WORKERS: ${FRONTEND_WORKERS:-2}
       DEFAULT_STT_PROVIDER: ${DEFAULT_STT_PROVIDER:-whisper}
@@ -206,8 +217,15 @@ services:
       MAX_TEXT_CHARS: ${PIPER_MAX_TEXT_CHARS:-20000}
       MAX_UPLOAD_MB: ${PIPER_MAX_UPLOAD_MB:-100}
       MAX_ANALYZE_UPLOAD_MB: ${PIPER_MAX_ANALYZE_UPLOAD_MB:-25}
+      # Longest recording /analyze_audio decodes (413 beyond it), most uploaded voices
+      # (409; 0 = no new upload), their total size in MB (413) and the seconds a new
+      # voice gets to load and answer a test request before it is published.
+      PIPER_ANALYZE_MAX_SECONDS: ${PIPER_ANALYZE_MAX_SECONDS:-600}
+      PIPER_MAX_CUSTOM_VOICES: ${PIPER_MAX_CUSTOM_VOICES:-20}
+      PIPER_MAX_CUSTOM_MB: ${PIPER_MAX_CUSTOM_MB:-2048}
+      PIPER_ONNX_VALIDATE_TIMEOUT_S: ${PIPER_ONNX_VALIDATE_TIMEOUT_S:-30}
       # Backends are not browser-facing (the gateway is) and are not published.
-      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-*}
+      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${APP_DATA_DIR:?set dataset path}/models:/app/models"
@@ -270,7 +288,7 @@ services:
       MODEL_TTL: ${MODEL_TTL:-300}
       OMP_NUM_THREADS: ${OMP_NUM_THREADS:-4}
       PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
-      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-*}
+      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${APP_DATA_DIR:?set dataset path}/models:/app/models"
@@ -310,10 +328,14 @@ services:
       MAX_UPLOAD_MB: ${ASR_MAX_UPLOAD_MB:-200}
       MAX_AUDIO_SECONDS: ${ASR_MAX_AUDIO_SECONDS:-7200}
       ASR_MAX_CONCURRENCY: ${ASR_MAX_CONCURRENCY:-1}
+      # Waiting requests (empty = 4 x ASR_MAX_CONCURRENCY, 0 = nobody waits) and how
+      # long one waits; beyond either the answer is 503 + Retry-After.
+      ASR_MAX_QUEUE: ${ASR_MAX_QUEUE:-}
+      ASR_QUEUE_TIMEOUT_S: ${ASR_QUEUE_TIMEOUT_S:-60}
       PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
       ASR_MODEL_TTL: ${ASR_MODEL_TTL:-300}
       MODEL_TTL: ${MODEL_TTL:-300}
-      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-*}
+      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${APP_DATA_DIR:?set dataset path}/cache:/root/.cache"
@@ -348,13 +370,19 @@ services:
       QWEN3_TTS_ATTN_IMPLEMENTATION: ${QWEN3_TTS_ATTN_IMPLEMENTATION:-auto}
       MAX_TEXT_CHARS: ${QWEN3_TTS_MAX_TEXT_CHARS:-5000}
       MAX_UPLOAD_MB: ${QWEN3_TTS_MAX_UPLOAD_MB:-20}
+      # Longest reference clip in seconds (413 beyond it, whatever its file size).
+      QWEN3_TTS_REF_MAX_SECONDS: ${QWEN3_TTS_REF_MAX_SECONDS:-60}
       TTS_MAX_CONCURRENCY: ${TTS_MAX_CONCURRENCY:-1}
+      # Waiting requests (empty = 4 x TTS_MAX_CONCURRENCY, 0 = nobody waits) and how
+      # long one waits; beyond either the answer is 503 + Retry-After.
+      TTS_MAX_QUEUE: ${TTS_MAX_QUEUE:-}
+      TTS_QUEUE_TIMEOUT_S: ${TTS_QUEUE_TIMEOUT_S:-60}
       TTS_MAX_BATCH: ${TTS_MAX_BATCH:-8}
       TTS_MODEL_TTL: ${TTS_MODEL_TTL:-300}
       MODEL_TTL: ${MODEL_TTL:-300}
       PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
       QWEN3_ASR_SERVICE_URL: http://qwen3-asr-service:5002
-      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-*}
+      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${APP_DATA_DIR:?set dataset path}/cache:/root/.cache"
@@ -396,7 +424,6 @@ services:
       NVIDIA_VISIBLE_DEVICES: ${GPU_DEVICE_ID:-0}
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
       CANARY_ASR_MODEL: ${CANARY_ASR_MODEL:-nvidia/canary-180m-flash}
-      ASR_MAX_BATCH: ${ASR_MAX_BATCH:-8}
       CANARY_DEFAULT_LANGUAGE: ${CANARY_DEFAULT_LANGUAGE:-de}
       CANARY_SUPPORTED_LANGUAGES: ${CANARY_SUPPORTED_LANGUAGES:-}
       MAX_UPLOAD_MB: ${ASR_MAX_UPLOAD_MB:-200}
@@ -404,10 +431,14 @@ services:
       NEMO_MATMUL_PRECISION: ${NEMO_MATMUL_PRECISION:-high}
       NEMO_BF16: ${NEMO_BF16:-false}
       ASR_MAX_CONCURRENCY: ${ASR_MAX_CONCURRENCY:-1}
+      # Waiting requests (empty = 4 x ASR_MAX_CONCURRENCY, 0 = nobody waits) and how
+      # long one waits; beyond either the answer is 503 + Retry-After.
+      ASR_MAX_QUEUE: ${ASR_MAX_QUEUE:-}
+      ASR_QUEUE_TIMEOUT_S: ${ASR_QUEUE_TIMEOUT_S:-60}
       PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
       ASR_MODEL_TTL: ${ASR_MODEL_TTL:-300}
       MODEL_TTL: ${MODEL_TTL:-300}
-      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-*}
+      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${APP_DATA_DIR:?set dataset path}/cache:/root/.cache"
@@ -444,10 +475,14 @@ services:
       NEMO_MATMUL_PRECISION: ${NEMO_MATMUL_PRECISION:-high}
       NEMO_BF16: ${NEMO_BF16:-false}
       ASR_MAX_CONCURRENCY: ${ASR_MAX_CONCURRENCY:-1}
+      # Waiting requests (empty = 4 x ASR_MAX_CONCURRENCY, 0 = nobody waits) and how
+      # long one waits; beyond either the answer is 503 + Retry-After.
+      ASR_MAX_QUEUE: ${ASR_MAX_QUEUE:-}
+      ASR_QUEUE_TIMEOUT_S: ${ASR_QUEUE_TIMEOUT_S:-60}
       PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
       ASR_MODEL_TTL: ${ASR_MODEL_TTL:-300}
       MODEL_TTL: ${MODEL_TTL:-300}
-      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-*}
+      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${APP_DATA_DIR:?set dataset path}/cache:/root/.cache"
@@ -488,8 +523,12 @@ services:
       TTS_MODEL_TTL: ${TTS_MODEL_TTL:-300}
       MODEL_TTL: ${MODEL_TTL:-300}
       TTS_MAX_CONCURRENCY: ${TTS_MAX_CONCURRENCY:-1}
+      # Waiting requests (empty = 4 x TTS_MAX_CONCURRENCY, 0 = nobody waits) and how
+      # long one waits; beyond either the answer is 503 + Retry-After.
+      TTS_MAX_QUEUE: ${TTS_MAX_QUEUE:-}
+      TTS_QUEUE_TIMEOUT_S: ${TTS_QUEUE_TIMEOUT_S:-60}
       PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
-      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-*}
+      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${APP_DATA_DIR:?set dataset path}/cache:/root/.cache"
@@ -540,10 +579,10 @@ services:
       TRAIN_NUM_WORKERS: ${TRAIN_NUM_WORKERS:-2}
       # Shutdown waits this long for running jobs; stop_grace_period below must stay larger.
       TRAINING_SHUTDOWN_GRACE_S: ${TRAINING_SHUTDOWN_GRACE_S:-30}
-      UVICORN_TIMEOUT_KEEP_ALIVE: ${UVICORN_TIMEOUT_KEEP_ALIVE:-75}
+      UVICORN_TIMEOUT_KEEP_ALIVE: ${UVICORN_TIMEOUT_KEEP_ALIVE:-120}
       MAX_UPLOAD_MB: ${TRAINING_MAX_UPLOAD_MB:-500}
       MAX_TEXT_CHARS: ${TRAINING_MAX_TEXT_CHARS:-1000}
-      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-*}
+      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${APP_DATA_DIR:?set dataset path}/piper-training-service/data:/app/data"

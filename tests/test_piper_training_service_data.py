@@ -21,14 +21,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from test_piper_training_service_support import (  # noqa: F401  (training_service is a fixture)
-    asgi_client, install_fake_stt, settle, status_of, stt_result, training_service, write_wav,
+    asgi_client, install_fake_stt, make_dataset, settle, status_of, stt_result, training_service, write_job_state,
+    write_wav,
 )
 
 
@@ -632,7 +635,7 @@ def test_an_unreachable_stt_service_raises_instead_of_returning_no_segments(trai
         processor.session = FakeSession([refused] * 3)
         return await processor.process_audio_file(audio)
 
-    with pytest.raises(Exception) as caught:
+    with pytest.raises(module.STTError, match=r"3 attempts.*10\.0\.0\.5") as caught:
         asyncio.run(run())
     assert "10.0.0.5" in str(caught.value) and "3 attempts" in str(caught.value)
 
@@ -848,6 +851,86 @@ def test_train_validates_what_it_would_otherwise_train_on(training_service, tmp_
             assert len(svc.module.active_runs) == 0
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("path,field,value", [
+    (path, field, value)
+    for path, field, values in (
+        ("/train-from-dataset", "epochs", ("0", "-5", "1000000000")),
+        ("/retrain-from-segments", "epochs", ("0", "-5", "1000000000")),
+        # extra_epochs=0 is meaningful here: "continue to the original total".
+        ("/resume-training", "extra_epochs", ("-5", "1000000000")),
+    )
+    for value in values
+])
+def test_every_other_way_of_starting_a_job_bounds_the_epoch_count_too(training_service, path, field, value):
+    """`epochs=0` produced a job reporting 0/0 that divided by zero in the resume path's own
+    progress calculation; the bound has to hold at every entry point, not only /train."""
+    svc = training_service()
+    make_dataset(svc.root, "voice")
+    write_wav(svc.root / "data" / "voice" / "audio" / "voice_clip_0.wav")
+    write_job_state(svc.root, "job-a", "voice", status="training")
+
+    async def run():
+        async with asgi_client(svc.module) as client:
+            response = await client.post(path, data={"model_name": "voice", field: value})
+            assert response.status_code == 400, response.text
+            assert field in response.text
+            assert svc.module.training_jobs == {}
+            assert len(svc.module.active_runs) == 0
+            assert svc.pipeline.calls == []
+
+    asyncio.run(run())
+
+
+def _segmenter(training_service, monkeypatch, fake_run):
+    """An AudioSegmenter whose ffmpeg call goes to *fake_run* (the service is put on sys.path first)."""
+    training_service()
+    import audio_segmenter
+
+    monkeypatch.setattr(audio_segmenter.AudioSegmenter, "_find_ffmpeg", lambda self: "ffmpeg")
+    monkeypatch.setattr(audio_segmenter.subprocess, "run", fake_run)
+    return audio_segmenter.AudioSegmenter()
+
+
+def test_a_segment_is_cut_by_seeking_the_input_off_the_event_loop_and_under_a_timeout(
+        training_service, tmp_path, monkeypatch):
+    """`-ss` after `-i` is output seeking: ffmpeg decodes the file from the start for every cut,
+    so N segments cost N full decodes. The call must also leave the event loop (it runs in a
+    BackgroundTask that /health shares) and be bounded (a wedged ffmpeg hung it for good)."""
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen.update(cmd=list(cmd), kwargs=kwargs, thread=threading.get_ident())
+        Path(cmd[-1]).write_bytes(b"RIFF" + b"\0" * 40)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    segmenter = _segmenter(training_service, monkeypatch, fake_run)
+
+    async def cut():
+        return threading.get_ident(), await segmenter.extract_audio_segment(
+            tmp_path / "in.wav", tmp_path / "out" / "seg.wav", 12.5, 15.0)
+
+    loop_thread, ok = asyncio.run(cut())
+
+    cmd = seen["cmd"]
+    assert ok is True
+    assert cmd.index("-ss") < cmd.index("-i"), f"-ss after -i decodes the whole file for every cut: {cmd}"
+    assert cmd[cmd.index("-ss") + 1] == "12.5" and cmd[cmd.index("-t") + 1] == "2.5"
+    assert cmd[cmd.index("-i") + 1] == str(tmp_path / "in.wav")
+    assert seen["kwargs"]["timeout"] > 0, "ffmpeg runs with no timeout"
+    assert seen["thread"] != loop_thread, "ffmpeg was run on the event loop thread"
+
+
+def test_a_wedged_ffmpeg_is_a_failed_cut_not_a_hung_job(training_service, tmp_path, monkeypatch):
+    def hung(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+    segmenter = _segmenter(training_service, monkeypatch, hung)
+
+    ok = asyncio.run(segmenter.extract_audio_segment(tmp_path / "in.wav", tmp_path / "seg.wav", 0.0, 2.0))
+
+    assert ok is False
 
 
 def test_retrain_from_segments_reports_an_stt_outage_and_uses_the_language(training_service, monkeypatch):

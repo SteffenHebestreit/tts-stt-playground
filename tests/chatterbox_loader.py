@@ -30,7 +30,6 @@ import os
 import sys
 import threading
 import types
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib.util import module_from_spec, spec_from_file_location
 from itertools import count
@@ -38,6 +37,8 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+
+from stub_modules import stubbed_modules
 
 REPO = Path(__file__).resolve().parents[1]
 SERVICE_DIR = Path(os.environ.get("CHATTERBOX_SERVICE_DIR") or REPO / "chatterbox-tts-service")
@@ -49,7 +50,7 @@ MANAGED_ENV = (
     "CHATTERBOX_DEFAULT_LANGUAGE", "CHATTERBOX_T3_MODEL", "CHATTERBOX_HF_REVISION",
     "CHATTERBOX_REPETITION_PENALTY", "CHATTERBOX_CHUNK_GAP_MS", "CHATTERBOX_REF_MAX_SECONDS",
     "CHATTERBOX_REF", "MAX_TEXT_CHARS", "MAX_UPLOAD_MB", "TTS_MODEL_TTL", "MODEL_TTL",
-    "TTS_MAX_CONCURRENCY", "ALLOWED_ORIGINS", "ALLOW_CREDENTIALS",
+    "TTS_MAX_CONCURRENCY", "TTS_QUEUE_TIMEOUT_S", "TTS_MAX_QUEUE", "ALLOWED_ORIGINS", "ALLOW_CREDENTIALS",
 )
 
 SAMPLE_RATE = 24000
@@ -61,33 +62,20 @@ SAMPLES_PER_CHAR = 10
 MODEL_MAX_CHARS = 200
 
 
-def _is_stub(module) -> bool:
-    return getattr(module, "__file__", None) is None
-
-
-def _install_torch_stub() -> None:
-    """A torch stand-in only where the real package is absent; fills in what we need."""
-    if "torch" not in sys.modules:
-        sys.modules["torch"] = types.ModuleType("torch")
-    torch = sys.modules["torch"]
-    if not _is_stub(torch):
-        return
-    if not hasattr(torch, "__version__"):
-        torch.__version__ = "0.0.0-stub"
-    if not hasattr(torch, "is_tensor"):
-        torch.is_tensor = lambda x: False
-    if not hasattr(torch, "cuda"):
-        torch.cuda = types.SimpleNamespace()
-    for name, value in {
-        "is_available": lambda: False,
-        "empty_cache": lambda: None,
-        "ipc_collect": lambda: None,
-        "get_device_name": lambda i: "stub",
-        "memory_allocated": lambda: 0,
-        "get_device_properties": lambda i: types.SimpleNamespace(total_memory=0),
-    }.items():
-        if not hasattr(torch.cuda, name):
-            setattr(torch.cuda, name, value)
+def _torch_stub() -> types.ModuleType:
+    """A torch stand-in with what the service touches at import and when it loads a model."""
+    torch = types.ModuleType("torch")
+    torch.__version__ = "0.0.0-stub"
+    torch.is_tensor = lambda x: False
+    torch.cuda = types.SimpleNamespace(
+        is_available=lambda: False,
+        empty_cache=lambda: None,
+        ipc_collect=lambda: None,
+        get_device_name=lambda i: "stub",
+        memory_allocated=lambda: 0,
+        get_device_properties=lambda i: types.SimpleNamespace(total_memory=0),
+    )
+    return torch
 
 
 def _soundfile_stub() -> types.ModuleType:
@@ -113,21 +101,16 @@ def _uvicorn_stub() -> types.ModuleType:
     return uv
 
 
-@contextmanager
 def _stubbed_modules():
-    """soundfile / uvicorn stand-ins for the duration of the import only."""
-    names = ("soundfile", "uvicorn")
-    saved = {name: sys.modules.get(name) for name in names}
-    sys.modules["soundfile"] = _soundfile_stub()
-    sys.modules["uvicorn"] = _uvicorn_stub()
-    try:
-        yield
-    finally:
-        for name, module in saved.items():
-            if module is None:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = module
+    """torch / soundfile / uvicorn stand-ins for the duration of the import only.
+
+    soundfile is always the recording one (the tests read its output back), even where
+    the real package is installed. torch is only stubbed where there is no real one.
+    """
+    return stubbed_modules(
+        {"torch": _torch_stub, "soundfile": _soundfile_stub, "uvicorn": _uvicorn_stub},
+        force=("soundfile", "uvicorn"),
+    )
 
 
 _counter = count()
@@ -139,7 +122,6 @@ def load_app(**env):
     The idle TTL defaults to "never" so no test leaves a 5-minute timer thread
     behind; tests of the TTL pass their own.
     """
-    _install_torch_stub()
     env = {"TTS_MODEL_TTL": "-1", **env}
     previous = {key: os.environ.get(key) for key in MANAGED_ENV}
     for key in MANAGED_ENV:
@@ -358,6 +340,33 @@ def wait_until(predicate, timeout: float = 5.0, interval: float = 0.005) -> bool
             return True
         time.sleep(interval)
     return bool(predicate())
+
+
+class WatchedLock:
+    """A `threading.Lock` stand-in that reports when a caller had to wait for it.
+
+    For proving a negative without sleeping: "the second generation must NOT start while
+    the first holds the model" used to be "wait 0.4 s and see that it did not", which
+    also passes when the machine is too busy to start it in 0.4 s. Here the test waits
+    for the second caller to be parked on the lock (`contended`), or for the forbidden
+    thing to happen, whichever comes first, and then looks.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.contended = threading.Event()
+
+    def __enter__(self):
+        if not self._lock.acquire(blocking=False):
+            self.contended.set()
+            self._lock.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self._lock.release()
+
+    def locked(self) -> bool:
+        return self._lock.locked()
 
 
 async def wait_until_async(predicate, timeout: float = 5.0, interval: float = 0.005) -> bool:

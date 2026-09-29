@@ -42,7 +42,8 @@ MANAGED_ENV = (
     "PIPER_DEFAULT_VOICE", "PIPER_AUTO_DETECT", "PIPER_TIMEOUT_S", "PIPER_MAX_CONCURRENCY",
     "MAX_TEXT_CHARS", "MAX_UPLOAD_MB", "MAX_ANALYZE_UPLOAD_MB", "OUTPUT_RETENTION_HOURS",
     "OUTPUT_PRUNE_INTERVAL_S", "ONNX_NUM_THREADS", "ONNX_SESSION_CACHE_SIZE",
-    "ALLOWED_ORIGINS", "ALLOW_CREDENTIALS",
+    "ALLOWED_ORIGINS", "ALLOW_CREDENTIALS", "PIPER_ANALYZE_MAX_SECONDS",
+    "PIPER_MAX_CUSTOM_VOICES", "PIPER_MAX_CUSTOM_MB", "PIPER_ONNX_VALIDATE_TIMEOUT_S",
 )
 
 _counter = count()
@@ -60,7 +61,8 @@ def _fake_librosa() -> types.ModuleType:
     import numpy as np
 
     module = types.ModuleType("librosa")
-    module.load = lambda path, sr=None: (np.zeros(100, dtype="float32"), 22050)
+    # `duration` limits the decode, like the real one.
+    module.load = lambda path, sr=None, duration=None, **_kw: (np.zeros(100, dtype="float32"), 22050)
     module.feature = types.SimpleNamespace(
         rms=lambda y: np.full((1, 4), 0.25),
         zero_crossing_rate=lambda y: np.full((1, 4), 0.1),
@@ -154,7 +156,9 @@ case "$mode" in
     printf 'partial' > "$out"
     exit 3 ;;
   hang)
-    echo $$ > "$FAKE_PIPER_DIR/pid"
+    # Temp file + rename: a poller must never see `pid` created but still empty.
+    echo $$ > "$FAKE_PIPER_DIR/pid.tmp"
+    mv -f "$FAKE_PIPER_DIR/pid.tmp" "$FAKE_PIPER_DIR/pid"
     printf 'partial' > "$out"
     exec sleep 60 ;;
   slow)
@@ -200,8 +204,12 @@ class FakePiper:
         return [tuple(line.split("\t", 1)) for line in log.read_text().splitlines()]
 
     def pid(self) -> int | None:
-        pid_file = self.dir / "pid"
-        return int(pid_file.read_text()) if pid_file.exists() else None
+        """The hung fake's pid; None until it has published it (a missing or empty file is "not yet")."""
+        try:
+            text = (self.dir / "pid").read_text().strip()
+        except OSError:
+            return None
+        return int(text) if text.isdigit() else None
 
     def peak_concurrency(self) -> int:
         log = self.dir / "concurrency.log"
@@ -239,13 +247,20 @@ def start(tmp_path, monkeypatch):
     fake = FakePiper(tmp_path)
     fake.env(monkeypatch)
 
-    def _start(voices=("de_DE-thorsten-medium", "en_US-lessac-medium"), **env):
+    def _start(voices=("de_DE-thorsten-medium", "en_US-lessac-medium"), validate_models=False, **env):
+        """`validate_models=True` keeps the real upload validation (a child process running
+        onnxruntime); by default it accepts everything, so the tests can upload placeholder bytes."""
         models, out = tmp_path / "models", tmp_path / "out"
         out.mkdir(exist_ok=True)
         (models / "default").mkdir(parents=True, exist_ok=True)
         for voice in voices:
             install_voice(models, voice)
         module = load_piper_app({"PIPER_DATA_DIR": str(models), "PIPER_OUTPUT_DIR": str(out), **env})
+        if not validate_models and hasattr(module, "_validate_onnx"):
+            async def accept_any_model(*_args):
+                return None
+
+            module._validate_onnx = accept_any_model
         client = stack.enter_context(TestClient(module.app))
         return Service(module, client, fake, models, out)
 

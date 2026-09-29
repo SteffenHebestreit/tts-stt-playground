@@ -32,6 +32,9 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 RUN python3 -c "import torch; assert torch.version.hip, 'torch %s is not a ROCm build' % torch.__version__"
 
 COPY app.py .
+# Request-body limit and cross-origin guard, imported by app.py at startup.
+COPY body_limit.py .
+COPY origin_guard.py .
 
 EXPOSE 5004
 

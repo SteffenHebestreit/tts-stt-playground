@@ -53,21 +53,30 @@ def test_a_piper_that_hangs_is_killed_at_the_timeout(start):
     assert r.status_code == 504
     assert "PIPER_TIMEOUT_S" in r.json()["detail"]
     assert 0.9 < elapsed < 10
-    assert not process_alive(svc.fake.pid()), "the timed-out piper process was left running"
+    pid = svc.fake.pid()
+    assert pid is not None, "piper was never started (the timeout fired before the fake got going)"
+    assert not process_alive(pid), "the timed-out piper process was left running"
     assert list(svc.out.iterdir()) == [], "the partial WAV was not removed"
 
     svc.fake.mode = "ok"
     assert svc.speak().status_code == 200, "the timed-out request kept its slot"
 
 
-def test_a_failing_piper_reports_its_message_and_leaves_no_file(start):
+def test_a_failing_piper_is_reported_without_its_stderr_and_leaves_no_file(start, caplog):
     svc = start()
     svc.fake.mode = "fail"
 
-    r = svc.speak()
+    with caplog.at_level("ERROR"):
+        r = svc.speak()
 
     assert r.status_code == 500
-    assert "boom: model exploded" in r.json()["detail"]
+    detail = r.json()["detail"]
+    request_id = r.headers["X-Request-ID"]
+    assert "boom" not in detail and "exploded" not in detail, "piper's stderr reached the client"
+    assert request_id in detail
+    # ...and the operator can still find it, under the same id
+    assert any(request_id in record.getMessage() and "boom: model exploded" in record.getMessage()
+               for record in caplog.records)
     assert list(svc.out.iterdir()) == []
 
 
@@ -194,9 +203,9 @@ def test_audio_analysis_does_not_block_the_event_loop(start, monkeypatch):
     svc = start()
     threads = {}
 
-    def slow_load(path, sr=None):
+    def slow_load(path, sr=None, duration=None):
         threads["load"] = threading.get_ident()
-        time.sleep(0.8)
+        time.sleep(2.0)
         return np.zeros(100, dtype="float32"), 22050
 
     monkeypatch.setattr(svc.module.librosa, "load", slow_load)
@@ -228,7 +237,45 @@ def test_audio_analysis_does_not_block_the_event_loop(start, monkeypatch):
     assert response.status_code == 200
     assert response.json()["librosa"]["sample_rate"] == 22050
     assert threads["load"] != loop_thread, "librosa ran on the event loop thread"
-    assert longest_stall < 0.4, f"the event loop stalled for {longest_stall:.2f}s during analysis"
+    # Decoded on the loop, the stall would be the whole 2 s load; off it, the loop only
+    # stalls when the machine itself does. 1 s sits far from both (0.4 s against a 0.8 s
+    # load was within reach of a busy CI runner), and the thread check above is exact.
+    assert longest_stall < 1.0, f"the event loop stalled for {longest_stall:.2f}s during analysis"
+
+
+FAKE_FFPROBE = """#!/bin/sh
+# Stand-in for ffprobe that never answers. Publishes its pid (temp file + rename, so a
+# poller never reads it half-written) and then becomes a process that just sleeps.
+echo $$ > "$FAKE_PIPER_DIR/ffprobe.pid.tmp"
+mv -f "$FAKE_PIPER_DIR/ffprobe.pid.tmp" "$FAKE_PIPER_DIR/ffprobe.pid"
+exec sleep 20
+"""
+
+
+def test_a_wedged_ffprobe_is_killed_at_the_timeout_and_the_analysis_carries_on(start):
+    """`FFPROBE_TIMEOUT_S` bounds ffprobe, and the child does not outlive it.
+
+    Without the bound a wedged ffprobe held the request open for as long as the client
+    cared to wait; without the kill it kept running after the request was answered.
+    """
+    svc = start()
+    stub = svc.fake.dir / "ffprobe"
+    stub.write_text(FAKE_FFPROBE)
+    stub.chmod(0o755)
+    svc.module.FFPROBE_TIMEOUT_S = 1.0
+
+    began = time.monotonic()
+    r = svc.client.post("/analyze_audio", files={"audio_file": ("a.wav", WAV_BYTES, "audio/wav")})
+    elapsed = time.monotonic() - began
+
+    body = r.json()
+    assert r.status_code == 200, r.text
+    assert "timed out" in body["error"], body
+    assert 0.9 < elapsed < 10, f"ffprobe was waited for {elapsed:.1f}s: the timeout is not bounding it"
+    pid_file = svc.fake.dir / "ffprobe.pid"
+    assert pid_file.exists(), "the stand-in ffprobe never ran: the timeout fired before it started"
+    assert not process_alive(int(pid_file.read_text())), "the wedged ffprobe was left running"
+    assert "librosa" in body, "a timed-out ffprobe must not stop the signal analysis"
 
 
 def test_audio_analysis_reports_signal_statistics_from_real_librosa(start, monkeypatch, tmp_path):

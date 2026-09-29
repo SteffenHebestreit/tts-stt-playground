@@ -390,7 +390,10 @@ panel, not against feel):
 | A service fails after you enabled another | Out of VRAM | `nvidia-smi` while it runs; smaller Whisper or `0.6B` Qwen3-TTS, shorter `MODEL_TTL`, or drop a service |
 | No Piper voices | The models directory is empty and the seed job did not run | `docker logs ix-tts-stt-piper-voices-seed-1`; voices are files `*.onnx` + `*.onnx.json` in `models/default` |
 | Microphone button does nothing | Browsers grant the microphone only in a secure context | Use `https://` (or `http://localhost`); check the proxy forwards the WebSocket upgrade |
-| 403 on every button behind a reverse proxy | The proxy changes the `Host` header | Set `TRUSTED_ORIGINS` to the proxy's public URL |
+| `403 Host '...' is not allowed` (`host_not_allowed`) on every request, the page does not even load | The web UI is reached by a name the gateway does not accept without setup: a real domain (a reverse proxy) or a Tailscale MagicDNS name. IP addresses, `localhost`, `*.local`, `*.lan`, `*.internal`, `*.home.arpa` and plain names such as `truenas` are always accepted | Set `TRUSTED_HOSTS:-voice.example.com` (comma separated, `*.tail1234.ts.net` for a whole domain) on `frontend-service`, or open the UI by the NAS's IP address. `ALLOWED_HOSTS:-*` switches the check off; avoid it |
+| 403 on every button behind a reverse proxy (the page loads) | The proxy changes the `Host` header, so the browser's `Origin` no longer matches it | Set `TRUSTED_ORIGINS` to the proxy's public URL (it also trusts that host name) |
+| The UI asks for an API key, or a script gets `401` | `API_KEY` is set. There is no exemption for the web UI | Type the key into the prompt (once per browser tab); scripts send `Authorization: Bearer <key>` |
+| `503` with `Retry-After` | A limit was reached, not a fault: too many uploads or `ffmpeg` conversions at once, or a full or timed-out queue at a model service | Retry after the delay. Limits: `MAX_CONCURRENT_UPLOADS`, `MAX_CONCURRENT_FFMPEG`, `ASR_MAX_QUEUE`, `TTS_MAX_QUEUE`, `ASR_QUEUE_TIMEOUT_S`, `TTS_QUEUE_TIMEOUT_S` |
 | Live transcription lags | Decode time exceeds the update interval | Read `decode NNN ms`: under 500 ms is fine; near 1000 ms use a smaller model; over 1500 ms you are probably on CPU or the GPU is contended. Audio is skipped rather than queued, so lag stays bounded |
 | Permission problems on the dataset | ACL denies root, or the folder is read-only | Containers run as root; check the dataset's ACL type and that no restrictive ACL blocks root. `preflight.sh` reports a dataset it cannot write |
 
@@ -429,11 +432,21 @@ server {
 ```
 
 `ALLOWED_ORIGINS` stays empty: the UI and the API are the same origin, also over
-`http://<ip>:3000`. With `proxy_set_header Host $host` nothing else is needed. A proxy that does
-not pass the original `Host` needs `TRUSTED_ORIGINS:-https://voice.example.com` on
-`frontend-service` (symptom without it: 403 on every button). To lock a script-facing API, set
-`API_KEY` (Bearer token for `/v1/*` and mutating `/api/*`; same-origin browser calls are exempt,
-and it is not user authentication).
+`http://<ip>:3000`. The gateway refuses a `Host` header that is not an IP address, `localhost`,
+`*.local`, `*.lan`, `*.internal`, `*.home.arpa` or a plain name (it is the guard against DNS
+rebinding), so the proxy's public name has to be listed: set `TRUSTED_HOSTS:-voice.example.com` on
+`frontend-service` (comma separated; `*.example.com` covers a whole domain; symptom without it:
+`403 host_not_allowed` on every request). With `proxy_set_header Host $host` that is all. A proxy
+that does not pass the original `Host` needs `TRUSTED_ORIGINS:-https://voice.example.com` as well
+(symptom without it: 403 on every button; the host name of a trusted origin counts as trusted, so
+this one setting also satisfies the Host check). If the proxy sets `X-Forwarded-Host` instead, set
+`TRUST_PROXY_HEADERS:-true` (only when the proxy overwrites what the client sent) and list that name
+in `TRUSTED_HOSTS`.
+
+To lock a script-facing API, set `API_KEY`: a Bearer token for `/v1/*`, mutating `/api/*` and the
+live-transcription socket. There is **no exemption for the web UI**: it asks for the key once per
+browser tab and keeps it in `sessionStorage`. The key is a shared secret, not user authentication,
+and it crosses the network in clear over plain `http://`: use it behind the HTTPS proxy.
 
 ---
 
@@ -512,7 +525,18 @@ updates on its own, which is why it is not used here.
   with `PULL_POLICY:-always`.
 - **`BROWSER_*_URL` is gone** and backend ports are no longer published. Remove them from your config.
 - **CORS is closed by default.** `ALLOWED_ORIGINS` used to default to `*`; the web UI needs none
-  of it. List origins only for scripts in other web pages.
+  of it. List origins only for scripts in other web pages. The backends are closed the same way
+  (`BACKEND_ALLOWED_ORIGINS` empty), and a state-changing request that carries a foreign `Origin`
+  gets `403`.
+- **Host names are validated.** A request must address an IP address, `localhost`, `*.local`,
+  `*.lan`, `*.internal`, `*.home.arpa` or a plain name; a real domain or a Tailscale name has to be
+  listed in `TRUSTED_HOSTS`, or every request answers `403 host_not_allowed` (see Troubleshooting).
+- **`API_KEY` has no UI exemption any more.** With a key set, the web UI prompts for it once per
+  browser tab; `/ws/stt` needs it too.
+- **`MAX_TTS_CHARS` defaults to 5000** (it was 20000): what Qwen3-TTS and Chatterbox accept. A
+  Piper-only install can raise it.
+- **`pcm` speech is 24 kHz** (`X-Sample-Rate: 24000`), as OpenAI documents, instead of the voice's
+  own rate.
 - **Whisper defaults to `large-v3-turbo`,** which cannot translate. For `task=translate` set
   `WHISPER_MODEL_SIZE:-large-v3`; a translation request on a turbo model returns HTTP 400.
 

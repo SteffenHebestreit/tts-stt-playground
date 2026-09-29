@@ -18,9 +18,19 @@ RUN apt-get update && apt-get install -y \
 # TARGETARCH is supplied by BuildKit and is exactly "amd64" or "arm64", which
 # matches the release asset names. Hardcoding piper_amd64 made this image
 # unbuildable for ARM SBCs (RK3588), where Piper is the primary TTS engine.
+#
+# A builder that is not BuildKit (the classic `docker build`, podman) does not set
+# TARGETARCH, and the empty value asked for piper_.tar.gz: a 404. Without it the
+# host's own architecture is used, amd64 unless the host says aarch64: the classic
+# builder never cross-builds, so the host IS the target. (A fixed amd64 default
+# would build an x86 binary into an image for an ARM board without any error.)
 ARG TARGETARCH
-RUN wget -O /tmp/piper.tar.gz \
-      "https://github.com/rhasspy/piper/releases/download/v1.2.0/piper_${TARGETARCH}.tar.gz" \
+RUN arch="${TARGETARCH:-}" \
+    && if [ -z "$arch" ]; then \
+         case "$(uname -m)" in aarch64|arm64) arch=arm64 ;; *) arch=amd64 ;; esac; \
+       fi \
+    && wget -O /tmp/piper.tar.gz \
+      "https://github.com/rhasspy/piper/releases/download/v1.2.0/piper_${arch}.tar.gz" \
     && tar -xzf /tmp/piper.tar.gz -C /opt/ \
     && rm /tmp/piper.tar.gz \
     && ln -s /opt/piper/piper /usr/local/bin/piper

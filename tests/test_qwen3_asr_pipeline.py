@@ -289,10 +289,13 @@ def test_a_failing_ffmpeg_falls_back_to_the_python_decoder(tmp_path, ffmpeg):
 def test_a_hanging_ffmpeg_is_killed_and_the_python_decoder_takes_over(tmp_path, ffmpeg):
     ffmpeg.mode = "hang"
     path = write_clip(tmp_path, silent_wav(1.0))
-    samples = pipeline.decode_audio(path, ffmpeg=str(ffmpeg.path), timeout=1.0)
+    # The fake publishes its pid before anything slow; 2 s is far more than it needs even
+    # on a loaded runner, and the timeout must not fire before it has.
+    samples = pipeline.decode_audio(path, ffmpeg=str(ffmpeg.path), timeout=2.0)
     assert len(samples) == seconds_of(1.0)
     pid = ffmpeg.hung_pid()
-    assert pid is not None and not process_alive(pid)
+    assert pid is not None, "the timeout fired before the fake ffmpeg started: raise the timeout"
+    assert not process_alive(pid)
 
 
 def test_audio_no_decoder_can_read_is_a_decode_error(tmp_path, ffmpeg):

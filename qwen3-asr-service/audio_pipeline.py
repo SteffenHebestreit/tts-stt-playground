@@ -28,7 +28,6 @@ from typing import Optional
 
 import numpy as np
 from fastapi import HTTPException, UploadFile
-from fastapi.responses import JSONResponse
 
 try:  # the images always have both; stripped test environments may not
     import soundfile as sf
@@ -145,32 +144,9 @@ async def spool_upload(upload: UploadFile, *, max_bytes: int) -> tuple[str, int]
     return path, total
 
 
-class BodyLimitMiddleware:
-    """Answer 413 from the Content-Length header, before anything is buffered.
-
-    FastAPI parses the whole multipart body (parts are spooled to disk) before a
-    handler runs, so a size check inside the handler comes after the disk was
-    filled. Clients that send no Content-Length (chunked) are still bounded per
-    file by ``spool_upload``, just later.
-
-    ``limits`` maps a request path to the largest body accepted there; paths not
-    listed are not checked. ``detail`` is the message of the 413.
-    """
-
-    def __init__(self, app, limits: dict[str, int], detail: str = "Request body is too large."):
-        self.app = app
-        self.limits = limits
-        self.detail = detail
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] == "http" and scope["method"] in ("POST", "PUT"):
-            limit = self.limits.get(scope["path"])
-            declared = dict(scope["headers"]).get(b"content-length", b"")
-            if limit is not None and declared.isdigit() and int(declared) > limit:
-                response = JSONResponse(status_code=413, content={"detail": self.detail})
-                await response(scope, receive, send)
-                return
-        await self.app(scope, receive, send)
+# The request-body limit is body_limit.py (a copy in every service directory): it
+# checks the declared Content-Length and counts the bytes that arrive, which the
+# middleware that used to live here did not, so a chunked upload got past it.
 
 
 # --- duration ------------------------------------------------------------------

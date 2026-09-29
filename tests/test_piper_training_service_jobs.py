@@ -479,6 +479,51 @@ def test_deleting_a_running_job_is_refused_and_removes_nothing(training_service)
     asyncio.run(run())
 
 
+def test_deleting_one_of_several_jobs_for_a_voice_keeps_its_dataset_and_deployed_voice(training_service, monkeypatch):
+    """Retraining a voice is the normal workflow: several jobs share `data/<name>` and one
+    deployed voice, and the delete endpoint is keyed on the job id.
+
+    Deleting an old job used to take the dataset and undeploy the voice the newer job depends
+    on. This drives the real endpoint with both jobs only on disk (completed jobs are not
+    restored into memory after a restart, so the model name has to come from the state file),
+    and then deletes the last one, which has to clean up: a sibling lookup that did not
+    exclude the job being deleted would find itself and keep everything for ever.
+    """
+    svc = training_service()
+    make_dataset(svc.root, "alpha")
+    write_job_state(svc.root, "job-old", "alpha", status="completed")
+    write_job_state(svc.root, "job-new", "alpha", status="completed")
+    undeployed = []
+
+    async def record_undeploy(model_name, deployment_target=None):
+        undeployed.append(model_name)
+
+    monkeypatch.setattr(svc.module, "remove_model_from_deployment_target", record_undeploy)
+
+    async def run():
+        async with client_for(svc) as client:
+            first = await client.delete("/model/job-old")
+            assert first.status_code == 200, first.text
+            body = first.json()
+            assert body["model_name"] == "alpha", "the model name was not resolved from the job's state file"
+            assert body["retained_for_jobs"] == ["job-new"], "the response must say why the dataset survived"
+            assert "dataset directory" not in body["deleted_items"] and "deployed voice" not in body["deleted_items"]
+            assert (svc.root / "data" / "alpha" / "train.json").exists(), "the newer job lost its dataset"
+            assert undeployed == [], "the voice the newer job deployed was removed"
+            assert not (svc.root / "checkpoints" / "job-old").exists()
+            assert (svc.root / "checkpoints" / "job-new" / "job_state.json").exists()
+
+            last = await client.delete("/model/job-new")
+            assert last.status_code == 200, last.text
+            body = last.json()
+            assert body["retained_for_jobs"] == []
+            assert "dataset directory" in body["deleted_items"] and "deployed voice" in body["deleted_items"]
+            assert not (svc.root / "data" / "alpha").exists()
+            assert undeployed == ["alpha"]
+
+    asyncio.run(run())
+
+
 def test_a_job_can_be_deleted_once_it_has_stopped(training_service):
     svc = training_service()
 

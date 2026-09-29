@@ -18,7 +18,7 @@ RUN ln -sf /usr/bin/python3.11 /usr/bin/python3 && \
     ln -sf /usr/bin/python3.11 /usr/bin/python
 
 # Upgrade pip
-RUN pip3 install --upgrade pip setuptools wheel
+RUN pip3 install --no-cache-dir --upgrade pip setuptools wheel
 
 # Install PyTorch with CUDA 12.8 support (required for Blackwell / RTX 50 series, sm_120+).
 # Pinned: unpinned, a rebuild took whatever the cu128 index served last. PyTorch
@@ -39,10 +39,17 @@ RUN pip3 install --no-cache-dir "torch==${TORCH_VERSION}" "torchaudio==${TORCHAU
 #   --build-arg NEMO_TOOLKIT_SPEC='>=2.7.3,<3'   roll back to the 2.x line
 #   --build-arg NEMO_TOOLKIT_SPEC='>=3.0.0,<4'   accept 3.1 and later 3.x releases
 # The torch check runs again because installing NeMo must not swap the wheel.
+#
+# torch and torchaudio are also HELD during the install by a constraint file (the
+# way chatterbox-tts-service does it): a NeMo release whose requirements want another
+# torch (the `>=3.0.0,<4` line above accepts future ones) then fails the resolver
+# right here, instead of downloading several GB of a different, non-cu128 torch and
+# failing only at the check below.
 COPY requirements.txt .
 ARG NEMO_TOOLKIT_SPEC=">=3.0.0,<3.1"
 RUN grep -viE '^[[:space:]]*nemo[-_]toolkit' requirements.txt > requirements.app.txt && \
-    pip3 install --no-cache-dir "nemo_toolkit[asr]${NEMO_TOOLKIT_SPEC}" -r requirements.app.txt && \
+    printf 'torch==%s\ntorchaudio==%s\n' "${TORCH_VERSION}" "${TORCHAUDIO_VERSION}" > /tmp/torch-constraints.txt && \
+    pip3 install --no-cache-dir -c /tmp/torch-constraints.txt "nemo_toolkit[asr]${NEMO_TOOLKIT_SPEC}" -r requirements.app.txt && \
     python3 -c "import sys, torch; cuda = torch.version.cuda; archs = torch._C._cuda_getArchFlags().split(); print('torch', torch.__version__, 'built for CUDA', cuda, 'kernels for', ' '.join(archs)); sys.exit(0 if cuda == '12.8' and 'sm_120' in archs else 'FATAL: this torch build is not CUDA 12.8 with sm_120 (Blackwell, RTX 50 series) kernels; set TORCH_VERSION/TORCHAUDIO_VERSION to a release that has a cu128 wheel')"
 
 # Copy application code
@@ -50,6 +57,9 @@ COPY app.py .
 COPY transcription.py .
 COPY model_lifecycle.py .
 COPY nemo_common.py .
+# Request-body limit and cross-origin guard, imported by app.py at startup.
+COPY body_limit.py .
+COPY origin_guard.py .
 
 # Pre-download model during build (cached in Docker layer)
 # Uncomment to bake the model into the image for faster startup:

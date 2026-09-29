@@ -310,6 +310,106 @@ def test_the_reaper_leaves_the_model_alone_while_a_request_is_not_generating(cle
     assert after is None, "once the request ended and the TTL passed, the model must go"
 
 
+class _CountingLock(asyncio.Lock):
+    """An asyncio.Lock that counts how many times something asked for it.
+
+    `attempts` rises as a task enters `acquire()`, and a task that finds the lock taken
+    parks in that same step, so a test can tell "is queued for the lock" without sleeping
+    or reaching into asyncio's private waiter queue.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.attempts = 0
+
+    async def acquire(self):
+        self.attempts += 1
+        return await super().acquire()
+
+
+def test_the_reaper_rechecks_under_the_lock_and_spares_a_model_a_request_just_took(clean, monkeypatch):
+    """The window the re-check under _LOAD_LOCK exists for.
+
+    The reaper decides "idle, unload" from `_should_unload()` *outside* the lock, then
+    has to queue for the lock, because a request that is obtaining the model holds it.
+    Requests raise `_inflight` before they release the lock, so when the reaper finally
+    gets the lock the second `_should_unload()` sees that request and backs off. Without
+    that re-check the reaper acts on its stale decision and frees the weights under a
+    request that was handed them a moment ago.
+
+    Set up on purpose, in this order, with a real `_acquire_model()`: the lock is held
+    (a load or another request), a request queues for it, the reaper decides to unload
+    and queues behind the request, the lock is released.
+    """
+    m = clean
+    model = _resident(m)
+    m.MODEL_TTL = 0.0           # idle the moment nothing is in flight
+    lock = m._LOAD_LOCK = _CountingLock()
+    decisions, ticks, unloaded = [], [], []
+    real_should_unload = m._should_unload
+
+    def watching_should_unload(*args, **kwargs):
+        verdict = real_should_unload(*args, **kwargs)
+        decisions.append((verdict, lock.locked(), m._inflight))
+        return verdict
+
+    real_unload = m._unload_qwen3_tts
+    monkeypatch.setattr(m, "_should_unload", watching_should_unload)
+    monkeypatch.setattr(m, "_reaper_tick_seconds", lambda: ticks.append(1) or 0.01)
+    monkeypatch.setattr(m, "_unload_qwen3_tts", lambda: (unloaded.append(m._inflight), real_unload()))
+
+    async def until(predicate, what, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while not predicate():
+            if time.monotonic() > deadline:
+                raise AssertionError(f"timed out waiting for {what}")
+            await asyncio.sleep(0.005)
+
+    async def scenario():
+        holding, leave = asyncio.Event(), asyncio.Event()
+
+        async def request():
+            async with m._acquire_model():
+                holding.set()
+                await leave.wait()
+
+        await lock.acquire()    # the test itself plays the load (or the request ahead) that holds it
+        request_task = asyncio.create_task(request())
+        reaper = None
+        try:
+            await until(lambda: lock.attempts == 2, "the request to queue for the lock")
+            assert m._inflight == 0, "the queued request must not count yet: that is the window"
+            reaper = asyncio.create_task(m._idle_reaper())
+            await until(lambda: lock.attempts == 3, "the reaper to queue behind the request")
+            assert decisions[0][0] is True, "the reaper never decided to unload: the test proves nothing"
+            assert unloaded == [] and m.tts_model is model, "the reaper must wait for the lock"
+
+            lock.release()
+            await asyncio.wait_for(holding.wait(), 5)
+            # The reaper now holds the lock and re-checks, then loops at least once more.
+            seen = len(ticks)
+            await until(lambda: len(ticks) >= seen + 2, "the reaper to go round again")
+            survived = (m.tts_model is model, list(unloaded), m._inflight)
+
+            leave.set()  # the request ends: now the reaper is right to unload
+            await until(lambda: m.tts_model is None, "the reaper to unload the idle model")
+            return survived
+        finally:
+            for task in (reaper, request_task):
+                if task is not None:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
+    resident, unloaded_while_held, held = asyncio.run(scenario())
+    assert held == 1
+    assert resident and unloaded_while_held == [], (
+        "the reaper unloaded a model a request had just taken: its re-check under the lock is gone")
+    assert unloaded == [0], "the model must go once the request ended, and only then"
+
+
 def test_a_cancelled_request_releases_its_hold(clean):
     m = clean
     _resident(m)
@@ -566,5 +666,6 @@ def test_a_failed_switch_is_a_500_and_leaves_the_desired_model_alone(clean, monk
     monkeypatch.setattr(m, "load_model", broken)
     with pytest.raises(m.HTTPException) as exc:
         asyncio.run(m.switch_model(m.LoadModelRequest(model=DESIGN_17)))
-    assert exc.value.status_code == 500 and "download failed" in exc.value.detail
+    assert exc.value.status_code == 500 and "download failed" not in exc.value.detail
+    assert exc.value.headers["X-Request-ID"] in exc.value.detail
     assert m._desired_model_name == BASE_06
