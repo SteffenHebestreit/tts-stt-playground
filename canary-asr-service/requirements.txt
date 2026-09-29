@@ -18,4 +18,4 @@ soundfile>=0.12.0
 # No upper bound: the <2.0.0 cap came from NeMo 2.3, whose own numpy requirement was
 # numpy<2.0.0. 2.4 and later, 2.7.3 and 3.0.0 accept numpy 2, and the ASR API used
 # here ran on numpy 2.4 with both of the last two.
-numpy>=1.24.0
+numpy>=2.5.3
