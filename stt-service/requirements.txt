@@ -1,17 +1,25 @@
-fastapi==0.115.8
-uvicorn[standard]==0.34.0
-python-multipart==0.0.20
+fastapi==0.141.1
+uvicorn[standard]==0.54.0
+python-multipart==0.0.32
 # PyTorch - will be installed based on hardware availability in Dockerfile
 # torch>=2.1.0 (installed separately to detect hardware)
 # torchaudio>=2.1.0 (installed separately to detect hardware)
-faster-whisper==1.1.1
+# 1.2.1 (2025-10-31) over 1.1.1: Silero VAD v6, distil-large-v3.5, batched-pipeline
+# timestamp fixes. Everything app.py calls is unchanged between the two: the
+# WhisperModel constructor and transcribe() keyword arguments, and
+# BatchedInferencePipeline.transcribe(); the constructor only gained the optional
+# revision / use_auth_token. It no longer falls back to the local cache by itself
+# when the Hub is unreachable - huggingface-hub's own snapshot_download does.
+faster-whisper==1.2.1
 # ctranslate2 >=4.5 requires cuDNN 9 — provided by the cuda:12.8.1-cudnn base image
 ctranslate2>=4.5,<5
 tokenizers>=0.13.0
-# huggingface-hub 1.x dropped the `requests` dependency (switched to httpx),
-# but faster-whisper 1.1.1 still imports `requests` directly — keep hub <1.0
-# and declare requests explicitly.
+# huggingface-hub 1.x replaced `requests` with httpx. faster-whisper 1.2.1 no
+# longer imports requests itself, but its model download has only been exercised
+# against hub 0.x, so the cap stays until that is checked against 1.x.
 huggingface-hub>=0.23,<1.0
+# Still needed by huggingface-hub 0.x; declared so the cap above and this line
+# are lifted together.
 requests>=2.31.0
 onnxruntime>=1.18.0
 librosa

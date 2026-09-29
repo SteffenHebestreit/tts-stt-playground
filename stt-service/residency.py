@@ -39,12 +39,22 @@ class IdleUnloader:
     zero, so a burst of requests keeps resetting the clock instead of racing it.
     """
 
-    def __init__(self, ttl: float, on_expire: Callable[[], object], name: str = "model"):
+    def __init__(
+        self,
+        ttl: float,
+        on_expire: Callable[[], object],
+        name: str = "model",
+        timer_factory: Callable[..., threading.Timer] = threading.Timer,
+    ):
         self._ttl = float(ttl)
         self._on_expire = on_expire
         self._name = name
+        # Injectable so tests can fire a timer by hand instead of racing a
+        # wall-clock delay against a loaded CI machine.
+        self._timer_factory = timer_factory
         self._lock = threading.Lock()
         self._timer: threading.Timer | None = None
+        self._generation = 0
 
     @property
     def ttl(self) -> float:
@@ -66,6 +76,9 @@ class IdleUnloader:
         """Stop any pending unload. Safe to call when nothing is armed."""
         with self._lock:
             timer, self._timer = self._timer, None
+            # Invalidates a timer whose thread already left cancel()'s reach and
+            # is about to call _fire().
+            self._generation += 1
         if timer is not None:
             timer.cancel()
 
@@ -80,18 +93,27 @@ class IdleUnloader:
             self._fire()
             return
 
-        timer = threading.Timer(self._ttl, self._fire)
-        # Daemon, or a pending timer keeps the interpreter alive past shutdown.
-        timer.daemon = True
         with self._lock:
+            self._generation += 1
+            timer = self._timer_factory(self._ttl, self._fire, args=(self._generation,))
+            # Daemon, or a pending timer keeps the interpreter alive past shutdown.
+            timer.daemon = True
             previous, self._timer = self._timer, timer
         if previous is not None:
             previous.cancel()
         timer.start()
 
-    def _fire(self) -> None:
-        """Timer callback. Deliberately holds no lock while calling on_expire."""
+    def _fire(self, generation: int | None = None) -> None:
+        """Timer callback. Deliberately holds no lock while calling on_expire.
+
+        ``generation`` identifies the arm() that scheduled this call. A timer that
+        was superseded (re-armed or cancelled) after it had already started
+        running must neither unload nor clear the handle of its successor, or
+        cancel() could no longer reach the live timer.
+        """
         with self._lock:
+            if generation is not None and generation != self._generation:
+                return
             self._timer = None
         try:
             self._on_expire()

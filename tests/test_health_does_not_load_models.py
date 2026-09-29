@@ -34,8 +34,8 @@ SERVICES = [
 FORBIDDEN = {"get_model", "load_model", "_acquire_model", "acquire", "acquire_async", "acquire_ref"}
 
 
-def _health_functions(tree: ast.AST):
-    """Yield (name, node) for every function routed at a /health path."""
+def _health_functions(tree: ast.AST, path: str = "/health"):
+    """Yield (name, node) for every function routed at a /health (or `path`) route."""
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
@@ -44,7 +44,7 @@ def _health_functions(tree: ast.AST):
                 continue
             for arg in deco.args:
                 if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                    if arg.value.rstrip("/").endswith("/health") or arg.value == "/health":
+                    if arg.value.rstrip("/").endswith(path) or arg.value == path:
                         yield node.name, node
 
 
@@ -93,3 +93,16 @@ def test_health_handler_exists_and_is_cheap(service):
             f"{service}: /health handler '{name}' calls {sorted(expensive)} — "
             "health checks run every 30 seconds and must stay cheap."
         )
+
+
+def test_stt_ready_handler_does_not_load_a_model():
+    """/ready is polled on a timer exactly like /health, so it has the same rule:
+    a readiness probe that loaded the model would keep it resident for as long as
+    anything polls it. (The behavioural twin of this is in test_stt_http_endpoints.py;
+    this catches the call being written.)"""
+    tree = ast.parse((REPO / "stt-service" / "app.py").read_text(encoding="utf-8"))
+    handlers = list(_health_functions(tree, "/ready"))
+    assert handlers, "stt-service: no /ready handler found — did the route move?"
+    for name, node in handlers:
+        offenders = sorted(FORBIDDEN.intersection(_called_names(node)))
+        assert not offenders, f"stt-service: /ready handler '{name}' calls {offenders}."

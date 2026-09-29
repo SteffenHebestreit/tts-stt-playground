@@ -9,6 +9,9 @@ are invisible to the existing integration suite (which needs live services):
 - hallucinated segments are filtered before they can be promoted to "confirmed"
 - the final decode is the accurate one, not the greedy interim one
 
+Sessions longer than the decode window, failures reaching the client, language
+handling and idle sockets are in test_stt_live_session.py.
+
 The Whisper model is stubbed, so nothing here needs a GPU or a downloaded model.
 torch/faster-whisper are stubbed too; numpy is genuinely required.
 """
@@ -129,6 +132,9 @@ def _test_client(stt_app):
     unable to schedule a decode (and hanging on the partial that never arrives).
     """
     with TestClient(stt_app.app) as test_client:
+        # The model loads in the background; a load that lands after a test has
+        # put its scripted model in place would replace it.
+        assert stt_app._preload_done.wait(10), "startup preload never finished"
         yield test_client
 
 
@@ -549,6 +555,8 @@ def test_explicit_auto_still_means_auto_detect(client):
         _drain_until(ws, "partial")
 
     languages = [c.get("language") for c in client.fake_model.calls]
-    assert languages and all(lang is None for lang in languages), (
-        f"faster-whisper rejects the literal 'auto'; got {languages}"
-    )
+    # faster-whisper rejects the literal 'auto'. The first decode has nothing to
+    # go on and detects; later ones may reuse what it found (see
+    # test_stt_live_session.py), but never the placeholder.
+    assert languages and languages[0] is None
+    assert "auto" not in languages, f"the literal 'auto' reached faster-whisper: {languages}"
