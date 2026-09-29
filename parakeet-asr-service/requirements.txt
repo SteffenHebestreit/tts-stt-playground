@@ -9,7 +9,7 @@ nemo_toolkit[asr]>=3.0.0,<3.1
 # NeMo's CUDA-graph decoder imports these and picks its call signatures from their
 # major version, which has to match the CUDA of the installed torch (12.x). Unpinned,
 # NeMo resolves the newest release, 13.x.
-cuda-bindings>=12.8,<13
+cuda-bindings>=13.4.3,<14
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
 python-multipart>=0.0.6
