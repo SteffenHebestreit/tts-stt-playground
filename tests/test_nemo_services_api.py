@@ -12,6 +12,8 @@ Findings covered:
 
 from __future__ import annotations
 
+import logging
+import re
 import wave
 
 import pytest
@@ -116,11 +118,11 @@ def test_cuda_out_of_memory_is_a_503_that_says_so_and_frees_the_cache(service, m
     assert ("empty_cache",) in module.torch.calls
 
 
-def test_other_model_errors_are_a_500_with_the_message(service, monkeypatch):
+def test_other_model_errors_are_a_500_that_names_a_request_id_and_not_the_message(service, monkeypatch, caplog):
     module, model = build(service, monkeypatch)
 
     def explode(paths, kwargs):
-        raise RuntimeError("decoder exploded")
+        raise RuntimeError("decoder exploded reading /tmp/tmpab12cd.wav")
 
     model.reply = explode
 
@@ -128,10 +130,17 @@ def test_other_model_errors_are_a_500_with_the_message(service, monkeypatch):
         async with make_client(module) as client:
             return await post(client, wav_bytes(1.0))
 
-    response = run(scenario())
+    with caplog.at_level(logging.ERROR):
+        response = run(scenario())
 
     assert response.status_code == 500
-    assert "decoder exploded" in response.json()["detail"]
+    detail = response.json()["detail"]
+    assert "decoder exploded" not in detail and "/tmp/" not in detail, "the exception text is for the log"
+    request_id = re.search(r"Request id: ([0-9a-f]{12})\.", detail).group(1)
+    logged = [r for r in caplog.records if request_id in r.getMessage()]
+    assert logged and "decoder exploded reading /tmp/tmpab12cd.wav" in caplog.text, (
+        "the operator must be able to find the exception under the id the client was given"
+    )
 
 
 # --- N4 / batch ----------------------------------------------------------------------
@@ -231,7 +240,7 @@ def test_a_batch_that_fails_as_a_whole_is_retried_file_by_file():
 
     assert results[0]["text"] == "fine" and results[2]["text"] == "fine"
     assert results[1]["filename"] == "bad.wav" and results[1]["status"] == 500
-    assert "cannot decode" in results[1]["error"]
+    assert "cannot decode" not in results[1]["error"] and "Request id:" in results[1]["error"]
     # one batched attempt over all three, then one call per file
     assert [len(call["paths"]) for call in model.calls] == [3, 1, 1, 1]
 
@@ -281,7 +290,8 @@ def test_canary_batch_reports_a_model_failure_per_file():
     results = run(scenario()).json()["results"]
 
     assert results[0]["text"] == "fine" and results[2]["text"] == "fine"
-    assert results[1]["status"] == 500 and "bad audio" in results[1]["error"]
+    assert results[1]["status"] == 500
+    assert "bad audio" not in results[1]["error"] and "Request id:" in results[1]["error"]
     assert results[0]["language"] == "de"
 
 
@@ -428,7 +438,7 @@ def test_a_type_error_inside_the_decode_is_not_retried_and_not_hidden(monkeypatc
     response = decode(module, "de")
 
     assert response.status_code == 500
-    assert "unsupported operand" in response.json()["detail"]
+    assert "unsupported operand" not in response.json()["detail"], "the internals stay in the log"
     assert len(model.calls) == 1, "the decode ran twice"
 
 

@@ -48,7 +48,9 @@ have verified another language. `GET /status` shows the effective set.
 | `NEMO_BF16` | `false` | Run inference in bfloat16 (less VRAM, faster). Needs an NVIDIA GPU with compute capability 8.0+, ignored otherwise. **German WER has not been re-measured under bf16**, so it is opt-in |
 | `ASR_MODEL_TTL` / `MODEL_TTL` | `300` | Seconds idle before the ~2 GB model is released. `0` releases as soon as it falls idle, `-1` pins it resident. |
 | `ASR_MAX_CONCURRENCY` | `1` | Concurrent inferences on the shared model |
-| `ALLOWED_ORIGINS` | `*` | Comma-separated CORS origins |
+| `ASR_MAX_QUEUE` | `4` × `ASR_MAX_CONCURRENCY` | How many requests may wait beyond the ones running. The next one is refused at once with `503` + `Retry-After: 5`, before its upload is copied or converted. `0` = nobody waits. See [Queue](#queue) |
+| `ASR_QUEUE_TIMEOUT_S` | `60` | Longest a request waits for its turn before it is refused with `503` + `Retry-After: 5` (must be at least `0.1`) |
+| `ALLOWED_ORIGINS` | *(empty)* | Comma-separated origins a browser page may call this service from. **Unset or empty: no CORS headers at all.** `*` opens it to every page and must be written down (it logs a warning). Independently of this, a state-changing request (anything but `GET`/`HEAD`/`OPTIONS`) that carries an `Origin` header for another host than the one it was sent to is refused with `403` unless the origin is listed; requests without an `Origin` (the gateway, curl) are not affected |
 | `ALLOW_CREDENTIALS` | `false` | Enables CORS credentials when origins are explicit |
 
 ## Limits
@@ -58,6 +60,8 @@ have verified another language. `GET /status` shows the effective set.
 | `MAX_UPLOAD_MB` per file | `200` | `413`, also from the `Content-Length` header before the body is read (single-file routes). Uploads are streamed to disk in 1 MiB chunks, never held in memory |
 | `NEMO_MAX_AUDIO_S` per file | `1500` (25 min) | `413` with a message. Checked from the container header before ffmpeg runs, and again on the converted file; ffmpeg is told to stop at the limit (`-t`), so a file whose header lies cannot be decoded in full first |
 | Unsupported `language` | | `422`, before the model is touched |
+| More than `ASR_MAX_CONCURRENCY + ASR_MAX_QUEUE` requests in progress | `1 + 4` | `503` + `Retry-After: 5` at once, before the upload is copied (see [Queue](#queue)) |
+| Waiting longer than `ASR_QUEUE_TIMEOUT_S` for a turn | `60` | `503` + `Retry-After: 5` |
 | Empty upload | | `400` |
 | Audio no decoder can open | | `422` |
 | GPU out of memory | | `503` (the CUDA cache is released), not a generic `500` |
@@ -146,9 +150,41 @@ failing to load, so Docker never restarts a container that is doing its job.
 |--------|----------|---------|
 | `200` | `ok` | The model has loaded at least once (an idle unload or one failed reload does not flip it), or nothing is known to be wrong yet (lazy start, `ASR_MODEL_TTL=0`) |
 | `503` + `Retry-After: 5` | `loading` | The first load, or the startup preload, is still running |
-| `503` | `load_failed` | The last load failed and none ever succeeded; `detail` carries the error |
+| `503` | `load_failed` | The last load failed and none ever succeeded; `detail` is a short category (`model_files_unavailable`, `out_of_memory`, `missing_dependency`, `load_error`), never the exception text, which can hold paths: that is in the log |
 
 The startup preload runs in the background, so the port answers (`/health` 200,
 `/ready` 503 `loading`) during the first-time model download instead of staying
 closed. A request that arrives meanwhile waits for the load. Gate anything that
 needs a usable model on `/ready`, not `/health`.
+### Queue
+
+At most `ASR_MAX_CONCURRENCY` forward passes run at once. Every request that got
+past that point used to have copied its upload to disk and converted the audio and
+then waited for the ones ahead of it, with no limit on how many or how long, so a
+burst of uploads piled up temp files and held every client until the slowest one
+was done. Now a request is admitted only if fewer than `ASR_MAX_CONCURRENCY +
+ASR_MAX_QUEUE` are in progress (otherwise `503` + `Retry-After: 5` at once, having
+cost nothing), and one that waits more than `ASR_QUEUE_TIMEOUT_S` for its turn is
+refused the same way. Whichever way a request ends, refused, timed out, cancelled or
+done, its temp files are removed and its model reference is handed back. Requests
+that wait keep the model resident, so with `ASR_MODEL_TTL=0` a queue does not
+reload it once per request. `GET /status` reports `queue` (the limits, `in_flight`,
+`running`, `waiting`).
+
+`/transcribe-batch` holds one place for the whole request however many files it
+carries and decodes them one after another. If a file cannot get a turn in time,
+the answer is `503` when nothing was done yet; otherwise the files already done are
+returned and the rest are reported as `503` (each would only wait as long again).
+
+There is no `ASR_MAX_BATCH` here: this service decodes one file per forward pass
+(that setting belongs to `parakeet-asr-service`, which batches).
+
+### Errors
+
+An unexpected failure is a `500` whose `detail` says `Transcription failed (internal
+error). Request id: <id>.`; the exception (which can hold file paths and library
+internals) is in the service log under that id. A GPU out of memory is a `503` with
+advice, and an error the service wrote for the caller (`413`, `422`, "no
+transcription") is passed on as written. In `/transcribe-batch` a failed file
+carries the same message in its `error`.
+
