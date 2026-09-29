@@ -1,13 +1,23 @@
 # TTS-STT Studio
 
-Self-hosted neural **Text-to-Speech** and **Speech-to-Text** in one web UI:
+Self-hosted neural **Text-to-Speech** and **Speech-to-Text** in one web UI and one
+OpenAI-compatible API, German first. Everything runs locally; no data leaves your server.
 
-- **TTS:** PiperTTS (40+ voices, CPU) and Qwen3-TTS (voice cloning, GPU)
-- **STT:** Whisper (faster-whisper), Qwen3-ASR, and optional Parakeet-TDT (realtime, 25 EU languages incl. German)
-- **Voice training:** custom VITS pipeline (upload audio → segment → train → export)
+- **TTS:** Piper (CPU, 40+ voices), Qwen3-TTS (voice cloning, GPU), optional Chatterbox
+  (streaming German TTS with cloning)
+- **STT:** Whisper (live microphone transcription), Qwen3-ASR, optional Canary and Parakeet
+  (25 European languages), optional whisper.cpp (CPU only)
+- **Voice training:** upload recordings, segment, train and export a Piper voice (optional)
 
-All processing is local — no data leaves your server. NVIDIA GPU recommended.
+## After install
 
-After install, open the Web UI on the configured port (default **3000**). Set
-**Browser-facing host** to your TrueNAS IP/hostname if you access it from another
-machine, and point **Data dataset** at a pool dataset with room for models.
+Open the Web UI on the configured port (default **3000**). The first start downloads the
+models in the background (several GB): the app is usable while that runs, and the status row
+in the UI shows each backend's state.
+
+- All data lives in the dataset you chose under **Storage**.
+- Only the Web UI port is published. Backends stay on the internal network.
+- **Image release** defaults to a pinned version: nothing updates behind your back. To update,
+  snapshot the dataset, change the release and save. See docs/truenas-installation-guide.md.
+- GPU images need an NVIDIA driver that supports CUDA 12.8 (R570 or newer; GeForce cards need
+  exactly that). Run `scripts/truenas/preflight.sh` in the TrueNAS shell for a readiness check.

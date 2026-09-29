@@ -1,0 +1,206 @@
+name: TrueNAS
+
+# The TrueNAS install and update path: the Custom App compose file, the build-from-source overlay,
+# the catalog template and the helper scripts. It runs when one of them changes, and checks what a
+# maintainer would otherwise only find on a NAS: a compose file that does not validate, a catalog
+# template that renders to something Docker rejects, a script with a shell bug, a release number
+# that differs between files.
+#
+# What it cannot check is TrueNAS itself (the Apps UI, ix-apps, a real GPU). The guide lists what to
+# click on a real system: docs/truenas-installation-guide.md, "What has and has not been verified".
+#
+# The tag of a release is compared with app_version by tests/test_truenas_release_consistency.py,
+# which runs in ci.yml, and publish-images.yml calls that before publishing anything. It is not
+# repeated here: a `paths` filter and a tag trigger do not combine reliably.
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "truenas/**"
+      - "docker-compose.truenas.yml"
+      - "docker-compose.truenas-app.yml"
+      - ".env.truenas.example"
+      - ".env.truenas.production.example"
+      - "scripts/truenas/**"
+      - "docs/truenas-*.md"
+      - "tests/test_truenas_*.py"
+      - "tests/truenas_*.py"
+      - ".github/workflows/truenas.yml"
+  pull_request:
+    paths:
+      - "truenas/**"
+      - "docker-compose.truenas.yml"
+      - "docker-compose.truenas-app.yml"
+      - ".env.truenas.example"
+      - ".env.truenas.production.example"
+      - "scripts/truenas/**"
+      - "docs/truenas-*.md"
+      - "tests/test_truenas_*.py"
+      - "tests/truenas_*.py"
+      - ".github/workflows/truenas.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: truenas-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scripts:
+    name: helper scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Blocking here, unlike the repository-wide informational job in ci.yml: these scripts are
+      # clean and stay clean. `-x` follows `. lib.sh`, whose location the scripts declare.
+      - name: bash -n and shellcheck
+        run: |
+          set -e
+          pip install shellcheck-py==0.11.0.1
+          for f in scripts/truenas/*.sh; do
+            echo "--- $f"
+            bash -n "$f"
+          done
+          shellcheck -x scripts/truenas/*.sh
+
+      - name: The Python helpers compile
+        run: python -m py_compile scripts/truenas/set_version.py scripts/truenas/render_catalog.py
+
+      # Every file that names the release (both compose files, both env examples, the catalog form,
+      # the commands in the docs) must agree with `app_version` in truenas/tts-stt/app.yaml.
+      - name: Release number is the same everywhere
+        run: python scripts/truenas/set_version.py --check
+
+  compose:
+    name: compose files and catalog template
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the template renderer's dependencies
+        run: pip install -r tests/requirements.txt
+
+      # The Custom App file has no default for APP_DATA_DIR on purpose, so it is validated with the
+      # example settings that set it. The optional services sit behind profiles: a bare `config`
+      # would skip them, so enable them all once.
+      - name: Custom App file validates
+        run: |
+          set -e
+          check() {
+            echo "--- $*"
+            docker compose "$@" config -q
+          }
+          OPTIONAL=(--profile canary-asr --profile parakeet-asr --profile chatterbox-tts
+                    --profile training --profile whisper-cpp --profile update-watch)
+          for env in .env.truenas.example .env.truenas.production.example; do
+            check --env-file "$env" -f docker-compose.truenas-app.yml
+            check --env-file "$env" "${OPTIONAL[@]}" -f docker-compose.truenas-app.yml
+          done
+
+      # Pasted unchanged, the placeholder path must be refused by Compose: that is the message the
+      # Apps YAML editor shows, and what stops a stack from writing to a wrong place.
+      - name: The placeholder path is refused
+        run: |
+          if docker compose -f docker-compose.truenas-app.yml config -q 2> /tmp/refused.txt; then
+            echo "::error::docker-compose.truenas-app.yml validated without APP_DATA_DIR"
+            exit 1
+          fi
+          cat /tmp/refused.txt
+          grep -q "required variable APP_DATA_DIR is missing a value" /tmp/refused.txt
+
+      # `latest` is an opt-in channel: it has to resolve, and with PULL_POLICY=always every service
+      # of the stack must carry the policy, or a Stop/Start would not pull.
+      - name: Following latest resolves with pull_policy always
+        run: |
+          set -e
+          IMAGE_TAG=latest PULL_POLICY=always docker compose --env-file .env.truenas.example \
+            -f docker-compose.truenas-app.yml config --format json > /tmp/latest.json
+          jq -e '[.services[] | select(.image | startswith("ghcr.io/steffenhebestreit/")) | .pull_policy == "always"] | all' /tmp/latest.json
+          jq -e '[.services[] | select(.image | startswith("ghcr.io/steffenhebestreit/")) | .image | endswith(":latest")] | all' /tmp/latest.json
+
+      # A build-from-source overlay: the base file with the TrueNAS single-GPU overlay, using the
+      # settings file the docs tell people to copy.
+      - name: Build-from-source overlay validates
+        run: |
+          set -e
+          docker compose --env-file .env.truenas.example \
+            --profile all --profile training --profile canary-asr --profile parakeet-asr \
+            --profile chatterbox-tts --profile whisper-cpp \
+            -f docker-compose.yml -f docker-compose.truenas.yml config -q
+
+      # The catalog template is plain Jinja2. Render it with the answers a user could give and let
+      # Docker judge the result. The renderer hides answers whose show_if is false and rejects
+      # unknown names, like the real form does.
+      - name: Catalog template renders to valid compose
+        run: |
+          set -e
+          render() {
+            echo "--- render $*"
+            python scripts/truenas/render_catalog.py --set host_path=/mnt/tank/apps/tts-stt "$@" \
+              | docker compose -f - config -q
+          }
+          render
+          render --set use_gpu=false
+          render --set use_gpu=false --set enable_whisper_cpp=true
+          render --set enable_canary=true --set enable_parakeet=true --set enable_chatterbox=true \
+                 --set enable_training=true --set enable_whisper_cpp=true --set expose_backend_ports=true
+          render --set image_tag=latest --set pull_policy=always
+          # An API key with characters that YAML and Compose treat specially must survive.
+          # shellcheck disable=SC2016
+          render --set api_key='a"b\c$d#e:f' --set trusted_origins=https://voice.example.com
+          python scripts/truenas/render_catalog.py --set storage_type=ix_volume \
+            --ix-volume-path /mnt/.ix-apps/app_mounts/tts-stt/data | docker compose -f - config -q
+
+  tests:
+    name: TrueNAS tests (python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    env:
+      REQUIRE_DRIFT_SUITES: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: tests/requirements.txt
+
+      - name: Install test dependencies
+        run: pip install -r tests/requirements.txt
+
+      # The scripts run under a fake PATH (tests/truenas_helpers.py); the catalog tests use the
+      # docker CLI of the runner. Nothing here needs a daemon or a GPU.
+      - name: Run the TrueNAS tests
+        run: pytest tests/test_truenas_*.py tests/test_env_wiring.py tests/test_compose_hygiene.py -v --tb=short -rs --junitxml=junit.xml
+
+      # A module skipped for a missing docker CLI or bash would go green while checking nothing.
+      # Both exist on the runner, so no skip is tolerated except the release-tag comparison,
+      # which only applies to a build of a tag.
+      - name: No TrueNAS module was skipped
+        if: ${{ !cancelled() && hashFiles('junit.xml') != '' }}
+        run: |
+          python scripts/check_no_skips.py junit.xml \
+            --module tests/test_truenas_release_consistency.py \
+            --module tests/test_truenas_catalog.py \
+            --module tests/test_truenas_compose.py \
+            --module tests/test_truenas_scripts.py \
+            --module tests/test_truenas_preflight.py \
+            --module tests/test_truenas_update_check.py \
+            --module tests/test_truenas_workflow.py \
+            --allow "only applies to a build of a release tag"

@@ -1,86 +1,36 @@
-# TrueNAS Custom App Checklist
+# TrueNAS: first-run checklist
 
-Use this checklist when turning the repository into a TrueNAS SCALE Custom App deployment.
+One page to tick off. The steps and the reasons are in
+[`truenas-installation-guide.md`](./truenas-installation-guide.md).
 
-> For a full walkthrough (prerequisites, GPU setup, verification, troubleshooting) see
-> [`truenas-installation-guide.md`](./truenas-installation-guide.md).
+## Before
 
-## Before You Start
+- [ ] TrueNAS SCALE 24.10 or newer.
+- [ ] NVIDIA driver installed (Apps -> Settings -> Install NVIDIA Drivers) with CUDA 12.8 support
+      (R570 or newer: every GeForce card needs it, and an RTX 50 series card cannot run on less).
+      `nvidia-smi` works in the shell.
+- [ ] Dataset created, e.g. `/mnt/tank/apps/tts-stt`.
+- [ ] `scripts/truenas/preflight.sh --data-dir <dataset> --create` ends with `READY`.
+- [ ] The release you are about to pin is published: `scripts/truenas/update-check.sh --tag <release>`.
+- [ ] Optional: `scripts/truenas/pull-images.sh --tag <release>` (TrueNAS aborts an Apps job after 20 minutes).
 
-- Confirm the NVIDIA GPU is visible in TrueNAS SCALE
-- Confirm the repo is stored on a persistent dataset, for example `/mnt/pool/apps/tts-stt` (needed to build the images)
-- Copy `.env.truenas.example` to `.env` and set `APP_DATA_DIR`
-- Decide whether you need backend ports published at all — the web UI does not need them
-  (everything is proxied through the frontend on port 3000)
+## Install
 
-## Dataset Layout
+- [ ] Apps -> Discover Apps -> Custom App -> Install via YAML, name `tts-stt`.
+- [ ] Paste `docker-compose.truenas-app.yml`; replace `${APP_DATA_DIR:?set dataset path}` with the dataset path.
+- [ ] Optional services: delete the `profiles:` line **and** set the `ENABLE_*` flag (training has none).
+- [ ] Install. The app shows **Running** within about a minute; model downloads continue in the background.
 
-Set **one** variable and every data directory is created under it:
+## After
 
-```env
-APP_DATA_DIR=/mnt/pool/apps/tts-stt
-```
+- [ ] `curl -s http://localhost:3000/api/health`: every backend `healthy`, GPU services `"device": "cuda"`.
+- [ ] Web UI at `http://<truenas-ip>:3000`: generate speech (Text-to-Speech tab).
+- [ ] Microphone test over `https://` or `localhost` (Live Transcription).
+- [ ] Snapshot the dataset (Datasets -> Data Protection) or add a periodic snapshot task.
+- [ ] Optional: `diun` for release notifications, `update-check.sh` in a cron job.
 
-That produces `models/`, `output/`, `.cache/`, and `piper-training-service/{data,checkpoints,models}/` under the dataset. Optionally relocate the big Hugging Face caches with `QWEN3_TTS_CACHE_DIR`, `QWEN3_ASR_CACHE_DIR`, `PARAKEET_ASR_CACHE_DIR`, `WHISPER_CPP_MODELS_DIR`.
+## Decisions
 
-## TrueNAS App Setup Steps
-
-1. Create or select a dataset, for example `/mnt/pool/apps/tts-stt`.
-2. Clone or copy the repository into that dataset (required to build images).
-3. Copy `.env.truenas.example` to `.env`; set `APP_DATA_DIR`.
-4. If reached over the network, set `ALLOWED_ORIGINS` to the origin the browser loads.
-   `BROWSER_*_URL` is not needed — see the note under *First Startup Validation*.
-5. Launch the stack with:
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.truenas.yml --profile all up -d
-```
-
-(The base + `truenas` overlay run from the built images — do **not** add `docker-compose.dev.yml`, which is for local source editing only.)
-
-Optional STT backends, each opt-in via its own profile + frontend flag:
-
-- `whisper-cpp`: `ENABLE_WHISPER_CPP=true` + `--profile whisper-cpp`
-- `parakeet-asr` (25 EU langs incl. German): `ENABLE_PARAKEET_ASR=true` + `--profile parakeet-asr`
-- `canary-asr` (fastest German STT): `ENABLE_CANARY_ASR=true` + `--profile canary-asr`
-- `chatterbox-tts` (streaming German TTS): `ENABLE_CHATTERBOX_TTS=true` + `--profile chatterbox-tts`
-
-## First Startup Validation
-
-Run these checks after the first deployment:
-
-```bash
-docker compose ps
-
-# Gateway liveness
-curl http://localhost:3000/health
-
-# Every backend at once, probed concurrently over the internal network.
-# Reports healthy / latency_ms / model_loaded / model_size / device per provider.
-curl http://localhost:3000/api/health | jq
-```
-
-Backend ports (5000-5007, 8080) only answer directly if you chose to publish
-them; the web UI never uses them.
-
-If using Apps -> Discover -> Install via YAML instead of a shell compose
-command, pin `qwen3-asr-service` and `qwen3-tts-service` to the same GPU with
-`device_ids: ["0"]`, `NVIDIA_VISIBLE_DEVICES=0`, and `CUDA_VISIBLE_DEVICES=0`.
-Do not combine `device_ids` with `count` in the same reservation block.
-
-## Common Decisions
-
-- Always-on inference only: enable `frontend`, `piper-tts`, `stt`, `qwen3-asr`, `qwen3-tts`
-- Training sessions: stop `qwen3-tts-service` before enabling `piper-training-service`
-- Lowest-memory mode: run `frontend`, `piper-tts`, and `stt` only
-- Remote browser access: set `ALLOWED_ORIGINS`; no backend ports or `BROWSER_*_URL` needed
-- Microphone from another machine: requires HTTPS (browsers demand a secure context)
-
-## Cleanup From Older Repo States
-
-Only if these paths are not in active use:
-
-```bash
-rm -rf cache/tts cache/xtts-cache
-rm -f models/luna.json models/luna.onnx
-```
+- Remote browser access: leave `ALLOWED_ORIGINS` empty; behind a proxy that rewrites `Host`, set `TRUSTED_ORIGINS`.
+- Training: free `qwen3-tts-service`'s VRAM first on a small card (`POST /api/providers/qwen3/unload`).
+- Lowest memory: run `frontend`, `piper-tts` and `stt` only.

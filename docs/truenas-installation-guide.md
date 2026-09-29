@@ -1,377 +1,410 @@
-# TrueNAS SCALE — Installation Guide
+# TrueNAS SCALE: install, update, roll back
 
-A complete, start-to-finish install of the TTS-STT stack on TrueNAS SCALE. Follow it top to
-bottom; nothing is assumed except a working TrueNAS box and, for GPU use, an NVIDIA card.
+The one guide for running TTS-STT on TrueNAS SCALE. The other TrueNAS pages in this folder are
+short and point back here.
 
-Reading time ~10 minutes. Actual install ~15 minutes plus model downloads.
+- **Install** in about 5 minutes: [section 2](#2-install-in-5-minutes)
+- **Update** in about 2 minutes: [section 4](#4-update-in-2-minutes)
+- **Roll back**: [section 5](#5-roll-back)
+- **VRAM planning**: [section 6](#6-vram-and-disk-planning)
+- Something is wrong: [section 7](#7-troubleshooting)
 
-- **New here? Use [Path A](#path-a--install-via-yaml-recommended).** It is the supported route.
-- Already running an older version? Jump to [Upgrading](#upgrading-from-an-earlier-install).
+Commands in a `code block` run in the TrueNAS shell (System -> Shell, or SSH) as root.
 
 ---
 
 ## 1. What you are installing
 
-| Component | Purpose | GPU |
-|---|---|---|
-| `frontend-service` | Web UI **and the gateway every browser request goes through** | no |
-| `piper-tts-service` | Fast CPU text-to-speech, 40+ voices incl. German | no |
-| `stt-service` | Whisper speech-to-text + **live microphone transcription** | yes |
-| `qwen3-asr-service` | Multilingual speech recognition | yes |
-| `qwen3-tts-service` | Voice cloning / high-quality TTS | yes |
-| *optional* `chatterbox-tts` | Streaming German TTS — speech starts before the text is finished | yes |
-| *optional* `canary-asr` | Fastest German STT (180M params) | yes |
-| *optional* `parakeet-asr` | 25 EU languages incl. German | yes |
-| *optional* `piper-training` | Train your own voice from recordings | yes |
-| *optional* `whisper-cpp` | CPU-only STT, no GPU required | no |
+| Service | Purpose | GPU | Runs by default |
+|---|---|---|---|
+| `frontend-service` | Web UI and the gateway every browser request goes through | no | yes |
+| `piper-tts-service` | Fast CPU text-to-speech, German voices included | no | yes |
+| `stt-service` | Whisper speech-to-text and live microphone transcription | yes | yes |
+| `qwen3-asr-service` | Multilingual speech recognition | yes | yes |
+| `qwen3-tts-service` | Voice cloning and high-quality TTS | yes | yes |
+| `chatterbox-tts-service` | Streaming German TTS: speech starts before the text is finished | yes | opt-in |
+| `canary-asr-service` | Fastest German speech recognition (180M parameters) | yes | opt-in |
+| `parakeet-asr-service` | Speech recognition for 25 European languages | yes | opt-in |
+| `piper-training-service` | Train your own voice from recordings | yes | opt-in |
+| `whisper-cpp` | CPU-only speech recognition, no GPU needed | no | opt-in |
+| `diun` | Notifies you about new releases; never updates anything | no | opt-in |
 
-### Only one port is published
+**Only port 3000 is published.** The browser talks to the frontend, which proxies every backend
+call, the live-microphone WebSocket (`/ws/stt`) included, over the internal network. You do not
+publish backend ports and you do not set any `BROWSER_*_URL` variable. It also works behind an
+HTTPS reverse proxy ([section 8](#8-reverse-proxy-and-https)).
 
-The browser talks **only** to the frontend on port `3000`. It proxies everything else over the
-internal Docker network:
-
-```
-browser  ──►  :3000  ──┬──►  /api/*        TTS, STT, voices, training
-                       ├──►  /api/health   all backend probes, run concurrently
-                       └──►  /ws/stt       live microphone (WebSocket relay)
-```
-
-This matters more than it sounds:
-
-- You do **not** need to publish ports 5000–5007 or 8080.
-- You do **not** need to set any `BROWSER_*_URL` variable, even when reaching the NAS from
-  another machine. (Older versions of this project required it. That is now obsolete.)
-- It works behind an HTTPS reverse proxy. Browsers block `ws://` from an `https://` page as
-  mixed content, so the old direct-to-port design could not do live microphone over HTTPS at all.
+**Nothing updates by itself.** The compose file pins a release (`IMAGE_TAG`), so a fresh image
+reaches you only when you change that value.
 
 ---
 
-## 2. Prerequisites
+## 2. Install in 5 minutes
 
-### TrueNAS version
+### Before you start
 
-TrueNAS SCALE **Electric Eel (24.10) or newer**. These releases run apps on Docker. Earlier
-Kubernetes-based releases (Bluefin, Cobia, Dragonfish) are **not** supported by this guide.
+- TrueNAS SCALE **24.10 (Electric Eel) or newer**: these releases run Apps on Docker.
+- For the GPU services: an NVIDIA driver installed from **Apps -> Settings -> Install NVIDIA
+  Drivers**, and the GPU **not** isolated for a VM. The images are built on CUDA 12.8: use a
+  driver with CUDA 12.8 support (R570 or newer). A GeForce card (RTX 30, 40, 50 series) needs
+  exactly that; only data-centre and workstation cards also start on the older branches 470 to 565.
+- About 60 GB free: 25 GB of images, the models ([section 6](#6-vram-and-disk-planning)) and room
+  for generated audio.
 
-Check under **System → Update**.
+### Step 1: create the dataset (1 minute)
 
-### For GPU services
-
-| Requirement | Minimum |
-|---|---|
-| NVIDIA driver | 550 (570+ recommended) |
-| GPU architecture | Ampere (sm_80) → Blackwell (sm_120) |
-| VRAM | 8 GB minimum, 16 GB comfortable |
-
-Verify the GPU is visible to TrueNAS:
-
-```bash
-# In the TrueNAS shell
-nvidia-smi
-```
-
-If that fails, install the NVIDIA drivers under **Apps → Configuration → Settings** and reboot
-before continuing. TrueNAS will not expose a GPU it cannot see.
-
-> **No GPU?** The stack still runs. Install `frontend` + `piper-tts` (both CPU-only) and
-> optionally `whisper-cpp` for CPU speech-to-text. Skip every GPU service.
-
-### Disk space
-
-| What | Size |
-|---|---|
-| Container images | ~25 GB (torch + CUDA are large) |
-| Whisper `large-v3-turbo` | ~1.6 GB |
-| Qwen3-ASR 1.7B | ~4 GB |
-| Qwen3-TTS 0.6B | ~2.5 GB |
-| Piper voices | ~500 MB |
-| **Recommended free space** | **60 GB** |
-
----
-
-## 3. Create the dataset
-
-Everything persistent lives under one directory. Create it first — TrueNAS will not create a
-missing host path for you, and the app will fail to start if it is absent.
-
-**Datasets → your pool → Add Dataset**
-
-- Name: `tts-stt` (e.g. under an existing `apps` dataset)
-- Everything else: defaults are fine
-
-Note the resulting path, e.g. `/mnt/tank/apps/tts-stt`. You need it in the next step.
-
-<details>
-<summary>Shell alternative</summary>
-
-```bash
-zfs create tank/apps/tts-stt
-```
-</details>
-
-### What ends up there
+**Datasets -> your pool -> Add Dataset**, name `tts-stt`, defaults are fine. Note the path, for
+example `/mnt/tank/apps/tts-stt`. Everything persistent goes there:
 
 ```text
 /mnt/tank/apps/tts-stt/
-  models/                  # Piper voices + your exported custom voices
-  output/                  # generated audio (auto-pruned, default 24 h)
-  .cache/                  # Whisper model cache
-  hf-cache/                # HuggingFace downloads, one subdir per service
-  qwen3-voices/            # saved voice-clone profiles
-  piper-training-service/  # datasets + checkpoints (only if training is enabled)
+  models/                  Piper voices (image voices are copied in) and your trained voices
+  output/                  generated audio, pruned after 24 h
+  cache/                   ONE model cache for all services: a model downloads once
+  qwen3-voices/            saved voice-clone profiles
+  piper-training-service/  datasets and checkpoints (training only)
+  whisper-cpp-models/      whisper.cpp models (whisper-cpp only)
 ```
 
-> **Put this on an SSD if you can.** Model loading is read-heavy, and cold start on spinning
-> rust adds tens of seconds per service.
+Use an SSD-backed pool if you can: model loading is read-heavy.
 
----
+### Step 2: check the host (1 minute, recommended)
 
-## Path A — Install via YAML (recommended)
+Get the helper scripts once (they are read-only unless noted):
 
-### A1. Open the installer
-
-**Apps → Discover Apps → Custom App** (top right) **→ Install via YAML**
-
-### A2. Paste the stack definition
-
-Copy the entire contents of
-[`docker-compose.truenas-app.yml`](../docker-compose.truenas-app.yml) and paste it in.
-
-### A3. Set your data directory
-
-This is **the only edit most people need**. In the pasted YAML, replace every occurrence of the
-fallback path with your dataset:
-
-```
-/mnt/pool/apps/tts-stt   →   /mnt/tank/apps/tts-stt
+```bash
+mkdir -p /mnt/tank/apps/tts-stt/scripts && cd /mnt/tank/apps/tts-stt/scripts
+for f in lib.sh preflight.sh update-check.sh pull-images.sh; do
+  curl -fsSLO "https://raw.githubusercontent.com/SteffenHebestreit/tts-stt-playground/v0.2.0/scripts/truenas/$f"
+done
+chmod +x ./*.sh
+./preflight.sh --data-dir /mnt/tank/apps/tts-stt --create
 ```
 
-A search-and-replace in the editor is fine. Alternatively leave the YAML untouched and set
-`APP_DATA_DIR=/mnt/tank/apps/tts-stt` in the app's environment.
+`preflight.sh` checks Docker and Compose, the driver against the CUDA 12.8 requirement, the GPU
+and its VRAM against the services you plan to run, free disk on the dataset and the Docker root,
+and that port 3000 is free. `--create` makes the subdirectories, `--with canary-asr,training`
+plans for optional services, `--with-docker` proves a container can use the GPU. It ends with
+`READY` or lists what to fix.
 
-### A4. Allocate the GPU
+### Step 3: pre-pull the images (optional)
 
-In the same install form, find the **GPU Configuration** section and allocate your NVIDIA card
-to the app.
+```bash
+./pull-images.sh --tag 0.2.0
+```
 
-> If you skip this, the GPU services will start but fall back to CPU — Whisper will still work,
-> just far slower, and `/health` will report `"device": "cpu"` so you can tell.
+Takes 5 to 15 minutes on a decent link. TrueNAS stops an Apps job after **20 minutes**. The default images are about 25 GB and need
+roughly 21 MB/s to finish in that time. If you skip this step and the install job times out,
+press Install (or Save) again: layers already downloaded are kept.
 
-### A5. Install
+### Step 4: paste the YAML (1 minute)
 
-Click **Install**. TrueNAS pulls the images (~25 GB — expect 5–15 minutes on a decent link).
+1. **Apps -> Discover Apps -> Custom App** (three-dots menu) **-> Install via YAML**.
+2. Name it `tts-stt`. Paste the complete
+   [`docker-compose.truenas-app.yml`](../docker-compose.truenas-app.yml).
+3. Search-and-replace `${APP_DATA_DIR:?set dataset path}` (every occurrence) with your dataset path,
+   for example `/mnt/tank/apps/tts-stt`. **This is the only edit most installs need.**
+4. **Install.**
 
-### A6. Wait for the models
+The path has no default on purpose: if you forget it, the editor rejects the YAML with
+`required variable APP_DATA_DIR is missing a value` instead of writing to a wrong place.
 
-**The app will look unhealthy for several minutes after the containers start. This is normal.**
-Each GPU service downloads its model on first run. The health checks deliberately report *not
-ready* until the model is actually loaded, so "healthy" means genuinely usable.
+No search-and-replace in the editor (not checked whether it has one)? Make the edit in the shell,
+print the result and paste that instead:
 
-Watch progress:
+```bash
+curl -fsSL https://raw.githubusercontent.com/SteffenHebestreit/tts-stt-playground/v0.2.0/docker-compose.truenas-app.yml \
+  | sed 's|${APP_DATA_DIR:?set dataset path}|/mnt/tank/apps/tts-stt|g' > /mnt/tank/apps/tts-stt/app.yml
+cat /mnt/tank/apps/tts-stt/app.yml
+```
+
+The other settings sit in the same file as `${NAME:-default}`; you change the default in place:
+
+| Setting | Text to search for | Meaning |
+|---|---|---|
+| `IMAGE_TAG` | `IMAGE_TAG:-0.2.0` | The release to run. Change it to [update or roll back](#4-update-in-2-minutes). |
+| `PULL_POLICY` | `PULL_POLICY:-missing` | `missing` pulls only absent images (pinned release). `always` pulls on every Start/Save. |
+| `GPU_DEVICE_ID` | `GPU_DEVICE_ID:-0` | Index or `GPU-...` UUID from `nvidia-smi -L`. |
+| `FRONTEND_PORT` | `FRONTEND_PORT:-3000` | Web UI port. Also change `port:` under `x-portals`. |
+
+There is **no separate GPU step**: the file itself asks Docker for the GPU
+(`deploy.resources.reservations.devices`) on every GPU service.
+
+### Step 5: open it (30 seconds)
+
+`http://<truenas-ip>:3000`. The app reaches **Running** within about a minute. Models download in
+the background on the first start (several GB): the status row in the UI shows each backend, and
 
 ```bash
 docker logs -f ix-tts-stt-stt-service-1
 ```
 
-First start typically takes 3–10 minutes. Subsequent starts take seconds — the models are cached
-on your dataset.
-
-### A7. Open the UI
-
-```
-http://<truenas-host>:3000
-```
-
-The status row at the top shows one indicator per backend. Hover any indicator to see its loaded
-model, device and probe latency.
-
----
-
-## Path B — Custom catalog (guided form)
-
-The [`truenas/tts-stt/`](../truenas/tts-stt/) directory is a catalog scaffold that gives you a
-point-and-click form (ports, GPU, dataset, models, optional backends) instead of raw YAML.
-
-Add this repository as a **custom catalog** under **Apps → Discover Apps → Manage Catalogs → Add
-Catalog**, then install "TTS-STT Studio" from it.
-
-> **Caveat, stated plainly:** TrueNAS renders catalog templates with its internal `ix-lib` Jinja2
-> helpers, and that contract changes between releases. This scaffold uses plain Jinja2 so it is
-> readable and adaptable, but it is **not guaranteed to render unchanged on every TrueNAS
-> version**. If it fails to render, use Path A — it has no templating and cannot break this way.
-
----
-
-## Path C — Build from source
-
-Only needed if you want to modify the code or cannot pull from GHCR.
+shows the download. Check everything at once:
 
 ```bash
-cd /mnt/tank/apps
-git clone https://github.com/steffenhebestreit/tts-stt.git
-cd tts-stt
-
-cp .env.truenas.example .env
-nano .env                      # set APP_DATA_DIR and review the model choices
-
-docker compose \
-  -f docker-compose.yml \
-  -f docker-compose.truenas.yml \
-  --profile all up -d --build
+curl -s http://localhost:3000/api/health | python3 -m json.tool
 ```
 
-The build takes 20–40 minutes. `docker-compose.truenas.yml` pins every GPU service to card `0`
-and picks 16 GB-friendly model sizes.
+Every enabled backend should report `"healthy": true`, and the GPU services `"device": "cuda"`
+(`cpu` means the GPU did not reach the container). `"model_loaded": false` on a fresh install is
+the download still running.
 
-> Do **not** add `docker-compose.dev.yml` on a NAS. It live-mounts source over the images and is
-> for local development only.
+**End-to-end test:** Text-to-Speech tab, type `Guten Tag, wie geht es Ihnen?`, Generate. Then
+Live Transcription, start, allow the microphone, speak: words appear within about a second. The
+microphone needs a secure context: `http://` works on `localhost` only, so from another machine
+use [HTTPS](#8-reverse-proxy-and-https).
 
----
+### Optional services
 
-## 4. Verify the install
+Two edits per service, both required (a flag without its service is a permanently red
+indicator; a service without its flag runs but never shows in the UI):
 
-```bash
-# The gateway
-curl http://localhost:3000/health
+1. Delete the service's `profiles:` line in the YAML.
+2. Set its flag on `frontend-service` to true, for example `ENABLE_CANARY_ASR:-false` to
+   `ENABLE_CANARY_ASR:-true`.
 
-# Every backend at once, probed concurrently — the useful one
-curl http://localhost:3000/api/health | jq
-```
-
-A healthy backend looks like:
-
-```json
-{
-  "providers": {
-    "whisper": {
-      "healthy": true,
-      "status_code": 200,
-      "latency_ms": 3.1,
-      "model_loaded": true,
-      "model_size": "large-v3-turbo",
-      "device": "cuda"
-    }
-  }
-}
-```
-
-Check these three things:
-
-1. `"healthy": true` for every backend you enabled
-2. `"device": "cuda"` — if it says `cpu`, the GPU was not allocated (see A4)
-3. `"model_loaded": true` — if false, the model is still downloading
-
-### End-to-end test
-
-1. Open `http://<truenas-host>:3000`
-2. **Text-to-Speech** tab → type `Guten Tag, wie geht es Ihnen?` → Generate. Audio should play
-   automatically.
-3. **Live Transcription** panel → *Start Live Transcription* → allow microphone access → speak.
-   Words should appear within about a second, with a `decode NNN ms` readout underneath.
-
-> The microphone requires a **secure context**. `http://` works on `localhost` only. To use the
-> microphone from another machine you need HTTPS — see
-> [Reverse proxy](#7-reverse-proxy--https) below.
-
----
-
-## 5. Choosing your services
-
-Everything past the four defaults is opt-in, because VRAM is the binding constraint.
-
-### VRAM budget
-
-| Service | VRAM | Notes |
+| Service | Delete the `profiles` line of | Flag |
 |---|---|---|
-| `stt-service` (`large-v3-turbo`) | ~1.6 GB | Best latency/accuracy trade; cannot translate |
-| `stt-service` (`large-v3`) | ~3.1 GB | Only option that supports speech translation |
-| `qwen3-asr-service` | ~4 GB | Multilingual recognition |
-| `qwen3-tts-service` (`0.6B`) | ~2.5 GB | Voice cloning |
-| `qwen3-tts-service` (`1.7B`) | ~4.5 GB | Better quality |
-| `chatterbox-tts-service` | ~4 GB | Streaming German TTS |
-| `canary-asr-service` | ~2 GB | Fastest German STT |
-| `parakeet-asr-service` | ~3 GB | 25 EU languages |
-| `piper-training-service` | 2–4 GB | On demand only |
+| Canary (fast German STT) | `canary-asr-service` | `ENABLE_CANARY_ASR` |
+| Parakeet (25 languages) | `parakeet-asr-service` | `ENABLE_PARAKEET_ASR` |
+| Chatterbox (streaming TTS) | `chatterbox-tts-service` | `ENABLE_CHATTERBOX_TTS` |
+| whisper.cpp (CPU STT) | `whisper-cpp` | `ENABLE_WHISPER_CPP` |
+| Voice training | `piper-training-service` | none |
 
-These are *resident* figures, and none of them is permanent. Every GPU service
-releases its weights after `MODEL_TTL` seconds idle (300 by default) and reloads
-transparently on the next request, so the number that has to fit on the card is
-closer to the largest concurrently-active model than to the sum of the column
-above. Per-service overrides: `STT_MODEL_TTL`, `ASR_MODEL_TTL`, `TTS_MODEL_TTL`
-— `>0` seconds, `0` to release the moment a service falls idle, `-1` to pin it
-resident and never pay a reload.
+Check the VRAM first: `./preflight.sh --data-dir /mnt/tank/apps/tts-stt --with canary-asr`.
 
-Unloading is reference counted, so a request in flight is never freed underneath
-itself. `POST /api/providers/{id}/unload` forces it early and answers `409` if
-the model is busy.
+`whisper-cpp` downloads its model (about 0.6 GB) before its server starts, so with it enabled the
+app shows **Deploying** until that finishes. Every other service answers `/health` at once and
+downloads in the background.
 
-### Suggested configurations
+**No GPU?** Delete `stt-service`, `qwen3-asr-service` and `qwen3-tts-service`, enable
+`whisper-cpp` as above, and set `DEFAULT_STT_PROVIDER:-whisper` to `whisper-cpp`.
 
-**16 GB card, everyday use** *(the default)*
-`frontend` + `piper-tts` + `stt` + `qwen3-asr` + `qwen3-tts (0.6B)` ≈ 8 GB
+### Other ways to install
 
-**16 GB card, tuned for realtime German**
-`frontend` + `piper-tts` + `stt (turbo)` + `canary-asr` + `chatterbox-tts` ≈ 8 GB
-Lowest latency in both directions: Canary for recognition, Chatterbox for streaming speech.
+- **Settings file** (recommended if you will edit settings often). TrueNAS keeps only the parsed
+  YAML, so comments and your edit history are gone after Save, and a change of release means
+  editing the tag in 11 places. With a settings file the pasted YAML is fixed and the release
+  is one line:
 
-**8 GB card**
-`frontend` + `piper-tts` + `stt (turbo)` ≈ 2 GB. Add one more service at most.
+  ```bash
+  cd /mnt/tank/apps/tts-stt && mkdir -p app && cd app
+  BASE=https://raw.githubusercontent.com/SteffenHebestreit/tts-stt-playground/v0.2.0
+  curl -fsSLO "$BASE/docker-compose.truenas-app.yml"
+  curl -fsSL "$BASE/.env.truenas.example" -o settings.env
+  nano settings.env     # APP_DATA_DIR, IMAGE_TAG, ...
+  ```
 
-**Training**
-Stop `qwen3-tts-service` first, then start `piper-training-service`. Training wants several GB
-and is not something to leave running.
-
-### Enabling an optional backend
-
-Two steps, both required:
-
-1. Uncomment its service block in the app YAML.
-2. Set the matching `ENABLE_*` flag on `frontend-service` (`ENABLE_CHATTERBOX_TTS=true`, etc.).
-
-Set the flag without the service and the UI shows a permanently red indicator. Add the service
-without the flag and it runs but never appears in the UI.
+  Then paste [`truenas/custom-app-include.yml`](../truenas/custom-app-include.yml) into Install via
+  YAML after changing its two paths. Optional services still need their `profiles:` line deleted in
+  the downloaded compose file. **Not yet run on a real TrueNAS** (see
+  [section 9](#9-what-has-and-has-not-been-verified)).
+- **Custom catalog** (a form instead of YAML): a scaffold in [`truenas/tts-stt/`](../truenas/tts-stt/),
+  not loadable by TrueNAS as it stands. See [`truenas/README.md`](../truenas/README.md).
+- **Build from source on the NAS:** [`truenas-deployment.md`](./truenas-deployment.md).
 
 ---
 
-## 6. Tuning for lower latency
+## 3. What TrueNAS does with this app
 
-Defaults are already tuned for realtime. These are the knobs that matter, set on `stt-service`:
+Read from the TrueNAS middleware source (`truenas/middleware`, plugins/apps), because it decides
+how updates behave:
+
+- **Install, Edit and Save** run `docker compose up -d --force-recreate --remove-orphans`.
+  Compose pulls an image when it is missing locally (`pull_policy: missing`) or on every run
+  (`always`). It does **not** pass `--pull=always` for you.
+- **Stop** runs `docker compose down` (containers removed, images and data kept). **Start** runs
+  `up --force-recreate`. Both take the `stop_grace_period` of each service into account.
+- The Apps UI stores the YAML as **parsed data**: comments and anchors are dropped. What has to
+  survive lives in `x-notes` and this guide.
+- The app state is **Deploying** while any container with a health check is not healthy yet, and
+  **Running** once all are. Here `/health` is a liveness check that answers while a model is
+  still loading, so the state settles within about a minute.
+- Compose calls are killed after **20 minutes** (see [Step 3](#step-3-pre-pull-the-images-optional)).
+- TrueNAS checks the registries for newer images of a running app itself and can pull and
+  redeploy them. That covers floating tags; a *pinned* tag never changes, which is why
+  [`update-check.sh`](#check-for-a-new-release) exists.
+- Every container runs as **root** (no image sets `USER`). Root can write anywhere in the
+  dataset: no `chown` or ACL entry is needed. If you also share the dataset over SMB, set the
+  share's ACL for your users on the folders you want to edit.
+
+---
+
+## 4. Update in 2 minutes
+
+### Check for a new release
+
+```bash
+./update-check.sh
+```
+
+Read-only. It compares the images your containers run with the registry and the newest published
+release, and prints `UPDATE AVAILABLE` (exit status 10) or `Up to date`. Use `--quiet` in a cron
+job. `./update-check.sh --tag <new-release>` tells you whether a release's images exist yet.
+
+Prefer a push notification? Enable the optional `diun` service ([section 10](#10-optional-update-notifications-diun)).
+
+### Apply it
+
+1. **Read the release notes** on GitHub (Releases). Note anything under "breaking" or "data".
+2. **Snapshot the dataset:** `zfs snapshot tank/apps/tts-stt@pre-update` (or Datasets -> your
+   dataset -> Data Protection -> Snapshots -> Create). `preflight.sh` prints your dataset name.
+3. **Pre-pull (optional):** `./pull-images.sh --tag <new-release>` (add `--with canary-asr,...` for
+   the optional services you run).
+4. **Change the release:** **Apps -> Installed -> tts-stt -> Edit**. Replace the old release in
+   the YAML with the new one, everywhere (search for `IMAGE_TAG:-`; the version follows it). With a settings file:
+   edit `IMAGE_TAG=` in `settings.env`, then Stop and Start the app.
+5. **Save.** TrueNAS recreates the containers; images that are missing are pulled first.
+6. **Check:** `curl -s http://localhost:3000/api/health` and open the UI.
+
+Your models, voices and output stay in the dataset; nothing is downloaded again. Once you are sure
+of the new version, free the old images: `docker image prune -a --filter "until=720h"` removes
+unused images older than 30 days (keep the previous release's images until then, they make a
+rollback instant).
+
+### Follow the newest build instead (`latest`)
+
+Set `IMAGE_TAG:-latest` **and** `PULL_POLICY:-always`. Then **every Stop/Start or Save pulls**, so
+an update is: Stop, Start. The Apps UI also flags images that changed on the registry. This
+trades reproducibility for convenience: a `latest` build can change behaviour. `:latest` moves
+when a release `vX.Y.Z` is tagged and on every push to `master`; a prerelease tag and a manual
+run never move it (the rules are in `scripts/plan_publish.py`, run by
+`.github/workflows/publish-images.yml`, which runs the test suite first).
+
+### From the shell
+
+Both read from the middleware source, not run by the author:
+`midclt call -job app.redeploy tts-stt` re-applies the current config (a Start does the same), and
+`midclt call -job app.pull_images tts-stt '{"redeploy": true}'` pulls and then redeploys.
+
+### Data compatibility between releases
+
+The data folders are only ever added to: new releases add files (a new `vocab.json` in a training
+checkpoint, more fields in a saved voice's metadata, new voice files copied into `models/default`)
+and read what older releases wrote. A rollback to the previous release therefore keeps working
+with the same dataset. What can go wrong is a release that *changes the meaning* of something it
+already stored; the release notes call that out, and the snapshot in step 2 covers it.
+
+---
+
+## 5. Roll back
+
+**Usual case: only the software is the problem.**
+
+1. **Apps -> Installed -> tts-stt -> Edit**, put the previous release back in `IMAGE_TAG:-`,
+   Save. Its images are still on the host if you did not prune them, so this takes seconds. If
+   they are gone, run `./pull-images.sh --tag <previous-release>` first.
+2. Check `curl -s http://localhost:3000/api/health`.
+
+**A NeMo service misbehaves after an update (canary, parakeet):** the images are built on NeMo
+3.x. Every release also publishes both services built against NeMo 2.x as `<release>-nemo2`
+(for example `0.2.0-nemo2`). Set `NEMO_IMAGE_SUFFIX:-` to `NEMO_IMAGE_SUFFIX:--nemo2` on those two
+services (or `NEMO_IMAGE_SUFFIX=-nemo2` in the settings file); nothing else changes.
+
+**The dataset is damaged (a release changed stored data):**
+
+```bash
+zfs list -t snapshot -o name,creation tank/apps/tts-stt        # find the snapshot
+# Stop the app first: Apps -> Installed -> tts-stt -> Stop
+zfs rollback tank/apps/tts-stt@pre-update                       # add -r to drop newer snapshots
+```
+
+then put the previous release back as above and Start. `zfs rollback` discards everything written
+since the snapshot (voices you created, downloads). To look before you commit, clone it:
+`zfs clone tank/apps/tts-stt@pre-update tank/apps/tts-stt-restore`.
+
+---
+
+## 6. VRAM and disk planning
+
+Budget against the VRAM `nvidia-smi` reports for **your** card:
+
+```bash
+nvidia-smi --query-gpu=name,memory.total --format=csv
+```
+
+These are **planning figures** (resident weights with the default settings, and what the first
+start downloads), not measurements on your hardware. `preflight.sh` uses this table.
+
+| Service | VRAM | First-start download | Notes |
+|---|---|---|---|
+| `frontend-service` | 0 GB | 0 GB | Web UI and gateway |
+| `piper-tts-service` | 0 GB | 0.5 GB | CPU only; voices ship in the image |
+| `stt-service` (`large-v3-turbo`) | 1.6 GB | 1.6 GB | Default. Best latency/accuracy trade; cannot translate |
+| `stt-service` (`large-v3`) | 3.1 GB | - | The only Whisper choice that translates |
+| `qwen3-asr-service` | 4 GB | 4 GB | Multilingual recognition |
+| `qwen3-tts-service` (`0.6B`) | 2.5 GB | 2.5 GB | Default. Voice cloning |
+| `qwen3-tts-service` (`1.7B`) | 4.5 GB | - | Better quality |
+| `canary-asr-service` | 2 GB | 1 GB | Estimate: 182M parameters at 4 bytes |
+| `parakeet-asr-service` | 3 GB | 2.5 GB | Estimate: 0.6B parameters at 4 bytes |
+| `chatterbox-tts-service` | 4 GB | 3 GB | Streaming German TTS |
+| `piper-training-service` | 4 GB | 2 GB | On demand only. Download column is a data and checkpoint reserve |
+| `whisper-cpp` | 0 GB | 0.6 GB | CPU only; estimate for the q5_0 model |
+
+The default set (`stt` turbo + `qwen3-asr` + `qwen3-tts` 0.6B) is about **8.1 GB** resident. Images
+are about **25 GB** for that set, and each optional GPU image adds several GB more.
+
+Resident figures are peaks, and none of them is permanent: every GPU service releases its weights
+after `MODEL_TTL` seconds idle (300) and reloads on the next request, so what has to fit is close
+to the models in *use*, not the sum. `STT_MODEL_TTL`, `ASR_MODEL_TTL`, `TTS_MODEL_TTL` override it
+per service: `>0` seconds, `0` to free the moment a service is idle, `-1` to keep it resident.
+Unloading is reference counted, so a request in flight is never freed underneath itself.
+`POST /api/providers/{id}/unload` frees a model early and answers `409` while it is busy.
+
+**Suggested sets**
+
+| Card | Set | Resident |
+|---|---|---|
+| 8 GB | `frontend`, `piper`, `stt` (turbo) and at most one more service | 2 to 6 GB |
+| 12 GB | the default set, with `MODEL_TTL` at 120 if you add one optional service | 8.1 GB, up to about 10 GB |
+| 16 GB | the default set plus `chatterbox` or `canary` | about 10 to 12 GB |
+| Training | free the VRAM of `qwen3-tts-service` first (`POST /api/providers/qwen3/unload`, or stop the service), then enable `piper-training-service` | training wants several GB |
+
+**Lower latency** (set on `stt-service`; tune against the `decode NNN ms` readout in the live
+panel, not against feel):
 
 | Variable | Default | Effect |
 |---|---|---|
-| `WHISPER_MODEL_SIZE` | `large-v3-turbo` | Dominant quality/speed lever |
-| `WS_WINDOW_S` | `8.0` | How much trailing audio each interim decode re-transcribes. Whisper pads its input to a fixed 30 s before the encoder, so this does **not** change encoder cost — it bounds the decoder tokens regenerated per tick. A real saving, but a moderate one; raising it buys more context for punctuation than it costs. |
-| `WS_MIN_NEW_AUDIO_S` | `0.5` | Floor on how often a partial transcript can be emitted |
-| `WS_MAX_SESSIONS` | `4` | Concurrent live microphone sessions before new ones are refused |
-| `WHISPER_NUM_WORKERS` | `2` | Gives live and batch traffic independent slots |
-| `STT_MODEL_TTL` | `300` | Seconds idle before the Whisper weights are released. `-1` pins them resident, which trades ~1.6–3.1 GB for never paying a reload on a cold request. |
-
-The live panel prints `decode NNN ms` under the transcript. **Tune against that number, not
-against feel.** If decode time approaches `WS_MIN_NEW_AUDIO_S × 1000`, move to a smaller model
-first — that changes encoder cost, which the window length does not. Lowering `WS_WINDOW_S`
-helps second, and costs you punctuation context.
-
-On the GPU services generally:
-
-| Variable | Default | Effect |
-|---|---|---|
-| `ASR_MAX_CONCURRENCY` / `TTS_MAX_CONCURRENCY` | `1` | Bounds concurrent inference. Raise only with VRAM to spare — overlapping requests on one model make each one slower. |
-| `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True` | Reduces allocator fragmentation when several models share a card |
+| `WHISPER_MODEL_SIZE` | `large-v3-turbo` | Dominant quality/speed lever. Move to a smaller model first if decode time nears `WS_MIN_NEW_AUDIO_S x 1000` |
+| `WS_WINDOW_S` | `8.0` | Target amount of trailing audio each interim decode re-transcribes; cut at the last finished sentence, never above min(30, 2x). Bounds decoder work, not encoder cost |
+| `WS_MIN_NEW_AUDIO_S` | `0.5` | Floor on how often a partial transcript is sent |
+| `WS_MAX_SESSIONS` | `4` | Concurrent live microphone sessions |
+| `WHISPER_COMPUTE_TYPE` | `float16` | Pinned because INT8 is not available on Blackwell (RTX 50). Empty probes the device |
+| `STT_DEFAULT_LANGUAGE` | `de` | Language for API requests that name none (empty = auto-detect). The web UI sends its own choice |
 
 ---
 
-## 7. Reverse proxy / HTTPS
+## 7. Troubleshooting
 
-**You need this if you want the microphone to work from any machine other than the NAS itself.**
-Browsers only grant microphone access in a secure context.
+| What you see | Cause | Fix |
+|---|---|---|
+| YAML rejected: `required variable APP_DATA_DIR is missing a value` | The placeholder is still in the file | Replace `${APP_DATA_DIR:?set dataset path}` everywhere with your dataset path |
+| Install job fails after about 20 minutes, or `Timed out` in the job log | 25 GB of images did not finish inside TrueNAS's 20 minute limit | Press Install/Save again (layers are kept), or `./pull-images.sh --tag <release>` first |
+| `manifest unknown` / `not found` while pulling | The release you pinned has not been published yet | `./update-check.sh --tag <release>`; CI publishes the images after the `vX.Y.Z` tag is pushed |
+| `mkdir ...: read-only file system` at start | The data path is not a real dataset path (still `/mnt/pool/...`?) | Fix `APP_DATA_DIR`; `./preflight.sh --data-dir ...` |
+| App stays **Deploying** | A container's health check is not passing | `docker ps --filter label=com.docker.compose.project=ix-tts-stt --format 'table {{.Names}}\t{{.Status}}'`, then `docker logs ix-tts-stt-<service>-1` |
+| A backend is red in the UI | Not reachable or unhealthy | `curl -s http://localhost:3000/api/health` and read its `error`. `ConnectError` means the service name in `*_SERVICE_URL` does not match a running service |
+| `"device": "cpu"` on a GPU service | The container does not see the GPU | `nvidia-smi` on the host; `./preflight.sh --with-docker`; reinstall the driver under Apps -> Settings; check the GPU is not isolated for a VM |
+| `could not select device driver "nvidia"` | No NVIDIA runtime in Docker | Install the driver from the Apps settings and restart the Apps service |
+| `unsatisfied condition: cuda>=12.8, please update your driver` | The driver is older than R570 (a GeForce card has no other way in) | Update under Apps -> Settings -> Install NVIDIA Drivers; `./preflight.sh` says which case applies |
+| A service fails after you enabled another | Out of VRAM | `nvidia-smi` while it runs; smaller Whisper or `0.6B` Qwen3-TTS, shorter `MODEL_TTL`, or drop a service |
+| No Piper voices | The models directory is empty and the seed job did not run | `docker logs ix-tts-stt-piper-voices-seed-1`; voices are files `*.onnx` + `*.onnx.json` in `models/default` |
+| Microphone button does nothing | Browsers grant the microphone only in a secure context | Use `https://` (or `http://localhost`); check the proxy forwards the WebSocket upgrade |
+| 403 on every button behind a reverse proxy | The proxy changes the `Host` header | Set `TRUSTED_ORIGINS` to the proxy's public URL |
+| Live transcription lags | Decode time exceeds the update interval | Read `decode NNN ms`: under 500 ms is fine; near 1000 ms use a smaller model; over 1500 ms you are probably on CPU or the GPU is contended. Audio is skipped rather than queued, so lag stays bounded |
+| Permission problems on the dataset | ACL denies root, or the folder is read-only | Containers run as root; check the dataset's ACL type and that no restrictive ACL blocks root. `preflight.sh` reports a dataset it cannot write |
 
-Because everything is proxied through port 3000, the config is a single upstream. Nginx:
+---
+
+## 8. Reverse proxy and HTTPS
+
+You need HTTPS for the microphone from any machine other than the NAS. Everything is proxied
+through port 3000, so the proxy has one upstream. nginx:
 
 ```nginx
 server {
     listen 443 ssl;
     server_name voice.example.com;
-
     ssl_certificate     /path/to/fullchain.pem;
     ssl_certificate_key /path/to/privkey.pem;
 
@@ -379,7 +412,7 @@ server {
         proxy_pass http://truenas.lan:3000;
         proxy_http_version 1.1;
 
-        # Required — live transcription is a WebSocket
+        # Required: live transcription is a WebSocket.
         proxy_set_header Upgrade    $http_upgrade;
         proxy_set_header Connection "upgrade";
 
@@ -388,143 +421,107 @@ server {
         proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
 
-        # Streaming TTS starts playing before synthesis finishes; buffering here
-        # would throw that away and restore full-text latency.
+        # Streaming TTS plays before synthesis finishes; buffering would undo that.
         proxy_buffering off;
-
-        # Long-running jobs (training, large transcriptions)
         proxy_read_timeout 600s;
     }
 }
 ```
 
-Then set on `frontend-service`:
-
-```env
-ALLOWED_ORIGINS=https://voice.example.com
-```
-
-Traefik users: enable the WebSocket-capable HTTP router (the default) and disable response
-buffering for this service.
+`ALLOWED_ORIGINS` stays empty: the UI and the API are the same origin, also over
+`http://<ip>:3000`. With `proxy_set_header Host $host` nothing else is needed. A proxy that does
+not pass the original `Host` needs `TRUSTED_ORIGINS:-https://voice.example.com` on
+`frontend-service` (symptom without it: 403 on every button). To lock a script-facing API, set
+`API_KEY` (Bearer token for `/v1/*` and mutating `/api/*`; same-origin browser calls are exempt,
+and it is not user authentication).
 
 ---
 
-## 8. Maintenance
+## 9. What has and has not been verified
 
-### Update
+Verified while writing this (no TrueNAS machine or GPU was available), and re-checked by
+`tests/test_truenas_*.py` and `.github/workflows/truenas.yml` on every change: the compose files
+pass `docker compose config` and resolve as described here; the catalog template renders and
+matches the compose file; the release number is the same in every file; the scripts run against
+fake `docker`, `nvidia-smi`, `curl`, `skopeo`, `df` and `stat`, which proves their logic and not
+what the real tools print. The TrueNAS behaviour in section 3 was read from the TrueNAS source,
+not observed.
 
-**Apps → Installed → tts-stt → Edit**, then re-deploy. To pin a version, set `IMAGE_TAG` to a
-release tag instead of `latest`.
+Not verified, in the order to check them after your first install:
 
-Shell (Path C):
-
-```bash
-cd /mnt/tank/apps/tts-stt
-git pull
-docker compose -f docker-compose.yml -f docker-compose.truenas.yml --profile all up -d --build
-```
-
-### Back up
-
-Snapshot the dataset. **Datasets → tts-stt → Snapshots → Add**, or set a periodic task.
-
-Worth keeping: `models/` (your trained voices) and `qwen3-voices/` (saved clone profiles).
-`hf-cache/` and `.cache/` are re-downloadable — exclude them if snapshot size matters.
-
-### Free disk space
-
-```bash
-docker image prune -a     # old images after an update
-```
-
-Generated audio in `output/` is pruned automatically (`OUTPUT_RETENTION_HOURS`, default 24).
-
----
-
-## 9. Troubleshooting
-
-### The app installs but never goes healthy
-
-Almost always a model still downloading. Health checks intentionally report not-ready until the
-model is loaded.
-
-```bash
-docker logs -f ix-tts-stt-stt-service-1
-```
-
-Look for `Model loaded successfully`. If you instead see a HuggingFace network error, the NAS
-cannot reach `huggingface.co` — check DNS and any egress firewall.
-
-### `"device": "cpu"` when you have a GPU
-
-The GPU was not allocated to the app. Edit the app, allocate the NVIDIA card, redeploy. Confirm
-the host sees it with `nvidia-smi` first.
-
-### Everything worked, then a service started failing after adding another
-
-VRAM exhaustion. Check with `nvidia-smi` while the stack runs. Use a smaller Whisper model, drop
-to `Qwen3-TTS-12Hz-0.6B-Base`, or disable a backend. See the [VRAM budget](#vram-budget).
-
-### The microphone button does nothing
-
-1. Are you on `https://` or `http://localhost`? Browsers refuse microphone access otherwise.
-2. Browser console: a WebSocket error to `/ws/stt` means the reverse proxy is not forwarding
-   `Upgrade`/`Connection` headers (see [section 7](#7-reverse-proxy--https)).
-3. `curl http://<host>:3000/api/health` — is the `whisper` provider healthy?
-
-### Live transcription lags behind my speech
-
-Read the `decode NNN ms` readout under the transcript:
-
-- **Under ~500 ms** — working as intended.
-- **Approaching 1000 ms** — try a smaller `WHISPER_MODEL_SIZE` first; then `WS_WINDOW_S` `5.0`.
-- **Over 1500 ms** — you are likely on CPU (check `/api/health` for `"device"`), or the GPU is
-  contended. Reduce concurrent services or use a smaller model.
-
-The system deliberately **skips** audio rather than queueing it when decoding falls behind, so
-lag stays bounded instead of growing through a session. Dropped blocks are reported when you
-stop.
-
-### `permission denied` on the dataset
-
-The containers run as root and need write access to `APP_DATA_DIR`. Confirm the path exists and
-that no restrictive ACL is applied. Simplest fix from the shell:
-
-```bash
-chmod -R u+rwX /mnt/tank/apps/tts-stt
-```
-
-### A backend shows red but its container is running
-
-`curl http://localhost:3000/api/health | jq` and read the `error` field. `ConnectError` means the
-frontend cannot resolve the service — usually the service name in `*_SERVICE_URL` does not match
-the service key in the YAML.
+1. `./preflight.sh --data-dir ... --with-docker` reports `READY` on the real host, including the
+   GPU test container and the driver verdict.
+2. The YAML installs, the app reaches **Running** within a few minutes, and `/api/health` is green.
+   Note whether the **Web UI** button and the notes appear (`x-portals` and `x-notes` are read
+   from the source, not observed) and whether "Deploying" ends before the model downloads do.
+3. Change `IMAGE_TAG` to a second release and Save: it pulls only the new images and the data
+   is untouched. Put it back: instant.
+4. `./update-check.sh` prints a sensible table, and `UPDATE AVAILABLE` after a newer tag exists.
+5. Stop and Start with `PULL_POLICY:-always` and `IMAGE_TAG:-latest` pulls a moved tag.
+6. The settings-file route (`include:` with `env_file:`) is accepted by Install via YAML.
+7. The NVIDIA driver rule. Verified (from the published config of the `nvidia/cuda:12.8.1` base
+   image and NVIDIA's `libnvidia-container` source): the image starts on a driver that reports
+   CUDA >= 12.8 (R570 or newer), or on a data-centre/workstation GPU with driver branch 470, 535,
+   550, 560 or 565; the list has no `geforce` brand, so a GeForce card needs R570 or newer. Not
+   verified: NVIDIA's own minimum for Blackwell (expected R570), and that your card's brand is
+   what `preflight.sh` guesses from its name.
+8. The menu paths named in this guide (Datasets -> Add Dataset, Apps -> Discover Apps -> Custom
+   App -> Install via YAML, Apps -> Settings -> Install NVIDIA Drivers, Data Protection ->
+   Snapshots) are from memory of the UI, and whether the YAML editor has search-and-replace.
+9. That an exited `piper-voices-seed` counts as normal for the app state. The middleware source
+   counts an exited container with a normal exit code as fine while another one runs; the list
+   of normal exit codes was not in the copy that was read.
 
 ---
 
-## Upgrading from an earlier install
+## 10. Optional update notifications (Diun)
 
-This release changed how the browser reaches the backends. If you installed a previous version:
+[Diun](https://crazymax.dev/diun/) watches the images of your containers and **notifies** you when
+a newer release is published. It never pulls, restarts or changes anything. The `tts-stt` services
+already carry the labels it reads (`diun.enable`, `diun.watch_repo`, `diun.include_tags`,
+`diun.sort_tags`, `diun.max_tags`), so only the watcher is missing:
 
-1. **You can stop publishing backend ports.** Ports 5000–5007 and 8080 no longer need to be
-   reachable from the browser. Remove them from your app config to reduce exposure.
-2. **`BROWSER_*_URL` variables are obsolete.** They are ignored by the web UI. Remove them.
-   (They still apply if you deliberately publish backend ports for your own scripts.)
-3. **`ALLOWED_ORIGINS` can be tightened.** With everything same-origin, set it to just your
-   frontend origin instead of `*`.
-4. **The default Whisper model changed** to `large-v3-turbo`. It is faster and roughly as
-   accurate — but it **cannot do speech translation**. If you use `task=translate`, set
-   `WHISPER_MODEL_SIZE=large-v3` explicitly. Requests for translation on a turbo model now return
-   a clear HTTP 400 instead of silently returning untranslated text.
-5. **Health checks now report 503 until the model loads.** A service that shows unhealthy during
-   startup is correct behaviour, not a regression.
+1. Delete the `profiles:` line of the `diun` service in the YAML.
+2. Set `DIUN_NTFY_TOPIC:-` to a topic you subscribe to in the [ntfy](https://ntfy.sh/) app (any
+   hard-to-guess name), or replace the two `DIUN_NOTIF_NTFY_*` variables with another notifier
+   (mail, Telegram, webhook: <https://crazymax.dev/diun/notif/>).
+3. Save. It checks once a day at 06:00 (`DIUN_WATCH_SCHEDULE`) and does not notify about the tags
+   that exist when it first starts.
+
+It needs read access to the Docker socket, which is root-equivalent on the host: enable it only if
+you want it. What's up Docker (WUD) is a comparable alternative; Watchtower is archived and
+updates on its own, which is why it is not used here.
 
 ---
 
-## Related documentation
+## 11. Upgrading from an installation before 0.2
 
-- [`truenas/README.md`](../truenas/README.md) — catalog vs YAML install, image registry
-- [`docs/truenas-service-profiles.md`](./truenas-service-profiles.md) — which services to run when
-- [`docs/truenas-custom-app-checklist.md`](./truenas-custom-app-checklist.md) — first-run checklist
-- [`docs/truenas-deployment.md`](./truenas-deployment.md) — build-from-source detail, storage layout
-- [`docs/provider-contracts.md`](./provider-contracts.md) — the API contracts each backend implements
+- **One model cache.** Models used to live in `.cache/` (Whisper) and `hf-cache/<service>/`.
+  Now all services share `cache/`. Reuse what you downloaded instead of downloading it again,
+  with the app stopped:
+
+  ```bash
+  cd /mnt/tank/apps/tts-stt
+  mkdir -p cache
+  [ -d .cache ] && cp -an .cache/. cache/
+  for d in hf-cache/*/; do [ -d "$d" ] && cp -an "$d". cache/; done
+  ```
+
+  Check that the app works, then delete `.cache/` and `hf-cache/`.
+- **Images are pinned.** They used to follow `latest`. To keep that, set `IMAGE_TAG:-latest`
+  with `PULL_POLICY:-always`.
+- **`BROWSER_*_URL` is gone** and backend ports are no longer published. Remove them from your config.
+- **CORS is closed by default.** `ALLOWED_ORIGINS` used to default to `*`; the web UI needs none
+  of it. List origins only for scripts in other web pages.
+- **Whisper defaults to `large-v3-turbo`,** which cannot translate. For `task=translate` set
+  `WHISPER_MODEL_SIZE:-large-v3`; a translation request on a turbo model returns HTTP 400.
+
+---
+
+## Related
+
+- [`truenas/README.md`](../truenas/README.md): the install routes and the catalog scaffold
+- [`truenas-deployment.md`](./truenas-deployment.md): build from source, storage layout, GPU driver
+- [`truenas-service-profiles.md`](./truenas-service-profiles.md): which services to run when
+- [`truenas-custom-app-checklist.md`](./truenas-custom-app-checklist.md): one-page first-run checklist
+- [`provider-contracts.md`](./provider-contracts.md): the API each backend implements
