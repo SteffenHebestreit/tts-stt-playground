@@ -11,7 +11,7 @@ nemo_toolkit[asr]>=3.0.0,<3.1
 # NeMo resolves the newest release, 13.x.
 cuda-bindings>=12.8,<13
 fastapi>=0.104.0
-uvicorn[standard]>=0.24.0
+uvicorn[standard]>=0.54.0
 python-multipart>=0.0.6
 librosa>=0.10.0
 soundfile>=0.12.0
