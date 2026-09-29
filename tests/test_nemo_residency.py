@@ -82,7 +82,9 @@ def test_asr_helper_pins_the_model_for_the_whole_call(service: str):
     helper = _named(_tree(service), "_asr")
     assert helper is not None, f"{service}: no _asr helper — did the wrapper move?"
     body = ast.unparse(helper)
-    assert "acquire_async" in body, (
+    # acquire_lease is the idempotent form of the same pin (ModelLease), for a
+    # helper that has to hand the reference to something that outlives it.
+    assert "acquire_async" in body or "acquire_lease" in body, (
         f"{service}: _asr does not acquire the model slot, so nothing stops the "
         f"idle reaper from unloading during a transcription"
     )

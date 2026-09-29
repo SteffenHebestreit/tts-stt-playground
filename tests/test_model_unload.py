@@ -226,6 +226,61 @@ def test_unload_bool_wrapper_still_matches_try_unload(lifecycle):
     assert slot.unload() is False  # already gone
 
 
+def test_try_unload_async_reports_the_same_three_outcomes(lifecycle):
+    """The HTTP handlers are coroutines: they must be able to unload without
+    holding the event loop for the length of an unload hook (seconds, for a
+    multi-GB `.cpu()`), and get the same answers the 409/200 mapping relies on."""
+    import asyncio
+
+    slot = lifecycle.ModelSlot(lambda: object(), ttl_seconds=-1, name="test")
+
+    async def scenario():
+        gone = await slot.try_unload_async()
+        lease = await slot.acquire_lease()
+        busy = await slot.try_unload_async()
+        await lease.release_async()
+        ok = await slot.try_unload_async()
+        return gone, busy, ok
+
+    gone, busy, ok = asyncio.run(scenario())
+    assert gone == {"unloaded": False, "reason": "not_resident", "refs": 0}
+    assert busy["reason"] == "busy" and busy["unloaded"] is False and busy["refs"] == 1
+    assert ok == {"unloaded": True, "reason": "ok", "refs": 0}
+    assert not slot.resident
+
+
+def test_try_unload_is_busy_while_the_model_is_still_loading(lifecycle):
+    """A request is waiting for weights that are not resident yet. /unload must
+    say 409 straight away, not sit behind a load that can run for minutes."""
+    started = threading.Event()
+    proceed = threading.Event()
+
+    def slow():
+        started.set()
+        assert proceed.wait(5)
+        return object()
+
+    slot = lifecycle.ModelSlot(slow, ttl_seconds=-1, name="test")
+    loader_thread = threading.Thread(target=slot.lease, daemon=True)
+    loader_thread.start()
+    assert started.wait(5)
+
+    answered = threading.Event()
+    result: dict = {}
+
+    def ask():
+        result.update(slot.try_unload())
+        answered.set()
+
+    threading.Thread(target=ask, daemon=True).start()
+    try:
+        assert answered.wait(2), "try_unload blocked behind the in-flight load"
+        assert result["reason"] == "busy" and result["unloaded"] is False
+    finally:
+        proceed.set()
+        loader_thread.join(timeout=5)
+
+
 # --- stt-service reference counting -----------------------------------------
 #
 # stt-service does not use ModelSlot; it has its own counter because load_model()
