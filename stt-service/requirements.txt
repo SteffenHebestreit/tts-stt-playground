@@ -12,7 +12,7 @@ python-multipart==0.0.32
 # when the Hub is unreachable - huggingface-hub's own snapshot_download does.
 faster-whisper==1.2.1
 # ctranslate2 >=4.5 requires cuDNN 9 — provided by the cuda:12.8.1-cudnn base image
-ctranslate2>=4.5,<5
+ctranslate2>=4.8.2,<5
 tokenizers>=0.13.0
 # huggingface-hub 1.x replaced `requests` with httpx. faster-whisper 1.2.1 no
 # longer imports requests itself, but its model download has only been exercised
