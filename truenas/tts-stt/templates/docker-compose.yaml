@@ -157,7 +157,7 @@ services:
       MAX_TEXT_CHARS: "20000"
       MAX_UPLOAD_MB: "100"
       MAX_ANALYZE_UPLOAD_MB: "25"
-      ALLOWED_ORIGINS: "*"
+      ALLOWED_ORIGINS: ""
       ALLOW_CREDENTIALS: "false"
     volumes:
       - "{{ data }}/models:/app/models"
@@ -210,7 +210,7 @@ services:
       MODEL_TTL: "{{ values.model_ttl }}"
       OMP_NUM_THREADS: "4"
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
-      ALLOWED_ORIGINS: "*"
+      ALLOWED_ORIGINS: ""
       ALLOW_CREDENTIALS: "false"
     volumes:
       - "{{ data }}/models:/app/models"
@@ -244,7 +244,7 @@ services:
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
       ASR_MODEL_TTL: "{{ values.model_ttl }}"
       MODEL_TTL: "{{ values.model_ttl }}"
-      ALLOWED_ORIGINS: "*"
+      ALLOWED_ORIGINS: ""
       ALLOW_CREDENTIALS: "false"
     volumes:
       - "{{ data }}/cache:/root/.cache"
@@ -276,7 +276,7 @@ services:
       MODEL_TTL: "{{ values.model_ttl }}"
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
       QWEN3_ASR_SERVICE_URL: "http://qwen3-asr-service:5002"
-      ALLOWED_ORIGINS: "*"
+      ALLOWED_ORIGINS: ""
       ALLOW_CREDENTIALS: "false"
     volumes:
       - "{{ data }}/cache:/root/.cache"
@@ -317,7 +317,7 @@ services:
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
       ASR_MODEL_TTL: "{{ values.model_ttl }}"
       MODEL_TTL: "{{ values.model_ttl }}"
-      ALLOWED_ORIGINS: "*"
+      ALLOWED_ORIGINS: ""
       ALLOW_CREDENTIALS: "false"
     volumes:
       - "{{ data }}/cache:/root/.cache"
@@ -351,7 +351,7 @@ services:
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
       ASR_MODEL_TTL: "{{ values.model_ttl }}"
       MODEL_TTL: "{{ values.model_ttl }}"
-      ALLOWED_ORIGINS: "*"
+      ALLOWED_ORIGINS: ""
       ALLOW_CREDENTIALS: "false"
     volumes:
       - "{{ data }}/cache:/root/.cache"
@@ -387,7 +387,7 @@ services:
       MODEL_TTL: "{{ values.model_ttl }}"
       TTS_MAX_CONCURRENCY: "1"
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
-      ALLOWED_ORIGINS: "*"
+      ALLOWED_ORIGINS: ""
       ALLOW_CREDENTIALS: "false"
     volumes:
       - "{{ data }}/cache:/root/.cache"
@@ -430,10 +430,10 @@ services:
       KEEP_LAST_CHECKPOINTS: "5"
       TRAIN_NUM_WORKERS: "2"
       TRAINING_SHUTDOWN_GRACE_S: "30"
-      UVICORN_TIMEOUT_KEEP_ALIVE: "75"
+      UVICORN_TIMEOUT_KEEP_ALIVE: "120"
       MAX_UPLOAD_MB: "500"
       MAX_TEXT_CHARS: "1000"
-      ALLOWED_ORIGINS: "*"
+      ALLOWED_ORIGINS: ""
       ALLOW_CREDENTIALS: "false"
     volumes:
       - "{{ data }}/piper-training-service/data:/app/data"

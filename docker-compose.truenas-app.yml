@@ -207,7 +207,7 @@ services:
       MAX_UPLOAD_MB: ${PIPER_MAX_UPLOAD_MB:-100}
       MAX_ANALYZE_UPLOAD_MB: ${PIPER_MAX_ANALYZE_UPLOAD_MB:-25}
       # Backends are not browser-facing (the gateway is) and are not published.
-      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-*}
+      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${APP_DATA_DIR:?set dataset path}/models:/app/models"
@@ -270,7 +270,7 @@ services:
       MODEL_TTL: ${MODEL_TTL:-300}
       OMP_NUM_THREADS: ${OMP_NUM_THREADS:-4}
       PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
-      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-*}
+      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${APP_DATA_DIR:?set dataset path}/models:/app/models"
@@ -313,7 +313,7 @@ services:
       PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
       ASR_MODEL_TTL: ${ASR_MODEL_TTL:-300}
       MODEL_TTL: ${MODEL_TTL:-300}
-      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-*}
+      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${APP_DATA_DIR:?set dataset path}/cache:/root/.cache"
@@ -354,7 +354,7 @@ services:
       MODEL_TTL: ${MODEL_TTL:-300}
       PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
       QWEN3_ASR_SERVICE_URL: http://qwen3-asr-service:5002
-      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-*}
+      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${APP_DATA_DIR:?set dataset path}/cache:/root/.cache"
@@ -407,7 +407,7 @@ services:
       PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
       ASR_MODEL_TTL: ${ASR_MODEL_TTL:-300}
       MODEL_TTL: ${MODEL_TTL:-300}
-      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-*}
+      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${APP_DATA_DIR:?set dataset path}/cache:/root/.cache"
@@ -447,7 +447,7 @@ services:
       PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
       ASR_MODEL_TTL: ${ASR_MODEL_TTL:-300}
       MODEL_TTL: ${MODEL_TTL:-300}
-      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-*}
+      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${APP_DATA_DIR:?set dataset path}/cache:/root/.cache"
@@ -489,7 +489,7 @@ services:
       MODEL_TTL: ${MODEL_TTL:-300}
       TTS_MAX_CONCURRENCY: ${TTS_MAX_CONCURRENCY:-1}
       PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
-      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-*}
+      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${APP_DATA_DIR:?set dataset path}/cache:/root/.cache"
@@ -540,10 +540,10 @@ services:
       TRAIN_NUM_WORKERS: ${TRAIN_NUM_WORKERS:-2}
       # Shutdown waits this long for running jobs; stop_grace_period below must stay larger.
       TRAINING_SHUTDOWN_GRACE_S: ${TRAINING_SHUTDOWN_GRACE_S:-30}
-      UVICORN_TIMEOUT_KEEP_ALIVE: ${UVICORN_TIMEOUT_KEEP_ALIVE:-75}
+      UVICORN_TIMEOUT_KEEP_ALIVE: ${UVICORN_TIMEOUT_KEEP_ALIVE:-120}
       MAX_UPLOAD_MB: ${TRAINING_MAX_UPLOAD_MB:-500}
       MAX_TEXT_CHARS: ${TRAINING_MAX_TEXT_CHARS:-1000}
-      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-*}
+      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-}
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${APP_DATA_DIR:?set dataset path}/piper-training-service/data:/app/data"
