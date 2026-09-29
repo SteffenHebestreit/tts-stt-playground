@@ -833,11 +833,14 @@ def test_normalize_qwen3_language(frontend_module):
     fn = frontend_module._normalize_qwen3_language
     assert fn("de") == "German"
     assert fn("en_US") == "English"
-    assert fn("auto") == "English"
-    assert fn("nl") == "English"          # Dutch unsupported -> English
+    assert fn("de-DE") == "German"
     assert fn("French") == "French"       # already a capitalized label
-    assert fn("zz") == "English"          # unknown lowercase -> English
-    assert fn("") == "English"
+    # "auto" and "no language" are the service's to resolve (QWEN3_DEFAULT_LANGUAGE)
+    assert fn("auto") == fn("AUTO") == fn(" Auto ") == fn("") == fn(None) == "auto"
+    # A language the model cannot speak is forwarded so the service can refuse it
+    assert fn("nl") == "nl"
+    assert fn("zz") == "zz"
+    assert fn("Dutch") == "Dutch"
 
 
 def test_format_frontend_timestamp(frontend_module):
@@ -1546,6 +1549,330 @@ def test_registry_strings_cannot_close_the_script_element(monkeypatch):
     embedded = json.loads(_registry_element(page))
     assert embedded["providers"]["evil"]["display_name"] == evil, "the value must round-trip intact"
     assert embedded["ui"]["copy"]["app_subtitle"] == evil
+
+
+# --- Qwen3-TTS language ---------------------------------------------------------
+#
+# The gateway used to turn "auto" (and every language the model lacks, Dutch
+# among them) into English before calling qwen3-tts-service. That defeated the
+# service's own German default and its 400 for an unsupported language: HTTP 200,
+# English accent, no signal. These tests stand in for the service, so what they
+# check is what the gateway *sends*, and what a caller *gets back* when the
+# service refuses.
+
+_QWEN3_UNSUPPORTED_DETAIL = (
+    "Language 'nl' is not supported by Qwen3-TTS. Supported: Chinese, English, "
+    "Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian "
+    "(names or ISO codes), or 'auto' for the service default (German)."
+)
+
+
+def _qwen3_like_service(method, url, kwargs):
+    """qwen3-tts-service's contract for `lang`: names, "auto", or a 400 naming the rest."""
+    lang = (kwargs.get("json") or {}).get("lang", "")
+    known = {"auto", "chinese", "english", "japanese", "korean", "german",
+             "french", "russian", "portuguese", "spanish", "italian"}
+    if lang.lower() not in known:
+        return httpx.Response(400, json={"detail": _QWEN3_UNSUPPORTED_DETAIL})
+    return httpx.Response(200, content=wav_bytes(), headers={"content-type": "audio/wav"})
+
+
+def _qwen3_gateway(monkeypatch, handler=_qwen3_like_service):
+    module = load_frontend_app({"DEFAULT_TTS_PROVIDER": "qwen3"})
+    stub = install_stub(monkeypatch, module, handler)
+    return TestClient(module.app), stub
+
+
+def _qwen3_bodies(monkeypatch, language):
+    """The JSON body /api/tts and /v1/audio/speech each send for one language."""
+    client, stub = _qwen3_gateway(monkeypatch)
+    client.post("/api/tts", json={"provider": "qwen3", "text": "Guten Tag", "language": language})
+    via_api = stub.calls[-1][2]["json"]
+    client.post("/v1/audio/speech", json={
+        "input": "Guten Tag", "response_format": "wav", "language": language})
+    via_v1 = stub.calls[-1][2]["json"]
+    return via_api, via_v1
+
+
+@pytest.mark.parametrize("language, expected", [
+    ("auto", "auto"), ("AUTO", "auto"), (" Auto ", "auto"), ("", "auto"),
+    ("de", "German"), ("de_DE", "German"), ("en", "English"), ("French", "French"),
+    # not spoken by the model: forwarded as given, never swapped for English
+    ("nl", "nl"), ("pl", "pl"), ("zz", "zz"),
+])
+def test_qwen3_language_reaches_the_service_unmasked(monkeypatch, language, expected):
+    via_api, via_v1 = _qwen3_bodies(monkeypatch, language)
+    assert via_api["lang"] == via_v1["lang"] == expected
+    assert via_api == via_v1, "/api/tts and /v1/audio/speech must build the same body"
+
+
+def test_qwen3_request_without_a_language_is_auto_on_both_routes(monkeypatch):
+    client, stub = _qwen3_gateway(monkeypatch)
+    client.post("/api/tts", json={"provider": "qwen3", "text": "Hallo"})
+    via_api = stub.calls[-1][2]["json"]
+    client.post("/v1/audio/speech", json={"input": "Hallo", "response_format": "wav"})
+    via_v1 = stub.calls[-1][2]["json"]
+    assert via_api["lang"] == via_v1["lang"] == "auto"
+    assert via_api == via_v1
+
+
+def test_qwen3_400_for_an_unsupported_language_reaches_the_caller(monkeypatch):
+    client, _ = _qwen3_gateway(monkeypatch)
+
+    r = client.post("/api/tts", json={"provider": "qwen3", "text": "Hallo", "language": "nl"})
+    assert r.status_code == 400
+    assert r.json()["detail"] == _QWEN3_UNSUPPORTED_DETAIL
+
+    r = client.post("/v1/audio/speech", json={
+        "input": "Hallo", "language": "nl", "response_format": "wav"})
+    assert r.status_code >= 400
+    assert _QWEN3_UNSUPPORTED_DETAIL in r.json()["error"]["message"]
+
+
+def test_qwen3_voice_design_without_a_language_leaves_it_to_the_service(monkeypatch):
+    client, stub = _qwen3_gateway(monkeypatch)
+    r = client.post("/api/providers/qwen3/voice-design",
+                    json={"text": "Hallo", "voice_description": "warm narrator"})
+    assert r.status_code == 200
+    assert stub.calls[-1][2]["json"]["lang"] == "auto"
+
+
+def test_qwen3_registry_default_is_selectable_and_is_not_english():
+    settings = load_frontend_app().PROVIDER_REGISTRY["providers"]["qwen3"]["settings"]
+    default = settings["defaults"]["language"]
+    values = [item["value"] for item in settings["languages"]]
+    assert default == "auto"
+    # populateSelectOptions() falls back to the first option when the default is
+    # not among the values, which would send that language on every request.
+    assert default in values
+
+
+# --- Canary languages -----------------------------------------------------------
+#
+# Canary decodes four languages on the flash checkpoints and 25 on
+# canary-1b-v2, and only the service knows which it runs (CANARY_ASR_MODEL is
+# not the gateway's variable). The gateway read a hardcoded en/de/es/fr, so the
+# UI offered four languages in front of a model that speaks 25.
+
+CANARY_EU25 = [
+    "bg", "cs", "da", "de", "el", "en", "es", "et", "fi", "fr", "hr", "hu", "it",
+    "lt", "lv", "mt", "nl", "pl", "pt", "ro", "ru", "sk", "sl", "sv", "uk",
+]
+CANARY_FALLBACK = ["de", "en", "fr", "es"]
+CANARY_UNSUPPORTED_DETAIL = (
+    "Language 'xx' is not supported by nvidia/canary-180m-flash. Supported: de, en, es, fr. "
+    "Send 'auto' to use the default ('de')."
+)
+
+
+def _canary_status(languages, model, default="de"):
+    return {
+        "status": "ok", "service": "Canary-ASR", "current_model": model,
+        "supported_languages": sorted(languages), "default_language": default,
+    }
+
+
+def _canary_gateway(monkeypatch, handler, env=None):
+    module = load_frontend_app({"ENABLE_CANARY_ASR": "true", **(env or {})})
+    stub = install_stub(monkeypatch, module, handler)
+    return module, stub, TestClient(module.app)
+
+
+def _canary_entry(client):
+    return client.get("/providers").json()["providers"]["canary"]
+
+
+def _values(entry):
+    return [item["value"] for item in entry["settings"]["languages"]]
+
+
+def _status_calls(stub):
+    return [call for call in stub.calls if call[1].endswith("/status")]
+
+
+def test_canary_languages_follow_the_model_the_service_runs(monkeypatch):
+    import json
+    module, stub, client = _canary_gateway(
+        monkeypatch, lambda m, u, k: _canary_status(CANARY_EU25, "nvidia/canary-1b-v2"))
+
+    entry = _canary_entry(client)
+    values = _values(entry)
+    assert sorted(values) == CANARY_EU25
+    assert values[0] == entry["settings"]["defaults"]["language"] == "de"
+    labels = {item["value"]: item["label"] for item in entry["settings"]["languages"]}
+    assert labels["pl"] == "Polish" and labels["uk"] == "Ukrainian"
+    assert entry["display_name"] == "Canary-1B-v2 (realtime, 25 languages)"
+    assert stub.calls[0][:2] == ("GET", f"{module.CANARY_ASR_SERVICE_URL}/status")
+
+    # The browser reads the registry from the page, not from /providers.
+    embedded = json.loads(_registry_element(client.get("/").text))["providers"]["canary"]
+    assert sorted(_values(embedded)) == CANARY_EU25
+
+
+def test_canary_flash_model_keeps_its_four_languages_and_says_which_model(monkeypatch):
+    _, _, client = _canary_gateway(
+        monkeypatch, lambda m, u, k: _canary_status(CANARY_FALLBACK, "nvidia/canary-180m-flash"))
+    entry = _canary_entry(client)
+    assert sorted(_values(entry)) == sorted(CANARY_FALLBACK)
+    assert entry["display_name"] == "Canary-180M-flash (realtime, de/en/es/fr)"
+
+
+def test_the_language_the_service_defaults_to_leads_the_list(monkeypatch):
+    _, _, client = _canary_gateway(
+        monkeypatch, lambda m, u, k: _canary_status(CANARY_EU25, "nvidia/canary-1b-v2", default="en"))
+    entry = _canary_entry(client)
+    assert _values(entry)[0] == entry["settings"]["defaults"]["language"] == "en"
+
+
+def _unreachable(method, url, kwargs):
+    raise httpx.ConnectError("refused")
+
+
+def test_canary_falls_back_to_the_four_languages_when_the_service_is_unreachable(monkeypatch):
+    _, _, client = _canary_gateway(monkeypatch, _unreachable)
+    entry = _canary_entry(client)
+    assert _values(entry) == CANARY_FALLBACK
+    assert entry["settings"]["defaults"]["language"] == "de"
+    assert entry["display_name"] == "Canary-180M (realtime, en/de/es/fr)"
+    assert client.get("/").status_code == 200, "the page must still render"
+
+
+@pytest.mark.parametrize("answer", [
+    lambda: httpx.Response(503, json={"detail": "loading"}),
+    lambda: httpx.Response(200, content=b"<html>bad gateway</html>"),
+    lambda: httpx.Response(200, json=["de", "en"]),
+    lambda: httpx.Response(200, json={"supported_languages": "de"}),
+    lambda: httpx.Response(200, json={"supported_languages": []}),
+    lambda: httpx.Response(200, json={"supported_languages": [1, None, "", "de-DE", "  "]}),
+], ids=["error-status", "not-json", "not-an-object", "not-a-list", "empty-list", "no-usable-code"])
+def test_canary_keeps_the_fallback_when_status_is_not_usable(monkeypatch, answer):
+    _, _, client = _canary_gateway(monkeypatch, lambda m, u, k: answer())
+    entry = _canary_entry(client)
+    assert _values(entry) == CANARY_FALLBACK
+    assert entry["settings"]["defaults"]["language"] == "de"
+
+
+def test_canary_keeps_its_last_answer_when_the_service_goes_away(monkeypatch):
+    state = {"up": True}
+
+    def handler(method, url, kwargs):
+        if not state["up"]:
+            raise httpx.ConnectError("refused")
+        return _canary_status(CANARY_EU25, "nvidia/canary-1b-v2")
+
+    module, _, client = _canary_gateway(monkeypatch, handler)
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(module, "_canary_status_clock", lambda: clock["now"])
+
+    assert len(_values(_canary_entry(client))) == 25
+    state["up"] = False
+    clock["now"] += module.CANARY_STATUS_TTL_S + 1     # expired: it does ask again
+    entry = _canary_entry(client)
+    assert sorted(_values(entry)) == CANARY_EU25, "a restart must not shrink the list back to four"
+    assert entry["display_name"].startswith("Canary-1B-v2")
+
+
+def test_canary_status_is_asked_once_per_ttl_and_a_failure_is_retried_sooner(monkeypatch):
+    state = {"up": False}
+
+    def handler(method, url, kwargs):
+        if not state["up"]:
+            raise httpx.ConnectError("refused")
+        return _canary_status(CANARY_EU25, "nvidia/canary-1b-v2")
+
+    module, stub, client = _canary_gateway(monkeypatch, handler)
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(module, "_canary_status_clock", lambda: clock["now"])
+    retry, ttl = module.CANARY_STATUS_RETRY_S, module.CANARY_STATUS_TTL_S
+    assert retry < ttl
+
+    for _ in range(3):                                   # down: one probe, not three
+        client.get("/providers")
+    client.get("/")
+    assert len(_status_calls(stub)) == 1
+
+    state["up"] = True
+    clock["now"] += retry + 1                            # not a whole TTL
+    assert len(_values(_canary_entry(client))) == 25
+    assert len(_status_calls(stub)) == 2
+
+    for _ in range(3):                                   # up: cached for the TTL
+        client.get("/providers")
+    assert len(_status_calls(stub)) == 2
+    clock["now"] += ttl + 1
+    client.get("/providers")
+    assert len(_status_calls(stub)) == 3
+
+
+def test_an_operator_supplied_canary_entry_keeps_its_own_languages(monkeypatch):
+    import json
+    custom = {
+        "kind": "stt", "display_name": "My Canary", "internal_url": "http://canary-asr-service:5006",
+        "settings": {"defaults": {"language": "fr"}, "languages": [{"value": "fr", "label": "Français"}]},
+        "ui": {"selectable_as_stt": True},
+    }
+    _, stub, client = _canary_gateway(
+        monkeypatch, lambda m, u, k: _canary_status(CANARY_EU25, "nvidia/canary-1b-v2"),
+        env={"PROVIDER_REGISTRY_JSON": json.dumps({"providers": {"canary": custom}})})
+    entry = _canary_entry(client)
+    assert _values(entry) == ["fr"] and entry["display_name"] == "My Canary"
+    assert not _status_calls(stub)
+
+
+def _canary_rejecting_language(method, url, kwargs):
+    if url.endswith("/status"):
+        return _canary_status(CANARY_EU25, "nvidia/canary-1b-v2")
+    return httpx.Response(422, json={"detail": CANARY_UNSUPPORTED_DETAIL})
+
+
+def test_canary_422_for_an_unsupported_language_reaches_the_caller(monkeypatch):
+    _, stub, client = _canary_gateway(
+        monkeypatch, _canary_rejecting_language, env={"DEFAULT_STT_PROVIDER": "canary"})
+
+    r = client.post("/api/stt", data={"provider": "canary", "language": "xx"},
+                    files={"audio": ("a.wav", wav_bytes(), "audio/wav")})
+    assert r.status_code == 422
+    assert r.json()["detail"] == CANARY_UNSUPPORTED_DETAIL
+    sent = [call for call in stub.calls if call[1].endswith("/transcribe")]
+    assert sent[-1][2]["data"]["language"] == "xx", "the gateway must not filter on its own list"
+
+    r = client.post("/v1/audio/transcriptions", data={"model": "whisper-1", "language": "xx"},
+                    files={"file": ("a.wav", wav_bytes(), "audio/wav")})
+    assert r.status_code >= 400
+    assert CANARY_UNSUPPORTED_DETAIL in r.json()["error"]["message"]
+
+
+# --- Piper default language -----------------------------------------------------
+#
+# piper-tts-service reports what it does for language="auto" (PIPER_DEFAULT_LANGUAGE)
+# on GET /voices. The gateway dropped the field, so the UI could not name the
+# language behind its "Automatic" option and the API consumer could not either.
+
+
+def _piper_catalog(**extra):
+    return {
+        "voices": {"de_DE-thorsten-medium": {
+            "name": "thorsten", "language": "de_DE", "quality": "medium", "model_type": "default"}},
+        "default_count": 1, "custom_count": 0, "total": 1,
+        **extra,
+    }
+
+
+def test_piper_voice_catalog_passes_on_the_services_default_language(monkeypatch):
+    module = load_frontend_app()
+    install_stub(monkeypatch, module, lambda m, u, k: _piper_catalog(
+        default_language="de", default_voice="de_DE-thorsten-medium", catalog_only=False))
+    body = TestClient(module.app).get("/api/providers/piper/voices").json()
+    assert body["default_language"] == "de"
+    assert body["provider"] == "piper" and body["contract"] == "voice-catalog-v1"
+    assert body["voices"][0]["id"] == "de_DE-thorsten-medium"
+
+
+def test_piper_voice_catalog_reports_null_when_the_service_names_no_default(monkeypatch):
+    module = load_frontend_app()
+    install_stub(monkeypatch, module, lambda m, u, k: _piper_catalog())
+    body = TestClient(module.app).get("/api/providers/piper/voices").json()
+    assert "default_language" in body and body["default_language"] is None
 
 
 # --- entrypoint -----------------------------------------------------------------

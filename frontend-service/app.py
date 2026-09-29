@@ -36,6 +36,7 @@ import httpx
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 
@@ -621,10 +622,15 @@ def _build_provider_registry() -> dict:
             },
             "settings": {
                 "defaults": {
-                    "language": "English",
+                    # "auto" reaches qwen3-tts-service as-is and resolves there
+                    # to QWEN3_DEFAULT_LANGUAGE (German unless the operator says
+                    # otherwise). A language named here would override that
+                    # setting on every request the UI makes.
+                    "language": "auto",
                     "speaker": "Vivian",
                 },
                 "languages": [
+                    {"value": "auto", "label": "Automatic (service default)"},
                     {"value": "English", "label": "English"},
                     {"value": "German", "label": "German"},
                     {"value": "French", "label": "French"},
@@ -1140,6 +1146,13 @@ def _build_provider_registry() -> dict:
                     "language": "de",
                     "enable_segmentation": True,
                 },
+                # This entry follows the checkpoint the service actually runs
+                # (_refresh_canary_registry): CANARY_ASR_MODEL=nvidia/canary-1b-v2
+                # decodes 25 languages, the flash models four. What is written
+                # here is only the fallback for a service that cannot be reached,
+                # and an operator override that replaces the entry drops the flag
+                # and so keeps its own list.
+                "languages_from_service": True,
                 # Canary has no auto-detection — the language picks the decoder
                 "languages": [
                     {"value": "de", "label": "German"},
@@ -1312,10 +1325,18 @@ def _get_provider(provider_id: str, kind: Optional[str] = None) -> dict:
     return provider
 
 
-def _normalize_qwen3_language(language: str) -> str:
-    """Map common language codes to the English labels expected by Qwen3-TTS."""
+def _normalize_qwen3_language(language: Optional[str]) -> str:
+    """The ``lang`` to send to qwen3-tts-service for a normalized request language.
+
+    Codes the model speaks become the labels it expects. ``auto`` and a blank
+    value go through as ``"auto"``: the service resolves that to its own default
+    (QWEN3_DEFAULT_LANGUAGE), which the gateway must not second-guess. Anything
+    else is forwarded untouched, so a language the model cannot speak reaches the
+    service and comes back as its 400 naming the supported ones. Mapping ``auto``
+    and ``nl`` to English here used to hide both: every request that did not name
+    a language, and every Dutch one, was spoken with an English accent, HTTP 200.
+    """
     language_map = {
-        "auto": "English",
         "en": "English",
         "en_us": "English",
         "en_gb": "English",
@@ -1333,11 +1354,12 @@ def _normalize_qwen3_language(language: str) -> str:
         "ko": "Korean",
         "zh": "Chinese",
         "zh_cn": "Chinese",
-        # Qwen3-TTS has no Dutch support; fall back to English rather than erroring
-        "nl": "English",
     }
-    normalized = (language or "English").strip().lower().replace("-", "_")
-    return language_map.get(normalized, language if language and language[:1].isupper() else "English")
+    requested = (language or "").strip()
+    normalized = requested.lower().replace("-", "_")
+    if not normalized or normalized == "auto":
+        return "auto"
+    return language_map.get(normalized, requested)
 
 
 def _normalize_piper_voice_catalog(payload: dict) -> list[dict]:
@@ -1999,7 +2021,8 @@ class ProviderVoiceDesignRequest(BaseModel):
 
     text: str = Field(max_length=MAX_TTS_CHARS)
     voice_description: str = Field(max_length=4000)
-    lang: str = Field(default="English", max_length=64)
+    # Forwarded verbatim; "auto" is resolved by the service (QWEN3_DEFAULT_LANGUAGE).
+    lang: str = Field(default="auto", max_length=64)
 
 
 async def _build_frontend_stt_payload(provider_id: str, form, contract: str) -> tuple[str, dict, list[tuple[str, tuple[str, bytes, str]]]]:
@@ -2110,9 +2133,113 @@ def _voice_id_param():
     return PathParam(..., pattern=_RESOURCE_ID_PATTERN, max_length=128)
 
 
+# --- Canary follows its checkpoint ---------------------------------------------
+#
+# Which languages Canary decodes depends on CANARY_ASR_MODEL: four for the flash
+# models, 25 for canary-1b-v2. That variable is the canary service's, not the
+# gateway's, so the gateway asks the service (GET /status -> supported_languages)
+# instead of carrying a list that is right for one checkpoint and wrong for the
+# other. The browser reads the registry once, from the page it is served, so the
+# refresh runs before that page (and /providers) is rendered.
+
+_CANARY_LANGUAGE_LABELS = {
+    "bg": "Bulgarian", "hr": "Croatian", "cs": "Czech", "da": "Danish", "nl": "Dutch",
+    "en": "English", "et": "Estonian", "fi": "Finnish", "fr": "French", "de": "German",
+    "el": "Greek", "hu": "Hungarian", "it": "Italian", "lv": "Latvian", "lt": "Lithuanian",
+    "mt": "Maltese", "pl": "Polish", "pt": "Portuguese", "ro": "Romanian", "sk": "Slovak",
+    "sl": "Slovenian", "es": "Spanish", "sv": "Swedish", "ru": "Russian", "uk": "Ukrainian",
+    "be": "Belarusian",
+}
+
+# A checkpoint only changes when the service restarts, so a successful answer is
+# kept for a while. While the service cannot be reached the page still has to
+# render promptly, so a failure is remembered for a shorter time instead of
+# costing every page load a connect attempt.
+CANARY_STATUS_TTL_S = 60.0
+CANARY_STATUS_RETRY_S = 10.0
+# Injectable so tests can move time instead of sleeping.
+_canary_status_clock = time.monotonic
+_canary_status_state: dict = {"at": None, "ok": False}
+
+
+def _canary_display_name(model: Optional[str], codes: list[str]) -> str:
+    """``nvidia/canary-1b-v2`` + 25 codes -> ``Canary-1B-v2 (realtime, 25 languages)``."""
+    match = re.match(r"canary-(\d+[mb])(?:-(\w+))?", (model or "").rsplit("/", 1)[-1], re.IGNORECASE)
+    label = "Canary" if not match else f"Canary-{match.group(1).upper()}" + (
+        f"-{match.group(2)}" if match.group(2) else "")
+    listed = "/".join(sorted(codes)) if len(codes) <= 6 else f"{len(codes)} languages"
+    return f"{label} (realtime, {listed})"
+
+
+def _apply_canary_status(entry: dict, status: Any) -> bool:
+    """Make the registry's canary *entry* describe what ``/status`` reports.
+
+    Returns False, leaving the entry as it was, when the body has no usable
+    ``supported_languages``: a half-understood answer must not empty the dropdown.
+    """
+    listed = status.get("supported_languages") if isinstance(status, dict) else None
+    if not isinstance(listed, list):
+        return False
+    codes: list[str] = []
+    for item in listed:
+        code = item.strip().lower() if isinstance(item, str) else ""
+        if code.isalpha() and code not in codes:
+            codes.append(code)
+    if not codes:
+        return False
+
+    settings = entry.setdefault("settings", {})
+    defaults = settings.setdefault("defaults", {})
+    reported = status.get("default_language")
+    default = next(
+        (code for code in (str(reported or "").strip().lower(), defaults.get("language")) if code in codes),
+        codes[0],
+    )
+
+    def label(code: str) -> str:
+        return _CANARY_LANGUAGE_LABELS.get(code, code.upper())
+
+    # The default first (it is what the dropdown opens on), the rest by name.
+    ordered = sorted(codes, key=lambda code: (code != default, label(code)))
+    settings["languages"] = [{"value": code, "label": label(code)} for code in ordered]
+    defaults["language"] = default
+    model = status.get("current_model")
+    entry["display_name"] = _canary_display_name(model if isinstance(model, str) else None, codes)
+    return True
+
+
+async def _refresh_canary_registry() -> None:
+    """Bring the canary registry entry in line with the service, at most once per TTL.
+
+    Never raises and never blocks past one short probe: an unreachable service,
+    an error status or an unreadable body leaves the entry as it was, which is the
+    built-in fallback on a first failure and the last known answer after that.
+    """
+    entry = PROVIDER_REGISTRY["providers"].get("canary")
+    if not entry or not (entry.get("settings") or {}).get("languages_from_service"):
+        return
+
+    state = _canary_status_state
+    now = _canary_status_clock()
+    ttl = CANARY_STATUS_TTL_S if state["ok"] else CANARY_STATUS_RETRY_S
+    if state["at"] is not None and 0 <= now - state["at"] < ttl:
+        return
+    # Claimed before the request, so page loads arriving during it do not each
+    # start their own probe.
+    state["at"], state["ok"] = now, False
+
+    try:
+        response = await _get_http_client().get(f"{entry['internal_url']}/status", timeout=_timeout(2.0))
+        if response.status_code < 400:
+            state["ok"] = _apply_canary_status(entry, response.json())
+    except Exception as exc:
+        logger.debug("canary /status unavailable (%s); keeping the current language list", type(exc).__name__)
+
+
 @app.get("/", response_class=HTMLResponse)
 async def read_root(request: Request):
     """Render the main web UI page with service URLs injected into the template."""
+    await _refresh_canary_registry()
     tts_providers, stt_providers, status_providers = _template_provider_lists()
     # Request-first signature. The legacy TemplateResponse(name, context) form
     # is not merely deprecated in Starlette 1.x, it is gone: the name slot takes
@@ -2160,6 +2287,7 @@ async def health():
 @app.get("/providers")
 async def providers():
     """Return the UI provider registry and provider contracts."""
+    await _refresh_canary_registry()
     return PROVIDER_REGISTRY
 
 
@@ -2273,10 +2401,14 @@ async def provider_voices(provider_id: str):
 
     if contract == "voice-catalog-v1":
         response = await _provider_get(provider_id, "/voices", timeout=15.0)
+        upstream_payload = _upstream_json(response, provider, dict)
         return {
             "provider": provider_id,
             "contract": contract,
-            "voices": _normalize_piper_voice_catalog(_upstream_json(response, provider, dict)),
+            "voices": _normalize_piper_voice_catalog(upstream_payload),
+            # What the service does for language="auto" (PIPER_DEFAULT_LANGUAGE).
+            # The UI names it in the "auto" option instead of guessing one.
+            "default_language": upstream_payload.get("default_language"),
         }
 
     if contract == "speaker-catalog-v1":

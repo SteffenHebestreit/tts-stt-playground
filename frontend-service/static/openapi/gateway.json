@@ -1278,7 +1278,7 @@
             "type": "string",
             "maxLength": 64,
             "title": "Lang",
-            "default": "English"
+            "default": "auto"
           }
         },
         "type": "object",

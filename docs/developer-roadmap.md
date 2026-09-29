@@ -37,12 +37,14 @@ Status as of 2026-09-29. What exists, and what is still hardcoded:
   committed spec is stale, so the training spec can no longer describe routes that do not exist.
 - **TTS and training are still Piper- and Qwen3-specific in the UI**, although adding Chatterbox
   needed only registry data, one adapter mapping and no change to the general TTS request path.
-- **Still hardcoded in the gateway** (found while wiring this release, not fixed there): Canary's
-  language list is fixed to en/de/es/fr even when `CANARY_ASR_MODEL=nvidia/canary-1b-v2` supports
-  25; `/api/providers/piper/voices` does not pass on the service's `default_language`; and the
-  Qwen3-TTS adapter maps `auto` to English, which defeats the service's German default
-  (`QWEN3_DEFAULT_LANGUAGE`). Each is a case of provider metadata living in the adapter instead of
-  in the registry, which is what phase 4 is for.
+- **Provider metadata is mostly static, and the exceptions are narrow.** Canary's language list and
+  display name are refreshed from the service's `/status`, so they follow `CANARY_ASR_MODEL`
+  (fallback en/de/es/fr while it is unreachable); `/api/providers/piper/voices` passes on the
+  service's `default_language`; and the Qwen3-TTS adapter forwards `auto` and languages the model
+  lacks instead of mapping them to English, so `QWEN3_DEFAULT_LANGUAGE` and the service's 400
+  apply. These three were hardcoded in the adapter when this release was wired. Canary is still the
+  only registry entry that is updated from its service; the others are static, which is what
+  phase 4 is for.
 - **Live transcription is not a shared contract.** Only `stt-service` implements
   `/ws/transcribe`; the gateway refuses the other providers with a reason (close code 1008).
 
