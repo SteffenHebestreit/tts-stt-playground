@@ -1,8 +1,14 @@
 # Usage:
-#   docker-compose -f docker-compose.yml -f tests/docker-compose.test.yml up --build test-runner
+#   docker compose --profile all --profile training \
+#     -f docker-compose.yml -f tests/docker-compose.test.yml up --build test-runner
 #
 # This extends the main docker-compose.yml to add a test runner service.
 # All backend services must be healthy before tests start.
+#
+# BOTH profiles are required. Every service in docker-compose.yml sits behind a
+# profile, and `all` deliberately does not include piper-training-service (it is
+# in `training`). Without them compose rejects the project outright with
+# "depends on undefined service" rather than starting anything.
 
 services:
   test-runner:
@@ -10,6 +16,10 @@ services:
       context: .
       dockerfile: tests/Dockerfile
     environment:
+      # Every service below is gated on `service_healthy`, so an unreachable
+      # one is a real failure, not an absent stack. Without this the live tests
+      # would skip themselves and the run would go green having tested nothing.
+      REQUIRE_LIVE_SERVICES: "1"
       PIPER_TTS_URL: http://piper-tts-service:5000
       STT_URL: http://stt-service:8000
       TRAINING_URL: http://piper-training-service:8080

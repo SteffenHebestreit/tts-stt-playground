@@ -1,96 +1,69 @@
-# TrueNAS Service Profile Recommendations
+# TrueNAS: which services to run when
 
-These recommendations assume one NVIDIA RTX 5060 Ti with 16 GB of VRAM dedicated to this repository.
+Sizes (VRAM, downloads) are in one place: the table in
+[`truenas-installation-guide.md`](./truenas-installation-guide.md#6-vram-and-disk-planning).
+Budget against the VRAM `nvidia-smi` reports for your card.
 
-## Always-On Services
+## Always on
 
-Recommended for day-to-day operation:
+- `frontend-service`, `piper-tts-service`
+- `stt-service`, `qwen3-asr-service`, `qwen3-tts-service` (the `0.6B` model)
 
-- `frontend-service`
-- `piper-tts-service`
-- `stt-service`
-- `qwen3-asr-service`
-- `qwen3-tts-service` using `Qwen/Qwen3-TTS-12Hz-0.6B-Base`
+This gives the broadest feature coverage at reasonable GPU pressure. All GPU services share the
+card you select (`GPU_DEVICE_ID`).
 
-This mode gives the broadest feature coverage while keeping GPU pressure reasonable.
-On the single-GPU TrueNAS profile, `qwen3-asr-service` and `qwen3-tts-service`
-both target GPU `0`.
+## Start only when needed
 
-## On-Demand Services
+- `piper-training-service`: competes for VRAM with the Qwen services. Run it in a training window.
+- `parakeet-asr-service`: 25 European languages including German, heavy NeMo image.
+- `canary-asr-service`: the fastest German STT, also NeMo.
+- `chatterbox-tts-service`: streaming German TTS.
+- `whisper-cpp`: CPU-only STT alternative; not needed while `stt-service` runs.
 
-Recommended to start only when needed:
+The web UI only shows a backend when its `ENABLE_*` flag is true on `frontend-service`
+(`ENABLE_PARAKEET_ASR`, `ENABLE_CANARY_ASR`, `ENABLE_CHATTERBOX_TTS`, `ENABLE_WHISPER_CPP`);
+training has no flag.
 
-- `piper-training-service`
-- `whisper-cpp`
-- `parakeet-asr-service`
+## Modes
 
-Reasons:
+| Mode | Services |
+|---|---|
+| **A. Daily use** | `frontend`, `piper-tts`, `stt`, `qwen3-asr`, `qwen3-tts` |
+| **B. Training window** | Mode A without `qwen3-tts-service`, plus `piper-training-service` |
+| **C. Minimal footprint** | `frontend`, `piper-tts`, `stt`; add `whisper-cpp` instead of `stt` for no GPU at all |
 
-- `piper-training-service` competes for VRAM with the Qwen services
-- `whisper-cpp` is useful as an alternative STT backend, but not required if `stt-service` is already running
-- if you do enable `whisper-cpp`, set `ENABLE_WHISPER_CPP=true` in the frontend environment so it appears in the browser UI
-- `parakeet-asr-service` is the fastest STT (25 EU languages incl. German) but pulls a heavy NeMo image and competes for VRAM; enable with `--profile parakeet-asr` and `ENABLE_PARAKEET_ASR=true`
+## Switching modes
 
-## Recommended Modes
-
-### Mode A: Daily Use
-
-- `frontend`
-- `piper-tts`
-- `stt`
-- `qwen3-asr`
-- `qwen3-tts`
-
-### Mode B: Training Window
-
-Stop:
-
-- `qwen3-tts-service`
-
-Then start or keep running:
-
-- `frontend-service`
-- `piper-tts-service`
-- `stt-service`
-- `qwen3-asr-service`
-- `piper-training-service`
-
-### Mode C: Minimal Footprint
-
-- `frontend-service`
-- `piper-tts-service`
-- `stt-service`
-
-Use this when the host should remain responsive and you do not need Qwen-based inference.
-
-## Suggested Commands
-
-### Daily Use
+**Custom App YAML** (`docker-compose.truenas-app.yml`): optional services are dormant behind a
+`profiles:` line. Delete the line to enable one, put it back to disable it; the exact edits are
+in [the guide](./truenas-installation-guide.md#optional-services). For a training window, free
+the VRAM of the Qwen3-TTS model without touching the app (it reloads on its next use; the idle
+container keeps about 0.5 GB for its CUDA context):
 
 ```bash
-docker compose --env-file .env -f docker-compose.yml -f docker-compose.truenas.yml \
-  --profile frontend \
-  --profile piper-tts \
-  --profile stt \
-  --profile qwen3-asr \
-  --profile qwen3-tts up -d
+curl -X POST http://localhost:3000/api/providers/qwen3/unload    # add -H "Authorization: Bearer <API_KEY>" if you set one
 ```
 
-### Training Window
+**Compose from source:**
 
 ```bash
+# Mode A
+docker compose --env-file .env -f docker-compose.yml -f docker-compose.truenas.yml --profile all up -d
+
+# Mode B: free the VRAM first, then start training
 docker compose stop qwen3-tts-service
 docker compose --env-file .env -f docker-compose.yml -f docker-compose.truenas.yml --profile training up -d
+
+# Mode C
+docker compose --env-file .env -f docker-compose.yml -f docker-compose.truenas.yml \
+  --profile frontend --profile piper-tts --profile stt up -d
 ```
 
-## Browser Access Strategy
+## Browser access
 
-If the frontend is accessed from another machine on the network, do not leave the browser-facing URLs at `localhost`. Set these in `.env`:
-
-- `BROWSER_TTS_URL`
-- `BROWSER_STT_URL`
-- `BROWSER_TRAINING_URL`
-- `BROWSER_QWEN3_ASR_URL`
-- `BROWSER_QWEN3_TTS_URL`
-
-Also set `ALLOWED_ORIGINS` to the exact frontend origin.
+The browser talks only to the frontend on port 3000, which proxies everything else internally
+(`/api/*`, `/api/health`, `/ws/stt`). Leave `ALLOWED_ORIGINS` empty: it is only for scripts in
+other web pages. Open the UI by IP address, `*.local` or a plain name; a real domain or a
+Tailscale name must be listed in `TRUSTED_HOSTS` (`403 host_not_allowed` otherwise). The microphone
+from another machine needs HTTPS
+([reverse proxy](./truenas-installation-guide.md#8-reverse-proxy-and-https)).

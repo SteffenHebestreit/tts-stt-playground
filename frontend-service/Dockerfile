@@ -1,11 +1,19 @@
 # Frontend Service Dockerfile
-FROM python:3.10-slim
+# 3.10 reaches end of life in 2026-10; 3.12 is what the test suite also runs on.
+FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
+# Install system dependencies.
+# ffmpeg is required by /v1/audio/speech: mp3 is the OpenAI default
+# response_format, every TTS backend here emits WAV, and doing the container
+# conversion once at the gateway beats teaching each backend to transcode.
+# It also resamples response_format=pcm to OpenAI's 24 kHz for Piper voices
+# (22.05/16 kHz). Without it those two formats return a documented 501 pointing
+# at wav; MAX_CONCURRENT_FFMPEG bounds how many run at once.
+RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements and install Python dependencies
@@ -14,6 +22,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application files
 COPY app.py .
+COPY openai_router.py .
+COPY entrypoint.sh .
 COPY templates/ templates/
 COPY static/ static/
 
@@ -27,5 +37,6 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:3000/health || exit 1
 
-# Start command
-CMD ["python", "app.py"]
+# Start command. Worker count comes from FRONTEND_WORKERS (default 2); see
+# entrypoint.sh for why this is a script rather than an inline CMD.
+CMD ["sh", "/app/entrypoint.sh"]

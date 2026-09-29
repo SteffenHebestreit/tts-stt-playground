@@ -96,6 +96,7 @@
         .get { background-color: #28a745; }
         .post { background-color: #007bff; }
         .delete { background-color: #dc3545; }
+        .ws { background-color: #6f42c1; }
         
         .code-example {
             margin: 15px 0;
@@ -174,6 +175,17 @@
             100% { opacity: 1; }
         }
         
+        .api-link:focus-visible {
+            outline: 3px solid #ffbf47;
+            outline-offset: 2px;
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            .service-card:hover { transform: none; }
+            .loading { animation: none; }
+            * { transition-duration: 0.01ms !important; }
+        }
+
         .footer {
             text-align: center;
             color: white;
@@ -203,7 +215,54 @@
                     <li><span class="method get">GET</span> /api-docs - This documentation</li>
                 </ul>
                 <div class="api-links">
-                    <a href="http://localhost:3000" class="api-link" target="_blank">Open Interface</a>
+                    <a href="http://localhost:3000" class="api-link" target="_blank" rel="noopener">Open Interface</a>
+                </div>
+            </div>
+
+            <!-- Gateway API: what a client outside the compose network talks to -->
+            <div class="service-card">
+                <h2>🔌 Gateway API (single port)</h2>
+                <div class="service-info">
+                    <p><strong>Port:</strong> 3000 (same origin as this page)</p>
+                    <p><strong>Description:</strong> One entry point in front of every backend, including an OpenAI-compatible audio API for clients such as openai-python, Open WebUI or Home Assistant.</p>
+                </div>
+                <ul class="endpoint-list">
+                    <li><span class="method post">POST</span> /v1/audio/transcriptions - multipart: file, model, language, response_format (json, text, srt, verbose_json, vtt)</li>
+                    <li><span class="method post">POST</span> /v1/audio/speech - JSON: model, input (max 4096 chars), voice, response_format (mp3, wav, pcm), speed 0.25-4.0</li>
+                    <li><span class="method get">GET</span> /v1/models - Advertised model ids (whisper-1, tts-1)</li>
+                    <li><span class="method get">GET</span> /api/health - Health of every provider in one call</li>
+                    <li><span class="method ws">WS</span> /ws/stt?provider=whisper - Live microphone transcription (PCM16, 16 kHz, mono)</li>
+                </ul>
+                <div class="code-example">
+                    <h4>Transcribe with any OpenAI client:</h4>
+                    <pre>curl -X POST "http://localhost:3000/v1/audio/transcriptions" \
+  -F "file=@speech.wav" \
+  -F "model=whisper-1" \
+  -F "language=de"</pre>
+                </div>
+                <div class="code-example">
+                    <h4>When the server runs with API_KEY:</h4>
+                    <pre># /v1/* and every state-changing /api/* call
+curl -H "Authorization: Bearer $API_KEY" ...
+
+# /ws/stt from a browser: the key rides as a subprotocol
+new WebSocket(url, ["tts-stt.v1", "bearer." + base64url(key)])
+# scripts can send the Authorization header on the upgrade request instead</pre>
+                </div>
+                <div class="api-links">
+                    <a href="/static/openapi/gateway.json" class="api-link" target="_blank">OpenAPI Spec</a>
+                </div>
+                <div class="code-example">
+                    <h4>Live transcription protocol:</h4>
+                    <pre># client -> server
+{"language": "de"}            # optional first frame, "auto" = detect
+&lt;binary PCM16 frames&gt;
+{"event": "stop"}             # ask for the final transcript
+
+# server -> client
+{"type": "partial", "confirmed": "...", "pending": "..."}
+{"type": "final", "text": "...", "language": "de", "duration": 12.3}
+{"type": "warning" | "error", "message": "..."}</pre>
                 </div>
             </div>
             
@@ -213,7 +272,7 @@
                 <div class="service-info">
                     <p><strong>Port:</strong> 5000</p>
                     <p><strong>Description:</strong> Neural TTS with multi-language support & voice selection</p>
-                    <p><strong>Status:</strong> <span id="tts-status" class="health-status healthy">Healthy</span></p>
+                    <p><strong>Status:</strong> <span id="tts-status" data-provider="piper" class="health-status loading" aria-live="polite">Checking...</span></p>
                     <p><strong>Languages:</strong> EN, DE, FR, ES, IT, NL | <strong>Models:</strong> ONNX | <strong>Quality:</strong> High</p>
                 </div>
                 <ul class="endpoint-list">
@@ -246,7 +305,7 @@
                 <div class="service-info">
                     <p><strong>Port:</strong> 8080</p>
                     <p><strong>Description:</strong> VITS neural network voice training with GPU acceleration</p>
-                    <p><strong>Status:</strong> <span id="training-status" class="health-status healthy">Healthy</span></p>
+                    <p><strong>Status:</strong> <span id="training-status" data-provider="piper-training" class="health-status loading" aria-live="polite">Checking...</span></p>
                     <p><strong>Export:</strong> ONNX for PiperTTS deployment</p>
                 </div>
                 <ul class="endpoint-list">
@@ -281,8 +340,8 @@
                 <div class="service-info">
                     <p><strong>Port:</strong> 5001</p>
                     <p><strong>Description:</strong> Speech-to-text with hardware acceleration & audio segmentation</p>
-                    <p><strong>Status:</strong> <span id="stt-status" class="health-status healthy">Healthy</span></p>
-                    <p><strong>Device:</strong> CUDA | <strong>Model:</strong> Medium | <strong>Precision:</strong> Float16</p>
+                    <p><strong>Status:</strong> <span id="stt-status" data-provider="whisper" class="health-status loading" aria-live="polite">Checking...</span></p>
+                    <p><strong>Device / model:</strong> <span data-detail-for="whisper">reported by the service once it answers</span></p>
                 </div>
                 <ul class="endpoint-list">
                     <li><span class="method post">POST</span> /transcribe - Convert speech to text</li>
@@ -302,8 +361,8 @@
                 <div class="service-info">
                     <p><strong>Port:</strong> 5004</p>
                     <p><strong>Description:</strong> Voice cloning and multilingual TTS using Qwen3-TTS</p>
-                    <p><strong>Status:</strong> <span id="xtts-status" class="health-status healthy">Healthy</span></p>
-                    <p><strong>Model:</strong> Qwen3-TTS-1.7B | <strong>Languages:</strong> 13 supported</p>
+                    <p><strong>Status:</strong> <span id="xtts-status" data-provider="qwen3" class="health-status loading" aria-live="polite">Checking...</span></p>
+                    <p><strong>Device / model:</strong> <span data-detail-for="qwen3">reported by the service once it answers</span></p>
                 </div>
                 <ul class="endpoint-list">
                     <li><span class="method post">POST</span> /tts - Generate speech with built-in speaker</li>
@@ -334,8 +393,8 @@
                 <div class="service-info">
                     <p><strong>Port:</strong> 5002</p>
                     <p><strong>Description:</strong> Fast multilingual speech recognition using Qwen3-ASR</p>
-                    <p><strong>Status:</strong> <span id="asr-status" class="health-status healthy">Healthy</span></p>
-                    <p><strong>Model:</strong> Qwen3-ASR-1.7B</p>
+                    <p><strong>Status:</strong> <span id="asr-status" data-provider="qwen3-asr" class="health-status loading" aria-live="polite">Checking...</span></p>
+                    <p><strong>Device / model:</strong> <span data-detail-for="qwen3-asr">reported by the service once it answers</span></p>
                 </div>
                 <ul class="endpoint-list">
                     <li><span class="method post">POST</span> /transcribe - Transcribe audio to text</li>
@@ -441,47 +500,48 @@
         // Update timestamp
         document.getElementById('timestamp').textContent = new Date().toLocaleString();
         
-        // Check service health status periodically
+        // The doc links below say localhost; point them at whatever host served
+        // this page instead, or they open the *reader's* machine on a NAS/LAN
+        // deployment.
+        document.querySelectorAll('a[href^="http://localhost:"]').forEach((link) => {
+            const url = new URL(link.getAttribute('href'));
+            url.hostname = window.location.hostname;
+            link.href = url.toString();
+        });
+
+        // One same-origin call to the gateway, which probes the backends over the
+        // internal network. Calling each backend port from the browser needed
+        // those ports published and failed as a CORS error when they were not.
         async function checkHealth() {
-            const services = [
-                {name: 'tts', url: 'http://localhost:5000/health', element: 'tts-status'},
-                {name: 'training', url: 'http://localhost:8080/health', element: 'training-status'},
-                {name: 'stt', url: 'http://localhost:5001/health', element: 'stt-status'},
-                {name: 'qwen3-tts', url: 'http://localhost:5004/health', element: 'xtts-status'},
-                {name: 'qwen3-asr', url: 'http://localhost:5002/health', element: 'asr-status'}
-            ];
-            
-            for (const service of services) {
-                const element = document.getElementById(service.element);
-                if (element) {
-                    // Set loading state
-                    element.classList.remove('healthy', 'error');
-                    element.classList.add('loading');
-                    element.textContent = 'Checking...';
-                    
-                    try {
-                        const response = await fetch(service.url, { 
-                            signal: AbortSignal.timeout(5000),
-                            mode: 'cors'
-                        });
-                        
-                        if (response.ok) {
-                            element.classList.remove('loading', 'error');
-                            element.classList.add('healthy');
-                            element.textContent = 'Healthy';
-                        } else {
-                            throw new Error('Service unhealthy');
-                        }
-                    } catch (error) {
-                        element.classList.remove('loading', 'healthy');
-                        element.classList.add('error');
-                        element.textContent = 'Offline';
-                        console.log(`${service.name} service: offline - ${error.message}`);
-                    }
-                }
+            const badges = Array.from(document.querySelectorAll('[data-provider]'));
+            badges.forEach((element) => {
+                element.classList.remove('healthy', 'error');
+                element.classList.add('loading');
+                element.textContent = 'Checking...';
+            });
+
+            let providers = {};
+            try {
+                const response = await fetch('/api/health', { signal: AbortSignal.timeout(15000) });
+                if (response.ok) providers = (await response.json()).providers || {};
+            } catch (error) {
+                console.log(`health check failed: ${error.message}`);
             }
+
+            badges.forEach((element) => {
+                const entry = providers[element.dataset.provider];
+                const up = Boolean(entry && entry.healthy);
+                element.classList.remove('loading', 'healthy', 'error');
+                element.classList.add(up ? 'healthy' : 'error');
+                element.textContent = up ? (entry.model_resident === false ? 'Idle' : 'Healthy') : 'Offline';
+
+                const detail = document.querySelector(`[data-detail-for="${CSS.escape(element.dataset.provider)}"]`);
+                if (detail && entry) {
+                    detail.textContent = [entry.model_size, entry.device].filter(Boolean).join(' · ') || 'not reported';
+                }
+            });
         }
-        
+
         // Check health on load
         checkHealth();
         

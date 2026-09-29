@@ -10,9 +10,12 @@ import io
 import librosa
 import numpy as np
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Optional
+
+from audio_sources import AudioSourceError, max_upload_bytes, resolve_audio_source
+from phonemization import normalize_language, phonemize_texts
+from validation import split_train_val
 import soundfile as sf
-from phonemizer import phonemize
 import asyncio
 import aiofiles
 import aiohttp
@@ -20,6 +23,10 @@ import subprocess
 import logging
 
 logger = logging.getLogger(__name__)
+
+# ffprobe reads a header; it should answer immediately. A bound stops a wedged
+# process from hanging the caller indefinitely.
+FFPROBE_TIMEOUT_S = 30
 
 class DataProcessor:
     """Prepare audio/text examples and mel features for VITS training."""
@@ -31,9 +38,29 @@ class DataProcessor:
         self.n_fft = 1024
         self.n_mels = 80
         
-    async def prepare_dataset(self, segments: List, model_name: str, language: str = "en") -> Path:
-        """Build a training dataset from STT segments (audio + mel + phonemes)."""
-        
+    async def prepare_dataset(self, segments: List, model_name: str, language: str = "de",
+                              stats: Optional[dict] = None) -> Path:
+        """Build a training dataset from STT segments (audio + mel + phonemes).
+
+        Every audio_path is vetted before anything is written (see
+        ``audio_sources``): ``AudioSourceError`` for the first that is not
+        permitted, ``PhonemizationError`` if phonemes cannot be produced.
+        The decode / trim / mel work of each segment runs in a worker thread, so
+        the event loop (health checks, status polls) stays responsive for the
+        minutes a large dataset takes. *stats*, if given, receives the counts.
+        """
+        normalize_language(language)  # ValueError before any file is touched
+
+        sources = []
+        for idx, segment in enumerate(segments):
+            try:
+                sources.append(resolve_audio_source(segment.audio_path))
+            except AudioSourceError as exc:
+                raise AudioSourceError(f"segments[{idx}]: {exc}") from exc
+
+        # Fails fast if phonemizer/espeak is missing, before minutes of audio work.
+        await asyncio.to_thread(phonemize_texts, [], language)
+
         dataset_dir = Path(f"data/{model_name}")
         dataset_dir.mkdir(parents=True, exist_ok=True)
         
@@ -42,82 +69,51 @@ class DataProcessor:
         (dataset_dir / "mel").mkdir(exist_ok=True)
         
         metadata = []
+        skipped = 0
         
         logger.info(f"Processing {len(segments)} segments for model {model_name}")
         
-        for idx, segment in enumerate(segments):
+        for idx, (segment, (kind, source)) in enumerate(zip(segments, sources)):
             try:
-                # Handle both local paths and URLs
-                audio_path = segment.audio_path
-                if audio_path.startswith('http'):
-                    # Download audio file
-                    audio_data = await self._download_audio(audio_path)
-                    audio, sr = librosa.load(io.BytesIO(audio_data), sr=self.sample_rate)
+                if kind == "url":
+                    audio_source = io.BytesIO(await self._download_audio(source))
                 else:
-                    # Load local file
-                    audio, sr = librosa.load(audio_path, sr=self.sample_rate)
-                
-                # Extract segment if start_time and end_time are provided
-                if hasattr(segment, 'start_time') and hasattr(segment, 'end_time'):
-                    start_sample = int(segment.start_time * sr)
-                    end_sample = int(segment.end_time * sr)
-                    audio = audio[start_sample:end_sample]
-                
-                # Trim silence
-                audio, _ = librosa.effects.trim(audio, top_db=20)
-                
-                # Skip if too short
-                if len(audio) < sr * 0.5:  # Less than 0.5 seconds
-                    logger.warning(f"Skipping segment {idx}: too short ({len(audio)/sr:.2f}s)")
+                    audio_source = str(source)
+
+                entry = await asyncio.to_thread(
+                    self._process_segment, idx, audio_source, segment, dataset_dir)
+                if entry is None:
+                    skipped += 1
                     continue
-                
-                # Normalize
-                audio = audio / (np.max(np.abs(audio)) + 1e-6)
-                
-                # Save processed audio
-                output_audio_path = dataset_dir / "audio" / f"{idx:05d}.wav"
-                sf.write(output_audio_path, audio, self.sample_rate)
-                
-                # Compute mel spectrogram
-                mel_spec = self._compute_mel_spectrogram(audio)
-                mel_path = dataset_dir / "mel" / f"{idx:05d}.npy"
-                np.save(mel_path, mel_spec)
-                
-                # Get phonemes - map language code to phonemizer format
-                lang_map = {
-                    'de': 'de', 'en': 'en-us', 'fr': 'fr-fr', 'es': 'es',
-                    'it': 'it', 'nl': 'nl', 'pt': 'pt', 'ru': 'ru',
-                }
-                phonemizer_lang = lang_map.get(language, 'en-us')
-                try:
-                    phonemes = phonemize(
-                        segment.text,
-                        language=phonemizer_lang,
-                        backend='espeak',
-                        strip=True
-                    )
-                except Exception as e:
-                    logger.warning(f"Phonemization error for segment {idx}: {e}")
-                    phonemes = segment.text  # Fallback to text
-                
-                # Add to metadata
-                metadata.append({
-                    'audio_path': str(output_audio_path.relative_to(dataset_dir)),
-                    'mel_path': str(mel_path.relative_to(dataset_dir)),
-                    'text': segment.text,
-                    'phonemes': phonemes,
-                    'duration': len(audio) / self.sample_rate,
-                    'segment_id': idx
-                })
-                
+                metadata.append(entry)
                 logger.info(f"Processed segment {idx+1}/{len(segments)}")
                 
             except Exception as e:
                 logger.error(f"Error processing segment {idx}: {e}")
+                skipped += 1
                 continue
         
         if not metadata:
             raise ValueError("No valid segments were processed. Please check your audio files and transcriptions.")
+
+        # Phonemes for the segments that made it this far. A segment whose text
+        # cannot be phonemised is dropped, never given its raw text as phonemes.
+        all_phonemes = await asyncio.to_thread(
+            phonemize_texts, [entry['text'] for entry in metadata], language)
+        prepared = []
+        for entry, phonemes in zip(metadata, all_phonemes):
+            if phonemes is None:
+                continue
+            entry['phonemes'] = phonemes
+            prepared.append(entry)
+        metadata = prepared
+        
+        if stats is not None:
+            stats.update({
+                'received': len(segments),
+                'prepared': len(metadata),
+                'skipped': len(segments) - len(metadata),
+            })
         
         # Save metadata
         metadata_path = dataset_dir / "metadata.json"
@@ -129,13 +125,77 @@ class DataProcessor:
         
         logger.info(f"Dataset prepared with {len(metadata)} samples at {dataset_dir}")
         return dataset_dir
+
+    def _process_segment(self, idx: int, audio_source, segment, dataset_dir: Path) -> Optional[dict]:
+        """Decode, trim, normalise and write one segment; ``None`` if it is unusable.
+
+        Blocking (librosa, soundfile, numpy): call it through ``asyncio.to_thread``.
+        Only the requested slice is decoded. Loading the whole file for every
+        segment made a long recording cost one full decode per segment.
+        """
+        text = (segment.text or "").strip()
+        if not text:
+            logger.warning(f"Skipping segment {idx}: empty text")
+            return None
+
+        start = float(getattr(segment, 'start_time', 0.0) or 0.0)
+        end = float(getattr(segment, 'end_time', 0.0) or 0.0)
+        if start < 0 or end <= start:
+            logger.warning(f"Skipping segment {idx}: invalid time range {start}-{end}")
+            return None
+
+        audio, sr = librosa.load(audio_source, sr=self.sample_rate, offset=start, duration=end - start)
+
+        # Trim silence
+        audio, _ = librosa.effects.trim(audio, top_db=20)
+        
+        # Skip if too short
+        if len(audio) < sr * 0.5:  # Less than 0.5 seconds
+            logger.warning(f"Skipping segment {idx}: too short ({len(audio)/sr:.2f}s)")
+            return None
+        
+        # Normalize
+        audio = audio / (np.max(np.abs(audio)) + 1e-6)
+        
+        # Save processed audio
+        output_audio_path = dataset_dir / "audio" / f"{idx:05d}.wav"
+        sf.write(output_audio_path, audio, self.sample_rate)
+        
+        # Compute mel spectrogram
+        mel_spec = self._compute_mel_spectrogram(audio)
+        mel_path = dataset_dir / "mel" / f"{idx:05d}.npy"
+        np.save(mel_path, mel_spec)
+        
+        return {
+            'audio_path': str(output_audio_path.relative_to(dataset_dir)),
+            'mel_path': str(mel_path.relative_to(dataset_dir)),
+            'text': text,
+            'duration': len(audio) / self.sample_rate,
+            'segment_id': idx
+        }
     
     async def _download_audio(self, url: str) -> bytes:
-        """Download an audio file from *url* and return the raw bytes."""
+        """Download an audio file from *url* (already vetted) and return the raw bytes.
+
+        Bounded in size and time, and redirects are refused: a redirect would let
+        an allowed host send the request to one that is not.
+        """
+        limit = max_upload_bytes()
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=60),
+                                   allow_redirects=False) as resp:
+                if 300 <= resp.status < 400:
+                    raise AudioSourceError(f"{url} redirected ({resp.status}); redirects are not followed")
                 resp.raise_for_status()
-                return await resp.read()
+                if resp.content_length is not None and resp.content_length > limit:
+                    raise AudioSourceError(f"{url} is {resp.content_length} bytes; the limit is {limit}")
+                chunks, received = [], 0
+                async for chunk in resp.content.iter_chunked(1024 * 1024):
+                    received += len(chunk)
+                    if received > limit:
+                        raise AudioSourceError(f"{url} exceeds the {limit} byte limit")
+                    chunks.append(chunk)
+                return b"".join(chunks)
     
     def _compute_mel_spectrogram(self, audio):
         """Compute a normalised log-mel spectrogram from a waveform array."""
@@ -165,16 +225,15 @@ class DataProcessor:
         return mel_spec
     
     async def _create_splits(self, metadata: List[Dict], dataset_dir: Path):
-        """Write train.json / val.json with a 90/10 random split."""
-        n_samples = len(metadata)
-        n_val = max(1, int(n_samples * 0.1))  # 10% validation
-        
-        indices = np.random.permutation(n_samples)
-        val_indices = indices[:n_val]
-        train_indices = indices[n_val:]
-        
-        train_metadata = [metadata[i] for i in train_indices]
-        val_metadata = [metadata[i] for i in val_indices]
+        """Write train.json / val.json with a reproducible 90/10 split.
+
+        Shares ``split_train_val`` with the segmenter rather than repeating the
+        unseeded ``np.random.permutation`` that used to be here: an unseeded
+        split means two runs over the same data validate against different sets
+        and their loss curves cannot be compared. It also refuses a dataset too
+        small to divide, instead of handing back an empty training set.
+        """
+        train_metadata, val_metadata = split_train_val(metadata)
         
         async with aiofiles.open(dataset_dir / "train.json", 'w') as f:
             await f.write(json.dumps(train_metadata, indent=2))
@@ -213,7 +272,8 @@ class DataProcessor:
                 "-show_format", "-show_streams", audio_path
             ]
             
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, check=True, timeout=FFPROBE_TIMEOUT_S)
             info = json.loads(result.stdout)
             
             # Extract audio stream information
@@ -268,8 +328,10 @@ class DataProcessor:
             if sr != target_sample_rate:
                 audio = librosa.resample(audio, orig_sr=sr, target_sr=target_sample_rate)
             
-            # Normalize audio
-            audio = audio / np.max(np.abs(audio))
+            # Normalize audio. The +1e-6 matters: a fully silent file makes
+            # np.max(np.abs(audio)) zero, and the division then writes a WAV of
+            # NaN. prepare_dataset() guards this the same way.
+            audio = audio / (np.max(np.abs(audio)) + 1e-6)
             
             # Save preprocessed audio
             filename = Path(audio_path).stem + ".wav"

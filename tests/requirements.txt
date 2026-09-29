@@ -1,7 +1,39 @@
 pytest>=7.0
 pytest-asyncio>=0.21
 pytest-cov>=4.1
-httpx>=0.24
-fastapi>=0.104
-jinja2>=3.1
-python-multipart>=0.0.6
+
+# Pins here must MATCH frontend-service/requirements.txt, not merely satisfy
+# it. The unit tests import frontend-service/app.py directly, so a floating
+# `fastapi>=0.104` meant CI exercised whatever FastAPI happened to be current
+# while the container shipped the pinned one — two different frameworks under
+# the same test name. That drift is not theoretical: it resolved to Starlette
+# 1.x, which removed the legacy TemplateResponse(name, context) signature, so
+# CI failed on a code path that worked perfectly in the image.
+#
+# Keep these in lockstep with frontend-service/requirements.txt.
+fastapi==0.141.1
+jinja2==3.1.6
+python-multipart==0.0.32
+httpx==0.28.1
+# piper-tts-service/app.py imports uvicorn at module level. Without it those tests
+# only passed when an earlier test module had left a stand-in in sys.modules, so
+# running one of them alone (or in another order) failed on import.
+uvicorn==0.54.0
+
+# Needed by the offline stt-service WebSocket tests, which stub torch and
+# faster-whisper but exercise the real numpy buffer handling.
+numpy>=1.24
+
+# The config-drift suites (test_env_wiring, test_docker_image_contents) parse
+# compose files and `importorskip` this. Without it they were reported as
+# skips in CI and silently guarded nothing.
+pyyaml>=6.0
+
+# stt-service WebSocket tests and the frontend /ws/stt relay client
+# (`additional_headers=` needs >=14).
+websockets>=14.0
+
+# Optional: benchmarks/asr_metrics.py uses it for long recordings, and
+# test_benchmarks_metrics.py compares it with the pure-Python edit distance. A
+# small pure wheel; without it that one comparison is skipped.
+rapidfuzz>=3.0

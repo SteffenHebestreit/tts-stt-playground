@@ -1,45 +1,73 @@
 # TTS-STT Platform
 
-A self-hosted, Docker-based platform for text-to-speech synthesis, speech-to-text transcription, custom voice training, and voice cloning.
+A self-hosted, Docker-based platform for text-to-speech synthesis, speech-to-text transcription, custom voice training, and voice cloning. German first: every default that has a language defaults to German.
 
 ## Services
 
 | Service | Port | Description |
 |---------|------|-------------|
-| **Frontend** | 3000 | Web UI and API documentation hub |
-| **PiperTTS** | 5000 | Text-to-speech with 40+ voices and custom model support |
+| **Frontend** | 3000 | Web UI, OpenAI-compatible API (`/v1`) and API documentation hub |
+| **PiperTTS** | 5000 | Text-to-speech with 40+ voices and custom model support (CPU) |
 | **STT (faster-whisper)** | 5001 | Speech-to-text — Python, CUDA/ROCm/CPU |
 | **whisper-cpp** | 5003 | Optional speech-to-text — C++, Vulkan/CPU, OpenAI-compatible API |
-| **Piper Training** | 8080 | VITS neural network voice training pipeline |
+| **Piper Training** | 8080 | VITS neural network voice training pipeline (opt-in profile `training`) |
 | **Qwen3-TTS** | 5004 | Voice cloning and multilingual TTS |
 | **Qwen3-ASR** | 5002 | Fast multilingual speech recognition |
+| **Parakeet-ASR** | 5005 | Optional realtime STT — 25 EU languages (NeMo) |
+| **Canary-ASR** | 5006 | Optional fastest STT — en/de/es/fr with punctuation (NeMo) |
+| **Chatterbox-TTS** | 5007 | Optional multilingual TTS + voice cloning (MIT, watermarked) |
+
+Only the **Frontend** is meant to be reached over the network: it proxies every backend call, the live
+microphone WebSocket included. The backend ports are published on `127.0.0.1` only (for `curl`, benchmarks
+and scripts on the host itself), because the backends have no authentication. Set `BACKEND_BIND_ADDR=0.0.0.0`
+to reach them from other machines, or `FRONTEND_BIND_ADDR=127.0.0.1` to keep the UI local behind a reverse proxy.
 
 ## Quick Start
 
+The default stack expects an NVIDIA GPU (the GPU services reserve one device); without one, use the
+CPU-capable services shown below.
+
 ```bash
-# CPU-only — works everywhere, no GPU setup required
-docker compose --profile stt up -d          # faster-whisper STT
+cp .env.example .env                        # every setting is documented there; the defaults work
+docker compose --profile all up -d          # default full stack: UI, Piper, Whisper, Qwen3-ASR, Qwen3-TTS (NVIDIA GPU)
+
+# No NVIDIA GPU: CPU-capable services only
+docker compose --profile piper-tts --profile frontend up -d            # TTS and the UI
 ENABLE_WHISPER_CPP=true docker compose --profile whisper-cpp --profile frontend up -d  # whisper.cpp surfaced in UI
-docker compose --profile piper-tts up -d    # TTS
-docker compose --profile all up -d          # default full stack (without optional whisper-cpp)
-ENABLE_WHISPER_CPP=true docker compose --profile all --profile whisper-cpp up -d  # full stack plus whisper.cpp
+
+# Optional extras (heavy images, off by default; the UI also needs the matching ENABLE_* flag)
+ENABLE_WHISPER_CPP=true docker compose --profile all --profile whisper-cpp up -d       # plus whisper.cpp
+ENABLE_CHATTERBOX_TTS=true docker compose --profile all --profile chatterbox-tts up -d # plus Chatterbox
 
 # Check status
 docker compose ps
 docker compose logs -f
+curl -fsS http://127.0.0.1:5001/ready       # is the Whisper model loaded? 503 with a reason until it is
 
 # Stop everything
 docker compose down
 ```
 
-Open **http://localhost:3000** for the web interface.
+Open **http://localhost:3000** for the web interface. The first start downloads the models in the
+background (several GB), so containers report healthy long before they can transcribe or speak; the UI
+shows each backend's state, and `GET /ready` on a backend says whether it can serve a request yet.
 
-`whisper-cpp` is opt-in. Starting the `whisper-cpp` profile alone is not enough for it to appear in the frontend; set `ENABLE_WHISPER_CPP=true` for the frontend service as well.
+`whisper-cpp`, Parakeet, Canary and Chatterbox are opt-in. Starting a profile alone is not enough for the
+service to appear in the frontend; set the matching `ENABLE_WHISPER_CPP`, `ENABLE_PARAKEET_ASR`,
+`ENABLE_CANARY_ASR` or `ENABLE_CHATTERBOX_TTS=true` for the frontend service as well.
+
+Images are pulled from GHCR as `ghcr.io/steffenhebestreit/tts-stt-*:${IMAGE_TAG}` (`latest` by default, which
+follows the newest release or master build). Pin `IMAGE_TAG=X.Y.Z` where a deployment has to be reproducible,
+and `PULL_POLICY=always` together with `latest` to fetch a moved tag on `up`.
 
 ## Developer Docs
 
-- [docs/developer-roadmap.md](docs/developer-roadmap.md) - planned architecture and migration steps for provider-generalization
+- [docs/api.md](docs/api.md) - the API: `/v1` (OpenAI-compatible), access control, limits, readiness, errors
 - [docs/provider-contracts.md](docs/provider-contracts.md) - provider registry schema and API contracts used by the frontend
+- [docs/developer-roadmap.md](docs/developer-roadmap.md) - planned architecture and migration steps for provider-generalization, with the current status
+- [docs/device-deployment-matrix.md](docs/device-deployment-matrix.md) - which services and models to run on which device, with ready-made presets in [`deploy/profiles/`](deploy/profiles/)
+- [docs/model-and-optimisation-research-2026-08.md](docs/model-and-optimisation-research-2026-08.md) - model and optimisation decisions, with an implementation-status addendum
+- [benchmarks/README.md](benchmarks/README.md) - measure German WER and latency of a backend on your own audio, and compare Whisper, Parakeet, Qwen3-ASR and a German fine-tune
 
 ---
 
@@ -56,7 +84,13 @@ Different services support different GPU backends. Choose based on your hardware
 | Piper Training | ✓ (slow) | ✓ | ✓ | — |
 | Qwen3-ASR | ✓ (slow) | ✓ | ✓ | — |
 | Qwen3-TTS | ✓ (slow) | ✓ | ✓ | — |
+| Parakeet-ASR | ✓ (slow) | ✓ | ✓ (NeMo 2.x image) | — |
+| Canary-ASR | ✓ (slow) | ✓ | — | — |
+| Chatterbox-TTS | ✓ (slow) | ✓ | — | — |
 | PiperTTS | CPU only | — | — | — |
+
+The CUDA images are built for Blackwell (RTX 50 series, sm_120) as well as older cards: CUDA 12.8 and
+PyTorch cu128 wheels, so the NVIDIA driver must report CUDA 12.8 or newer (R570+).
 
 ### Which GPU works in which environment?
 
@@ -121,7 +155,7 @@ docker compose -f docker-compose.yml -f docker-compose.rocm.yml --profile qwen3-
 
 The ROCm overlay (`docker-compose.rocm.yml`) replaces CUDA-based images with ROCm variants, removes NVIDIA device reservations, and mounts `/dev/kfd` + `/dev/dri`.
 
-**Strix Halo (gfx1201 / RDNA 4):** gfx1201 is not in ROCm 6.2's official support list. The overlay defaults `HSA_OVERRIDE_GFX_VERSION=11.0.0` to make ROCm treat it as gfx1100 (RDNA 3), which runs correctly on RDNA 4. `PYTORCH_HIP_ALLOC_CONF=expandable_segments:True` is also set automatically for the unified LPDDR5x memory pool.
+**Strix Halo (gfx1151 / RDNA 3.5 / Radeon 8060S):** gfx1151 is supported by current ROCm. The overlay defaults `HSA_OVERRIDE_GFX_VERSION=11.0.0` only because the `Dockerfile.rocm` images pin the rocm6.2 PyTorch wheel index, whose wheels carry no gfx1151 kernels; rocm7.0+ wheels do, so clear the override when those base images are bumped. `PYTORCH_ALLOC_CONF=expandable_segments:True` is set automatically for the unified LPDDR5X pool. See `docker-compose.rocm.yml` for the full gfx target table.
 
 > **WSL2 limitation:** `/dev/kfd` is not exposed by Docker Desktop's VM, nor by the WSL2 GPU-PV driver. ROCm requires bare-metal Linux or a Linux VM with direct PCIe GPU passthrough.
 
@@ -147,7 +181,7 @@ docker compose -f docker-compose.yml -f docker-compose.vulkan.yml --profile whis
 
 The Vulkan overlay (`docker-compose.vulkan.yml`) replaces the CPU `Dockerfile` with `Dockerfile.vulkan` (compiled with `-DGGML_VULKAN=1`), mounts `/dev/dri`, and sets `GGML_VULKAN_DEVICE=0`.
 
-**Strix Halo (gfx1201 / Radeon 890M):** No GFX version override needed — the Radeon 890M is natively Vulkan 1.3 capable. Set `GGML_VULKAN_DEVICE=1` if you have a discrete GPU and want to use device index 1 instead.
+**Strix Halo (gfx1151 / Radeon 8060S):** No GFX version override needed — Vulkan requires no per-target kernel compilation, which is what makes it the portable AMD path. Set `GGML_VULKAN_DEVICE=1` if you have a discrete GPU and want device index 1 instead.
 
 #### Vulkan on WSL2 with Docker Engine (no Docker Desktop)
 
@@ -227,28 +261,64 @@ Use smaller models (`WHISPER_MODEL_SIZE=small`, `WHISPER_MODEL=small`) to improv
 
 ### Speech Recognition (Qwen3-ASR)
 - Fast multilingual speech recognition via Qwen3-ASR-1.7B
+- Long recordings are cut into pieces at the quietest point near `QWEN3_ASR_CHUNK_S` seconds (30 by default), so nothing is silently truncated
 - Requires GPU for practical use; CPU inference is very slow (~60s per minute of audio vs ~2s on GPU)
+
+### Speech Recognition — Parakeet and Canary (NeMo, optional)
+- Parakeet (`parakeet-tdt-0.6b-v3`, 25 European languages incl. German) and Canary (`canary-180m-flash`, en/de/es/fr with punctuation)
+- Images default to NeMo 3.0.x on torch 2.11 (cu128), with a one-argument rollback to NeMo 2.x (`NEMO_TOOLKIT_SPEC`, or the prebuilt `-nemo2` images via `NEMO_IMAGE_SUFFIX=-nemo2`)
+- A local `.nemo` checkpoint (for example a German fine-tune) can be used through `PARAKEET_ASR_MODEL` / `CANARY_ASR_MODEL`
+- Opt-in: profile `parakeet-asr` / `canary-asr` plus `ENABLE_PARAKEET_ASR` / `ENABLE_CANARY_ASR` on the frontend
+
+### Text-to-Speech — Chatterbox (optional)
+- Multilingual TTS and voice cloning (MIT licence; every file carries a PerTh watermark)
+- Long texts are generated in chunks (up to `CHATTERBOX_MAX_TEXT_CHARS`, 5000, then HTTP 413) and can be streamed sentence by sentence (`/tts-stream`)
+- The image installs the multilingual v3 checkpoint's code from a pinned GitHub commit; the PyPI release has no v3
+- Opt-in: profile `chatterbox-tts` plus `ENABLE_CHATTERBOX_TTS` on the frontend
+
+### Model memory
+Every GPU model is released after `MODEL_TTL` seconds without use (300 by default; per-service `STT_MODEL_TTL`,
+`ASR_MODEL_TTL`, `TTS_MODEL_TTL` override it, `-1` keeps a model loaded) and reloads on the next request, so several
+multi-GB models can share one card. `POST /api/providers/<id>/unload` frees one immediately.
 
 ---
 
 ## API Endpoints
 
+The endpoints below are the backends' own (ports as in the service table, published on `127.0.0.1` by
+default). Use the gateway on port 3000 for anything beyond a local check: its OpenAI-compatible `/v1`
+surface and the `/api/*` routes are described in [docs/api.md](docs/api.md), and each spec is
+served at `/static/openapi/{gateway,stt,pipertts,training}.json`.
+
+Every model service has `GET /health` (liveness: 200 while a model loads or is idle-unloaded) and
+`GET /ready` (readiness: 503 while the first load runs or after it failed, with the reason; it never loads a model).
+Uploads and recordings beyond a service's limit answer 413.
+
 ### PiperTTS (port 5000)
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/tts` | Generate speech (JSON: `text`, `language`, `quality`, `gender`, `speed`) |
+| POST | `/tts` | Generate speech (JSON: `text`, `language`, `quality`, `gender`, `speed`); no language means German |
 | POST | `/synthesize` | Generate speech with a specific voice |
 | POST | `/upload_model` | Upload a custom ONNX model |
-| GET | `/voices` | List available voices |
+| GET | `/voices` | List the installed voices |
+| POST | `/refresh_voices` | Rescan the models directory (a voice file copied in is picked up without a restart) |
+| GET | `/ready` | 503 while no voice is installed |
 | GET | `/health` | Health check |
+
+Adding a Piper voice: copy its `.onnx` and `.onnx.json` files into `<models dir>/default`. A fresh install is
+seeded with the voices baked into the image by the one-shot `piper-voices-seed` service; `PIPER_VOICES` (a
+build argument) chooses which voices a custom image ships.
 
 ### STT — faster-whisper (port 5001)
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | POST | `/transcribe` | Transcribe audio (`audio`, `task`, `language`, `beam_size`, `vad_filter`, `vad_threshold`, `no_speech_threshold`) |
 | POST | `/transcribe-stream` | SSE streaming transcription (same params) |
+| WS | `/ws/transcribe` | Live transcription: stream PCM16 mono 16 kHz frames, receive partial (confirmed/pending) and final transcripts; `{"language": "de"}` config frame, `{"event": "stop"}` to finish |
 | POST | `/detect_language` | Detect spoken language |
-| GET | `/health` | Health — includes `multilingual` and `model_size` |
+| POST | `/unload` | Free the model now (409 while a request is using it) |
+| GET | `/ready` | Readiness: 503 until the model is loaded (200 again after an idle unload) |
+| GET | `/health` | Health — includes `multilingual`, `model_size`, and the device it actually runs on |
 | GET | `/models` | List models with size and multilingual flag |
 | GET | `/tasks` | Describe `transcribe` vs `translate` |
 
@@ -257,19 +327,19 @@ Use smaller models (`WHISPER_MODEL_SIZE=small`, `WHISPER_MODEL=small`) to improv
 ### STT — whisper-cpp (port 5003)
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/v1/audio/transcriptions` | Transcribe audio — OpenAI-compatible (`file`, `language`, `response_format`) |
-| POST | `/inference` | Native whisper.cpp inference endpoint |
+| POST | `/inference` | Native whisper-server endpoint (`file`, `language`, `response_format`) — used by the frontend gateway |
+| POST | `/v1/audio/transcriptions` | OpenAI-compatible route — only on whisper.cpp builds that include it (current master does not) |
 
 This backend is optional and is only shown in the frontend when `ENABLE_WHISPER_CPP=true` is set for `frontend-service`.
 
 ### Piper Training (port 8080)
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/train` | Start training (`model_name`, `language`, `audio_files`) |
+| GET | `/ready` | 503 with the reasons a job would fail (unwritable data directories, a PyTorch build without kernels for the GPU, low disk) |
+| POST | `/train` | Start training (`model_name`, `language`, `audio_files`); one job runs at a time (`TRAINING_MAX_CONCURRENT`), a second is 409 |
 | POST | `/resume-training` | Resume interrupted training from checkpoint |
 | POST | `/train-from-dataset` | Train from an already-prepared dataset |
 | POST | `/retrain-from-segments` | Re-transcribe existing clips and retrain |
-| POST | `/process-audio` | Segment/transcribe audio via STT |
 | POST | `/prepare-dataset` | Create dataset from STT segments |
 | POST | `/generate-missing-mels` | Regenerate missing mel spectrograms |
 | POST | `/export/{job_id}` | Export model to ONNX |
@@ -294,37 +364,78 @@ This backend is optional and is only shown in the frontend when `ENABLE_WHISPER_
 | GET | `/models` | List available model variants |
 | POST | `/load_model` | Switch to a different model variant |
 | GET | `/status` | Model and GPU status |
+| GET | `/ready` | Readiness (503 while the model loads or after a failed load) |
 | GET | `/health` | Health check |
+
+`/tts` (built-in speakers) needs a CustomVoice model variant and answers 409 on a Base model; the Base models
+clone voices (`/clone`, `/voices/save`). No language means German (`QWEN3_DEFAULT_LANGUAGE`); an unsupported one is a 400.
 
 ### Qwen3-ASR (port 5002)
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/transcribe` | Transcribe audio |
+| POST | `/transcribe` | Transcribe audio (recordings up to `ASR_MAX_AUDIO_SECONDS`, 7200; long ones are chunked) |
 | POST | `/transcribe-batch` | Batch-transcribe multiple files |
-| POST | `/detect_language` | Detect language |
+| POST | `/detect_language` | Detect language (from the first piece only) |
 | GET | `/status` | Detailed GPU and model info |
+| GET | `/ready` | Readiness (503 while the model loads or after a failed load) |
+| GET | `/health` | Health check |
+
+### Parakeet-ASR (port 5005) and Canary-ASR (port 5006)
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/transcribe` | Transcribe audio (`audio`, `language`; Canary answers 422 for a language its model cannot decode) |
+| POST | `/transcribe-batch` | Batch-transcribe multiple files, with a per-file `status` for failures |
+| GET | `/status` | Model info; `runtime` names the NeMo, torch and CUDA versions the image was built with |
+| GET | `/ready` | Readiness (503 while the model loads or after a failed load) |
+| GET | `/health` | Health check |
+
+### Chatterbox-TTS (port 5007)
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/tts` | Generate speech (long text is chunked; `X-Chunk-Count` reports how many pieces) |
+| POST | `/tts-stream` | The same, streamed sentence by sentence |
+| POST | `/clone`, `/clone-with-ref-text` | Clone a voice from a reference clip (only the first `CHATTERBOX_REF_MAX_SECONDS` are used) |
+| GET | `/status` | Loaded checkpoint (`t3_model`), Hugging Face revision, image build ref |
+| GET | `/ready` | Readiness (503 while the model loads or after a failed load) |
 | GET | `/health` | Health check |
 
 ---
 
 ## Configuration
 
-Copy `.env.example` to `.env` and adjust as needed.
+Copy `.env.example` to `.env` and adjust as needed. The file documents every variable (over 130), including
+the per-service limits; the ones most people touch:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `WHISPER_MODEL_SIZE` | `small` | faster-whisper model: `tiny` `base` `small` `medium` `large-v3` `distil-large-v3` |
-| `WHISPER_MODEL` | `large-v3` | whisper-cpp GGUF model: `tiny` `base` `small` `medium` `large-v3` `large-v3-turbo` |
-| `FORCE_ACCELERATION` | `cuda` | faster-whisper backend: `cuda` `rocm` `cpu` |
+| `IMAGE_TAG` | `latest` | Image release to run; pin `X.Y.Z` for a reproducible deployment |
+| `PULL_POLICY` | `missing` | `always` pulls on every `up` (needed to follow a moved tag such as `latest`) |
+| `APP_DATA_DIR` | (empty: `./`) | One directory (for example a TrueNAS dataset) that holds models, caches, voices and output |
+| `BACKEND_BIND_ADDR` | `127.0.0.1` | Interface the backend ports are published on; `0.0.0.0` exposes unauthenticated services |
+| `FRONTEND_BIND_ADDR` | `0.0.0.0` | Interface the web UI / API gateway is published on |
+| `WHISPER_MODEL_SIZE` | `large-v3-turbo` | faster-whisper model: `tiny` `base` `small` `medium` `large-v3` `large-v3-turbo` `distil-large-v3`, a Hugging Face repo id, or the path of a CTranslate2 export. Turbo is the best latency/accuracy trade for live use but **cannot translate**; unknown names fall back to `large-v3` |
+| `WHISPER_MODEL` | `large-v3-turbo-q5_0` | whisper-cpp GGML model: `tiny` `base` `small` `medium` `large-v3` `large-v3-turbo`, quantised builds only for some sizes (`large-v3-turbo-q5_0`, `small-q5_1`, ...) |
+| `STT_DEFAULT_LANGUAGE` | (empty: auto-detect) | Language `stt-service` uses when a request names none; the web UI sends `auto` itself |
+| `FORCE_ACCELERATION` | (empty: auto-detect) | Only `rocm` changes behaviour (faster-whisper on AMD); use `USE_CUDA=false` to force the CPU |
 | `WHISPER_CPP_PORT` | `5003` | Host port for whisper-cpp |
-| `ENABLE_WHISPER_CPP` | `false` | Exposes whisper-cpp in the frontend provider registry and status checks |
+| `ENABLE_WHISPER_CPP`, `ENABLE_PARAKEET_ASR`, `ENABLE_CANARY_ASR`, `ENABLE_CHATTERBOX_TTS` | `false` | Expose the optional backend in the frontend provider registry and status checks |
+| `DEFAULT_STT_PROVIDER`, `DEFAULT_TTS_PROVIDER` | `whisper`, `piper` | Engine the UI preselects; the ARM64 and Strix Halo presets use `whisper-cpp` because `stt-service` does not run there |
 | `GGML_VULKAN_DEVICE` | `0` | Vulkan GPU device index |
 | `HIP_VISIBLE_DEVICES` | `0` | ROCm GPU device index |
 | `HSA_OVERRIDE_GFX_VERSION` | `11.0.0` | ROCm GFX override (Strix Halo: keep at `11.0.0`) |
 | `CUDA_VISIBLE_DEVICES` | `0` | NVIDIA GPU device index |
-| `QWEN3_TTS_MODEL` | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | Qwen3 TTS model ID |
+| `MODEL_TTL` | `300` | Seconds of idleness before a GPU model is unloaded (`-1` never; `STT_MODEL_TTL`, `ASR_MODEL_TTL`, `TTS_MODEL_TTL` override it per group) |
+| `QWEN3_TTS_MODEL` | `Qwen/Qwen3-TTS-12Hz-0.6B-Base` | Qwen3 TTS model ID (the 1.7B needs headroom on a small card) |
+| `QWEN3_DEFAULT_LANGUAGE`, `PIPER_DEFAULT_LANGUAGE` | `German`, `de` | Language TTS uses when a request names none |
 | `QWEN3_ASR_MODEL` | `Qwen/Qwen3-ASR-1.7B` | Qwen3 ASR model ID |
-| `ALLOWED_ORIGINS` | `*` | CORS allowed origins (set explicitly in production) |
+| `ALLOWED_ORIGINS` | (empty: same origin only) | Extra origins that may call the gateway from a browser; `*` opens it to any page. Behind a reverse proxy that rewrites `Host`, set `TRUSTED_ORIGINS` |
+| `TRUSTED_HOSTS` | (empty) | Host names the gateway may be reached by, besides IP addresses, `localhost`, `*.local`, `*.lan`, `*.internal` and single-label names such as `truenas`, which need nothing. A real domain (reverse proxy) or a Tailscale name must be listed (`voice.example.com,*.tail1234.ts.net`), else every request is `403 host_not_allowed` (DNS-rebinding guard). `ALLOWED_HOSTS=*` switches the check off |
+| `API_KEY` | (empty: open) | Optional shared secret required as `Authorization: Bearer` on `/v1/*`, on state-changing `/api/*` calls and on the `/ws/stt` upgrade. No exemption for the web UI: it asks for the key once per browser tab |
+| `MAX_UPLOAD_MB`, `MAX_TTS_CHARS` | `512`, `5000` | Gateway limits (`5000` is what Qwen3-TTS and Chatterbox accept; a Piper-only setup can raise it). Each backend has its own (`ASR_MAX_UPLOAD_MB`, `PIPER_MAX_UPLOAD_MB`, `CHATTERBOX_MAX_TEXT_CHARS`, ... see `.env.example`) |
+| `MAX_CONCURRENT_UPLOADS`, `MAX_CONCURRENT_FFMPEG` | `4`, `4` | Per gateway worker: uploads forwarded at once and `ffmpeg` conversions for `/v1/audio/speech`; the next request gets `503` + `Retry-After` |
+| `ASR_MAX_QUEUE`, `ASR_QUEUE_TIMEOUT_S` | (empty: 4 x `ASR_MAX_CONCURRENCY`), `60` | Requests that may wait for the one inference slot of Qwen3-ASR, Parakeet and Canary (`0` = nobody waits) and how long; beyond either the answer is `503` + `Retry-After`. `TTS_MAX_QUEUE` and `TTS_QUEUE_TIMEOUT_S` do the same for Qwen3-TTS and Chatterbox |
+| `PIPER_MAX_CUSTOM_VOICES`, `PIPER_MAX_CUSTOM_MB` | `20`, `2048` | Most uploaded Piper voices (`0` = no upload; `409` beyond it) and their total size (`413`); a new voice must also load and answer a test request within `PIPER_ONNX_VALIDATE_TIMEOUT_S` (30) |
+| `BACKEND_ALLOWED_ORIGINS` | (empty: closed) | CORS for the backends' own ports. Empty means no CORS headers and foreign-Origin POST/DELETE requests are refused (`403`); `*` must be set explicitly (each service logs a warning) |
 | `ALLOW_CREDENTIALS` | `false` | Enables CORS credentials only when origins are explicit |
 | `STT_SERVICE_URL` | `http://stt-service:8000` | STT endpoint used by Piper Training for audio labelling |
 
@@ -337,8 +448,12 @@ tts-stt-playground/
 ├── docker-compose.yml           # Base stack — NVIDIA CUDA or CPU
 ├── docker-compose.rocm.yml      # AMD ROCm overlay (native Linux only)
 ├── docker-compose.vulkan.yml    # Vulkan overlay for whisper-cpp (Linux / WSL2+Docker Engine)
-├── .env.example
-├── frontend-service/            # Web UI (FastAPI + Jinja2)
+├── docker-compose.arm64.yml     # ARM64 / no-GPU overlay (RK3588S): frontend, Piper, whisper-cpp
+├── docker-compose.dev.yml       # Bind-mounts service source for local development
+├── docker-compose.truenas*.yml  # TrueNAS SCALE: Custom App YAML and the build-from-source overlay
+├── .env.example                 # Every setting, documented
+├── deploy/profiles/             # Ready-made .env presets per device (RK3588S, 5060 Ti, 4080, Strix Halo)
+├── frontend-service/            # Web UI + API gateway (FastAPI + Jinja2)
 ├── piper-tts-service/           # PiperTTS synthesis
 ├── piper-training-service/      # VITS training pipeline
 ├── stt-service/                 # faster-whisper STT (Python, CUDA/ROCm/CPU)
@@ -350,13 +465,16 @@ tts-stt-playground/
 │   ├── Dockerfile               # CPU build
 │   └── Dockerfile.vulkan        # Vulkan GPU build
 ├── qwen3-tts-service/           # Qwen3 TTS + voice cloning
-│   ├── app.py
-│   ├── Dockerfile               # CUDA / CPU
-│   └── Dockerfile.rocm          # AMD ROCm
 ├── qwen3-asr-service/           # Qwen3 ASR
-│   ├── app.py
-│   ├── Dockerfile               # CUDA / CPU
-│   └── Dockerfile.rocm          # AMD ROCm
+├── parakeet-asr-service/        # Parakeet STT (NeMo), optional
+├── canary-asr-service/          # Canary STT (NeMo), optional
+├── chatterbox-tts-service/      # Chatterbox TTS + cloning, optional
+│                                #   each service dir: app.py, Dockerfile (CUDA), Dockerfile.rocm where one exists
+├── benchmarks/                  # German ASR evaluation (WER, latency, significance test)
+├── scripts/                     # sync_openapi.py, plan_publish.py, check_no_skips.py, scripts/truenas/*
+├── tests/                       # pytest suite (unit, config-drift and, opt-in, live-stack tests)
+├── docs/                        # API reference, provider contracts, device matrix, TrueNAS guide, research
+├── truenas/                     # TrueNAS custom catalog scaffold
 └── models/                      # Shared model storage (gitignored)
 ```
 
@@ -365,15 +483,23 @@ tts-stt-playground/
 ## Troubleshooting
 
 ### Health checks
+`/health` says the process is up; `/ready` says it can serve a request (503 with a reason while the first model
+is downloading or loading, or when the load failed). Run these on the Docker host: the backend ports are bound
+to `127.0.0.1` unless `BACKEND_BIND_ADDR` says otherwise.
 ```bash
-curl http://localhost:5000/health   # PiperTTS
-curl http://localhost:5001/health   # STT faster-whisper
+curl http://localhost:5000/ready    # PiperTTS (503 if no voice is installed)
+curl http://localhost:5001/ready    # STT faster-whisper
+curl http://localhost:5002/ready    # Qwen3-ASR
+curl http://localhost:5004/ready    # Qwen3-TTS
+curl http://localhost:5005/ready    # Parakeet-ASR (optional)
+curl http://localhost:5006/ready    # Canary-ASR (optional)
+curl http://localhost:5007/ready    # Chatterbox-TTS (optional)
+curl http://localhost:8080/ready    # Piper Training (names unwritable directories, a wrong PyTorch build, low disk)
 curl http://localhost:5003/         # whisper-cpp (any HTTP response = up)
-curl http://localhost:8080/health   # Piper Training
-curl http://localhost:5004/health   # Qwen3-TTS
-curl http://localhost:5002/health   # Qwen3-ASR
 curl http://localhost:3000/health   # Frontend
+curl http://localhost:3000/api/health   # every backend's state, as the UI shows it
 ```
+Replace `/ready` with `/health` for the liveness view (what the Docker healthchecks use).
 
 ### Common issues
 
@@ -428,18 +554,44 @@ VAD parameter defaults (applied to all `/transcribe` and `/transcribe-stream` re
 For browser recordings (webm/opus), use `no_speech_threshold=0.95` to avoid false silence detection.
 
 **Slow first start**
-Models are downloaded on first launch. Sizes:
-- Whisper large-v3: ~3 GB
+Models are downloaded on first launch, in the background: containers are healthy before they can serve, and
+`/ready` (or the UI's status indicators) shows when a backend is done. Sizes:
+- Whisper large-v3-turbo: ~1.6 GB (large-v3: ~3 GB)
 - Qwen3-ASR-1.7B: ~3.5 GB
-- Qwen3-TTS-1.7B: ~4 GB
+- Qwen3-TTS-0.6B: ~2.5 GB (the 1.7B variant: ~4.5 GB)
+
+**"Backend unreachable" from another machine**
+Backend ports are published on `127.0.0.1` only. Use the UI or the API on port 3000, which proxies every
+backend; set `BACKEND_BIND_ADDR=0.0.0.0` only on a network you trust.
+
+**Every request answers `403 Host ... is not allowed` (`host_not_allowed`)**
+The gateway only answers to names that cannot be re-pointed by a third party: IP addresses, `localhost`,
+`*.local`, `*.lan`, `*.internal`, `*.home.arpa` and single-label names. A real domain in front of a reverse
+proxy, or a Tailscale MagicDNS name, has to be listed in `TRUSTED_HOSTS` (`TRUSTED_HOSTS=voice.example.com`).
+
+**Every button in the UI answers 403 behind a reverse proxy**
+The proxy rewrites the `Host` header, so the UI's requests look cross-origin. Add the public URL to
+`TRUSTED_ORIGINS` (and set `TRUST_PROXY_HEADERS=true` if the proxy overwrites `X-Forwarded-Host`).
+A proxy that passes `Host` through only needs its name in `TRUSTED_HOSTS`.
+
+**The UI asks for an API key, or answers 401**
+`API_KEY` is set on the gateway. The UI prompts once per browser tab and keeps the key in `sessionStorage`;
+scripts send `Authorization: Bearer <key>`. There is no exemption for the UI.
+
+**503 with `Retry-After`**
+The service is at its limit rather than broken: too many uploads or `ffmpeg` conversions at the gateway
+(`MAX_CONCURRENT_UPLOADS`, `MAX_CONCURRENT_FFMPEG`), or a full or timed-out queue at a model backend
+(`ASR_MAX_QUEUE`, `TTS_MAX_QUEUE`, `*_QUEUE_TIMEOUT_S`). Retry after the delay; raise the limit only if the
+hardware has room.
 
 **Out of memory**
 - Use a smaller model (`small`, `medium`)
+- Lower the idle TTL (`MODEL_TTL`) so idle models give their memory back, or free one now with `POST /api/providers/<id>/unload`
 - For Qwen3 on ROCm/APU: `PYTORCH_HIP_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512` (set automatically in ROCm overlay)
 - For training: reduce batch size
 
 **Port conflicts**
-Default ports: 3000, 5000, 5001, 5002, 5003, 5004, 8080. Override with env vars: `FRONTEND_PORT`, `PIPER_TTS_PORT`, `STT_PORT`, `QWEN3_ASR_PORT`, `WHISPER_CPP_PORT`, `QWEN3_TTS_PORT`, `TRAINING_PORT`.
+Default ports: 3000, 5000-5007, 8080. Override with env vars: `FRONTEND_PORT`, `PIPER_TTS_PORT`, `STT_PORT`, `QWEN3_ASR_PORT`, `WHISPER_CPP_PORT`, `QWEN3_TTS_PORT`, `PARAKEET_ASR_PORT`, `CANARY_ASR_PORT`, `CHATTERBOX_TTS_PORT`, `TRAINING_PORT`.
 
 ---
 
@@ -456,6 +608,25 @@ docker compose restart stt-service   # pick up an edited file
 
 All processing is local. No data is sent to external services.
 
+### Tests, lint and generated files
+
+```bash
+pip install -r tests/requirements.txt
+pytest tests/                       # ~2 minutes; tests that need a running stack skip themselves
+ruff check .                        # syntax errors and undefined names only (ruff.toml)
+python scripts/sync_openapi.py      # regenerate the OpenAPI specs after changing a route or model
+```
+
+The suite is offline: the heavy dependencies (torch, NeMo, faster-whisper, librosa) are stubbed, so it needs
+only the packages in `tests/requirements.txt`. Besides the unit tests it holds config-drift suites that fail
+when compose, `.env.example`, the device presets, the Dockerfiles and the OpenAPI specs disagree with each
+other (`REQUIRE_DRIFT_SUITES=1`, set in CI, turns a missing dependency into a failure instead of a skip). CI
+(`.github/workflows/ci.yml`) runs them on Python 3.11 and 3.12 together with lint, `docker compose config` for
+every overlay, actionlint and a JavaScript syntax check; shellcheck, hadolint, a dependency audit and the
+training and browser suites report without failing the run. Images are published by
+`.github/workflows/publish-images.yml` only after those checks pass: a `vX.Y.Z` tag publishes `X.Y.Z`, `X.Y` and
+`latest`, a push to master publishes `latest`, and a manual run never touches `latest` or a version tag.
+
 ### Storage location
 
 Persistent data (models, output, caches, training data) defaults to `./` under
@@ -464,104 +635,85 @@ everything with one variable; see `docs/truenas-deployment.md`.
 
 ---
 
-## TrueNAS Deployment (RTX 5060 Ti 16 GB)
+## TrueNAS Deployment
 
-This project supports deployment on a dedicated TrueNAS SCALE server with an
-NVIDIA RTX 5060 Ti (16 GB VRAM). Use the `docker-compose.truenas.yml` overlay
-for optimised GPU memory allocation and single-GPU pinning.
+Runs on TrueNAS SCALE 24.10 (Electric Eel) or newer as a **Custom App from prebuilt images**: no
+clone and no build. All data lives in one dataset and only the web UI port (3000) is published;
+the frontend proxies every backend call, live microphone transcription included.
+**[`docs/truenas-installation-guide.md`](docs/truenas-installation-guide.md)** is the complete
+guide (install, update, roll back, VRAM planning, troubleshooting).
 
-Start from `.env.truenas.example` (copy it to `.env`) and set `APP_DATA_DIR` to a
-dataset path. If the frontend is opened from another machine, change
-`ALLOWED_ORIGINS` and the `BROWSER_*_URL` values before deployment.
+### Install in 5 minutes
 
-### Install without building (prebuilt images)
+1. Create a dataset, for example `/mnt/tank/apps/tts-stt`.
+2. Optional, in the TrueNAS shell: `scripts/truenas/preflight.sh --data-dir /mnt/tank/apps/tts-stt`
+   checks Docker, the NVIDIA driver, VRAM, disk space and the port (the guide shows how to fetch
+   the scripts without cloning the repository).
+3. Apps → Discover Apps → Custom App → **Install via YAML**: paste
+   [`docker-compose.truenas-app.yml`](docker-compose.truenas-app.yml), replace
+   `${APP_DATA_DIR:?set dataset path}` (every occurrence) with your dataset path, install.
+4. Open `http://<truenas-ip>:3000`. Models download in the background on the first start.
 
-CI publishes every service image to GHCR (`ghcr.io/steffenhebestreit/tts-stt-*`),
-so you can deploy on TrueNAS **without cloning or building**:
+The images (`ghcr.io/steffenhebestreit/tts-stt-*`) are about 25 GB and TrueNAS aborts an Apps job
+after 20 minutes: run `scripts/truenas/pull-images.sh` first on a slow link.
 
-- **Install via YAML** — paste [`docker-compose.truenas-app.yml`](docker-compose.truenas-app.yml)
-  into Apps → Custom App, set the data dataset, allocate the GPU, deploy.
-- **Custom catalog (point-and-click form)** — add this repo as a community
-  catalog; see [`truenas/README.md`](truenas/README.md) and the
-  [`truenas/tts-stt/`](truenas/tts-stt/) scaffold (`questions.yaml`).
+### Updates
 
-See [`truenas/README.md`](truenas/README.md) for both paths and their caveats.
+The compose file **pins a release** (`IMAGE_TAG`), so nothing changes until you change it.
+`scripts/truenas/update-check.sh` is a read-only check that prints `UPDATE AVAILABLE` when a newer
+release (or a newer image for a floating tag) is published. To update: snapshot the dataset,
+change the release in the app's YAML, Save; to roll back, put the previous release back (data
+folders are only added to). `IMAGE_TAG:-latest` with `PULL_POLICY:-always` follows the newest build
+instead, and an optional `diun` service sends notifications only. Details are in the guide.
 
-For the build-from-source workflow, dataset layout, and profile strategy, see
-`docs/truenas-deployment.md`.
-For the first rollout, use `docs/truenas-custom-app-checklist.md`.
-For always-on versus training-window service recommendations, use
-`docs/truenas-service-profiles.md`.
+### Other routes
 
-### Prerequisites
+- **Settings file:** the same compose file with a `settings.env` on the dataset, so an update is
+  one changed line ([`truenas/custom-app-include.yml`](truenas/custom-app-include.yml)).
+- **Custom catalog** (a form instead of YAML): [`truenas/tts-stt/`](truenas/tts-stt/) is a
+  scaffold that TrueNAS cannot load as it stands, see [`truenas/README.md`](truenas/README.md).
+- **Build from source** on the NAS with `docker-compose.truenas.yml`:
+  [`docs/truenas-deployment.md`](docs/truenas-deployment.md).
 
-1. **TrueNAS SCALE** with Docker/Compose support (Apps → Custom App or shell access)
-2. **NVIDIA drivers** installed (TrueNAS SCALE ships them for supported GPUs)
-3. **NVIDIA Container Toolkit** configured (`nvidia-ctk runtime configure`)
-4. Clone this repo to a dataset: `/mnt/pool/apps/tts-stt`
+### Requirements and sizing
 
-### VRAM Budget (16 GB)
-
-| Service | Estimated VRAM | Notes |
-|---------|---------------:|-------|
-| STT (faster-whisper large-v3) | ~3 GB | Fits easily |
-| Qwen3-ASR-1.7B | ~4 GB | bfloat16 |
-| Qwen3-TTS-0.6B | ~3 GB | Default in `docker-compose.truenas.yml` |
-| Piper Training (VITS) | ~2–4 GB | Depends on batch size |
-
-> Running STT + Qwen3-ASR + Qwen3-TTS simultaneously uses roughly 10 to 11 GB,
-> leaving
-> headroom for training. Avoid running training concurrently with all three
-> inference services if you hit OOM.
-
-### Launch
-
-```bash
-cd /mnt/pool/apps/tts-stt
-
-# Start from the checked-in defaults and then edit for your host/network
-cp .env.example .env
-
-# Full stack with NVIDIA GPU
-docker compose --env-file .env -f docker-compose.yml -f docker-compose.truenas.yml --profile all up -d
-
-# Just STT + TTS (low VRAM)
-docker compose --env-file .env -f docker-compose.yml -f docker-compose.truenas.yml \
-  --profile stt --profile piper-tts up -d
-```
-
-### TrueNAS Custom App YAML
-
-If you paste a merged Compose file into Apps -> Discover -> Install via YAML and
-want `qwen3-asr-service` plus `qwen3-tts-service` to share the same NVIDIA GPU,
-pin both services to GPU `0` with `device_ids: ["0"]` and set
-`NVIDIA_VISIBLE_DEVICES=0` plus `CUDA_VISIBLE_DEVICES=0` in each service.
-Do not use `count` and `device_ids` together.
-
-### Persistent Storage
-
-Bind-mount a TrueNAS dataset so model caches survive container rebuilds:
-
-```
-/mnt/pool/apps/tts-stt/models  → /app/models          (PiperTTS, Training)
-/mnt/pool/apps/tts-stt/output  → /app/output           (PiperTTS)
-```
-
-Docker named volumes (`stt-cache`, `qwen3-tts-cache`, `qwen3-asr-cache`) are
-already defined in the base compose file — they persist automatically on TrueNAS.
-
-### Remote Browser Access
-
-If the frontend is opened from another machine on the network, do not leave the
-browser-facing URLs at `localhost`. Set `ALLOWED_ORIGINS` to the frontend origin
-and update the `BROWSER_TTS_URL`, `BROWSER_STT_URL`, `BROWSER_TRAINING_URL`,
-`BROWSER_QWEN3_ASR_URL`, and `BROWSER_QWEN3_TTS_URL` variables in `.env`.
+- An NVIDIA driver that supports CUDA 12.8 for the GPU services (R570 or newer; RTX 50 series
+  cards require it), installed from Apps → Settings → Install NVIDIA Drivers.
+- The default set (Whisper `large-v3-turbo`, Qwen3-ASR, Qwen3-TTS 0.6B) is about 8 GB of VRAM
+  resident; optional services add more (Canary, Parakeet, Chatterbox, training). Every GPU model is
+  freed after `MODEL_TTL` seconds idle (300), so the sum need not fit at once. Budget against what
+  `nvidia-smi` reports for your card; the per-service table is in the guide.
+- Remote browser access needs nothing beyond port 3000 (`ALLOWED_ORIGINS` stays empty) as long as you
+  open it by IP address, `*.local` or a plain name such as `truenas`. A real domain or a reverse proxy
+  needs `TRUSTED_HOSTS` (and `TRUSTED_ORIGINS` if the proxy rewrites `Host`). The microphone from another
+  machine needs HTTPS.
 
 ### Cleanup (optional)
 
-Remove leftover XTTS cache from an earlier version (requires root):
+Remove leftover XTTS cache from an earlier version, in the repository checkout (requires root):
 
 ```bash
 sudo rm -rf cache/tts cache/xtts-cache   # ~3.6 GB
 sudo rm -f models/luna.json models/luna.onnx  # old root-level export
 ```
+
+## API
+
+The stack is usable as a drop-in **OpenAI-compatible speech API** — point the official SDK at
+the gateway and it works unchanged across every device:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://your-host:3000/v1", api_key="unused")  # your API_KEY if the gateway has one
+client.audio.transcriptions.create(model="whisper-1", file=open("audio.wav", "rb")).text
+```
+
+`POST /v1/audio/transcriptions` (json, text, verbose_json, srt, vtt) · `POST /v1/audio/speech` (mp3, wav, pcm) · `GET /v1/models`
+
+The same request returns the same response shape whether the backend is whisper-cpp on an ARM
+SBC or faster-whisper on a workstation GPU. Full reference, including the language-handling
+rules that matter for German: **[`docs/api.md`](docs/api.md)**.
+
+The richer project-native `/api/*` surface (segment timestamps, streaming TTS, voice training)
+is unchanged and documented in [`docs/provider-contracts.md`](docs/provider-contracts.md).
+

@@ -1,0 +1,1352 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "TTS-STT Frontend Service",
+    "version": "2.0.0"
+  },
+  "paths": {
+    "/": {
+      "get": {
+        "summary": "Read Root",
+        "description": "Render the main web UI page with service URLs injected into the template.",
+        "operationId": "read_root__get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api-docs": {
+      "get": {
+        "summary": "Api Docs",
+        "description": "Serve the interactive API documentation page.",
+        "operationId": "api_docs_api_docs_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "summary": "Health",
+        "description": "Return service health status and configured backend URLs.\n\nKept lightweight: Docker probes this every 30s, so it returns only the\nsmall service map. The full provider registry is available at /providers.",
+        "operationId": "health_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/providers": {
+      "get": {
+        "summary": "Providers",
+        "description": "Return the UI provider registry and provider contracts.",
+        "operationId": "providers_providers_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/health": {
+      "get": {
+        "summary": "Provider Health",
+        "description": "Probe every provider's health endpoint concurrently.\n\nThe browser used to do this itself, one cross-origin request per provider,\nsequentially — so a single unreachable backend stalled the whole status row\nfor its full timeout, and every backend port had to be reachable from the\nbrowser just to render an indicator.\n\nDoing it here means the browser makes one same-origin call, the probes run in\nparallel, and the stack no longer needs its backend ports published.",
+        "operationId": "provider_health_api_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/auth/check": {
+      "post": {
+        "summary": "Auth Check",
+        "description": "204 when the caller may use the state-changing API, 401 when `API_KEY` is set and was not sent.\n\nThe request guard does the checking (this is a POST under /api, so it needs\nthe key exactly when every other mutating call does); the handler only\nanswers. The UI calls it before opening the live-transcription WebSocket,\nwhere a browser cannot react to a 401 the way it does for fetch(), so that\nthe key is known before the socket is dialled.",
+        "operationId": "auth_check_api_auth_check_post",
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          }
+        }
+      }
+    },
+    "/api/providers/{provider_id}/voices": {
+      "get": {
+        "summary": "Provider Voices",
+        "description": "Return a normalized voice catalog for a TTS provider.",
+        "operationId": "provider_voices_api_providers__provider_id__voices_get",
+        "parameters": [
+          {
+            "name": "provider_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Provider Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/providers/{provider_id}/models": {
+      "get": {
+        "summary": "Provider Models",
+        "description": "Return a normalized model catalog for providers that support model variants.",
+        "operationId": "provider_models_api_providers__provider_id__models_get",
+        "parameters": [
+          {
+            "name": "provider_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Provider Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/providers/{provider_id}/models/select": {
+      "post": {
+        "summary": "Provider Select Model",
+        "description": "Switch the active model for a provider that supports model variants.",
+        "operationId": "provider_select_model_api_providers__provider_id__models_select_post",
+        "parameters": [
+          {
+            "name": "provider_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Provider Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProviderModelSelectionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/providers/{provider_id}/status": {
+      "get": {
+        "summary": "Provider Status",
+        "description": "Return provider status for providers that expose runtime metadata.",
+        "operationId": "provider_status_api_providers__provider_id__status_get",
+        "parameters": [
+          {
+            "name": "provider_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Provider Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/providers/{provider_id}/unload": {
+      "post": {
+        "summary": "Provider Unload",
+        "description": "Ask a provider to release its model and free the memory now.\n\nPasses the upstream status and body through verbatim rather than going via\n`_provider_json_post`, which raises on any >=400 and would flatten the\nupstream body to its `detail`. A 409 here is a normal, actionable answer —\nthe model is busy — and the caller needs the reference count that comes with\nit to know when retrying is worthwhile.",
+        "operationId": "provider_unload_api_providers__provider_id__unload_post",
+        "parameters": [
+          {
+            "name": "provider_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Provider Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/providers/{provider_id}/saved-voices": {
+      "get": {
+        "summary": "Provider Saved Voices",
+        "description": "List saved voices for providers that support a voice library.",
+        "operationId": "provider_saved_voices_api_providers__provider_id__saved_voices_get",
+        "parameters": [
+          {
+            "name": "provider_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Provider Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Provider Save Voice",
+        "description": "Create a saved voice entry for providers that support voice libraries.",
+        "operationId": "provider_save_voice_api_providers__provider_id__saved_voices_post",
+        "parameters": [
+          {
+            "name": "provider_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Provider Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/providers/{provider_id}/custom-voices": {
+      "get": {
+        "summary": "Provider Custom Voices",
+        "description": "List managed custom voices for providers that support custom model management.",
+        "operationId": "provider_custom_voices_api_providers__provider_id__custom_voices_get",
+        "parameters": [
+          {
+            "name": "provider_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Provider Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/providers/{provider_id}/saved-voices/{voice_id}": {
+      "delete": {
+        "summary": "Provider Delete Saved Voice",
+        "description": "Delete a saved voice entry for providers that support voice libraries.",
+        "operationId": "provider_delete_saved_voice_api_providers__provider_id__saved_voices__voice_id__delete",
+        "parameters": [
+          {
+            "name": "provider_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Provider Id"
+            }
+          },
+          {
+            "name": "voice_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9_-]{1,128}$",
+              "title": "Voice Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/providers/{provider_id}/custom-voices/{voice_id}": {
+      "delete": {
+        "summary": "Provider Delete Custom Voice",
+        "description": "Delete a managed custom voice for providers that support custom model management.",
+        "operationId": "provider_delete_custom_voice_api_providers__provider_id__custom_voices__voice_id__delete",
+        "parameters": [
+          {
+            "name": "provider_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Provider Id"
+            }
+          },
+          {
+            "name": "voice_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9_-]{1,128}$",
+              "title": "Voice Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/providers/{provider_id}/saved-voices/{voice_id}/tts": {
+      "post": {
+        "summary": "Provider Saved Voice Tts",
+        "description": "Synthesize speech with a saved voice profile through the frontend adapter.",
+        "operationId": "provider_saved_voice_tts_api_providers__provider_id__saved_voices__voice_id__tts_post",
+        "parameters": [
+          {
+            "name": "provider_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Provider Id"
+            }
+          },
+          {
+            "name": "voice_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9_-]{1,128}$",
+              "title": "Voice Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/providers/{provider_id}/voice-clone": {
+      "post": {
+        "summary": "Provider Voice Clone",
+        "description": "Run provider-scoped voice cloning through a frontend adapter.",
+        "operationId": "provider_voice_clone_api_providers__provider_id__voice_clone_post",
+        "parameters": [
+          {
+            "name": "provider_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Provider Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/providers/{provider_id}/voice-design": {
+      "post": {
+        "summary": "Provider Voice Design",
+        "description": "Run provider-scoped voice design through a frontend adapter.",
+        "operationId": "provider_voice_design_api_providers__provider_id__voice_design_post",
+        "parameters": [
+          {
+            "name": "provider_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Provider Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProviderVoiceDesignRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/stt": {
+      "post": {
+        "summary": "Frontend Stt",
+        "description": "Transcribe audio through a normalized frontend STT adapter.",
+        "operationId": "frontend_stt_api_stt_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tts": {
+      "post": {
+        "summary": "Frontend Tts",
+        "description": "Synthesize speech through a normalized frontend TTS adapter.",
+        "operationId": "frontend_tts_api_tts_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FrontendTTSRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/training/deployment-targets": {
+      "get": {
+        "summary": "Frontend Training Deployment Targets",
+        "description": "Return training deployment targets through the frontend adapter.",
+        "operationId": "frontend_training_deployment_targets_api_training_deployment_targets_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/training/train": {
+      "post": {
+        "summary": "Frontend Training Start",
+        "description": "Start a training job through the frontend adapter.",
+        "operationId": "frontend_training_start_api_training_train_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/training/train-from-dataset": {
+      "post": {
+        "summary": "Frontend Training From Dataset",
+        "description": "Start a dataset-backed training job through the frontend adapter.",
+        "operationId": "frontend_training_from_dataset_api_training_train_from_dataset_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/training/resume": {
+      "post": {
+        "summary": "Frontend Training Resume",
+        "description": "Resume a training job through the frontend adapter.",
+        "operationId": "frontend_training_resume_api_training_resume_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/training/jobs": {
+      "get": {
+        "summary": "Frontend Training Jobs",
+        "description": "List training jobs through the frontend adapter.",
+        "operationId": "frontend_training_jobs_api_training_jobs_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/training/status/{job_id}": {
+      "get": {
+        "summary": "Frontend Training Status",
+        "description": "Get a single training job status through the frontend adapter.",
+        "operationId": "frontend_training_status_api_training_status__job_id__get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9_-]{1,128}$",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/training/export/{job_id}": {
+      "post": {
+        "summary": "Frontend Training Export",
+        "description": "Export and optionally deploy a model bundle through the frontend adapter.",
+        "operationId": "frontend_training_export_api_training_export__job_id__post",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9_-]{1,128}$",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/training/download/{job_id}": {
+      "get": {
+        "summary": "Frontend Training Download",
+        "description": "Download an exported model bundle through the frontend adapter.",
+        "operationId": "frontend_training_download_api_training_download__job_id__get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9_-]{1,128}$",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/training/model/{job_id}": {
+      "delete": {
+        "summary": "Frontend Training Delete Model",
+        "description": "Delete a trained model through the frontend adapter.",
+        "operationId": "frontend_training_delete_model_api_training_model__job_id__delete",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9_-]{1,128}$",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/training/job/{job_id}": {
+      "delete": {
+        "summary": "Frontend Training Cancel Job",
+        "description": "Cancel a training job through the frontend adapter.",
+        "operationId": "frontend_training_cancel_job_api_training_job__job_id__delete",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9_-]{1,128}$",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/audio/transcriptions": {
+      "post": {
+        "tags": [
+          "openai"
+        ],
+        "summary": "Create Transcription",
+        "description": "Transcribe audio. Mirrors POST /v1/audio/transcriptions.\n\nUnknown fields are accepted and ignored rather than rejected: the spec\nhas 14 request fields and grows, and a 422 on an unrecognised one breaks\nclients that send newer parameters harmlessly.",
+        "operationId": "create_transcription_v1_audio_transcriptions_post",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_create_transcription_v1_audio_transcriptions_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/audio/speech": {
+      "post": {
+        "tags": [
+          "openai"
+        ],
+        "summary": "Create Speech",
+        "description": "Synthesize speech. Mirrors POST /v1/audio/speech (JSON body, not multipart).",
+        "operationId": "create_speech_v1_audio_speech_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "tags": [
+          "openai"
+        ],
+        "summary": "List Models",
+        "description": "Spec: ListModelsResponse.required == ['object','data'] — no `has_more`.",
+        "operationId": "list_models_v1_models_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/models/{model_id}": {
+      "get": {
+        "tags": [
+          "openai"
+        ],
+        "summary": "Retrieve Model",
+        "operationId": "retrieve_model_v1_models__model_id__get",
+        "parameters": [
+          {
+            "name": "model_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Model Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Body_create_transcription_v1_audio_transcriptions_post": {
+        "properties": {
+          "file": {
+            "type": "string",
+            "contentMediaType": "application/octet-stream",
+            "title": "File"
+          },
+          "model": {
+            "type": "string",
+            "title": "Model"
+          },
+          "language": {
+            "type": "string",
+            "title": "Language"
+          },
+          "prompt": {
+            "type": "string",
+            "title": "Prompt"
+          },
+          "response_format": {
+            "type": "string",
+            "title": "Response Format",
+            "default": "json"
+          },
+          "temperature": {
+            "type": "number",
+            "title": "Temperature",
+            "default": 0.0
+          },
+          "stream": {
+            "type": "boolean",
+            "title": "Stream",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "file"
+        ],
+        "title": "Body_create_transcription_v1_audio_transcriptions_post"
+      },
+      "FrontendTTSRequest": {
+        "properties": {
+          "provider": {
+            "type": "string",
+            "maxLength": 64,
+            "title": "Provider"
+          },
+          "text": {
+            "type": "string",
+            "maxLength": 5000,
+            "title": "Text"
+          },
+          "voice": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 256
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Voice"
+          },
+          "language": {
+            "type": "string",
+            "maxLength": 64,
+            "title": "Language",
+            "default": "auto"
+          },
+          "quality": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 32
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Quality"
+          },
+          "gender": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 32
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Gender"
+          },
+          "speed": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Speed"
+          },
+          "instructions": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 4000
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Instructions"
+          },
+          "output_format": {
+            "type": "string",
+            "maxLength": 16,
+            "title": "Output Format",
+            "default": "wav"
+          }
+        },
+        "type": "object",
+        "required": [
+          "provider",
+          "text"
+        ],
+        "title": "FrontendTTSRequest",
+        "description": "Normalized text-to-speech request accepted by the frontend adapter.\n\nEvery free-text field is bounded: these are forwarded to a GPU service, and\nan unbounded string is an unbounded job (a 2 MB `text` was accepted before)."
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "ProviderModelSelectionRequest": {
+        "properties": {
+          "model": {
+            "type": "string",
+            "maxLength": 256,
+            "title": "Model"
+          }
+        },
+        "type": "object",
+        "required": [
+          "model"
+        ],
+        "title": "ProviderModelSelectionRequest",
+        "description": "Request body for selecting a provider model variant."
+      },
+      "ProviderVoiceDesignRequest": {
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 5000,
+            "title": "Text"
+          },
+          "voice_description": {
+            "type": "string",
+            "maxLength": 4000,
+            "title": "Voice Description"
+          },
+          "lang": {
+            "type": "string",
+            "maxLength": 64,
+            "title": "Lang",
+            "default": "auto"
+          }
+        },
+        "type": "object",
+        "required": [
+          "text",
+          "voice_description"
+        ],
+        "title": "ProviderVoiceDesignRequest",
+        "description": "Request body for provider-scoped voice design."
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    }
+  },
+  "servers": [
+    {
+      "url": "http://localhost:3000",
+      "description": "The web UI and API gateway (FRONTEND_PORT); the only port meant to be reachable over the network."
+    }
+  ]
+}

@@ -1,47 +1,93 @@
-# TrueNAS SCALE overlay for a single NVIDIA RTX 5060 Ti (16 GB).
+# TrueNAS SCALE overlay for a single NVIDIA GPU, for the build-from-source route.
 #
-# Requires NVIDIA driver >= 550 and CUDA 12.8 base images.
-# Dockerfiles use cuda:12.8.1 + PyTorch cu128 for Blackwell (sm_120) support.
+# Most installs should use docker-compose.truenas-app.yml instead (Apps -> Custom App ->
+# Install via YAML): prebuilt images, no clone, no build. Use this overlay when you cloned
+# the repository onto the NAS to change code or cannot pull from GHCR.
+#
+# GPU driver: the images are built on nvidia/cuda 12.8.1 with cu128 PyTorch wheels. That base image
+# only starts when the driver reports CUDA >= 12.8 (R570 or newer). Data-centre and workstation GPUs
+# are also accepted on the branches 470, 535, 550, 560 and 565 through CUDA forward compatibility;
+# GeForce cards (RTX 30, 40, 50 series) are not, they need R570 or newer (the image's
+# NVIDIA_REQUIRE_CUDA). Blackwell (RTX 50 series, sm_120) needs R570 or newer anyway.
+# scripts/truenas/preflight.sh checks this on your host.
 #
 # Usage:
-#   docker compose -f docker-compose.yml -f docker-compose.truenas.yml --profile all up -d
+#   cp .env.truenas.example .env       # set APP_DATA_DIR
+#   git checkout v0.2.0                # the release IMAGE_TAG below refers to
+#   docker compose -f docker-compose.yml -f docker-compose.truenas.yml --profile all up -d --build
 #
 # This overlay:
-#   - Pins CUDA_VISIBLE_DEVICES=0 and NVIDIA_VISIBLE_DEVICES=0 for all GPU services
-#   - Keeps the Qwen services on the same physical GPU on single-GPU hosts
-#   - Applies memory-friendly settings for 16 GB VRAM
-#   - Keeps restart policy for unattended operation
+#   - Pins every image to one release. IMAGE_TAG below has to match the checkout you build
+#     from; without --build, `up` pulls that release from GHCR instead.
+#   - Pins CUDA_VISIBLE_DEVICES=0 and NVIDIA_VISIBLE_DEVICES=0 for all GPU services, so the
+#     Qwen services share one card on a single-GPU host.
+#   - Applies memory-friendly settings for a single consumer card.
+#   - Keeps the restart policy for unattended operation (set in the base file).
+#
+# The release default below is kept in step with truenas/tts-stt/app.yaml (app_version) by
+# tests/test_truenas_release_consistency.py; scripts/truenas/set_version.py changes both.
 
 services:
+  piper-voices-seed:
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-piper-tts:${IMAGE_TAG:-0.2.0}
+
+  frontend-service:
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-frontend:${IMAGE_TAG:-0.2.0}
+
+  piper-tts-service:
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-piper-tts:${IMAGE_TAG:-0.2.0}
+
+  whisper-cpp:
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-whisper-cpp:${IMAGE_TAG:-0.2.0}
+
   stt-service:
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-stt:${IMAGE_TAG:-0.2.0}
     environment:
-      # Use medium model by default to leave VRAM for other services
-      WHISPER_MODEL_SIZE: ${WHISPER_MODEL_SIZE:-medium}
+      # large-v3-turbo leaves VRAM for the other services; it cannot translate.
+      WHISPER_MODEL_SIZE: ${WHISPER_MODEL_SIZE:-large-v3-turbo}
       FORCE_ACCELERATION: cuda
       CUDA_VISIBLE_DEVICES: "0"
       NVIDIA_VISIBLE_DEVICES: "0"
 
   piper-training-service:
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-piper-training:${IMAGE_TAG:-0.2.0}
     environment:
       CUDA_VISIBLE_DEVICES: "0"
       NVIDIA_VISIBLE_DEVICES: "0"
-    # Smaller shared-memory buffer — training uses gradient accumulation instead
+    # Smaller shared-memory buffer: training uses gradient accumulation instead.
     shm_size: 1gb
 
   qwen3-asr-service:
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-qwen3-asr:${IMAGE_TAG:-0.2.0}
     environment:
       CUDA_VISIBLE_DEVICES: "0"
       NVIDIA_VISIBLE_DEVICES: "0"
 
   qwen3-tts-service:
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-qwen3-tts:${IMAGE_TAG:-0.2.0}
     environment:
       CUDA_VISIBLE_DEVICES: "0"
       NVIDIA_VISIBLE_DEVICES: "0"
-      # Use the smaller 0.6B model to save ~2 GB VRAM
+      # The smaller 0.6B model saves ~2 GB of VRAM.
       QWEN3_TTS_MODEL: ${QWEN3_TTS_MODEL:-Qwen/Qwen3-TTS-12Hz-0.6B-Base}
 
-  # Optional realtime STT (start with --profile parakeet-asr + ENABLE_PARAKEET_ASR=true)
+  # Optional (--profile canary-asr, plus ENABLE_CANARY_ASR=true for the UI).
+  canary-asr-service:
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-canary-asr:${IMAGE_TAG:-0.2.0}${NEMO_IMAGE_SUFFIX:-}
+    environment:
+      CUDA_VISIBLE_DEVICES: "0"
+      NVIDIA_VISIBLE_DEVICES: "0"
+
+  # Optional (--profile parakeet-asr, plus ENABLE_PARAKEET_ASR=true for the UI).
   parakeet-asr-service:
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-parakeet-asr:${IMAGE_TAG:-0.2.0}${NEMO_IMAGE_SUFFIX:-}
+    environment:
+      CUDA_VISIBLE_DEVICES: "0"
+      NVIDIA_VISIBLE_DEVICES: "0"
+
+  # Optional (--profile chatterbox-tts, plus ENABLE_CHATTERBOX_TTS=true for the UI).
+  chatterbox-tts-service:
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-chatterbox-tts:${IMAGE_TAG:-0.2.0}
     environment:
       CUDA_VISIBLE_DEVICES: "0"
       NVIDIA_VISIBLE_DEVICES: "0"

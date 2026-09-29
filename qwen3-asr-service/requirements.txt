@@ -1,9 +1,12 @@
 # Qwen3-ASR dependencies
-# torch is installed separately in Dockerfile with CUDA support
-qwen-asr>=0.0.5
+# torch is installed separately in the Dockerfile (CUDA / ROCm wheels).
+# 0.0.6 (2026-01-30) is the latest release. It pins transformers==4.57.6 and
+# accelerate==1.12.0 itself, so they are deliberately not repeated here.
+qwen-asr>=0.0.6
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
-python-multipart>=0.0.6
+# 0.0.18 fixed a multipart-parsing denial of service reachable by any upload.
+python-multipart>=0.0.18
 soundfile>=0.12.0
 numpy>=1.24.0,<2.0.0
 aiofiles>=23.1.0

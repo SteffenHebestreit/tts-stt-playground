@@ -1,11 +1,44 @@
 """Optimiser, scheduler, checkpoint, and early-stopping utilities."""
 
+import os
 import torch
 import torch.optim as optim
 import logging
 from torch.optim.lr_scheduler import ExponentialLR, StepLR
 
 logger = logging.getLogger(__name__)
+
+# What the trainer in this service actually is. Recorded in the job state, in
+# every checkpoint and in the exported model's JSON, and logged as a WARNING when
+# a job starts, so nothing downstream can mistake the result for a Piper/VITS
+# voice. Change the kind only if the objective changes.
+TRAINER_KIND = 'experimental-mel-flow'
+TRAINER_CAVEAT = (
+    "This is not a real VITS or Piper fine-tune. The model reconstructs the "
+    "waveform from the ground-truth mel through a normalising flow and a HiFi-GAN "
+    "generator, so the text encoder receives no gradient from that loss; it is "
+    "trained only by a duration regressor whose targets are a synthetic uniform "
+    "split of the mel length over the tokens. There is no monotonic alignment "
+    "search and no adversarial or prior loss. The exported model turns text "
+    "into audio whose length follows the text, but nothing trains the text "
+    "encoder's output to resemble the mel features the vocoder learned from, so "
+    "the audio is not expected to be intelligible speech. For a usable voice, "
+    "fine-tune an existing Piper checkpoint instead."
+)
+
+
+def atomic_torch_save(obj, path):
+    """``torch.save`` through a temp file and ``os.replace``.
+
+    ``job_state.json`` and the resume endpoint point at a checkpoint by path. A
+    process killed mid-write (container stop, OOM kill) left a truncated file at
+    that path, and the resume then failed on it instead of using the previous
+    good checkpoint.
+    """
+    path = os.fspath(path)
+    tmp = path + ".tmp"
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
 
 def get_optimizer(model, config):
     """Get optimizer for training"""

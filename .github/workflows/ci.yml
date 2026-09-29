@@ -1,0 +1,465 @@
+name: CI
+
+# The repo had no test job at all: `publish-images.yml` only runs on master and
+# tags, and only builds. So nothing verified a change before it shipped, and
+# nothing ever built the `-rocm` / `-vulkan` variants — which is exactly how a
+# missing `COPY json_utils.py` and a missing `ENV PYTORCH_JIT=0` reached users.
+#
+# This runs on every branch and PR, and publish-images.yml calls it (workflow_call)
+# so nothing is published from a tree whose tests fail.
+#
+# Blocking jobs: lint, test (3.11 and 3.12), training, compile, compose, actionlint,
+# js, and build (unless called with image-builds: false). The rest report but never
+# fail the run: they are new, or depend on network/tool versions, and are meant to be
+# read and then promoted to blocking once they are clean. publish-images.yml also
+# skips them (informational: false): they cannot fail its gate, so they would only
+# delay the image builds. `training` is NOT one of them: it has no `if:` on that
+# input, so it runs (and can fail the gate) when publish-images.yml calls this file.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      image-builds:
+        description: >-
+          Also build the images that fit a runner. publish-images.yml builds every
+          image itself, so it passes false and only gets the checks.
+        type: boolean
+        default: true
+      informational:
+        description: >-
+          Also run the informational jobs (shellcheck, hadolint, dependency audit,
+          browser suite). They never fail the run.
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+# github.workflow is the CALLER's name when this runs through workflow_call, so a
+# call from publish-images.yml never shares a group with the push-triggered run of
+# this file for the same commit (which would cancel one of them).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' && !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  # The config-drift suites (compose wiring, Dockerfile contents, deploy presets,
+  # OpenAPI specs) fail instead of skipping when a dependency is missing. Left
+  # unset, a runner without PyYAML reported them as skipped: green, guarding nothing.
+  REQUIRE_DRIFT_SUITES: "1"
+
+jobs:
+  lint:
+    name: lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Rule set and Python floor live in ruff.toml (E9, F63, F7, F82: syntax errors
+      # and undefined names, not style). The pin keeps "clean today" meaning the
+      # same thing tomorrow; bump it deliberately.
+      - name: ruff check
+        run: |
+          pip install "ruff==0.15.8"
+          ruff check --output-format=github .
+
+  test:
+    name: unit tests (python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: tests/requirements.txt
+
+      - name: Install test dependencies
+        run: pip install -r tests/requirements.txt
+
+      # Tests that need a running container skip themselves here (no stack on
+      # the runner) and are reported as skips, not passes. The in-stack run
+      # sets REQUIRE_LIVE_SERVICES=1 so they cannot skip silently there.
+      - name: Run tests
+        run: pytest tests/ -v --tb=short -rs --junitxml=junit.xml
+
+      # The guard suites must have RUN. Their modules are named here; the only
+      # skips tolerated are the ones that are correct by construction (a service
+      # with no local module has nothing for the Dockerfile check to compare).
+      - name: Drift suites ran (none skipped)
+        if: ${{ !cancelled() && hashFiles('junit.xml') != '' }}
+        run: |
+          python scripts/check_no_skips.py junit.xml \
+            --module tests/test_env_wiring.py \
+            --module tests/test_docker_image_contents.py \
+            --module tests/test_deploy_profiles.py \
+            --module tests/test_compose_hygiene.py \
+            --module tests/test_openapi_specs.py \
+            --module tests/test_publish_plan.py \
+            --allow "has no local module imports" \
+            --allow "is not in the dev overlay" \
+            --allow "root ignores directory permissions"
+
+  # The piper-training fixes (a run that fails loudly on failed batches or a split too
+  # small for one batch, an ONNX export whose length follows the text) are tested ONLY
+  # by the two modules below, which need torch, onnx and onnxruntime. The unit job
+  # installs none of them and skips these modules, so without this job nothing in CI
+  # would notice those fixes regressing. It gates the run, and it gates the publish
+  # too: it has no `if:` on the `informational` input, so publish-images.yml runs it.
+  #
+  # REQUIRE_TORCH_TESTS=1 turns the modules' importorskip into an import error
+  # (tests/optional_deps.py): a torch install that quietly broke fails the job
+  # instead of skipping every test and leaving it green. check_no_skips.py is the
+  # second line, as in the unit job: it reads the JUnit report.
+  #
+  # Kept fast by the CPU wheels (a few hundred MB; the PyPI wheel drags in ~4.5 GB of
+  # CUDA libraries), a pip cache, and running only the two modules that need torch.
+  # torch is the version the image ships (the Dockerfile's TORCH_VERSION), not "latest":
+  # a gate must not turn red because a new torch appeared.
+  training:
+    name: training tests (torch, onnxruntime)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      REQUIRE_TORCH_TESTS: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            piper-training-service/requirements.txt
+            tests/requirements.txt
+
+      - name: Install (CPU torch, the version the image ships)
+        run: |
+          version=$(sed -n 's/^ARG TORCH_VERSION=//p' piper-training-service/Dockerfile)
+          test -n "$version" || { echo "::error::no ARG TORCH_VERSION in piper-training-service/Dockerfile"; exit 1; }
+          echo "torch==$version (CPU wheel)"
+          pip install "torch==$version" --index-url https://download.pytorch.org/whl/cpu
+          pip install -r piper-training-service/requirements.txt -r tests/requirements.txt
+
+      - name: Run tests
+        run: |
+          pytest tests/test_piper_training_core_export.py tests/test_piper_training_core_pipeline.py \
+            -v --tb=short -rs --junitxml=junit-training.xml
+
+      - name: Training suites ran (none skipped)
+        if: ${{ !cancelled() && hashFiles('junit-training.xml') != '' }}
+        run: |
+          python scripts/check_no_skips.py junit-training.xml \
+            --module tests/test_piper_training_core_export.py \
+            --module tests/test_piper_training_core_pipeline.py
+
+  compile:
+    name: compile all services (python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # Catches syntax and scope errors (e.g. a bad `global`) without needing
+      # any service's heavy dependencies installed. ast.parse is not enough —
+      # it accepts code that py_compile rejects.
+      - name: Byte-compile every service
+        run: |
+          set -e
+          for f in */*.py; do
+            python -m py_compile "$f" || { echo "FAILED: $f"; exit 1; }
+          done
+          echo "compiled $(printf '%s\n' ./*/*.py | wc -l) modules"
+
+  frontend-js:
+    name: frontend JavaScript syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # node ships on the runner image. --check parses without running, which is
+      # all a browser-only script allows here; the behaviour is covered by
+      # tests/test_frontend_ui_logic.py in the unit-test job.
+      - name: node --check
+        run: |
+          set -e
+          node --version
+          for f in frontend-service/static/js/*.js; do
+            echo "--- $f"
+            node --check "$f"
+          done
+
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Also runs shellcheck over every `run:` block (it is on the runner image).
+      - name: actionlint
+        run: |
+          pip install actionlint-py
+          actionlint -color
+
+  compose:
+    name: validate compose overlays
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Overlay merges fail silently in ways that are invisible until deploy:
+      # a `deploy.resources` reservation that survives into the ROCm overlay
+      # pins an AMD host to a device it does not have.
+      - name: Validate every overlay combination
+        run: |
+          set -e
+          cp -n .env.example .env || true
+          check() {
+            echo "--- $*"
+            docker compose "$@" config -q
+          }
+          # Every service sits behind a profile, so a bare `config` resolves to
+          # an empty project and would validate nothing. `all` is the core set;
+          # piper-training-service is only in `training`.
+          ALL=(--profile all --profile training)
+          check -f docker-compose.yml
+          check "${ALL[@]}" -f docker-compose.yml
+          check "${ALL[@]}" -f docker-compose.yml -f docker-compose.rocm.yml
+          check "${ALL[@]}" -f docker-compose.yml -f docker-compose.vulkan.yml
+          check "${ALL[@]}" -f docker-compose.yml -f docker-compose.arm64.yml
+          check "${ALL[@]}" -f docker-compose.yml -f docker-compose.dev.yml
+          check "${ALL[@]}" -f docker-compose.yml -f tests/docker-compose.test.yml
+          # truenas.yml is an overlay, not a standalone project.
+          check "${ALL[@]}" -f docker-compose.yml -f docker-compose.truenas.yml
+          # The standalone TrueNAS file has no default for APP_DATA_DIR on purpose
+          # (a forgotten path must not silently land in the wrong place), so it is
+          # validated with the example settings that do set it.
+          check --env-file .env.truenas.example -f docker-compose.truenas-app.yml
+          # The optional backends are outside `all`; their build args and images
+          # must validate too.
+          check "${ALL[@]}" --profile parakeet-asr --profile canary-asr \
+            --profile chatterbox-tts --profile whisper-cpp -f docker-compose.yml
+
+      # The ROCm overlay exists to remove NVIDIA reservations. Assert it, rather
+      # than trusting that the `!reset` merge behaved — it silently did not for
+      # a long time.
+      - name: Assert ROCm overlay leaves no NVIDIA reservations
+        run: |
+          cp -n .env.example .env || true
+          docker compose version
+
+          docker compose --profile all --profile training \
+            -f docker-compose.yml -f docker-compose.rocm.yml config > /tmp/rocm.yml
+
+          count=$(grep -c "driver: nvidia" /tmp/rocm.yml || true)
+          echo "nvidia reservations surviving into ROCm overlay: $count"
+
+          if [ "$count" -ne 0 ]; then
+            echo "--- services still reserving an NVIDIA device:"
+            # Print the owning service for each surviving reservation, so the
+            # failure names the culprit instead of just a count.
+            awk '/^  [a-z0-9-]+:/ {svc=$1} /driver: nvidia/ {print "    " svc}' /tmp/rocm.yml
+            exit 1
+          fi
+
+      # Only the gateway may be reachable beyond loopback by default. The pytest
+      # suite asserts the same from the YAML; this asks the compose CLI itself.
+      - name: Assert backends are published on loopback only
+        run: |
+          cp -n .env.example .env || true
+          docker compose --profile all --profile training --profile parakeet-asr \
+            --profile canary-asr --profile chatterbox-tts --profile whisper-cpp \
+            -f docker-compose.yml config --format json > /tmp/base.json
+          exposed=$(jq -r '.services | to_entries[]
+            | select(.key != "frontend-service")
+            | .key as $svc | (.value.ports // [])[]
+            | select(.host_ip != "127.0.0.1") | "\($svc) \(.host_ip) \(.published)"' /tmp/base.json)
+          if [ -n "$exposed" ]; then
+            echo "::error::backend ports published beyond loopback:"
+            echo "$exposed"
+            exit 1
+          fi
+          echo "all backend ports are bound to 127.0.0.1"
+
+  build:
+    name: build ${{ matrix.name }}
+    # publish-images.yml builds every image itself and only wants the checks.
+    # (`inputs.image-builds` is null outside workflow_call, hence the `== null`.)
+    if: ${{ inputs.image-builds || inputs.image-builds == null }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Only the images that fit a runner. The CUDA and ROCm bases do not:
+          # `rocm/dev-ubuntu-22.04:6.2-complete` alone is ~30 GB unpacked
+          # against ~14 GB of free disk. Those variants are covered statically
+          # by tests/test_docker_image_contents.py, which asserts the same two
+          # things a build would have caught — that every locally-imported
+          # module is COPYd, and that runtime-critical ENVs survive into the
+          # variant.
+          - { name: frontend,           context: ./frontend-service,    file: Dockerfile }
+          - { name: piper-tts,          context: ./piper-tts-service,   file: Dockerfile }
+          - { name: whisper-cpp,        context: ./whisper-cpp-service, file: Dockerfile }
+          - { name: whisper-cpp-vulkan, context: ./whisper-cpp-service, file: Dockerfile.vulkan }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.context }}/${{ matrix.file }}
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: ci-${{ matrix.name }}:test
+          cache-from: type=gha,scope=ci-${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=ci-${{ matrix.name }}
+
+      # A built image that cannot import its own entrypoint is the failure mode
+      # this whole job exists for. Only meaningful for the Python services.
+      - name: Verify the app imports inside the image
+        if: matrix.name == 'frontend' || matrix.name == 'piper-tts'
+        run: |
+          docker run --rm --entrypoint python ci-${{ matrix.name }}:test \
+            -c "import app; print('import ok:', app.__name__)"
+
+  # --- informational -----------------------------------------------------------------
+  # The jobs below never fail the run (continue-on-error). They are here to be
+  # read, and promoted to blocking once clean.
+
+  shellcheck:
+    name: shellcheck (informational)
+    # `== null`: the input does not exist outside workflow_call.
+    if: ${{ inputs.informational || inputs.informational == null }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck every *.sh
+        run: |
+          pip install shellcheck-py
+          mapfile -t scripts < <(git ls-files '*.sh')
+          echo "checking ${#scripts[@]} scripts"
+          shellcheck --format=gcc "${scripts[@]}"
+
+  dockerfile-lint:
+    name: hadolint (informational)
+    # `== null`: the input does not exist outside workflow_call.
+    if: ${{ inputs.informational || inputs.informational == null }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      # The ignored rules are house style, not defects here: unpinned apt packages
+      # (the base images pin the release), `pip install` without ==version (the
+      # requirements files do the pinning), consecutive RUNs (kept apart so a torch
+      # layer caches on its own), shell-form CMD (the services exec their scripts).
+      - name: hadolint
+        run: |
+          pip install hadolint-py
+          mapfile -t files < <(git ls-files '*Dockerfile*')
+          hadolint --failure-threshold warning \
+            --ignore DL3008 --ignore DL3013 --ignore DL3015 --ignore DL3059 \
+            --ignore DL3025 --ignore DL3003 "${files[@]}"
+
+  audit:
+    name: dependency audit (informational)
+    # `== null`: the input does not exist outside workflow_call.
+    if: ${{ inputs.informational || inputs.informational == null }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Each requirements file is resolved the way an image build would (uv, 3.11)
+      # and the resolved set is audited: the files themselves are mostly ranges, and
+      # pip-audit can only judge exact versions cheaply. torch and the NeMo toolkit
+      # are installed by Dockerfile ARGs, so their pins are not in these files.
+      - name: pip-audit every requirements file
+        run: |
+          pip install pip-audit uv
+          status=0
+          {
+            echo "## Dependency audit"
+            echo
+            echo "Requirements are resolved with uv for Python 3.11, then audited against the PyPI advisory database. Advisories do not fail the run yet."
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          for req in */requirements.txt; do
+            service="${req%%/*}"
+            if ! uv pip compile "$req" --python-version 3.11 --no-header --quiet -o "resolved-$service.txt" 2> "resolve-$service.log"; then
+              echo "- **$service**: could not be resolved: $(tail -n 1 "resolve-$service.log")" >> "$GITHUB_STEP_SUMMARY"
+              status=1
+              continue
+            fi
+            if pip-audit -r "resolved-$service.txt" --no-deps --disable-pip --progress-spinner off > "audit-$service.txt" 2>&1; then
+              echo "- **$service**: no known vulnerabilities" >> "$GITHUB_STEP_SUMMARY"
+            else
+              status=1
+              {
+                echo "- **$service**: advisories found"
+                echo
+                echo '```'
+                grep -v '^WARNING' "audit-$service.txt"
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+          exit "$status"
+
+  browser:
+    name: browser tests (informational)
+    # `== null`: the input does not exist outside workflow_call.
+    if: ${{ inputs.informational || inputs.informational == null }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # The real-browser suite for the UI, including the strict script-src policy
+      # case. It skips itself where Chromium is missing.
+      - name: Install
+        run: |
+          pip install -r tests/requirements.txt playwright uvicorn
+          playwright install --with-deps chromium
+
+      - name: Run
+        run: pytest tests/test_frontend_ui_browser.py tests/test_frontend_ui_logic.py -v --tb=short -rs

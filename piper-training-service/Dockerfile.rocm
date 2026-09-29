@@ -1,8 +1,10 @@
 FROM rocm/dev-ubuntu-22.04:6.2-complete
 
-# Install system dependencies
+# Install system dependencies. Python 3.11 like the other services (the pinned
+# onnxruntime has no 3.10 wheel).
 RUN apt-get update && apt-get install -y \
-    python3.10 \
+    python3.11 \
+    python3.11-dev \
     python3-pip \
     git \
     wget \
@@ -16,15 +18,33 @@ RUN apt-get update && apt-get install -y \
     lshw \
     && rm -rf /var/lib/apt/lists/*
 
+RUN ln -sf /usr/bin/python3.11 /usr/bin/python3 && \
+    ln -sf /usr/bin/python3.11 /usr/bin/python
+
 WORKDIR /app
 
-RUN pip3 install --upgrade pip setuptools wheel
+RUN pip3 install --no-cache-dir --upgrade pip setuptools wheel
 
+# Install ROCm-enabled PyTorch first, BEFORE `COPY requirements.txt`: a COPY whose
+# file changed invalidates every layer after it, so with the COPY first, editing
+# any requirement downloaded this multi-GB wheel again. requirements.txt has no
+# torch line, and the constraint below keeps it that way (see there).
+#
+# Pinned to 2.5.1, the newest release the rocm6.2 index serves (the ASR
+# Dockerfile.rocm files note the same). The ONNX export uses the TorchScript
+# tracer (torch.onnx.export(dynamo=False)); tests/test_piper_training_core_export.py
+# was run on 2.5.1 as well as on the 2.11.0 the CUDA image pins. Moving to a newer
+# ROCm wheel index means re-running it there. torchaudio is not installed: nothing
+# in this service imports it.
+ARG TORCH_VERSION=2.5.1
+RUN pip3 install --no-cache-dir "torch==${TORCH_VERSION}" --index-url https://download.pytorch.org/whl/rocm6.2
+
+# The other requirements, with torch held by a constraint: this is what used to
+# be guaranteed by installing torch last. If a requirement ever asks for another
+# release the build fails here instead of replacing the ROCm wheel with a PyPI one.
 COPY requirements.txt .
-
-RUN pip3 install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/rocm6.2
-
-RUN pip3 install --no-cache-dir -r requirements.txt
+RUN printf 'torch==%s\n' "${TORCH_VERSION}" > /tmp/torch-constraints.txt \
+    && pip3 install --no-cache-dir -c /tmp/torch-constraints.txt -r requirements.txt
 
 COPY . .
 

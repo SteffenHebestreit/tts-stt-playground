@@ -1,8 +1,15 @@
+# Catalog metadata. This file is the SINGLE SOURCE OF TRUTH for the release version:
+# `app_version` is the image tag every TrueNAS file defaults to (IMAGE_TAG), `version` is the
+# catalog version of this app definition and follows it one to one.
+# tests/test_truenas_release_consistency.py fails when a compose file, an env example, the
+# catalog form or the docs disagree; scripts/truenas/set_version.py X.Y.Z changes them all.
+# Release order: set_version.py, commit, tag vX.Y.Z (CI then publishes the images), and only
+# then tell anyone to install: until the images exist a pinned install cannot pull them.
 name: tts-stt
 title: TTS-STT Studio
 train: community
-version: 0.1.0
-app_version: "0.1.0"
+version: 0.2.0
+app_version: "0.2.0"
 categories:
   - media
   - ai
@@ -14,16 +21,18 @@ home: https://github.com/SteffenHebestreit/tts-stt-playground
 sources:
   - https://github.com/SteffenHebestreit/tts-stt-playground
 description: >-
-  Self-hosted neural Text-to-Speech and Speech-to-Text platform: PiperTTS,
-  Qwen3-TTS voice cloning, Whisper / Qwen3-ASR / Parakeet STT, and a custom
-  VITS voice-training pipeline, behind one web UI. GPU-accelerated (NVIDIA).
+  Self-hosted neural Text-to-Speech and Speech-to-Text platform, German first: Piper and
+  Qwen3-TTS voices (with cloning), Chatterbox streaming TTS, Whisper, Qwen3-ASR, Canary and
+  Parakeet speech recognition with live microphone transcription, and a voice-training
+  pipeline, behind one web UI and an OpenAI-compatible API. GPU-accelerated (NVIDIA).
 keywords:
   - tts
   - stt
   - whisper
   - piper
   - qwen3
+  - chatterbox
+  - canary
   - parakeet
   - voice-cloning
   - german
-icon: https://raw.githubusercontent.com/SteffenHebestreit/tts-stt-playground/master/frontend-service/static/favicon.ico

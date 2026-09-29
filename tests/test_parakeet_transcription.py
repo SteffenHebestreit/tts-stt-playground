@@ -67,3 +67,21 @@ def test_parse_hypothesis_missing_text_attr():
     text, segments = tr.parse_hypothesis(hyp)
     assert text == ""
     assert segments == []
+
+
+def test_the_two_nemo_services_parse_hypotheses_identically():
+    """Both services decode the same Hypothesis shape; a fix to one parser belongs in both."""
+    path = Path(__file__).resolve().parents[1] / "canary-asr-service" / "transcription.py"
+    spec = spec_from_file_location("canary_transcription_for_comparison", path)
+    canary = module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(canary)
+
+    samples = [
+        "  hallo  ",
+        SimpleNamespace(text=" x ", timestamp={"segment": [{"start": 0, "end": 1.5, "segment": " a "}]}),
+        SimpleNamespace(text="t", timestamp={"segment": [{"start": "bad", "end": 1, "segment": "x"}]}),
+        SimpleNamespace(timestamp=None),
+    ]
+    for sample in samples:
+        assert tr.parse_hypothesis(sample) == canary.parse_hypothesis(sample)

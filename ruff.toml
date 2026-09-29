@@ -1,0 +1,23 @@
+# Lint scope, deliberately narrow: bugs, not style.
+#
+# The code base has no formatter or linter history, so switching on E/W/I/UP
+# would drown the few findings that matter in thousands of style hits. This set
+# catches what actually breaks a container at import or first use, and is clean
+# on the current tree so a new hit is a real regression:
+#
+#   E9    syntax errors and unreadable files
+#   F63   invalid comparisons / assertions (`assert (x, "msg")`, `is` with a literal)
+#   F7    syntax-level misuse: `return`/`yield`/`await` outside a function, `break`
+#         outside a loop, misplaced `except*`, ...
+#   F82   undefined names (F821 undefined name, F822 in __all__, F823 used before
+#         assignment). The class of bug `py_compile` cannot see: it parses fine and
+#         raises NameError on the first request.
+#
+# Widen it one rule family at a time, fixing the hits in the same commit.
+
+# The oldest interpreter any image runs: stt-service sits on Ubuntu 22.04 (3.10).
+# Syntax newer than this is an error here instead of at container start.
+target-version = "py310"
+
+[lint]
+select = ["E9", "F63", "F7", "F82"]

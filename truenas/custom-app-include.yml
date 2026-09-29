@@ -1,0 +1,29 @@
+# Custom App wrapper: the settings live in a file on the dataset instead of inside this YAML.
+#
+# Paste this into Apps -> Discover Apps -> Custom App -> Install via YAML after changing the two
+# paths. They must point at the two files you downloaded next to each other (guide: "Other ways
+# to install", Settings file):
+#   docker-compose.truenas-app.yml   the stack, unchanged
+#   settings.env                     a copy of .env.truenas.example with APP_DATA_DIR and IMAGE_TAG set
+#
+# To update: change IMAGE_TAG in settings.env, then Stop and Start the app. Comments are not kept
+# once you press Save, so this file is deliberately tiny.
+#
+# STATUS: `include:` with `env_file:` is standard Compose (2.20 and newer) and the TrueNAS
+# middleware validates a pasted YAML with `docker compose config`, so it should be accepted.
+# It has not been run on a real TrueNAS.
+name: tts-stt
+x-portals:
+  - name: Web UI
+    scheme: http
+    host: 0.0.0.0
+    port: 3000
+    path: /
+x-notes: |
+  TTS-STT Studio. Web UI on port 3000.
+  Settings: /mnt/tank/apps/tts-stt/app/settings.env (IMAGE_TAG, APP_DATA_DIR, GPU_DEVICE_ID, ...).
+  Update: snapshot the dataset, change IMAGE_TAG there, then Stop and Start this app.
+  Guide: docs/truenas-installation-guide.md in the repository.
+include:
+  - path: /mnt/tank/apps/tts-stt/app/docker-compose.truenas-app.yml
+    env_file: /mnt/tank/apps/tts-stt/app/settings.env

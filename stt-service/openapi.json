@@ -1,77 +1,40 @@
 {
-  "openapi": "3.0.0",
+  "openapi": "3.1.0",
   "info": {
-    "title": "STT Service API",
-    "description": "Whisper-powered speech-to-text transcription service with intelligent segmentation and multi-language support",
-    "version": "1.0.0"
+    "title": "STT Service",
+    "description": "Speech-to-Text Service with Hardware Acceleration",
+    "version": "0.1.0"
   },
-  "servers": [
-    {
-      "url": "http://localhost:5001",
-      "description": "STT Service (External Port)"
-    }
-  ],
   "paths": {
     "/transcribe": {
       "post": {
-        "summary": "Transcribe audio to text",
-        "description": "Convert audio file to text using Whisper with optional segmentation for training data preparation",
+        "summary": "Transcribe Audio",
+        "description": "Transcribe one or more audio files to text.\n\nSupports single-file (``audio``) and multi-file (``audios``) uploads.\nReturns per-file results with segments, language, and timing information.",
+        "operationId": "transcribe_audio_transcribe_post",
         "requestBody": {
-          "required": true,
           "content": {
             "multipart/form-data": {
               "schema": {
-                "type": "object",
-                "properties": {
-                  "audio_file": {
-                    "type": "string",
-                    "format": "binary",
-                    "description": "Audio file to transcribe"
-                  },
-                  "language": {
-                    "type": "string",
-                    "description": "Target language code (auto-detect if not specified)",
-                    "example": "en"
-                  },
-                  "model": {
-                    "type": "string",
-                    "enum": ["tiny", "base", "small", "medium", "large"],
-                    "default": "medium",
-                    "description": "Whisper model size"
-                  },
-                  "segment_length": {
-                    "type": "integer",
-                    "description": "Segment length in seconds for training data",
-                    "default": 10
-                  },
-                  "overlap": {
-                    "type": "number",
-                    "description": "Overlap between segments in seconds",
-                    "default": 1.0
-                  }
-                },
-                "required": ["audio_file"]
+                "$ref": "#/components/schemas/Body_transcribe_audio_transcribe_post"
               }
             }
           }
         },
         "responses": {
           "200": {
-            "description": "Successful transcription",
+            "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/TranscriptionResponse"
-                }
+                "schema": {}
               }
             }
           },
-          "400": {
-            "description": "Invalid request",
+          "422": {
+            "description": "Validation Error",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
+                  "$ref": "#/components/schemas/HTTPValidationError"
                 }
               }
             }
@@ -81,75 +44,34 @@
     },
     "/transcribe-stream": {
       "post": {
-        "summary": "Stream transcription with real-time results",
-        "description": "Real-time transcription streaming for long audio files",
+        "summary": "Transcribe Audio Stream",
+        "description": "Stream transcription results via Server-Sent Events as segments are decoded.",
+        "operationId": "transcribe_audio_stream_transcribe_stream_post",
         "requestBody": {
-          "required": true,
           "content": {
             "multipart/form-data": {
               "schema": {
-                "type": "object",
-                "properties": {
-                  "audio_file": {
-                    "type": "string",
-                    "format": "binary",
-                    "description": "Audio file to transcribe"
-                  },
-                  "language": {
-                    "type": "string",
-                    "description": "Target language code",
-                    "example": "en"
-                  }
-                },
-                "required": ["audio_file"]
+                "$ref": "#/components/schemas/Body_transcribe_audio_stream_transcribe_stream_post"
               }
             }
-          }
+          },
+          "required": true
         },
         "responses": {
           "200": {
-            "description": "Streaming transcription",
+            "description": "Successful Response",
             "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string",
-                  "description": "Server-sent events stream with transcription updates"
-                }
+              "application/json": {
+                "schema": {}
               }
             }
-          }
-        }
-      }
-    },
-    "/detect_language": {
-      "post": {
-        "summary": "Detect audio language",
-        "description": "Automatically detect the language of provided audio file",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "multipart/form-data": {
-              "schema": {
-                "type": "object",
-                "properties": {
-                  "audio_file": {
-                    "type": "string",
-                    "format": "binary",
-                    "description": "Audio file for language detection"
-                  }
-                },
-                "required": ["audio_file"]
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Language detection result",
+          },
+          "422": {
+            "description": "Validation Error",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/LanguageDetectionResponse"
+                  "$ref": "#/components/schemas/HTTPValidationError"
                 }
               }
             }
@@ -159,16 +81,32 @@
     },
     "/health": {
       "get": {
-        "summary": "Health check",
-        "description": "Check service health and model status",
+        "summary": "Health Check",
+        "description": "Liveness for health monitoring. Never loads or waits on the model.\n\nDistinguishes two states that both mean \"no model in memory\" but need\nopposite handling:\n\n- **not resident** — the model was unloaded to free VRAM, or has not been\n  loaded yet. The service is fine and the next request will load it, so\n  this returns 200. Returning 503 here would make an idle container go\n  `unhealthy` under Docker's `curl -f` check and show as down in the UI.\n- **broken** — every load attempt failed. That is a real outage: 503.\n\nWhether the service can serve *right now* is /ready's question.",
+        "operationId": "health_check_health_get",
         "responses": {
           "200": {
-            "description": "Service is healthy",
+            "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HealthResponse"
-                }
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ready": {
+      "get": {
+        "summary": "Ready",
+        "description": "Readiness: can this service take a transcription request now?\n\n200 when the model is resident, or has been unloaded (idle TTL, POST /unload)\nand can be reloaded on demand. 503 with a JSON `reason` while a load is\nrunning (`loading`) and after every load attempt failed (`load_failed`).\n\nLike /health this only reads state and never triggers or waits for a load —\nan orchestrator polling it must not be what keeps the model resident, and a\npoll during a multi-minute download has to answer at once.",
+        "operationId": "ready_ready_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
               }
             }
           }
@@ -177,16 +115,32 @@
     },
     "/info": {
       "get": {
-        "summary": "Service information",
-        "description": "Get detailed service and model information",
+        "summary": "Service Info",
+        "description": "Return detailed service and GPU information.",
+        "operationId": "service_info_info_get",
         "responses": {
           "200": {
-            "description": "Service information",
+            "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/InfoResponse"
-                }
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/unload": {
+      "post": {
+        "summary": "Unload",
+        "description": "Release the model and its memory now, without stopping the container.\n\nThe idle TTL handles the common case; this is for the deliberate one — you\nare about to run something else on the same GPU and want the VRAM back\nimmediately. The next request reloads transparently, so this is safe to call\nat any time.\n\nReturns 200 when the model was released or was already unloaded, and **409\nwhen a transcription is in flight** — freeing memory a running decode is\nstill reading would crash the worker, so the caller is told to retry instead.",
+        "operationId": "unload_unload_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
               }
             }
           }
@@ -195,16 +149,15 @@
     },
     "/models": {
       "get": {
-        "summary": "List available models",
-        "description": "Get list of available Whisper models",
+        "summary": "Available Models",
+        "description": "List Whisper model variants with size and multilingual capability.",
+        "operationId": "available_models_models_get",
         "responses": {
           "200": {
-            "description": "Available models",
+            "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ModelsResponse"
-                }
+                "schema": {}
               }
             }
           }
@@ -213,15 +166,63 @@
     },
     "/tasks": {
       "get": {
-        "summary": "List active tasks",
-        "description": "Get list of currently running transcription tasks",
+        "summary": "Available Tasks",
+        "description": "Describe the supported transcription tasks (transcribe / translate).",
+        "operationId": "available_tasks_tasks_get",
         "responses": {
           "200": {
-            "description": "Active tasks",
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/detect_language": {
+      "post": {
+        "summary": "Detect Language",
+        "description": "Quickly detect the spoken language and return a sample transcript.",
+        "operationId": "detect_language_detect_language_post",
+        "parameters": [
+          {
+            "name": "duration_limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "number",
+              "default": 30.0,
+              "title": "Duration Limit"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_detect_language_detect_language_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/TasksResponse"
+                  "$ref": "#/components/schemas/HTTPValidationError"
                 }
               }
             }
@@ -232,197 +233,217 @@
   },
   "components": {
     "schemas": {
-      "TranscriptionResponse": {
-        "type": "object",
+      "Body_detect_language_detect_language_post": {
         "properties": {
-          "text": {
+          "file": {
             "type": "string",
-            "description": "Complete transcribed text"
-          },
-          "segments": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/TranscriptionSegment"
-            },
-            "description": "Segmented transcription with timestamps"
+            "contentMediaType": "application/octet-stream",
+            "title": "File"
+          }
+        },
+        "type": "object",
+        "required": [
+          "file"
+        ],
+        "title": "Body_detect_language_detect_language_post"
+      },
+      "Body_transcribe_audio_stream_transcribe_stream_post": {
+        "properties": {
+          "audio": {
+            "type": "string",
+            "contentMediaType": "application/octet-stream",
+            "title": "Audio"
           },
           "language": {
             "type": "string",
-            "description": "Detected or specified language"
+            "title": "Language"
           },
-          "duration": {
-            "type": "number",
-            "description": "Audio duration in seconds"
+          "task": {
+            "type": "string",
+            "title": "Task",
+            "default": "transcribe"
           },
-          "processing_time": {
-            "type": "number",
-            "description": "Processing time in seconds"
-          }
-        }
-      },
-      "TranscriptionSegment": {
-        "type": "object",
-        "properties": {
-          "id": {
+          "target_language": {
+            "type": "string",
+            "title": "Target Language",
+            "default": "english"
+          },
+          "beam_size": {
             "type": "integer",
-            "description": "Segment identifier"
+            "title": "Beam Size",
+            "default": 5
           },
-          "start": {
+          "vad_filter": {
+            "type": "boolean",
+            "title": "Vad Filter",
+            "default": true
+          },
+          "vad_threshold": {
             "type": "number",
-            "description": "Start time in seconds"
+            "title": "Vad Threshold",
+            "default": 0.5
           },
-          "end": {
+          "no_speech_threshold": {
             "type": "number",
-            "description": "End time in seconds"
-          },
-          "text": {
-            "type": "string",
-            "description": "Segment text"
-          },
-          "confidence": {
-            "type": "number",
-            "description": "Transcription confidence score"
+            "title": "No Speech Threshold",
+            "default": 0.6
           }
-        }
-      },
-      "LanguageDetectionResponse": {
+        },
         "type": "object",
+        "required": [
+          "audio"
+        ],
+        "title": "Body_transcribe_audio_stream_transcribe_stream_post"
+      },
+      "Body_transcribe_audio_transcribe_post": {
         "properties": {
+          "audio": {
+            "type": "string",
+            "contentMediaType": "application/octet-stream",
+            "title": "Audio"
+          },
+          "audios": {
+            "items": {
+              "type": "string",
+              "contentMediaType": "application/octet-stream"
+            },
+            "type": "array",
+            "title": "Audios"
+          },
+          "task": {
+            "type": "string",
+            "title": "Task",
+            "default": "transcribe"
+          },
           "language": {
             "type": "string",
-            "description": "Detected language code"
+            "title": "Language"
           },
-          "confidence": {
+          "beam_size": {
+            "type": "integer",
+            "title": "Beam Size",
+            "default": 5
+          },
+          "best_of": {
+            "type": "integer",
+            "title": "Best Of",
+            "default": 5
+          },
+          "patience": {
             "type": "number",
-            "description": "Detection confidence score"
+            "title": "Patience",
+            "default": 1.0
           },
-          "probabilities": {
+          "temperature": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "title": "Temperature",
+            "default": "0.0,0.2,0.4,0.6,0.8,1.0"
+          },
+          "suppress_tokens": {
+            "type": "string",
+            "title": "Suppress Tokens",
+            "default": "-1"
+          },
+          "initial_prompt": {
+            "type": "string",
+            "title": "Initial Prompt",
+            "default": ""
+          },
+          "condition_on_previous_text": {
+            "type": "boolean",
+            "title": "Condition On Previous Text",
+            "default": true
+          },
+          "compression_ratio_threshold": {
+            "type": "number",
+            "title": "Compression Ratio Threshold",
+            "default": 2.4
+          },
+          "no_speech_threshold": {
+            "type": "number",
+            "title": "No Speech Threshold",
+            "default": 0.6
+          },
+          "vad_filter": {
+            "type": "boolean",
+            "title": "Vad Filter",
+            "default": true
+          },
+          "vad_threshold": {
+            "type": "number",
+            "title": "Vad Threshold",
+            "default": 0.5
+          }
+        },
+        "type": "object",
+        "title": "Body_transcribe_audio_transcribe_post"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
             "type": "object",
-            "description": "Language probabilities",
-            "additionalProperties": {
-              "type": "number"
-            }
+            "title": "Context"
           }
-        }
-      },
-      "HealthResponse": {
+        },
         "type": "object",
-        "properties": {
-          "status": {
-            "type": "string",
-            "enum": ["healthy", "unhealthy"],
-            "description": "Service health status"
-          },
-          "model_loaded": {
-            "type": "boolean",
-            "description": "Whether Whisper model is loaded"
-          },
-          "model_name": {
-            "type": "string",
-            "description": "Currently loaded model name"
-          },
-          "gpu_available": {
-            "type": "boolean",
-            "description": "Whether GPU acceleration is available"
-          }
-        }
-      },
-      "InfoResponse": {
-        "type": "object",
-        "properties": {
-          "service": {
-            "type": "string",
-            "description": "Service name"
-          },
-          "version": {
-            "type": "string",
-            "description": "Service version"
-          },
-          "whisper_version": {
-            "type": "string",
-            "description": "Whisper library version"
-          },
-          "device": {
-            "type": "string",
-            "description": "Processing device (cuda/cpu)"
-          },
-          "supported_languages": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
-            "description": "Supported language codes"
-          }
-        }
-      },
-      "ModelsResponse": {
-        "type": "object",
-        "properties": {
-          "models": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
-            "description": "Available model names"
-          },
-          "current_model": {
-            "type": "string",
-            "description": "Currently loaded model"
-          }
-        }
-      },
-      "TasksResponse": {
-        "type": "object",
-        "properties": {
-          "active_tasks": {
-            "type": "integer",
-            "description": "Number of active transcription tasks"
-          },
-          "tasks": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/TaskInfo"
-            },
-            "description": "List of active tasks"
-          }
-        }
-      },
-      "TaskInfo": {
-        "type": "object",
-        "properties": {
-          "task_id": {
-            "type": "string",
-            "description": "Task identifier"
-          },
-          "status": {
-            "type": "string",
-            "enum": ["processing", "completed", "failed"],
-            "description": "Task status"
-          },
-          "progress": {
-            "type": "number",
-            "description": "Progress percentage (0-100)"
-          },
-          "started_at": {
-            "type": "string",
-            "format": "date-time",
-            "description": "Task start time"
-          }
-        }
-      },
-      "ErrorResponse": {
-        "type": "object",
-        "properties": {
-          "error": {
-            "type": "string",
-            "description": "Error message"
-          },
-          "details": {
-            "type": "string",
-            "description": "Detailed error information"
-          }
-        }
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
       }
     }
-  }
+  },
+  "servers": [
+    {
+      "url": "http://localhost:5001",
+      "description": "Published host port. Bound to 127.0.0.1 unless BACKEND_BIND_ADDR is changed; the gateway on :3000 proxies the routes the UI needs."
+    }
+  ]
 }

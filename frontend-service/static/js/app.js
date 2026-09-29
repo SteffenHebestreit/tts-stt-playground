@@ -2,11 +2,162 @@
 // Manages tab navigation, service health polling, TTS/STT actions,
 // training workflows, and Qwen3 voice-cloning interactions.
 
+/** Parse the JSON blob the template embeds in a <script type="application/json"> element. */
+function readEmbeddedJson(elementId) {
+    const element = document.getElementById(elementId);
+    if (!element) return null;
+    try {
+        return JSON.parse(element.textContent);
+    } catch (error) {
+        console.error(`Embedded JSON #${elementId} is not valid:`, error);
+        return null;
+    }
+}
+
 // Global variables
-const providerRegistry = window.PROVIDER_REGISTRY || { providers: {}, ui: {} };
+// Read the embedded blob directly instead of relying on an inline <script> to copy
+// it onto `window`: a CSP without 'unsafe-inline' script-src blocks that copy.
+const providerRegistry = window.PROVIDER_REGISTRY
+    || readEmbeddedJson('provider-registry-data')
+    || { providers: {}, ui: {} };
+// Cache-buster for the audio worklet module (see startCapture).
+const appVersion = String(window.APP_VERSION || document.documentElement?.dataset?.appVersion || '1');
 let currentTTSEngine = providerRegistry.ui?.default_tts_provider || 'piper';
 let trainingDeploymentRegistry = null;
 const qwen3ProviderId = 'qwen3';
+
+// ============================================================
+// API key
+// ============================================================
+//
+// When the gateway runs with API_KEY it requires `Authorization: Bearer <key>` on
+// every /v1 call and every state-changing /api call, this page included (it is
+// not treated as more trustworthy than a script: a rebinding page looks exactly
+// like it). The page learns that from the first 401 that carries a
+// `WWW-Authenticate: Bearer` challenge, asks for the key once, keeps it for this
+// browser tab (sessionStorage, so it is gone when the tab closes and never
+// reaches localStorage) and sends it on every later gateway request. With no
+// API_KEY nothing is ever prompted and nothing extra is sent.
+
+const API_KEY_STORAGE_KEY = 'tts-stt.api-key';
+const LIVE_STT_PROTOCOL = 'tts-stt.v1';
+const LIVE_STT_KEY_PROTOCOL_PREFIX = 'bearer.';
+
+function readStoredApiKey() {
+    try {
+        return window.sessionStorage.getItem(API_KEY_STORAGE_KEY) || '';
+    } catch {
+        return '';   // storage blocked (private window, site data off): keep it in memory only
+    }
+}
+
+let gatewayApiKey = readStoredApiKey();
+let apiKeyPromptInFlight = null;
+// The gateway has answered /api/auth/check with a 2xx for the key held now.
+let socketAuthAccepted = false;
+
+function setGatewayApiKey(key) {
+    if ((key || '') !== gatewayApiKey) socketAuthAccepted = false;
+    gatewayApiKey = key || '';
+    try {
+        if (gatewayApiKey) window.sessionStorage.setItem(API_KEY_STORAGE_KEY, gatewayApiKey);
+        else window.sessionStorage.removeItem(API_KEY_STORAGE_KEY);
+    } catch {
+        // memory copy above is enough for this page's lifetime
+    }
+}
+
+/** Gateway calls are the same-origin /api/... and /v1/... paths every fetch here uses. */
+function isGatewayRequest(input) {
+    return typeof input === 'string' && /^\/(?:api|v1)(?:\/|$)/.test(input);
+}
+
+function isApiKeyChallenge(response) {
+    if (!response || response.status !== 401) return false;
+    const challenge = response.headers && typeof response.headers.get === 'function'
+        ? response.headers.get('WWW-Authenticate') : '';
+    return /bearer/i.test(challenge || '');
+}
+
+function withApiKey(init, key) {
+    if (!key) return init;
+    const headers = new Headers((init && init.headers) || {});
+    headers.set('Authorization', `Bearer ${key}`);
+    return { ...(init || {}), headers };
+}
+
+/** Ask the user for the key. Concurrent callers share one prompt; null means they declined. */
+function promptForApiKey(previousWasRejected) {
+    if (!apiKeyPromptInFlight) {
+        apiKeyPromptInFlight = Promise.resolve().then(() => {
+            if (typeof window.prompt !== 'function') return null;
+            const entered = window.prompt(previousWasRejected
+                ? 'The API key was not accepted. Enter the API key for this server:'
+                : 'This server requires an API key. Enter it to continue:');
+            return entered && entered.trim() ? entered.trim() : null;
+        }).finally(() => { apiKeyPromptInFlight = null; });
+    }
+    return apiKeyPromptInFlight;
+}
+
+const nativeFetch = window.fetch.bind(window);
+
+window.fetch = async function gatewayFetch(input, init) {
+    if (!isGatewayRequest(input)) return nativeFetch(input, init);
+
+    const sentKey = gatewayApiKey;
+    const response = await nativeFetch(input, withApiKey(init, sentKey));
+    if (!isApiKeyChallenge(response)) return response;
+
+    // Another request may have collected a key while this one was in flight.
+    if (gatewayApiKey && gatewayApiKey !== sentKey) {
+        return nativeFetch(input, withApiKey(init, gatewayApiKey));
+    }
+    if (sentKey) setGatewayApiKey('');   // the stored key was refused: do not keep offering it
+
+    const entered = await promptForApiKey(Boolean(sentKey));
+    if (!entered) return response;       // declined: the caller shows the 401 it got
+
+    setGatewayApiKey(entered);
+    const retried = await nativeFetch(input, withApiKey(init, entered));
+    if (isApiKeyChallenge(retried)) setGatewayApiKey('');   // wrong key: ask again next time
+    return retried;
+};
+
+function base64UrlEncode(text) {
+    let binary = '';
+    new TextEncoder().encode(text).forEach((byte) => { binary += String.fromCharCode(byte); });
+    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+/**
+ * Subprotocols for the live-transcription socket. A browser cannot put an
+ * Authorization header on a WebSocket handshake, so the key rides next to the
+ * real protocol name; the server never echoes the `bearer.` one back.
+ * Undefined (no argument at all) when there is no key, as before.
+ */
+function liveSocketProtocols() {
+    if (!gatewayApiKey) return undefined;
+    return [LIVE_STT_PROTOCOL, LIVE_STT_KEY_PROTOCOL_PREFIX + base64UrlEncode(gatewayApiKey)];
+}
+
+/**
+ * Make sure the gateway knows whether it wants a key before the socket is dialled.
+ * A failed WebSocket handshake tells a page nothing, but an ordinary fetch can
+ * carry a 401 and prompt for the key, so this cheap POST does that first. It
+ * never throws: an unreachable server is reported by the socket attempt itself.
+ */
+async function ensureApiKeyForSocket() {
+    // Once the gateway has accepted this tab (no key needed, or a valid one), later
+    // starts do not repeat the round trip; dropping the key resets it.
+    if (socketAuthAccepted) return;
+    try {
+        const response = await fetch('/api/auth/check', { method: 'POST' });
+        socketAuthAccepted = Boolean(response && response.status >= 200 && response.status < 300);
+    } catch {
+        // reported by the WebSocket attempt
+    }
+}
 
 function removeOptionalProvider(providerId) {
     if (providerRegistry.providers?.[providerId]) {
@@ -20,7 +171,7 @@ function removeOptionalProvider(providerId) {
 
     const sttSelect = document.getElementById('stt-engine-select');
     if (sttSelect) {
-        const option = sttSelect.querySelector(`option[value="${providerId}"]`);
+        const option = sttSelect.querySelector(`option[value="${CSS.escape(providerId)}"]`);
         if (option) {
             option.remove();
         }
@@ -40,10 +191,6 @@ function getProvider(providerId) {
     return providerRegistry.providers?.[providerId] || null;
 }
 
-function getProviderUrl(providerId) {
-    return getProvider(providerId)?.browser_url || null;
-}
-
 function getProviderDisplayName(providerId) {
     return getProvider(providerId)?.display_name || providerId;
 }
@@ -56,12 +203,14 @@ function getProviderContract(providerId, contractName) {
     return getProvider(providerId)?.contracts?.[contractName] || null;
 }
 
-function getProviderHealthEndpoint(providerId) {
-    return getProvider(providerId)?.health_endpoint || '/health';
-}
-
+/**
+ * Same-origin gateway path for a provider. `path` must already be a well-formed
+ * suffix; any identifier inside it (voice id, model id) is the caller's to encode
+ * with encodeURIComponent, because an id containing `/`, `?` or `#` would
+ * otherwise address a different route or drop the rest of the URL.
+ */
 function getProviderApiPath(providerId, path) {
-    return `/api/providers/${providerId}${path}`;
+    return `/api/providers/${encodeURIComponent(providerId)}${path}`;
 }
 
 function getProviderSettings(providerId) {
@@ -74,36 +223,6 @@ function getProviderUI(providerId) {
 
 function getTrainingProviderId() {
     return providerRegistry.ui?.training_provider || 'piper-training';
-}
-
-function getTrainingBrowserUrl() {
-    return getProviderUrl(getTrainingProviderId());
-}
-
-async function fetchTrainingRequest(primaryPath, fallbackPath, options = {}) {
-    const fallbackUrl = getTrainingBrowserUrl();
-    let primaryError = null;
-
-    try {
-        const response = await fetch(primaryPath, options);
-        if (response.ok || response.status < 500 || !fallbackUrl) {
-            return response;
-        }
-    } catch (error) {
-        primaryError = error;
-        if (!fallbackUrl) {
-            throw error;
-        }
-    }
-
-    try {
-        return await fetch(`${fallbackUrl}${fallbackPath}`, options);
-    } catch (fallbackError) {
-        if (primaryError) {
-            throw primaryError;
-        }
-        throw fallbackError;
-    }
 }
 
 function getProviderMessages(providerId) {
@@ -123,7 +242,12 @@ function formatMessage(template, values = {}) {
 
 function setSingleSelectOption(select, label, value = '') {
     if (!select) return;
-    select.innerHTML = `<option value="${value}">${label}</option>`;
+    // Built with the DOM: `label` can come from the provider registry, and a `"` in
+    // `value` would end the attribute in a template string.
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    select.replaceChildren(option);
 }
 
 function setElementText(elementId, text) {
@@ -133,10 +257,16 @@ function setElementText(elementId, text) {
     }
 }
 
-function setElementHTML(elementId, html) {
+/**
+ * Set copy that may use a few formatting tags (<strong>, <code>, ...) and nothing
+ * else. The registry text is operator-supplied; letting it through as raw HTML
+ * would make it a script-injection point for anything that can edit the registry.
+ */
+function setElementFormattedText(elementId, text) {
     const element = document.getElementById(elementId);
-    if (element && html) {
-        element.innerHTML = html;
+    if (element && text) {
+        element.innerHTML = escapeHtml(text)
+            .replace(/&lt;(\/?)(strong|em|b|i|code)&gt;/gi, '<$1$2>');
     }
 }
 
@@ -189,7 +319,7 @@ function applyTrainingProviderCopy() {
     setElementText('start-training-button', startForm.actions?.submit);
 
     setElementText('continue-training-title', continueForm.title);
-    setElementHTML('continue-training-description', continueForm.description);
+    setElementFormattedText('continue-training-description', continueForm.description);
     setElementText('continue-voice-name-label', continueForm.fields?.voice_name?.label);
     setInputPlaceholder('continue-voice-name', continueForm.fields?.voice_name?.placeholder || copy.continue_voice_name_placeholder);
     setElementText('continue-epochs-label', continueForm.fields?.epochs?.label);
@@ -317,10 +447,64 @@ function applyInputNumberConfig(inputId, config, fallbackValue) {
     if (fallbackValue !== undefined) input.value = String(fallbackValue);
 }
 
+// Language each TTS backend falls back to when a request says "auto", as reported
+// by the backend itself (health / voice catalog). The UI must not hardcode one:
+// it is a deployment setting (PIPER_DEFAULT_LANGUAGE), not a constant.
+const serverDefaultLanguage = {};
+// What the registry shipped before "auto" meant anything more specific than
+// "the server picks". It promised detection that a TTS backend only does from the
+// text, and otherwise fell through to English.
+const LEGACY_AUTO_LABEL = /^auto[- ]?detect$/i;
+
+/** Human name for a language code, taken from the provider's own option list. */
+function languageDisplayName(providerId, code) {
+    const wanted = String(code || '').toLowerCase().split(/[-_]/)[0];
+    const match = (getProviderSettings(providerId).languages || []).find(
+        (item) => item && typeof item === 'object' && String(item.value).toLowerCase() === wanted);
+    return match ? (match.label || match.value) : String(code || '');
+}
+
+/** Label for the TTS "auto" language option. */
+function autoLanguageLabel(providerId, registryLabel) {
+    // A label somebody chose on purpose wins; only the legacy one is misleading.
+    if (registryLabel && !LEGACY_AUTO_LABEL.test(String(registryLabel).trim())) {
+        return registryLabel;
+    }
+    const fallback = serverDefaultLanguage[providerId]
+        || getProviderSettings(providerId).defaults?.server_language;
+    return fallback
+        ? `Automatic - server decides (default: ${languageDisplayName(providerId, fallback)})`
+        : 'Automatic - server decides';
+}
+
+/** The provider's language options with the "auto" entry described truthfully. */
+function ttsLanguageOptions(providerId) {
+    const languages = getProviderSettings(providerId).languages || [];
+    return languages.map((item) => (
+        item && typeof item === 'object' && item.value === 'auto'
+            ? { ...item, label: autoLanguageLabel(providerId, item.label) }
+            : item));
+}
+
+/** Remember a backend's fallback language and refresh the label that names it. */
+function noteServerDefaultLanguage(providerId, language) {
+    const code = String(language || '').trim();
+    if (!code || serverDefaultLanguage[providerId] === code) return;
+    serverDefaultLanguage[providerId] = code;
+    if (providerId !== currentTTSEngine) return;
+    const select = document.getElementById('tts-language-select');
+    const option = select && Array.from(select.options).find((item) => item.value === 'auto');
+    if (option) {
+        const registryLabel = (getProviderSettings(providerId).languages || [])
+            .find((item) => item && item.value === 'auto')?.label;
+        option.textContent = autoLanguageLabel(providerId, registryLabel);
+    }
+}
+
 function applyTTSProviderSettings(providerId) {
     const settings = getProviderSettings(providerId);
     const defaults = settings.defaults || {};
-    populateSelectOptions('tts-language-select', settings.languages, defaults.language || 'auto');
+    populateSelectOptions('tts-language-select', ttsLanguageOptions(providerId), defaults.language || 'auto');
     populateSelectOptions('tts-quality-select', settings.qualities, defaults.quality || 'medium');
     populateSelectOptions('tts-gender-select', settings.genders, defaults.gender || 'any');
 
@@ -501,16 +685,18 @@ function switchTTSEngine(engine) {
     piperElements.forEach(el => el.style.display = 'none');
     qwen3Elements.forEach(el => el.style.display = 'none');
 
+    // Decided by the active tab's *button*: only the buttons carry the
+    // piper-only / qwen3-only classes for the Piper tabs, so asking the panel
+    // never matched and left a Piper panel showing under the Qwen3 engine.
+    const activeButton = document.querySelector('.tab-button.active');
     if (family === 'piper') {
         piperElements.forEach(el => el.style.display = '');
-        const currentTab = document.querySelector('.tab-content.active');
-        if (currentTab && currentTab.classList.contains('qwen3-only')) {
+        if (activeButton && activeButton.classList.contains('qwen3-only')) {
             showTab('stt-tab');
         }
     } else if (family === 'qwen3') {
         qwen3Elements.forEach(el => el.style.display = '');
-        const currentTab = document.querySelector('.tab-content.active');
-        if (currentTab && currentTab.classList.contains('piper-only')) {
+        if (activeButton && activeButton.classList.contains('piper-only')) {
             showTab('qwen3-tts-tab');
         }
     }
@@ -519,12 +705,20 @@ function switchTTSEngine(engine) {
 }
 
 // Notification system
-/** Render a temporary toast-style notification in the top-right corner. */
+/**
+ * Render a temporary toast-style notification in the top-right corner.
+ *
+ * `message` is always assigned as text: callers pass backend error details and
+ * voice names, and a toast is the last place markup should be interpreted.
+ */
 function showNotification(message, type = 'info') {
     let notificationContainer = document.getElementById('notification-container');
     if (!notificationContainer) {
         notificationContainer = document.createElement('div');
         notificationContainer.id = 'notification-container';
+        // Announced politely; individual errors are upgraded to alerts below.
+        notificationContainer.setAttribute('role', 'status');
+        notificationContainer.setAttribute('aria-live', 'polite');
         notificationContainer.style.cssText = `
             position: fixed;
             top: 20px;
@@ -537,6 +731,7 @@ function showNotification(message, type = 'info') {
 
     const notification = document.createElement('div');
     notification.className = `notification notification-${type}`;
+    if (type === 'error') notification.setAttribute('role', 'alert');
     notification.style.cssText = `
         padding: 12px 16px;
         margin-bottom: 10px;
@@ -549,14 +744,15 @@ function showNotification(message, type = 'info') {
         animation: slideInRight 0.3s ease-out;
         background-color: ${type === 'success' ? '#10b981' : type === 'error' ? '#ef4444' : '#3b82f6'};
     `;
-    notification.textContent = message;
+    notification.textContent = String(message ?? '');
 
     notification.addEventListener('click', () => notification.remove());
     notificationContainer.appendChild(notification);
 
+    // Errors stay longer: five seconds is not enough to read a backend detail.
     setTimeout(() => {
         if (notification.parentNode) notification.remove();
-    }, 5000);
+    }, type === 'error' ? 10000 : 5000);
 }
 
 // Initialize the application
@@ -577,6 +773,7 @@ function initializeApp() {
     applyQwen3ProviderSettings();
     applyTTSProviderSettings(currentTTSEngine);
     applyTTSProviderCopy(currentTTSEngine);
+    setupLiveRegions();
     setupFileDragDrop();
     setupRangeSliders();
     refreshTTSVoices();
@@ -592,6 +789,9 @@ function initializeApp() {
     }, 1000);
 
     setInterval(() => {
+        // A background tab has nobody to show the result to; the next visible
+        // poll (or a tab switch) catches up.
+        if (document.hidden) return;
         checkServiceHealth();
         if (currentTTSEngine === 'qwen3') {
             updateQwen3TTSStatus();
@@ -599,14 +799,57 @@ function initializeApp() {
     }, 30000);
 }
 
-/** Bind tab buttons to the tab-switching helper. */
-function setupEventListeners() {
-    document.querySelectorAll('.tab-button').forEach(button => {
-        button.addEventListener('click', function() {
-            const match = this.getAttribute('onclick').match(/'([^']+)'/);
-            if (match) showTab(match[1]);
-        });
+/**
+ * Make the status areas live regions, so a screen reader announces "Generating..."
+ * / "Speech generated" / an error without the user hunting for the box.
+ *
+ * The Qwen3 system card is left out on purpose: it is rewritten by the 30 s
+ * health poll, and announcing an unchanged card every half minute is noise.
+ */
+function setupLiveRegions() {
+    document.querySelectorAll('.status-display').forEach((element) => {
+        if (element.id === 'qwen3-tts-system-status') {
+            element.setAttribute('aria-live', 'off');
+        } else if (!element.hasAttribute('aria-live')) {
+            element.setAttribute('aria-live', 'polite');
+        }
     });
+}
+
+/**
+ * Wire every static control in the template.
+ *
+ * The template carries no inline on* handlers, so a Content-Security-Policy
+ * without 'unsafe-inline' for scripts can be applied to it. Controls declare
+ * `data-action` (click by default, or the event named in `data-action-event`) and
+ * any argument as a `data-*` attribute; the handlers live here.
+ */
+function bindStaticActions() {
+    bindActions(document, {
+        'show-tab': (el) => showTab(el.dataset.tab),
+        'switch-tts-engine': (el) => switchTTSEngine(el.value),
+        'process-stt': (el) => withBusy(el, processSTT),
+        'toggle-live-transcription': () => toggleLiveTranscription(),
+        'start-training': (el) => withBusy(el, startTraining),
+        'resume-training-manual': (el) => withBusy(el, resumeTrainingManual),
+        'train-from-dataset': (el) => withBusy(el, trainFromDataset),
+        'refresh-tts-voices': () => refreshTTSVoices(),
+        'generate-tts': (el) => withBusy(el, generateTTS),
+        'refresh-custom-voices': () => refreshCustomVoices(),
+        'switch-qwen3-model': (el) => switchQwen3Model(el.value),
+        'generate-qwen3-builtin': (el) => withBusy(el, generateQwen3BuiltinTTS),
+        'clone-model-change': (el) => onCloneModelChange(el.value),
+        'switch-voice-source': (el) => switchVoiceSource(el.value),
+        'refresh-saved-voices': () => loadSavedVoices(),
+        'delete-saved-voice': (el) => withBusy(el, deleteSavedVoice),
+        'toggle-ref-text': () => toggleRefText(),
+        'generate-qwen3-tts': () => generateQwen3TTS(),
+    });
+}
+
+/** Bind dynamic control listeners. */
+function setupEventListeners() {
+    bindStaticActions();
 
     const sttEngineSelect = document.getElementById('stt-engine-select');
     if (sttEngineSelect) {
@@ -617,13 +860,25 @@ function setupEventListeners() {
 /** Activate a single tab and trigger tab-specific refresh actions. */
 function showTab(tabId) {
     document.querySelectorAll('.tab-content').forEach(tab => tab.classList.remove('active'));
-    document.querySelectorAll('.tab-button').forEach(btn => btn.classList.remove('active'));
+    document.querySelectorAll('.tab-button').forEach((btn) => {
+        btn.classList.remove('active');
+        btn.removeAttribute('aria-current');
+    });
 
     const tabEl = document.getElementById(tabId);
     if (tabEl) tabEl.classList.add('active');
 
-    const btn = document.querySelector(`.tab-button[onclick*="${tabId}"]`);
-    if (btn) btn.classList.add('active');
+    // By id, not by substring-matching the button's own handler text. Every tab
+    // button in index.html is `<tabId>-button`, and the old selector matched any
+    // handler *containing* the id — so a future tab whose name ends in an
+    // existing one would highlight whichever button happened to come first in
+    // document order.
+    const btn = document.getElementById(`${tabId}-button`);
+    if (btn) {
+        btn.classList.add('active');
+        // The highlight alone is invisible to a screen reader.
+        btn.setAttribute('aria-current', 'page');
+    }
 
     // Tab-specific initialization
     if (tabId === 'training-tab') {
@@ -710,33 +965,55 @@ function setupRangeSliders() {
 // Service Health Checks
 // ============================================================
 
-/** Poll each backend health endpoint and update its status indicator. */
+/**
+ * Refresh every backend status indicator from one same-origin call.
+ *
+ * The gateway probes the providers concurrently over the internal Docker
+ * network. Doing it here in the browser meant one cross-origin request per
+ * provider, issued sequentially — a single unreachable backend stalled the whole
+ * row for its full timeout — and it forced every backend port to be published
+ * just so the browser could reach it.
+ */
 async function checkServiceHealth() {
-    const services = Object.entries(providerRegistry.providers || {})
+    const ids = Object.entries(providerRegistry.providers || {})
         .filter(([, provider]) => provider.ui?.show_status)
-        .map(([providerId, provider]) => ({
-            providerId,
-            url: provider.browser_url,
-            healthEndpoint: getProviderHealthEndpoint(providerId),
-        }));
+        .map(([providerId]) => providerId);
 
-    for (const service of services) {
-        const element = document.getElementById(`service-status-${service.providerId}`);
+    const elements = new Map();
+    for (const providerId of ids) {
+        const element = document.getElementById(`service-status-${providerId}`);
         if (!element) continue;
-
+        elements.set(providerId, element);
         element.classList.remove('healthy', 'error');
         element.classList.add('loading');
+    }
+    if (!elements.size) return;
 
-        try {
-            const timeout = service.providerId === 'piper-training' ? 15000 : 5000;
-            const response = await fetch(`${service.url}${service.healthEndpoint}`, {
-                signal: AbortSignal.timeout(timeout)
-            });
-            element.classList.remove('loading');
-            element.classList.add(response.ok ? 'healthy' : 'error');
-        } catch {
-            element.classList.remove('loading');
-            element.classList.add('error');
+    let health = {};
+    try {
+        const response = await fetch('/api/health', { signal: AbortSignal.timeout(15000) });
+        if (response.ok) health = (await response.json()).providers || {};
+    } catch {
+        // Leave `health` empty: every indicator falls through to 'error' below.
+    }
+
+    for (const [providerId, element] of elements) {
+        const entry = health[providerId];
+        element.classList.remove('loading');
+        element.classList.add(entry && entry.healthy ? 'healthy' : 'error');
+        if (entry) {
+            if (entry.default_language) noteServerDefaultLanguage(providerId, entry.default_language);
+            const detail = [entry.model_size, entry.device].filter(Boolean).join(' · ');
+            if (!entry.healthy) {
+                element.title = `unavailable${entry.error ? ` (${entry.error})` : ''}`;
+            } else if (entry.model_resident === false) {
+                // Healthy but idle: the model was unloaded to free memory and
+                // the next request will reload it. Not an error state.
+                element.classList.add('idle');
+                element.title = `idle — model unloaded to free memory${detail ? ` (${detail})` : ''}`;
+            } else {
+                element.title = `ready${detail ? ` (${detail})` : ''} — ${entry.latency_ms} ms`;
+            }
         }
     }
 }
@@ -747,10 +1024,111 @@ function updateServiceStatus() {
 }
 
 // Helper functions
-/** Render a status message into the given result/status container. */
-function showStatus(elementId, type, message) {
+/**
+ * Render a status message into the given result/status container.
+ *
+ * Text, never markup. Every caller passes a plain string, and most of the error
+ * paths pass a backend `detail` — which can carry an uploaded filename or a
+ * voice name straight through from the user. Building this with innerHTML meant
+ * a message containing `<` either vanished or executed, depending on what
+ * followed it.
+ */
+function showStatus(elementId, type, message, { silent = false } = {}) {
     const element = document.getElementById(elementId);
-    if (element) element.innerHTML = `<div class="${type}">${message}</div>`;
+    if (!element) return;
+    const box = document.createElement('div');
+    box.className = type;
+    // The container is a polite live region. A failure should interrupt; a
+    // progress tick that rewrites the box twice a second should not be read out
+    // at all, so it is hidden from assistive technology (the final state is not).
+    if (silent) box.setAttribute('aria-hidden', 'true');
+    else if (type === 'error') box.setAttribute('role', 'alert');
+    box.textContent = String(message ?? '');
+    element.replaceChildren(box);
+}
+
+/**
+ * Render a small inline status box into an arbitrary container as text.
+ *
+ * Same reasoning as showStatus, for the places that render a status into an
+ * element they already hold rather than one they look up by id.
+ */
+function setStatusBox(container, type, message, style = 'padding: 8px; font-size: 0.9rem;') {
+    if (!container) return;
+    const box = document.createElement('div');
+    box.className = type;
+    box.style.cssText = style;
+    box.textContent = String(message ?? '');
+    container.replaceChildren(box);
+}
+
+/**
+ * Bind handlers to `data-action` elements inside `root`.
+ *
+ * Replaces inline `onclick="fn('${value}')"`, which cannot be made safe by
+ * escaping: the HTML parser decodes entities in an attribute value *before* the
+ * result is parsed as JavaScript, so an escaped apostrophe still closes the
+ * argument string. Routing values through `data-*` attributes keeps them data.
+ *
+ * The event is `click` unless the element says otherwise with
+ * `data-action-event` (selects, radios and checkboxes use `change`). Binding the
+ * same element/action twice is a no-op, so a re-render that calls this again on a
+ * container it did not replace cannot double every click.
+ */
+const _boundActions = new WeakMap();
+
+function bindActions(root, handlers) {
+    if (!root) return;
+    root.querySelectorAll('[data-action]').forEach((element) => {
+        const action = element.dataset.action;
+        const handler = handlers[action];
+        if (!handler) return;
+
+        const eventName = element.dataset.actionEvent || 'click';
+        const key = `${eventName}:${action}`;
+        let bound = _boundActions.get(element);
+        if (!bound) {
+            bound = new Set();
+            _boundActions.set(element, bound);
+        }
+        if (bound.has(key)) return;
+        bound.add(key);
+        element.addEventListener(eventName, () => handler(element));
+    });
+}
+
+/**
+ * Run `task` with `button` disabled and marked busy.
+ *
+ * A second click while the first request is still in flight used to start a
+ * second request: two trainings, two synthesis jobs, two deletes. Restores the
+ * button (and its label) whether the task resolves or throws.
+ */
+async function withBusy(button, task, busyLabel = '') {
+    if (!button) return task();
+    if (button.disabled) return undefined;
+
+    const label = button.textContent;
+    button.disabled = true;
+    button.setAttribute('aria-busy', 'true');
+    if (busyLabel) button.textContent = busyLabel;
+    try {
+        return await task();
+    } finally {
+        button.disabled = false;
+        button.removeAttribute('aria-busy');
+        if (busyLabel) button.textContent = label;
+    }
+}
+
+/** Escape a value for safe interpolation into innerHTML. */
+function escapeHtml(value) {
+    return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
 }
 
 /** Convert a byte count into a human-readable size string. */
@@ -772,6 +1150,41 @@ function formatTimestamp(value) {
 function toggleRefText() {
     const checked = document.getElementById('enable-ref-text').checked;
     document.getElementById('ref-text-group').style.display = checked ? '' : 'none';
+}
+
+// Object URLs live until explicitly revoked. Keyed on the container element so
+// that replacing a player — including when refreshCustomVoices() rebuilds the
+// containers wholesale — releases the blob the old player was holding.
+const _playerUrls = new WeakMap();
+
+/**
+ * Render an <audio> player for `blob` inside `container`, releasing whatever
+ * blob the previous player in that container was holding.
+ *
+ * `autoplay` matters for perceived latency: without it every synthesis result
+ * waits on a human noticing the player and clicking it, which dwarfs anything
+ * the backend can save.
+ */
+function setAudioPlayer(container, blob, extraStyle = '') {
+    if (!container) return null;
+    const previous = _playerUrls.get(container);
+    if (previous) URL.revokeObjectURL(previous);
+
+    const url = URL.createObjectURL(blob);
+    _playerUrls.set(container, url);
+    // Built with the DOM: `blob.type` is the response's Content-Type header, and a
+    // `"` in it would have ended the attribute in the old string template.
+    const audio = document.createElement('audio');
+    audio.controls = true;
+    audio.autoplay = true;
+    audio.preload = 'auto';
+    audio.style.cssText = `width: 100%;${extraStyle}`;
+    const source = document.createElement('source');
+    source.src = url;
+    source.type = blob.type || 'audio/wav';
+    audio.appendChild(source);
+    container.replaceChildren(audio);
+    return url;
 }
 
 // ============================================================
@@ -813,8 +1226,9 @@ async function generateTTS() {
         };
         if (voice !== 'auto') requestData.voice = voice;
         requestData.language = language;
-        if (quality !== 'medium') requestData.quality = quality;
-        if (gender !== 'any') requestData.gender = gender;
+        // Providers without a quality/gender setting leave those selects empty.
+        if (quality && quality !== 'medium') requestData.quality = quality;
+        if (gender && gender !== 'any') requestData.gender = gender;
 
         const response = await fetch('/api/tts', {
             method: 'POST',
@@ -827,14 +1241,7 @@ async function generateTTS() {
             throw new Error(errorData.detail || `TTS generation failed: ${response.statusText}`);
         }
 
-        const blob = await response.blob();
-        const audioUrl = URL.createObjectURL(blob);
-
-        audioPlayer.innerHTML = `
-            <audio controls style="width: 100%;">
-                <source src="${audioUrl}" type="audio/wav">
-            </audio>
-        `;
+        setAudioPlayer(audioPlayer, await response.blob());
 
         showStatus('tts-result-status', 'success', messages.success || 'Speech generated successfully!');
     } catch (error) {
@@ -847,28 +1254,75 @@ async function generateTTS() {
     }
 }
 
+// Refreshes can overlap (tab switch, the Refresh button, a delete that re-lists).
+// Without this the slower, older response lands last and shows a stale list.
+const _latestRequest = {};
+
+function beginLatest(key) {
+    _latestRequest[key] = (_latestRequest[key] || 0) + 1;
+    return _latestRequest[key];
+}
+
+function isLatest(key, token) {
+    return _latestRequest[key] === token;
+}
+
+/** Replace `container`'s content with one paragraph of plain text. */
+function setMessage(container, text, isError = false) {
+    const paragraph = document.createElement('p');
+    if (isError) paragraph.style.color = 'var(--error)';
+    paragraph.textContent = String(text ?? '');
+    container.replaceChildren(paragraph);
+}
+
+/**
+ * Quality tier of a catalog voice.
+ *
+ * The gateway keeps the backend's own record under `raw` and copies the tier to
+ * `description`; there is no top-level `quality`, so reading `voice.quality`
+ * returned undefined for every voice and the card never showed it.
+ */
+function getVoiceQuality(voice) {
+    return voice?.raw?.quality ?? voice?.quality ?? '';
+}
+
 /** Reload the list of Piper voices into the voice selector dropdown. */
 async function refreshTTSVoices() {
+    const providerId = currentTTSEngine;
+    const token = beginLatest('tts-voices');
     try {
-        const providerId = currentTTSEngine;
         const messages = getProviderMessages(providerId)?.tts_generation || {};
-        const response = await fetch(`/api/providers/${providerId}/voices`);
+        const response = await fetch(getProviderApiPath(providerId, '/voices'));
+        if (!response.ok) throw new Error(`Voice catalog request failed: HTTP ${response.status}`);
         const data = await response.json();
+        // The engine was switched, or a newer refresh started, while this one was in flight.
+        if (!isLatest('tts-voices', token) || providerId !== currentTTSEngine) return;
+
+        if (data.default_language) noteServerDefaultLanguage(providerId, data.default_language);
 
         const voiceSelect = document.getElementById('tts-voice-select');
-        voiceSelect.innerHTML = `<option value="auto">${messages.voice_auto_option || 'Auto-Select Best Voice'}</option>`;
+        const previous = voiceSelect.value;
+        const autoOption = document.createElement('option');
+        autoOption.value = 'auto';
+        autoOption.textContent = messages.voice_auto_option || 'Auto-Select Best Voice';
+        voiceSelect.replaceChildren(autoOption);
 
         if (Array.isArray(data.voices)) {
             data.voices.forEach(voice => {
                 const option = document.createElement('option');
                 option.value = voice.id;
-                const quality = voice.raw?.quality ? ` (${voice.raw.quality})` : '';
+                const tier = getVoiceQuality(voice);
+                const quality = tier ? ` (${tier})` : '';
                 const description = voice.description ? ` - ${voice.description}` : '';
                 option.textContent = voice.language
                     ? `${voice.language} - ${voice.name}${quality}`
                     : `${voice.name}${description}`;
                 voiceSelect.appendChild(option);
             });
+        }
+        // Refresh is a re-list, not a reset: keep the voice the user had picked.
+        if (Array.from(voiceSelect.options).some((option) => option.value === previous)) {
+            voiceSelect.value = previous;
         }
     } catch (error) {
         console.error('Error refreshing voices:', error);
@@ -882,59 +1336,74 @@ async function refreshCustomVoices() {
     const messages = getProviderMessages('piper')?.custom_voice_library || {};
     if (!container) return;
 
+    const token = beginLatest('custom-voices');
     try {
-        container.innerHTML = `<p>${messages.loading || 'Loading voices...'}</p>`;
+        setMessage(container, messages.loading || 'Loading voices...');
         const response = await fetch(getProviderApiPath('piper', '/custom-voices'));
+        if (!response.ok) throw new Error(`Custom voice request failed: HTTP ${response.status}`);
         const data = await response.json();
+        if (!isLatest('custom-voices', token)) return;
 
         if (!Array.isArray(data.voices)) {
-            container.innerHTML = `<p>${messages.empty_invalid || 'No voices available.'}</p>`;
+            setMessage(container, messages.empty_invalid || 'No voices available.');
             return;
         }
 
         const customVoices = data.voices;
 
         if (customVoices.length === 0) {
-            container.innerHTML = `<p>${messages.empty || 'No custom trained voices found. Train a voice model and it will appear here.'}</p>`;
+            setMessage(container, messages.empty || 'No custom trained voices found. Train a voice model and it will appear here.');
             return;
         }
 
         let html = '<div class="voices-grid">';
         customVoices.forEach(voice => {
+            const baseLanguage = (voice.language || 'en').split('_')[0];
+            const quality = getVoiceQuality(voice);
             html += `
                 <div class="voice-card">
                     <div class="voice-header">
-                        <h4>${voice.name || voice.id}</h4>
-                        <span class="voice-id">${voice.id}</span>
+                        <h4>${escapeHtml(voice.name || voice.id)}</h4>
+                        <span class="voice-id">${escapeHtml(voice.id)}</span>
                     </div>
                     <div class="voice-info">
-                        ${voice.language ? `<p>Language: ${voice.language}</p>` : ''}
-                        ${voice.quality ? `<p>Quality: ${voice.quality}</p>` : ''}
+                        ${voice.language ? `<p>Language: ${escapeHtml(voice.language)}</p>` : ''}
+                        ${quality ? `<p>Quality: ${escapeHtml(quality)}</p>` : ''}
                     </div>
                     <div class="voice-actions">
-                        <button class="btn-secondary" onclick="testVoice('${voice.id}', '${(voice.language || 'en').split('_')[0]}')">${messages.action_test || 'Test'}</button>
-                        <button class="btn-secondary" onclick="deleteCustomVoice('${voice.id}')" style="color: var(--error);">${messages.action_delete || 'Delete'}</button>
+                        <button class="btn-secondary" data-action="test-voice"
+                                data-voice-id="${escapeHtml(voice.id)}" data-lang="${escapeHtml(baseLanguage)}">${escapeHtml(messages.action_test || 'Test')}</button>
+                        <button class="btn-secondary" data-action="delete-voice"
+                                data-voice-id="${escapeHtml(voice.id)}" style="color: var(--error);">${escapeHtml(messages.action_delete || 'Delete')}</button>
                     </div>
-                    <div id="voice-test-${voice.id}" class="audio-player"></div>
+                    <div class="audio-player" data-voice-test="${escapeHtml(voice.id)}" aria-live="polite"></div>
                 </div>
             `;
         });
         html += '</div>';
         container.innerHTML = html;
+        bindActions(container, {
+            'test-voice': (el) => withBusy(el, () => testVoice(el.dataset.voiceId, el.dataset.lang)),
+            'delete-voice': (el) => withBusy(el, () => deleteCustomVoice(el.dataset.voiceId)),
+        });
     } catch (error) {
         console.error('Error refreshing custom voices:', error);
-        container.innerHTML = `<p style="color: var(--error);">${messages.unavailable || 'Failed to load voices. Is the PiperTTS service running?'}</p>`;
+        if (!isLatest('custom-voices', token)) return;
+        setMessage(container, messages.unavailable || 'Failed to load voices. Is the PiperTTS service running?', true);
     }
 }
 
 /** Generate a short preview clip for a specific custom Piper voice. */
 async function testVoice(voiceId, lang = 'en') {
-    const playerDiv = document.getElementById(`voice-test-${voiceId}`);
+    // Attribute selector rather than an id: a voice id is whatever the trainer
+    // named it, and CSS.escape is the only thing that makes that safe to put in
+    // a selector.
+    const playerDiv = document.querySelector(`[data-voice-test="${CSS.escape(voiceId)}"]`);
     const messages = getProviderMessages('piper')?.custom_voice_library || {};
     if (!playerDiv) return;
 
     try {
-        playerDiv.innerHTML = `<div class="info" style="padding: 8px; font-size: 0.9rem;">${messages.test_start || 'Generating test audio...'}</div>`;
+        setStatusBox(playerDiv, 'info', messages.test_start || 'Generating test audio...');
 
         const testTexts = {
             'de': 'Hallo, das ist ein Test dieser Stimme.',
@@ -952,11 +1421,12 @@ async function testVoice(voiceId, lang = 'en') {
 
         if (!response.ok) throw new Error('Test generation failed');
 
-        const blob = await response.blob();
-        const audioUrl = URL.createObjectURL(blob);
-        playerDiv.innerHTML = `<audio controls autoplay style="width: 100%; margin-top: 8px;"><source src="${audioUrl}" type="audio/wav"></audio>`;
+        setAudioPlayer(playerDiv, await response.blob(), ' margin-top: 8px;');
     } catch (error) {
-        playerDiv.innerHTML = `<div class="error" style="padding: 8px; font-size: 0.9rem;">${formatMessage(messages.test_error, { error: error.message }) || `Test failed: ${error.message}`}</div>`;
+        setStatusBox(
+            playerDiv, 'error',
+            formatMessage(messages.test_error, { error: error.message }) || `Test failed: ${error.message}`
+        );
     }
 }
 
@@ -966,7 +1436,8 @@ async function deleteCustomVoice(voiceId) {
     if (!confirm(formatMessage(messages.delete_confirm, { voice_id: voiceId }) || `Delete custom voice "${voiceId}"? This cannot be undone.`)) return;
 
     try {
-        const response = await fetch(getProviderApiPath('piper', `/custom-voices/${voiceId}`), { method: 'DELETE' });
+        const response = await fetch(
+            getProviderApiPath('piper', `/custom-voices/${encodeURIComponent(voiceId)}`), { method: 'DELETE' });
         if (!response.ok) throw new Error('Delete failed');
 
         showNotification(formatMessage(messages.delete_success, { voice_id: voiceId }) || `Voice "${voiceId}" deleted`, 'success');
@@ -1238,7 +1709,7 @@ async function deleteSavedVoice() {
     if (!confirm(formatMessage(messages.delete_confirm, { voice_name: voiceName }) || `Delete saved voice "${voiceName}"?`)) return;
 
     try {
-        const response = await fetch(getProviderApiPath(qwen3ProviderId, `/saved-voices/${voiceId}`), { method: 'DELETE' });
+        const response = await fetch(getProviderApiPath(qwen3ProviderId, `/saved-voices/${encodeURIComponent(voiceId)}`), { method: 'DELETE' });
         if (!response.ok) throw new Error('Delete failed');
         showNotification(formatMessage(messages.delete_success, { voice_name: voiceName }) || `Voice "${voiceName}" deleted.`, 'success');
         loadSavedVoices();
@@ -1325,15 +1796,8 @@ async function generateQwen3BuiltinTTS() {
             throw new Error(errorData.detail || `Generation failed: ${response.statusText}`);
         }
 
-        const blob = await response.blob();
-        const audioUrl = URL.createObjectURL(blob);
         const duration = ((Date.now() - startTime) / 1000).toFixed(1);
-
-        audioPlayer.innerHTML = `
-            <audio controls autoplay style="width: 100%;">
-                <source src="${audioUrl}" type="audio/wav">
-            </audio>
-        `;
+        setAudioPlayer(audioPlayer, await response.blob());
 
         showStatus(
             'qwen3-builtin-status',
@@ -1356,9 +1820,9 @@ function handleQwen3VoiceFile(file) {
     if (!file) return;
     const infoDiv = document.getElementById('qwen3-voice-file-info');
     infoDiv.innerHTML = `
-        <strong>Selected:</strong> ${file.name}<br>
+        <strong>Selected:</strong> ${escapeHtml(file.name)}<br>
         <strong>Size:</strong> ${(file.size / 1024 / 1024).toFixed(2)} MB<br>
-        <strong>Type:</strong> ${file.type}
+        <strong>Type:</strong> ${escapeHtml(file.type)}
     `;
     infoDiv.style.display = 'block';
 }
@@ -1411,11 +1875,12 @@ async function generateWithSavedVoice() {
             showStatus(
                 'qwen3-generation-status',
                 'info',
-                formatMessage(messages.progress, { elapsed }) || `Generating speech... ${elapsed}s`
+                formatMessage(messages.progress, { elapsed }) || `Generating speech... ${elapsed}s`,
+                { silent: true }
             );
         }, 500);
 
-        const response = await fetch(getProviderApiPath(qwen3ProviderId, `/saved-voices/${voiceId}/tts`), {
+        const response = await fetch(getProviderApiPath(qwen3ProviderId, `/saved-voices/${encodeURIComponent(voiceId)}/tts`), {
             method: 'POST',
             body: formData,
             signal: AbortSignal.timeout(600000),
@@ -1426,17 +1891,10 @@ async function generateWithSavedVoice() {
             throw new Error(errorData.detail || `Generation failed: ${response.statusText}`);
         }
 
-        const blob = await response.blob();
-        const audioUrl = URL.createObjectURL(blob);
         const duration = ((Date.now() - startTime) / 1000).toFixed(1);
         const genTime = response.headers.get('X-Generation-Time');
         const audioDur = response.headers.get('X-Audio-Duration');
-
-        audioPlayer.innerHTML = `
-            <audio controls autoplay style="width: 100%;">
-                <source src="${audioUrl}" type="audio/wav">
-            </audio>
-        `;
+        setAudioPlayer(audioPlayer, await response.blob());
 
         const audioDuration = audioDur ? parseFloat(audioDur).toFixed(1) : null;
         const statusMsg = audioDuration
@@ -1452,7 +1910,9 @@ async function generateWithSavedVoice() {
         );
     } finally {
         if (progressInterval) clearInterval(progressInterval);
-        generateBtn.disabled = false;
+        // Not simply `false`: the user may have switched to a model that cannot
+        // generate here while this request was running.
+        generateBtn.disabled = currentCloneMode === 'unsupported';
         generateBtn.textContent = getQwen3GenerateButtonLabel();
     }
 }
@@ -1514,7 +1974,7 @@ async function generateQwen3VoiceClone() {
             const phase = autoTranscribing && elapsed < 10
                 ? (formatMessage(messages.progress_auto_transcribe, { elapsed }) || `Auto-transcribing + cloning... ${elapsed}s`)
                 : (formatMessage(messages.progress_generate, { elapsed }) || `Generating voice clone... ${elapsed}s`);
-            showStatus('qwen3-generation-status', 'info', phase);
+            showStatus('qwen3-generation-status', 'info', phase, { silent: true });
         }, 500);
 
         const response = await fetch(getProviderApiPath(qwen3ProviderId, '/voice-clone'), {
@@ -1528,15 +1988,8 @@ async function generateQwen3VoiceClone() {
             throw new Error(errorData.detail || `Voice cloning failed: ${response.statusText}`);
         }
 
-        const blob = await response.blob();
-        const audioUrl = URL.createObjectURL(blob);
         const duration = ((Date.now() - startTime) / 1000).toFixed(1);
-
-        audioPlayer.innerHTML = `
-            <audio controls autoplay style="width: 100%;">
-                <source src="${audioUrl}" type="audio/wav">
-            </audio>
-        `;
+        setAudioPlayer(audioPlayer, await response.blob());
 
         const msg = saveName
             ? (formatMessage(messages.success_with_save, { duration, name: saveName }) || `Voice cloning completed in ${duration}s (voice "${saveName}" saved for fast reuse)`)
@@ -1551,7 +2004,9 @@ async function generateQwen3VoiceClone() {
         );
     } finally {
         if (progressInterval) clearInterval(progressInterval);
-        generateBtn.disabled = false;
+        // Not simply `false`: the user may have switched to a model that cannot
+        // generate here while this request was running.
+        generateBtn.disabled = currentCloneMode === 'unsupported';
         generateBtn.textContent = getQwen3GenerateButtonLabel();
     }
 }
@@ -1588,7 +2043,8 @@ async function generateQwen3VoiceDesign() {
             showStatus(
                 'qwen3-generation-status',
                 'info',
-                formatMessage(messages.progress, { elapsed }) || `Designing voice... ${elapsed}s`
+                formatMessage(messages.progress, { elapsed }) || `Designing voice... ${elapsed}s`,
+                { silent: true }
             );
         }, 500);
 
@@ -1604,15 +2060,8 @@ async function generateQwen3VoiceDesign() {
             throw new Error(errorData.detail || `Voice design failed: ${response.statusText}`);
         }
 
-        const blob = await response.blob();
-        const audioUrl = URL.createObjectURL(blob);
         const duration = ((Date.now() - startTime) / 1000).toFixed(1);
-
-        audioPlayer.innerHTML = `
-            <audio controls autoplay style="width: 100%;">
-                <source src="${audioUrl}" type="audio/wav">
-            </audio>
-        `;
+        setAudioPlayer(audioPlayer, await response.blob());
 
         showStatus(
             'qwen3-generation-status',
@@ -1628,7 +2077,9 @@ async function generateQwen3VoiceDesign() {
         );
     } finally {
         if (progressInterval) clearInterval(progressInterval);
-        generateBtn.disabled = false;
+        // Not simply `false`: the user may have switched to a model that cannot
+        // generate here while this request was running.
+        generateBtn.disabled = currentCloneMode === 'unsupported';
         generateBtn.textContent = getQwen3GenerateButtonLabel();
     }
 }
@@ -1658,7 +2109,7 @@ function updateQwen3TTSStatusDisplay(status) {
     if (!statusElement) return;
 
     if (!status) {
-        statusElement.innerHTML = `<div class="status-error">${messages.unavailable || 'Qwen3-TTS Service Unavailable'}</div>`;
+        statusElement.innerHTML = `<div class="status-error">${escapeHtml(messages.unavailable || 'Qwen3-TTS Service Unavailable')}</div>`;
         return;
     }
 
@@ -1670,24 +2121,26 @@ function updateQwen3TTSStatusDisplay(status) {
     const deviceSuffix = status.device_type === 'gpu' ? (messages.gpu_suffix || 'GPU') : (messages.cpu_suffix || 'CPU');
     const modelFallback = messages.not_loaded || 'Not Loaded';
 
+    // Everything here is escaped: device, model and speaker names come from the
+    // backend, the labels from the registry.
     statusElement.innerHTML = `
         <div class="status-success">
-            <h4>${messages.online || 'Qwen3-TTS Service Online'}</h4>
+            <h4>${escapeHtml(messages.online || 'Qwen3-TTS Service Online')}</h4>
             <div class="status-grid">
                 <div class="status-item">
-                    <strong>${messages.device_label || 'Device'}:</strong> ${deviceName}
-                    (${deviceSuffix})
+                    <strong>${escapeHtml(messages.device_label || 'Device')}:</strong> ${escapeHtml(deviceName)}
+                    (${escapeHtml(deviceSuffix)})
                 </div>
                 <div class="status-item">
-                    <strong>${messages.model_label || 'Model'}:</strong> ${status.model_loaded ? modelName : modelFallback}
+                    <strong>${escapeHtml(messages.model_label || 'Model')}:</strong> ${escapeHtml(status.model_loaded ? modelName : modelFallback)}
                 </div>
                 ${memoryGB ? `
                 <div class="status-item">
-                    <strong>${messages.gpu_memory_label || 'GPU Memory'}:</strong> ${memoryGB}GB
+                    <strong>${escapeHtml(messages.gpu_memory_label || 'GPU Memory')}:</strong> ${escapeHtml(memoryGB)}GB
                 </div>` : ''}
                 ${speakers ? `
                 <div class="status-item" style="grid-column: 1 / -1;">
-                    <strong>${messages.speakers_label || 'Speakers'}:</strong> ${speakers}
+                    <strong>${escapeHtml(messages.speakers_label || 'Speakers')}:</strong> ${escapeHtml(speakers)}
                 </div>` : ''}
             </div>
         </div>
@@ -1718,7 +2171,11 @@ async function processSTT() {
         const formData = new FormData();
         formData.append('provider', sttEngine);
         formData.append('audio', fileInput.files[0]);
-        if (language !== 'auto') formData.append('language', language);
+        // "auto" is sent, not left out: a missing field means "the server's
+        // default language" (German in the TrueNAS profile), an explicit "auto"
+        // means detect - which is what the Auto-Detect option promises, and what
+        // the live microphone path below already does.
+        formData.append('language', language || 'auto');
 
         const engineLabel = getProviderDisplayName(sttEngine);
         showStatus(
@@ -1741,36 +2198,40 @@ async function processSTT() {
         const result = await response.json();
 
         if (enableSegmentation && result.segments && result.segments.length > 0) {
+            // Times are formatted through Number(): a backend that reports them
+            // as strings (or omits one) must not throw halfway through the render.
+            const seconds = (value) => (Number.isFinite(Number(value)) ? Number(value).toFixed(2) : '?');
             resultsDiv.innerHTML = `
                 <div class="result-header">
-                    <h3>${messages.segmented_heading || 'Transcription with Segmentation'}</h3>
-                    <button class="btn-secondary btn-sm" onclick="copyTranscription()">${messages.copy_action || 'Copy Text'}</button>
+                    <h3>${escapeHtml(messages.segmented_heading || 'Transcription with Segmentation')}</h3>
+                    <button class="btn-secondary btn-sm" data-action="copy-transcription">${escapeHtml(messages.copy_action || 'Copy Text')}</button>
                 </div>
                 <div class="segment-stats">
-                    <strong>${messages.language_label || 'Language'}:</strong> ${result.language || messages.unknown || 'Unknown'} |
-                    <strong>${messages.duration_label || 'Duration'}:</strong> ${result.duration ? result.duration.toFixed(2) + 's' : (messages.not_available || 'N/A')} |
-                    <strong>${messages.segments_label || 'Segments'}:</strong> ${result.segments.length}
+                    <strong>${escapeHtml(messages.language_label || 'Language')}:</strong> ${escapeHtml(result.language || messages.unknown || 'Unknown')} |
+                    <strong>${escapeHtml(messages.duration_label || 'Duration')}:</strong> ${Number.isFinite(Number(result.duration)) && result.duration ? Number(result.duration).toFixed(2) + 's' : escapeHtml(messages.not_available || 'N/A')} |
+                    <strong>${escapeHtml(messages.segments_label || 'Segments')}:</strong> ${result.segments.length}
                 </div>
                 <div class="segments-container">
                     ${result.segments.map(seg => `
                         <div class="segment-item">
-                            <div class="segment-time">${seg.start.toFixed(2)}s - ${seg.end.toFixed(2)}s</div>
-                            <div class="segment-text">${seg.text}</div>
+                            <div class="segment-time">${seconds(seg.start)}s - ${seconds(seg.end)}s</div>
+                            <div class="segment-text">${escapeHtml(seg.text)}</div>
                         </div>
                     `).join('')}
                 </div>
-                <div id="full-transcription" style="display:none;">${result.text || result.segments.map(s => s.text).join(' ')}</div>
+                <div id="full-transcription" style="display:none;">${escapeHtml(result.text || result.segments.map(s => s.text).join(' '))}</div>
             `;
         } else {
             resultsDiv.innerHTML = `
                 <div class="result-header">
-                    <h3>${messages.result_heading || 'Transcription Result'}</h3>
-                    <button class="btn-secondary btn-sm" onclick="copyTranscription()">${messages.copy_action || 'Copy Text'}</button>
+                    <h3>${escapeHtml(messages.result_heading || 'Transcription Result')}</h3>
+                    <button class="btn-secondary btn-sm" data-action="copy-transcription">${escapeHtml(messages.copy_action || 'Copy Text')}</button>
                 </div>
-                <div class="transcription-text" id="full-transcription">${result.text}</div>
-                ${result.language ? `<div class="result-meta"><strong>${messages.language_label || 'Language'}:</strong> ${result.language}</div>` : ''}
+                <div class="transcription-text" id="full-transcription">${escapeHtml(result.text)}</div>
+                ${result.language ? `<div class="result-meta"><strong>${escapeHtml(messages.language_label || 'Language')}:</strong> ${escapeHtml(result.language)}</div>` : ''}
             `;
         }
+        bindActions(resultsDiv, { 'copy-transcription': () => copyTranscription() });
 
         showStatus('stt-result-status', 'success', messages.success || 'Audio processed successfully!');
     } catch (error) {
@@ -1783,26 +2244,621 @@ async function processSTT() {
     }
 }
 
+// ============================================================
+// Live microphone transcription (WebSocket to the Whisper service)
+// ============================================================
+
+const LIVE_STT_SAMPLE_RATE = 16000;
+// ~4 s of PCM16 @ 16 kHz. Past this the network is not keeping up, and queueing
+// more only adds latency the user cannot see until they press Stop.
+const LIVE_STT_MAX_BUFFERED_BYTES = 131072;
+
+const liveSTT = {
+    socket: null,
+    audioContext: null,
+    processor: null,
+    source: null,
+    filter: null,
+    sink: null,
+    mediaStream: null,
+    active: false,
+    starting: false,
+    droppedFrames: 0,
+    worletWatchdog: null,
+    // Stop was pressed and the server has been asked for the final transcript.
+    // Until it arrives (or the socket closes) the session is still "live" as far
+    // as error reporting goes, even though the microphone is already released.
+    awaitingFinal: false,
+    // Incremented on every start. Callbacks belonging to a retired socket
+    // compare against their captured value and bail out, so a late close from
+    // session N can no longer reset state that now belongs to session N+1.
+    generation: 0,
+};
+
+/** Encode a Float32 buffer already at 16 kHz as PCM16 little-endian. */
+function encodePCM16(float32) {
+    const pcm = new Int16Array(float32.length);
+    for (let i = 0; i < float32.length; i++) {
+        const s = Math.max(-1, Math.min(1, float32[i]));
+        pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    }
+    return pcm.buffer;
+}
+
+/**
+ * Create an AudioContext locked to 16 kHz so the browser's own (properly
+ * filtered) resampler does the rate conversion.
+ *
+ * The previous code resampled by picking every n-th sample with no anti-alias
+ * filter, which folded everything above 8 kHz back into the speech band and
+ * cost real accuracy. Returns {context, needsFallbackFilter}.
+ */
+function createCaptureContext() {
+    const Ctor = window.AudioContext || window.webkitAudioContext;
+    try {
+        const context = new Ctor({ sampleRate: LIVE_STT_SAMPLE_RATE, latencyHint: 'interactive' });
+        if (context.sampleRate === LIVE_STT_SAMPLE_RATE) {
+            return { context, needsFallbackFilter: false };
+        }
+        // Safari historically ignores the hint; fall through to the filtered path.
+        try { context.close(); } catch { /* noop */ }
+    } catch {
+        // NotSupportedError on browsers that cannot honour an explicit rate.
+    }
+    return { context: new Ctor({ latencyHint: 'interactive' }), needsFallbackFilter: true };
+}
+
+/** Decimate to 16 kHz. Only used when the context rate could not be forced. */
+function decimateTo16k(float32, inputRate) {
+    if (inputRate === LIVE_STT_SAMPLE_RATE) return float32;
+    const ratio = inputRate / LIVE_STT_SAMPLE_RATE;
+    const outLength = Math.floor(float32.length / ratio);
+    const out = new Float32Array(outLength);
+    for (let i = 0; i < outLength; i++) {
+        out[i] = float32[Math.floor(i * ratio)];
+    }
+    return out;
+}
+
+/**
+ * Show `next` in `element`. When it only extends `previous`, just the new tail is
+ * appended: rewriting the whole text on every partial makes a live region read
+ * the entire transcript out again each time.
+ */
+function setGrowingText(element, previous, next) {
+    if (next === previous) return;
+    if (previous && next.startsWith(previous)) {
+        element.appendChild(document.createTextNode(next.slice(previous.length)));
+    } else {
+        element.textContent = next;
+    }
+}
+
+/**
+ * Fold a `partial` frame into what is already on screen.
+ *
+ * The server's `confirmed` is the whole session so far and only ever grows, but
+ * the client must not depend on that: a reordered frame, an older server that
+ * confirmed per decode window, or a bug on the other side would otherwise make
+ * transcript the user has already read disappear. So `confirmed` never gets
+ * shorter here. When a frame carries a shorter prefix of what is shown, its
+ * `pending` tail is trimmed by the words the screen already has, so the same
+ * words do not appear twice.
+ *
+ * Returns the new {confirmed, pending}.
+ */
+function mergeLiveTranscript(shown, incomingConfirmed, incomingPending) {
+    const current = String(shown ?? '');
+    const confirmed = String(incomingConfirmed ?? '');
+    const pending = String(incomingPending ?? '');
+
+    // Longer, equal or a revision of the same length: the server is authoritative.
+    if (confirmed.length >= current.length) {
+        return { confirmed, pending };
+    }
+    if (current.startsWith(confirmed)) {
+        const covered = current.slice(confirmed.length).trim();
+        const tail = pending.trim();
+        if (covered && tail.startsWith(covered)) {
+            return { confirmed: current, pending: tail.slice(covered.length).trimStart() };
+        }
+        if (covered && covered.startsWith(tail)) {
+            return { confirmed: current, pending: '' };
+        }
+    }
+    return { confirmed: current, pending };
+}
+
+/**
+ * Readable text for a WebSocket close the page did not ask for, or null when
+ * the close is an ordinary one.
+ *
+ * A browser reports 1006 for any connection that dies without a close frame and
+ * gives no reason at all; the server-chosen codes below are the ones worth
+ * telling apart because the fix differs (retry, reload, ask the operator).
+ */
+function describeLiveClose(code, reason = '') {
+    const detail = reason ? ` (${reason})` : '';
+    switch (code) {
+        case undefined:
+        case 1000:
+        case 1005:
+            return null;
+        case 1001:
+            return 'The server is restarting or shutting down. Start the live transcription again in a moment.';
+        case 1008:
+            return `The server refused the connection${detail || ' (origin or provider not allowed)'}.`;
+        case 1011:
+            return `The server hit an internal error while transcribing${detail}. Start the live transcription again.`;
+        case 1013:
+            return 'The server is busy with other live sessions. Try again shortly.';
+        case 4408:
+            return 'The session was closed after being idle for too long.';
+        case 1006:
+            return 'Live transcription connection lost. Is the server reachable?';
+        default:
+            return `Live transcription connection closed (code ${code}${reason ? `: ${reason}` : ''}).`;
+    }
+}
+
+/** Text for a `{type: 'error'}` frame. Older servers send `error`, newer ones `message`. */
+function describeLiveError(frame) {
+    const text = frame && (frame.message || frame.error);
+    return text ? String(text) : 'Streaming error';
+}
+
+/** Readable reason a getUserMedia() call failed. */
+function describeMicError(error) {
+    if (typeof navigator === 'undefined' || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        return 'Microphone capture is not available here. Browsers only allow it on HTTPS pages (or localhost): open this UI over https://.';
+    }
+    switch (error && error.name) {
+        case 'NotAllowedError':
+        case 'SecurityError':
+            return `Microphone access was denied. Allow it in the browser's site settings and try again.`;
+        case 'NotFoundError':
+        case 'OverconstrainedError':
+            return 'No microphone was found on this device.';
+        case 'NotReadableError':
+            return 'The microphone is in use by another application.';
+        default:
+            return `Microphone access failed: ${error && error.message ? error.message : error}`;
+    }
+}
+
+/** The STT provider that can serve the live socket (first with the capability). */
+function getLiveSttProviderId() {
+    for (const [providerId, provider] of Object.entries(providerRegistry.providers || {})) {
+        if (provider.kind === 'stt' && (provider.capabilities || []).includes('live_transcribe')) {
+            return providerId;
+        }
+    }
+    return 'whisper';
+}
+
+/** Send one PCM block, dropping it if the socket is already backed up. */
+function sendLiveAudio(socket, buffer) {
+    if (socket.readyState !== WebSocket.OPEN) return;
+    if (socket.bufferedAmount > LIVE_STT_MAX_BUFFERED_BYTES) {
+        // The network is not keeping up. Queueing more would only add latency
+        // the user cannot see until they press Stop, so drop instead.
+        liveSTT.droppedFrames++;
+        return;
+    }
+    socket.send(buffer);
+}
+
+/** Build the capture graph, preferring an AudioWorklet over the main thread. */
+async function startCapture(socket) {
+    const { context, needsFallbackFilter } = createCaptureContext();
+    liveSTT.audioContext = context;
+    // Autoplay policy can hand back a suspended context.
+    if (context.state === 'suspended') {
+        try { await context.resume(); } catch { /* noop */ }
+    }
+    liveSTT.source = context.createMediaStreamSource(liveSTT.mediaStream);
+
+    let head = liveSTT.source;
+    if (needsFallbackFilter) {
+        // Band-limit below the 8 kHz Nyquist of the target rate before decimating.
+        liveSTT.filter = context.createBiquadFilter();
+        liveSTT.filter.type = 'lowpass';
+        liveSTT.filter.frequency.value = 7500;
+        liveSTT.source.connect(liveSTT.filter);
+        head = liveSTT.filter;
+    }
+
+    // Preferred path: capture on the audio rendering thread, where main-thread
+    // work (rendering partials, layout, GC) cannot drop frames.
+    if (!needsFallbackFilter && context.audioWorklet) {
+        try {
+            await context.audioWorklet.addModule(`/static/js/mic-worklet.js?v=${encodeURIComponent(appVersion)}`);
+            // numberOfOutputs: 1 routed through a muted gain node to the
+            // destination, exactly like the ScriptProcessor path below. A
+            // zero-output node is only rendered if the browser keeps it in the
+            // graph, and that behaviour is not reliable across engines — if it
+            // is skipped, process() never runs and the session silently sends
+            // no audio at all with no error to fall back on.
+            const node = new AudioWorkletNode(context, 'mic-capture', {
+                numberOfInputs: 1,
+                numberOfOutputs: 1,
+                outputChannelCount: [1],
+                processorOptions: { sampleRate: LIVE_STT_SAMPLE_RATE },
+            });
+            let gotAudio = false;
+            node.port.onmessage = (event) => {
+                if (event.data && event.data.type === 'error') {
+                    console.warn('mic-worklet:', event.data.message);
+                    return;
+                }
+                gotAudio = true;
+                sendLiveAudio(socket, event.data);
+            };
+            head.connect(node);
+            const sink = context.createGain();
+            sink.gain.value = 0;
+            node.connect(sink);
+            sink.connect(context.destination);
+            liveSTT.processor = node;
+            liveSTT.sink = sink;
+
+            // Belt and braces: if the worklet is never pulled, fall back rather
+            // than leaving the user with a permanently silent session.
+            liveSTT.worletWatchdog = setTimeout(() => {
+                if (!gotAudio && liveSTT.processor === node) {
+                    console.warn('AudioWorklet produced no audio; falling back to ScriptProcessor');
+                    try { node.disconnect(); } catch { /* noop */ }
+                    try { sink.disconnect(); } catch { /* noop */ }
+                    liveSTT.processor = null;
+                    liveSTT.sink = null;
+                    attachScriptProcessor(context, head, socket);
+                }
+            }, 2000);
+            return;
+        } catch (err) {
+            console.warn('AudioWorklet unavailable, falling back to ScriptProcessor:', err);
+        }
+    }
+
+    attachScriptProcessor(context, head, socket);
+}
+
+/**
+ * Fallback capture path: ScriptProcessorNode.
+ *
+ * Deprecated and main-thread, but universally supported. 1024 frames @ 16 kHz
+ * is 64 ms of granularity (the old 4096 @ 48 kHz was 85 ms and ran on the main
+ * thread regardless).
+ */
+function attachScriptProcessor(context, head, socket) {
+    const bufferSize = context.sampleRate === LIVE_STT_SAMPLE_RATE ? 1024 : 4096;
+    const processor = context.createScriptProcessor(bufferSize, 1, 1);
+    processor.onaudioprocess = (event) => {
+        const float32 = event.inputBuffer.getChannelData(0);
+        sendLiveAudio(socket, encodePCM16(decimateTo16k(float32, context.sampleRate)));
+    };
+    head.connect(processor);
+    // A ScriptProcessor only fires while it is part of a rendering graph, but
+    // routing it to the speakers would be a feedback path. A muted gain node
+    // keeps it pulling without making a sound.
+    const sink = context.createGain();
+    sink.gain.value = 0;
+    processor.connect(sink);
+    sink.connect(context.destination);
+    liveSTT.processor = processor;
+    liveSTT.sink = sink;
+}
+
+/** Start or stop the live microphone transcription session. */
+async function toggleLiveTranscription() {
+    if (liveSTT.active) {
+        stopLiveTranscription();
+        return;
+    }
+    // `active` is only set once the socket opens, two awaits later — without a
+    // synchronous guard a double-click strands a mic stream, an AudioContext
+    // and a socket that keeps decoding forever.
+    if (liveSTT.starting) return;
+    liveSTT.starting = true;
+    liveSTT.awaitingFinal = false;
+    const session = ++liveSTT.generation;
+
+    const button = document.getElementById('live-stt-button');
+    const transcript = document.getElementById('live-stt-transcript');
+    const confirmedEl = document.getElementById('live-stt-confirmed');
+    const pendingEl = document.getElementById('live-stt-pending');
+    if (button) button.disabled = true;
+
+    // Only the current session may clear the guard. The previous socket stays
+    // open after Stop so the server can deliver its final transcript, and its
+    // close can land *after* a new session has already started.
+    const release = () => {
+        if (liveSTT.generation !== session) return;
+        liveSTT.starting = false;
+        if (button) button.disabled = false;
+    };
+
+    // Go through the same-origin relay rather than dialling the STT container's
+    // published port. getUserMedia needs a secure context, and under HTTPS a
+    // ws:// handshake to another port is blocked as mixed content; behind
+    // single-port ingress that port is not reachable at all.
+    const wsScheme = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    const wsUrl = `${wsScheme}://${window.location.host}/ws/stt?provider=${encodeURIComponent(getLiveSttProviderId())}`;
+
+    // With API_KEY set the socket needs the key too, and only a fetch can ask for
+    // it (see ensureApiKeyForSocket). Before the microphone, so the user is not
+    // asked for microphone access by a session that is about to be refused.
+    await ensureApiKeyForSocket();
+    if (liveSTT.generation !== session) {
+        release();
+        return;
+    }
+
+    try {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+            // Undefined (not a rejection) on plain http:// pages other than
+            // localhost, which is what a LAN or NAS deployment without TLS is.
+            throw new Error('mediaDevices unavailable');
+        }
+        liveSTT.mediaStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+                channelCount: 1,
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true,
+            },
+        });
+    } catch (err) {
+        showStatus('live-stt-status', 'error', describeMicError(err));
+        release();
+        return;
+    }
+
+    confirmedEl.textContent = '';
+    pendingEl.textContent = '';
+    transcript.style.display = '';
+    liveSTT.droppedFrames = 0;
+    showStatus('live-stt-status', 'info', 'Connecting...');
+
+    const protocols = liveSocketProtocols();
+    const socket = protocols ? new WebSocket(wsUrl, protocols) : new WebSocket(wsUrl);
+    socket.binaryType = 'arraybuffer';
+    liveSTT.socket = socket;
+    // Distinguishes "server delivered the final transcript and closed" from
+    // "the connection died", which look identical at the onclose callback.
+    let sawFinal = false;
+    // The status line already says what went wrong; a generic close message
+    // must not overwrite a more specific one.
+    let problemShown = false;
+    // The last `confirmed` text on screen (raw server string, no trailing space).
+    let shownConfirmed = '';
+    // A non-fatal error frame (the server keeps the session open) replaces the
+    // "Listening..." line; the next partial proves decoding works again and
+    // puts it back.
+    let errorFrameShown = false;
+
+    const reportProblem = (text) => {
+        problemShown = true;
+        showStatus('live-stt-status', 'error', text);
+    };
+
+    socket.onopen = async () => {
+        if (liveSTT.generation !== session) return;
+        const language = document.getElementById('stt-language')?.value || 'auto';
+        socket.send(JSON.stringify({ language: language || 'auto' }));
+
+        try {
+            await startCapture(socket);
+        } catch (err) {
+            reportProblem(`Could not start capture: ${err.message}`);
+            release();
+            stopLiveTranscription(true);
+            return;
+        }
+
+        // startCapture awaits (worklet module fetch), so the server may have
+        // rejected and closed us in the meantime — e.g. "too many live
+        // sessions". Publishing "Listening..." then would leave the microphone
+        // hot on a dead socket.
+        if (liveSTT.generation !== session || socket.readyState !== WebSocket.OPEN) {
+            release();
+            stopLiveTranscription(true);
+            return;
+        }
+
+        liveSTT.active = true;
+        release();
+        button.textContent = 'Stop Live Transcription';
+        showStatus('live-stt-status', 'info', 'Listening... speak into your microphone.');
+    };
+
+    socket.onmessage = (event) => {
+        // The retired socket of an earlier session is still open while it waits
+        // for its final transcript. Its frames belong to text that is no longer
+        // on screen and must not overwrite the new session's.
+        if (liveSTT.generation !== session) return;
+        let message;
+        try {
+            message = JSON.parse(event.data);
+        } catch {
+            return;
+        }
+        if (!message || typeof message !== 'object') return;
+
+        if (message.type === 'partial') {
+            // Read scroll state before writing — afterwards scrollHeight has
+            // already changed and "was the user at the bottom" is unanswerable.
+            const atBottom = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 40;
+            const next = mergeLiveTranscript(shownConfirmed, message.confirmed, message.pending);
+            const previouslyShown = shownConfirmed ? shownConfirmed + ' ' : '';
+            shownConfirmed = next.confirmed;
+            setGrowingText(confirmedEl, previouslyShown, next.confirmed ? next.confirmed + ' ' : '');
+            pendingEl.textContent = next.pending;
+            if (atBottom) transcript.scrollTop = transcript.scrollHeight;
+            updateLiveLatency(message);
+            if (errorFrameShown && liveSTT.active) {
+                errorFrameShown = false;
+                problemShown = false;
+                showStatus('live-stt-status', 'info', 'Listening... speak into your microphone.');
+            }
+        } else if (message.type === 'final') {
+            sawFinal = true;
+            liveSTT.awaitingFinal = false;
+            // The final decode is authoritative, but an empty one must not blank
+            // a transcript the user has already been reading.
+            const finalText = typeof message.text === 'string' ? message.text : '';
+            if (finalText.trim() || !shownConfirmed.trim()) {
+                setGrowingText(confirmedEl, shownConfirmed ? shownConfirmed + ' ' : '', finalText);
+                shownConfirmed = finalText;
+            }
+            pendingEl.textContent = '';
+            transcript.scrollTop = transcript.scrollHeight;
+            const dropped = liveSTT.droppedFrames
+                ? ` — ${liveSTT.droppedFrames} audio blocks dropped (slow connection)` : '';
+            const audioLength = Number.isFinite(Number(message.duration))
+                ? `, ${Number(message.duration).toFixed(1)}s of audio` : '';
+            showStatus(
+                'live-stt-status',
+                'success',
+                `Final transcript ready (${message.language || 'unknown'}${audioLength})${dropped}.`
+            );
+        } else if (message.type === 'warning') {
+            // A standing condition (e.g. the buffer rolled over), not a hiccup: it
+            // stays on screen instead of being replaced by the next partial.
+            showStatus('live-stt-status', 'info', message.message || 'Warning');
+        } else if (message.type === 'error') {
+            errorFrameShown = true;
+            reportProblem(describeLiveError(message));
+        }
+    };
+
+    socket.onerror = () => {
+        if (liveSTT.generation !== session) return;
+        if (!problemShown) reportProblem('WebSocket connection failed. Is the Whisper service reachable?');
+        release();
+        stopLiveTranscription(true);
+    };
+
+    socket.onclose = (event) => {
+        if (liveSTT.generation !== session) return;
+        release();
+        // Refused for the key: the one on hand is missing or wrong, so the next
+        // attempt starts by asking for it again instead of offering it.
+        if (event && event.code === 1008 && /api key/i.test(event.reason || '')) setGatewayApiKey('');
+        const wasLive = liveSTT.active;
+        const wasWaiting = liveSTT.awaitingFinal;
+        liveSTT.awaitingFinal = false;
+
+        // A close without the final transcript, for any phase (connecting,
+        // listening, waiting for the final one) and any server-chosen code, ends
+        // the session silently at best: say why, unless something more specific
+        // is already on screen.
+        if (!sawFinal && !problemShown) {
+            const why = describeLiveClose(event && event.code, event && event.reason);
+            if (why) {
+                reportProblem(why);
+            } else if (wasWaiting) {
+                reportProblem('The connection closed before the final transcript arrived. The text above is what was confirmed so far.');
+            } else if (wasLive) {
+                reportProblem('Live transcription connection lost.');
+            }
+        }
+        if (wasLive) {
+            stopLiveTranscription(true);
+        }
+    };
+}
+
+/** Surface the server's decode timings so latency is visible, not guessed. */
+function updateLiveLatency(message) {
+    const el = document.getElementById('live-stt-latency');
+    if (!el || !Number.isFinite(Number(message.decode_ms))) return;
+    const parts = [`decode ${Math.round(Number(message.decode_ms))} ms`];
+    if (Number(message.pending_seconds) > 0) parts.push(`${Number(message.pending_seconds).toFixed(1)} s behind`);
+    if (liveSTT.droppedFrames) parts.push(`${liveSTT.droppedFrames} dropped`);
+    el.textContent = parts.join(' · ');
+}
+
+/** Tear down the microphone capture chain and (optionally) the socket. */
+function stopLiveTranscription(skipStopMessage = false) {
+    const button = document.getElementById('live-stt-button');
+    liveSTT.active = false;
+
+    if (liveSTT.worletWatchdog) { clearTimeout(liveSTT.worletWatchdog); liveSTT.worletWatchdog = null; }
+    if (liveSTT.processor) {
+        try { liveSTT.processor.disconnect(); } catch { /* noop */ }
+        if (liveSTT.processor.port) liveSTT.processor.port.onmessage = null;
+        liveSTT.processor.onaudioprocess = null;
+        liveSTT.processor = null;
+    }
+    if (liveSTT.sink) { try { liveSTT.sink.disconnect(); } catch { /* noop */ } liveSTT.sink = null; }
+    if (liveSTT.filter) { try { liveSTT.filter.disconnect(); } catch { /* noop */ } liveSTT.filter = null; }
+    if (liveSTT.source) { try { liveSTT.source.disconnect(); } catch { /* noop */ } liveSTT.source = null; }
+    if (liveSTT.audioContext) { try { liveSTT.audioContext.close(); } catch { /* noop */ } liveSTT.audioContext = null; }
+    if (liveSTT.mediaStream) {
+        liveSTT.mediaStream.getTracks().forEach(track => track.stop());
+        liveSTT.mediaStream = null;
+    }
+
+    const socket = liveSTT.socket;
+    if (socket && socket.readyState === WebSocket.OPEN && !skipStopMessage) {
+        // Ask for the final transcript; the server closes after sending it.
+        socket.send(JSON.stringify({ event: 'stop' }));
+        liveSTT.awaitingFinal = true;
+        showStatus('live-stt-status', 'info', 'Finishing final transcript...');
+    } else if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.close();
+    }
+    liveSTT.socket = null;
+
+    if (button) { button.textContent = 'Start Live Transcription'; button.disabled = false; }
+}
+
+/**
+ * Put `text` on the clipboard; true when it worked.
+ *
+ * `navigator.clipboard` only exists in a secure context, so on a plain-http LAN or
+ * NAS address it is undefined and calling it threw before any fallback could run.
+ * The legacy execCommand path is the only one that works there.
+ */
+async function copyTextToClipboard(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        try {
+            await navigator.clipboard.writeText(text);
+            return true;
+        } catch {
+            // Denied or unfocused document: fall through to the legacy path.
+        }
+    }
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', '');
+    textarea.style.cssText = 'position: fixed; top: 0; left: 0; opacity: 0;';
+    document.body.appendChild(textarea);
+    textarea.select();
+    let copied = false;
+    try {
+        copied = Boolean(document.execCommand('copy'));
+    } catch {
+        copied = false;
+    }
+    document.body.removeChild(textarea);
+    return copied;
+}
+
 /** Copy the current full transcription text to the clipboard. */
-function copyTranscription() {
+async function copyTranscription() {
     const el = document.getElementById('full-transcription');
     if (!el) return;
 
     const sttEngine = document.getElementById('stt-engine-select')?.value || providerRegistry.ui?.default_stt_provider || 'whisper';
     const messages = getProviderMessages(sttEngine)?.transcription || {};
     const text = el.textContent || el.innerText;
-    navigator.clipboard.writeText(text).then(() => {
+    if (await copyTextToClipboard(text)) {
         showNotification(messages.copy_success || 'Transcription copied to clipboard', 'success');
-    }).catch(() => {
-        // Fallback for older browsers
-        const textarea = document.createElement('textarea');
-        textarea.value = text;
-        document.body.appendChild(textarea);
-        textarea.select();
-        document.execCommand('copy');
-        document.body.removeChild(textarea);
-        showNotification(messages.copy_success || 'Transcription copied to clipboard', 'success');
-    });
+    } else {
+        showNotification(messages.copy_error || 'Could not copy automatically. Select the text and copy it manually.', 'error');
+    }
 }
 
 /** Show selected STT file metadata in the UI. */
@@ -1812,9 +2868,9 @@ function handleSTTFile(input) {
         const file = input.files[0];
         fileInfo.innerHTML = `
             <div class="file-details">
-                <strong>${file.name}</strong><br>
+                <strong>${escapeHtml(file.name)}</strong><br>
                 <span>Size: ${(file.size / 1024 / 1024).toFixed(2)} MB</span> |
-                <span>Type: ${file.type}</span>
+                <span>Type: ${escapeHtml(file.type)}</span>
             </div>
         `;
         fileInfo.style.display = 'block';
@@ -1833,8 +2889,8 @@ async function startTraining() {
     const voiceName = document.getElementById('training-voice-name').value.trim();
     const language = document.getElementById('training-language').value;
     const gender = document.getElementById('training-gender').value;
-    const epochs = parseInt(document.getElementById('training-epochs').value);
-    const batchSize = parseInt(document.getElementById('training-batch-size').value);
+    const epochs = parseInt(document.getElementById('training-epochs').value, 10);
+    const batchSize = parseInt(document.getElementById('training-batch-size').value, 10);
     const deploymentTarget = getSelectedTrainingDeploymentTarget('training-deployment-target');
     const fileInput = document.getElementById('training-files');
     const progressDiv = document.getElementById('training-progress');
@@ -1846,6 +2902,16 @@ async function startTraining() {
     }
     if (!fileInput.files.length) {
         showStatus('training-progress-status', 'error', messages.validation_files || 'Please select training audio files');
+        return;
+    }
+    // An empty field or the "Loading..." placeholder option parses to NaN, which
+    // used to be sent as the literal string "NaN" and come back as a 422.
+    if (!Number.isInteger(epochs) || epochs < 1) {
+        showStatus('training-progress-status', 'error', messages.validation_epochs || 'Please enter a valid number of training epochs');
+        return;
+    }
+    if (!Number.isInteger(batchSize) || batchSize < 1) {
+        showStatus('training-progress-status', 'error', messages.validation_batch_size || 'Please choose a batch size');
         return;
     }
 
@@ -1884,11 +2950,11 @@ async function startTraining() {
 
         progressDiv.innerHTML = `
             <div class="training-info">
-                <p><strong>Job ID:</strong> ${result.job_id}</p>
-                <p><strong>Voice Name:</strong> ${voiceName}</p>
-                <p><strong>Language:</strong> ${language}</p>
-                <p><strong>Epochs:</strong> ${epochs}</p>
-                <p><strong>Deployment Target:</strong> ${getTrainingDeploymentLabel(deploymentTarget)}</p>
+                <p><strong>Job ID:</strong> ${escapeHtml(result.job_id)}</p>
+                <p><strong>Voice Name:</strong> ${escapeHtml(voiceName)}</p>
+                <p><strong>Language:</strong> ${escapeHtml(language)}</p>
+                <p><strong>Epochs:</strong> ${escapeHtml(epochs)}</p>
+                <p><strong>Deployment Target:</strong> ${escapeHtml(getTrainingDeploymentLabel(deploymentTarget))}</p>
             </div>
         `;
 
@@ -1912,7 +2978,7 @@ function handleTrainingFiles(input) {
             <div class="file-details">
                 <strong>${input.files.length} file(s) selected</strong><br>
                 <span>Total Size: ${(totalSize / 1024 / 1024).toFixed(2)} MB</span><br>
-                ${Array.from(input.files).map(f => `<span>- ${f.name}</span>`).join('<br>')}
+                ${Array.from(input.files).map(f => `<span>- ${escapeHtml(f.name)}</span>`).join('<br>')}
             </div>
         `;
         fileInfo.style.display = 'block';
@@ -1922,54 +2988,124 @@ function handleTrainingFiles(input) {
     }
 }
 
-/** Poll the training service until a job completes, fails, or stops updating. */
-async function monitorTrainingProgress(sessionId) {
+// States after which a job never changes on its own. 'cancelled' and
+// 'interrupted' are resumable, but only by a new request (which starts its own
+// monitor); polling them just keeps the browser asking about a finished job.
+const TRAINING_TERMINAL_STATES = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
+const TRAINING_POLL_MS = 5000;
+const TRAINING_RETRY_MS = 10000;
+const TRAINING_MAX_FAILURES = 5;
+
+// The progress panel is a single shared element, so there is one monitor at a
+// time. Resume and Start used to launch another loop without ending the previous
+// one: after a few resumes the page ran several loops per job, all repainting the
+// same panel, none of them ever ending on cancelled/interrupted.
+let trainingMonitor = null;
+
+/** Stop the running progress monitor, if any, and cancel its pending poll. */
+function stopTrainingMonitor() {
+    if (!trainingMonitor) return;
+    trainingMonitor.stopped = true;
+    clearTimeout(trainingMonitor.timer);
+    trainingMonitor = null;
+}
+
+/** Poll the training service until the job reaches a terminal state or stops answering. */
+function monitorTrainingProgress(jobId) {
+    stopTrainingMonitor();
+
     const progressDiv = document.getElementById('training-progress');
     const messages = getProviderMessages(getTrainingProviderId())?.start_training || {};
+    const monitor = { jobId, timer: null, stopped: false };
+    trainingMonitor = monitor;
+    let consecutiveFailures = 0;
+
+    const finish = () => {
+        monitor.stopped = true;
+        if (trainingMonitor === monitor) trainingMonitor = null;
+    };
+    const schedule = (delayMs) => {
+        if (!monitor.stopped) monitor.timer = setTimeout(checkProgress, delayMs);
+    };
 
     const checkProgress = async () => {
+        if (monitor.stopped) return;
         try {
-            const response = await fetchTrainingRequest(`/api/training/status/${sessionId}`, `/status/${sessionId}`);
+            const response = await fetch(`/api/training/status/${encodeURIComponent(jobId)}`);
+            // Superseded (or stopped) while the request was in flight.
+            if (monitor.stopped) return;
+            if (response.status === 404) {
+                finish();
+                showStatus('training-progress-status', 'error', messages.not_found || 'This training job no longer exists.');
+                refreshTrainingJobs();
+                return;
+            }
+            if (!response.ok) {
+                throw new Error(`Status request failed: HTTP ${response.status}`);
+            }
             const status = await response.json();
+            if (monitor.stopped) return;
+            consecutiveFailures = 0;
 
-            if (status.status === 'completed') {
-                const deploymentLabel = status.deployment_target_label || getTrainingDeploymentLabel(status.deployment_target);
-                showStatus(
-                    'training-progress-status',
-                    'success',
-                    formatMessage(messages.completed, { deployment_target: deploymentLabel }) || `Training completed. Deployment target: ${deploymentLabel}.`
-                );
+            if (TRAINING_TERMINAL_STATES.has(status.status)) {
+                finish();
+                if (status.status === 'completed') {
+                    const deploymentLabel = status.deployment_target_label || getTrainingDeploymentLabel(status.deployment_target);
+                    showStatus(
+                        'training-progress-status',
+                        'success',
+                        formatMessage(messages.completed, { deployment_target: deploymentLabel }) || `Training completed. Deployment target: ${deploymentLabel}.`
+                    );
+                    refreshModels();
+                } else if (status.status === 'failed') {
+                    showStatus('training-progress-status', 'error', messages.failed || 'Training failed. Check training jobs for details.');
+                } else if (status.status === 'cancelled') {
+                    showStatus('training-progress-status', 'info', messages.cancelled || 'Training was cancelled. It can be resumed from its last checkpoint.');
+                } else {
+                    showStatus('training-progress-status', 'info', messages.interrupted || 'Training was interrupted. Use Resume to continue from the last checkpoint.');
+                }
                 refreshTrainingJobs();
-                refreshModels();
                 return;
-            } else if (status.status === 'failed') {
-                showStatus('training-progress-status', 'error', messages.failed || 'Training failed. Check training jobs for details.');
-                refreshTrainingJobs();
-                return;
-            } else if (status.status === 'running' || status.status === 'training') {
-                const progress = status.progress || 0;
-                const progressMessage = formatMessage(messages.progress, {
+            }
+
+            const progress = Math.min(100, Math.max(0, Number(status.progress) || 0));
+            const training = status.status === 'running' || status.status === 'training';
+            // Earlier phases (audio processing, transcription, export) have no
+            // epochs to report, so say which phase it is in instead.
+            const progressMessage = training
+                ? (formatMessage(messages.progress, {
                     progress: progress.toFixed(1),
                     current_epoch: status.current_epoch || 0,
                     total_epochs: status.total_epochs || 1000,
-                }) || `Progress: ${progress.toFixed(1)}% (Epoch ${status.current_epoch || 0}/${status.total_epochs || 1000})`;
-                progressDiv.innerHTML = `
-                    <div class="progress-bar">
-                        <div class="progress-fill" style="width: ${progress}%"></div>
-                    </div>
-                    <p>${progressMessage}</p>
-                `;
-                setTimeout(checkProgress, 5000);
-            } else {
-                // Unknown status — keep polling
-                setTimeout(checkProgress, 5000);
-            }
+                }) || `Progress: ${progress.toFixed(1)}% (Epoch ${status.current_epoch || 0}/${status.total_epochs || 1000})`)
+                : `${status.message || status.status || 'Working'} (${progress.toFixed(0)}%)`;
+            progressDiv.innerHTML = `
+                <div class="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progress.toFixed(0)}">
+                    <div class="progress-fill" style="width: ${progress}%"></div>
+                </div>
+                <p>${escapeHtml(progressMessage)}</p>
+            `;
+            schedule(TRAINING_POLL_MS);
         } catch (error) {
-            console.error('Progress monitoring error:', error);
+            if (monitor.stopped) return;
+            // Transient errors (service restart, network blip) shouldn't kill
+            // monitoring permanently — retry a few times before giving up.
+            consecutiveFailures += 1;
+            console.error(`Progress monitoring error (attempt ${consecutiveFailures}):`, error);
+            if (consecutiveFailures < TRAINING_MAX_FAILURES) {
+                schedule(TRAINING_RETRY_MS);
+            } else {
+                finish();
+                showStatus(
+                    'training-progress-status',
+                    'error',
+                    formatMessage(messages.error, { error: error.message }) || `Lost contact with the training job: ${error.message}`
+                );
+            }
         }
     };
 
-    checkProgress();
+    return checkProgress();
 }
 
 // ============================================================
@@ -1982,18 +3118,20 @@ async function refreshModels() {
     const messages = getProviderMessages(getTrainingProviderId())?.model_list || {};
     if (!modelsList) return;
 
+    const token = beginLatest('models');
     try {
-        modelsList.innerHTML = `<p>${messages.loading || 'Loading trained models...'}</p>`;
+        setMessage(modelsList, messages.loading || 'Loading trained models...');
 
         const response = await fetch('/api/training/jobs');
         if (!response.ok) throw new Error('Failed to fetch models');
 
         const data = await response.json();
+        if (!isLatest('models', token)) return;
         const jobs = Array.isArray(data) ? data : (data.jobs || []);
         const completedModels = jobs.filter(job => job.status === 'completed');
 
         if (completedModels.length === 0) {
-            modelsList.innerHTML = `<p>${messages.empty || 'No trained models found. Start training to create your first model!'}</p>`;
+            setMessage(modelsList, messages.empty || 'No trained models found. Start training to create your first model!');
             return;
         }
 
@@ -2005,14 +3143,17 @@ async function refreshModels() {
             const createdAtLabel = job.created_at_display || formatTimestamp(job.created_at);
             html += `
                 <tr>
-                    <td>${voiceName}</td>
-                    <td><code>${job.job_id}</code></td>
-                    <td>${deploymentLabel}</td>
-                    <td>${createdAtLabel}</td>
+                    <td>${escapeHtml(voiceName)}</td>
+                    <td><code>${escapeHtml(job.job_id)}</code></td>
+                    <td>${escapeHtml(deploymentLabel)}</td>
+                    <td>${escapeHtml(createdAtLabel)}</td>
                     <td class="action-buttons">
-                        <button class="btn-secondary btn-sm" onclick="deployExportedModel('${job.job_id}', '${voiceName}')">${messages.deploy_action || 'Deploy'}</button>
-                        <button class="btn-secondary btn-sm" onclick="downloadModel('${job.job_id}')">${messages.download_action || 'Download'}</button>
-                        <button class="btn-secondary btn-sm btn-danger" onclick="deleteModel('${job.job_id}')">${messages.delete_action || 'Delete'}</button>
+                        <button class="btn-secondary btn-sm" data-action="deploy"
+                                data-job-id="${escapeHtml(job.job_id)}" data-voice-name="${escapeHtml(voiceName)}">${escapeHtml(messages.deploy_action || 'Deploy')}</button>
+                        <button class="btn-secondary btn-sm" data-action="download"
+                                data-job-id="${escapeHtml(job.job_id)}">${escapeHtml(messages.download_action || 'Download')}</button>
+                        <button class="btn-secondary btn-sm btn-danger" data-action="delete"
+                                data-job-id="${escapeHtml(job.job_id)}">${escapeHtml(messages.delete_action || 'Delete')}</button>
                     </td>
                 </tr>
             `;
@@ -2020,9 +3161,15 @@ async function refreshModels() {
 
         html += '</tbody></table>';
         modelsList.innerHTML = html;
+        bindActions(modelsList, {
+            deploy: (el) => withBusy(el, () => deployExportedModel(el.dataset.jobId, el.dataset.voiceName)),
+            download: (el) => withBusy(el, () => downloadModel(el.dataset.jobId)),
+            delete: (el) => withBusy(el, () => deleteModel(el.dataset.jobId)),
+        });
     } catch (error) {
         console.error('Failed to refresh models:', error);
-        modelsList.innerHTML = `<p style="color: var(--error);">${messages.error || 'Failed to load models. Is the training service running?'}</p>`;
+        if (!isLatest('models', token)) return;
+        setMessage(modelsList, messages.error || 'Failed to load models. Is the training service running?', true);
     }
 }
 
@@ -2032,17 +3179,19 @@ async function refreshTrainingJobs() {
     const messages = getProviderMessages(getTrainingProviderId())?.job_list || {};
     if (!jobsList) return;
 
+    const token = beginLatest('training-jobs');
     try {
-        jobsList.innerHTML = `<p>${messages.loading || 'Loading training jobs...'}</p>`;
+        setMessage(jobsList, messages.loading || 'Loading training jobs...');
 
-        const response = await fetchTrainingRequest('/api/training/jobs', '/jobs');
+        const response = await fetch('/api/training/jobs');
         if (!response.ok) throw new Error('Failed to fetch training jobs');
 
         const data = await response.json();
+        if (!isLatest('training-jobs', token)) return;
         const jobs = Array.isArray(data) ? data : (data.jobs || []);
 
         if (jobs.length === 0) {
-            jobsList.innerHTML = `<p>${messages.empty || 'No training jobs found.'}</p>`;
+            setMessage(jobsList, messages.empty || 'No training jobs found.');
             return;
         }
 
@@ -2052,25 +3201,31 @@ async function refreshTrainingJobs() {
             const statusClass = job.status === 'completed' ? 'status-badge-success' :
                               job.status === 'failed' ? 'status-badge-error' :
                               job.status === 'training' || job.status === 'running' ? 'status-badge-active' :
-                              job.status === 'interrupted' ? 'status-badge-warning' : 'status-badge-default';
+                              job.status === 'interrupted' || job.status === 'cancelled' ? 'status-badge-warning' : 'status-badge-default';
 
             const voiceName = job.voice_name || job.model_name || job.job_id;
             const deploymentLabel = job.deployment_target_label || getTrainingDeploymentLabel(job.deployment_target);
             const createdAtLabel = job.created_at_display || formatTimestamp(job.created_at);
-            let actionButtons = `<button class="btn-secondary btn-sm" onclick="viewJobDetails('${job.job_id}')">${messages.details_action || 'Details'}</button>`;
-            if (job.status === 'interrupted') {
-                actionButtons += ` <button class="btn-secondary btn-sm" onclick="resumeTraining('${voiceName}')">${messages.resume_action || 'Resume'}</button>`;
-            } else if (job.status !== 'completed' && job.status !== 'failed') {
-                actionButtons += ` <button class="btn-secondary btn-sm btn-danger" onclick="cancelJob('${job.job_id}')">${messages.cancel_action || 'Cancel'}</button>`;
+            let actionButtons = `<button class="btn-secondary btn-sm" data-action="details"
+                    data-job-id="${escapeHtml(job.job_id)}">${escapeHtml(messages.details_action || 'Details')}</button>`;
+            // 'cancelled' is resumable now that cancelling actually stops the run
+            // and leaves the checkpoints in place — and it is terminal, so it
+            // must not keep offering a Cancel button the API answers with 400.
+            if (job.status === 'interrupted' || job.status === 'cancelled') {
+                actionButtons += ` <button class="btn-secondary btn-sm" data-action="resume"
+                    data-voice-name="${escapeHtml(voiceName)}">${escapeHtml(messages.resume_action || 'Resume')}</button>`;
+            } else if (!['completed', 'failed', 'cancelled'].includes(job.status)) {
+                actionButtons += ` <button class="btn-secondary btn-sm btn-danger" data-action="cancel"
+                    data-job-id="${escapeHtml(job.job_id)}">${escapeHtml(messages.cancel_action || 'Cancel')}</button>`;
             }
 
             html += `
                 <tr>
-                    <td>${voiceName}</td>
-                    <td><span class="status-badge ${statusClass}">${job.status}</span></td>
-                    <td>${deploymentLabel}</td>
-                    <td>${(job.progress || 0).toFixed(1)}%</td>
-                    <td>${createdAtLabel}</td>
+                    <td>${escapeHtml(voiceName)}</td>
+                    <td><span class="status-badge ${statusClass}">${escapeHtml(job.status)}</span></td>
+                    <td>${escapeHtml(deploymentLabel)}</td>
+                    <td>${(Number(job.progress) || 0).toFixed(1)}%</td>
+                    <td>${escapeHtml(createdAtLabel)}</td>
                     <td class="action-buttons">${actionButtons}</td>
                 </tr>
             `;
@@ -2078,9 +3233,15 @@ async function refreshTrainingJobs() {
 
         html += '</tbody></table>';
         jobsList.innerHTML = html;
+        bindActions(jobsList, {
+            details: (el) => withBusy(el, () => viewJobDetails(el.dataset.jobId)),
+            resume: (el) => withBusy(el, () => resumeTraining(el.dataset.voiceName)),
+            cancel: (el) => withBusy(el, () => cancelJob(el.dataset.jobId)),
+        });
     } catch (error) {
         console.error('Failed to refresh training jobs:', error);
-        jobsList.innerHTML = `<p style="color: var(--error);">${messages.error || 'Failed to load training jobs.'}</p>`;
+        if (!isLatest('training-jobs', token)) return;
+        setMessage(jobsList, messages.error || 'Failed to load training jobs.', true);
     }
 }
 
@@ -2099,7 +3260,7 @@ async function deployExportedModel(jobId, modelName) {
         formData.append('model_name', modelName);
         if (deploymentTarget) formData.append('deployment_target', deploymentTarget);
 
-        const response = await fetch(`/api/training/export/${jobId}`, {
+        const response = await fetch(`/api/training/export/${encodeURIComponent(jobId)}`, {
             method: 'POST',
             body: formData
         });
@@ -2138,7 +3299,7 @@ async function deployExportedModel(jobId, modelName) {
 async function downloadModel(jobId) {
     const messages = getProviderMessages(getTrainingProviderId())?.model_management || {};
     try {
-        const response = await fetch(`/api/training/download/${jobId}`);
+        const response = await fetch(`/api/training/download/${encodeURIComponent(jobId)}`);
         if (!response.ok) throw new Error('Download failed');
 
         const blob = await response.blob();
@@ -2164,7 +3325,7 @@ async function deleteModel(jobId) {
     if (!confirm(formatMessage(messages.delete_confirm, { job_id: jobId }) || `Delete model "${jobId}" and all training data? This cannot be undone.`)) return;
 
     try {
-        const response = await fetch(`/api/training/model/${jobId}`, { method: 'DELETE' });
+        const response = await fetch(`/api/training/model/${encodeURIComponent(jobId)}`, { method: 'DELETE' });
         if (!response.ok) throw new Error('Delete failed');
 
         showNotification(messages.delete_success || 'Model deleted successfully', 'success');
@@ -2182,7 +3343,7 @@ async function cancelJob(jobId) {
     if (!confirm(messages.cancel_confirm || 'Cancel this training job?')) return;
 
     try {
-        const response = await fetch(`/api/training/job/${jobId}`, { method: 'DELETE' });
+        const response = await fetch(`/api/training/job/${encodeURIComponent(jobId)}`, { method: 'DELETE' });
         if (!response.ok) throw new Error('Cancel failed');
 
         showNotification(messages.cancel_success || 'Training job cancelled', 'success');
@@ -2207,7 +3368,7 @@ async function resumeTrainingManual() {
 /** Start training from an already-prepared dataset on disk. */
 async function trainFromDataset() {
     const voiceName = document.getElementById('continue-voice-name').value.trim();
-    const epochs = parseInt(document.getElementById('continue-epochs').value) || 10000;
+    const epochs = parseInt(document.getElementById('continue-epochs').value, 10) || 10000;
     const deploymentTarget = getSelectedTrainingDeploymentTarget('continue-deployment-target');
     const messages = getProviderMessages(getTrainingProviderId())?.train_from_dataset || {};
     if (!voiceName) {
@@ -2229,7 +3390,7 @@ async function trainFromDataset() {
         formData.append('epochs', epochs);
         if (deploymentTarget) formData.append('deployment_target', deploymentTarget);
 
-        const response = await fetchTrainingRequest('/api/training/train-from-dataset', '/train-from-dataset', {
+        const response = await fetch('/api/training/train-from-dataset', {
             method: 'POST',
             body: formData
         });
@@ -2277,7 +3438,7 @@ async function resumeTraining(voiceName, statusElementId = 'training-progress-st
         formData.append('model_name', voiceName);
         if (deploymentTarget) formData.append('deployment_target', deploymentTarget);
 
-        const response = await fetchTrainingRequest('/api/training/resume', '/resume-training', {
+        const response = await fetch('/api/training/resume', {
             method: 'POST',
             body: formData
         });
@@ -2317,7 +3478,7 @@ async function resumeTraining(voiceName, statusElementId = 'training-progress-st
 async function viewJobDetails(jobId) {
     const messages = getProviderMessages(getTrainingProviderId())?.job_details || {};
     try {
-        const response = await fetchTrainingRequest(`/api/training/status/${jobId}`, `/status/${jobId}`);
+        const response = await fetch(`/api/training/status/${encodeURIComponent(jobId)}`);
         if (!response.ok) throw new Error('Failed to fetch job details');
 
         const job = await response.json();
@@ -2330,7 +3491,7 @@ async function viewJobDetails(jobId) {
         let details = `${messages.job_label || 'Job'}: ${voiceName}\n`;
         details += `${messages.status_label || 'Status'}: ${job.status}\n`;
         details += `${messages.deployment_target_label || 'Deployment Target'}: ${deploymentLabel}\n`;
-        details += `${messages.progress_label || 'Progress'}: ${(job.progress || 0).toFixed(1)}%\n`;
+        details += `${messages.progress_label || 'Progress'}: ${(Number(job.progress) || 0).toFixed(1)}%\n`;
         details += `${messages.current_epoch_label || 'Current Epoch'}: ${job.current_epoch || 0}\n`;
 
         if (configSummary.epochs || configSummary.batch_size || configSummary.learning_rate) {

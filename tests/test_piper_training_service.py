@@ -55,3 +55,21 @@ def test_generate_missing_mels_rejects_path_traversal(training_client):
         params={"model_name": "../secrets"},
     )
     assert r.status_code == 400
+
+
+def test_health_names_the_trainer(training_client):
+    """The trainer is experimental; /health must say so rather than imply a finished VITS."""
+    body = training_client.get("/health").json()
+    assert "trainer_kind" in body and "trainer_caveat" in body
+    if body["trainer_kind"]:
+        assert body["trainer_caveat"]
+
+
+def test_ready_reports_storage_and_device(training_client):
+    """200 when jobs can be accepted, 503 with the reasons when the environment is broken."""
+    r = training_client.get("/ready")
+    assert r.status_code in (200, 503)
+    body = r.json()
+    assert {"data", "checkpoints", "models", "device"} <= set(body["checks"])
+    assert (r.status_code == 200) == (body["status"] == "ready")
+
