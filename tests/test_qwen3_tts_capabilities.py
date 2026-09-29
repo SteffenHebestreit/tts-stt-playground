@@ -1,9 +1,10 @@
 """Capability routing and batch bounding in qwen3-tts.
 
-The four Qwen3-TTS variants share one class, so every generation method is
+The five Qwen3-TTS variants share one class, so every generation method is
 present on all of them and raises at call time on the ones that cannot do the
 work. `/tts` documents this and routes on the declared `AVAILABLE_MODELS`
-capabilities. Two endpoints did not:
+capabilities (answering 409, since the loaded model is what conflicts). Two
+endpoints did not:
 
 - `/voice_design` probed with ``hasattr(model, 'generate_voice_design')``, which
   is exactly the trap `/tts`'s own comment warns about;
@@ -18,18 +19,10 @@ Separately, `_generate_chunks` batched *every* sentence of the request into one
 forward pass, so peak VRAM scaled with the caller's text length on a card the
 whole stack shares.
 
-The model stack is stubbed; these run offline.
+The model stack is stubbed (see `qwen3_tts_loader`); these run offline.
 """
 
 from __future__ import annotations
-
-import ast
-import os
-import sys
-import tempfile
-import types
-from importlib.util import module_from_spec, spec_from_file_location
-from pathlib import Path
 
 import pytest
 
@@ -38,65 +31,20 @@ import numpy as np  # noqa: E402
 
 from fastapi import HTTPException  # noqa: E402
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-SERVICE_DIR = REPO_ROOT / "qwen3-tts-service"
-
-
-def _install_stubs():
-    if "torch" not in sys.modules:
-        torch = types.ModuleType("torch")
-        torch.__version__ = "0.0.0-stub"
-        torch.bfloat16 = "bfloat16"
-        torch.float32 = "float32"
-        torch.cuda = types.SimpleNamespace(
-            is_available=lambda: False,
-            empty_cache=lambda: None,
-            ipc_collect=lambda: None,
-            get_device_name=lambda i: "stub",
-            memory_allocated=lambda: 0,
-            get_device_properties=lambda i: types.SimpleNamespace(total_memory=0),
-            is_bf16_supported=lambda: False,
-        )
-        torch.is_tensor = lambda x: False
-        sys.modules["torch"] = torch
-
-    if "soundfile" not in sys.modules:
-        sf = types.ModuleType("soundfile")
-        sf.write = lambda *a, **k: None
-        sf.info = lambda p: types.SimpleNamespace(
-            format="WAV", samplerate=16000, channels=1, frames=0)
-        sys.modules["soundfile"] = sf
-
-    if "uvicorn" not in sys.modules:
-        uv = types.ModuleType("uvicorn")
-        uv.run = lambda *a, **k: None
-        sys.modules["uvicorn"] = uv
+from qwen3_tts_loader import (  # noqa: E402
+    BASE_06, CUSTOM_06, CUSTOM_17, DESIGN_17, FakeQwenModel, capture_wav, client,
+    install_model, load_app,
+)
 
 
 @pytest.fixture(scope="module")
 def app_mod():
-    _install_stubs()
-    previous_voices_dir = os.environ.get("VOICES_DIR")
-    os.environ["VOICES_DIR"] = tempfile.mkdtemp(prefix="qwen3-tts-caps-")
-    sys.path.insert(0, str(SERVICE_DIR))
-    try:
-        spec = spec_from_file_location("qwen3_tts_caps_under_test", SERVICE_DIR / "app.py")
-        module = module_from_spec(spec)
-        assert spec.loader is not None
-        sys.modules["qwen3_tts_caps_under_test"] = module
-        spec.loader.exec_module(module)
-        return module
-    finally:
-        sys.path.remove(str(SERVICE_DIR))
-        if previous_voices_dir is None:
-            os.environ.pop("VOICES_DIR", None)
-        else:
-            os.environ["VOICES_DIR"] = previous_voices_dir
+    return load_app()
 
 
-BASE = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
-CUSTOM_VOICE = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
-VOICE_DESIGN = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+BASE = BASE_06
+CUSTOM_VOICE = CUSTOM_17
+VOICE_DESIGN = DESIGN_17
 
 
 # --- _require_capability ------------------------------------------------------
@@ -149,48 +97,103 @@ def test_every_declared_capability_is_reachable(app_mod):
         )
 
 
-# --- endpoints route on declared capabilities, not hasattr --------------------
+def test_the_refusal_status_and_wording_can_be_overridden(app_mod):
+    with pytest.raises(HTTPException) as exc:
+        app_mod._require_capability(
+            BASE, "custom_voice", "a CustomVoice model", status_code=409,
+            what="built-in speakers")
+    assert exc.value.status_code == 409
+    assert "does not support built-in speakers" in exc.value.detail
+    assert "switch to a CustomVoice model" in exc.value.detail
 
 
-def _function_source(name: str) -> str:
-    tree = ast.parse((SERVICE_DIR / "app.py").read_text(encoding="utf-8"))
-    node = next(
-        (n for n in ast.walk(tree)
-         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name),
-        None,
-    )
-    assert node is not None, f"{name} not found in qwen3-tts app.py"
-    return ast.unparse(node)
+def test_the_0_6b_customvoice_variant_is_registered_and_can_serve_speakers(app_mod):
+    info = app_mod.AVAILABLE_MODELS[CUSTOM_06]
+    assert "custom_voice" in info["capabilities"] and "voice_clone" not in info["capabilities"]
+    app_mod._require_capability(CUSTOM_06, "custom_voice", "a CustomVoice model")
 
 
-@pytest.mark.parametrize("handler,capability", [
-    ("clone_voice", "voice_clone"),
-    ("clone_voice_with_ref_text", "voice_clone"),
-    ("save_voice", "voice_clone"),
-    ("tts_with_saved_voice", "voice_clone"),
-    ("voice_design", "voice_design"),
+# --- every endpoint refuses the wrong variant, through the HTTP layer ----------
+#
+# These replaced source scans that asserted the handlers *mentioned*
+# `_require_capability`. What matters is the answer a caller gets, and that the
+# model is never asked to do work it cannot.
+
+
+def _upload():
+    return {"file": ("ref.wav", b"RIFF" + b"\0" * 64, "audio/wav")}
+
+
+def _call(c, endpoint):
+    """POST *endpoint* with a valid body; returns the response."""
+    if endpoint == "/tts":
+        return c.post("/tts", json={"text": "Hallo Welt.", "lang": "German"})
+    if endpoint == "/voice_design":
+        return c.post("/voice_design", json={
+            "text": "Hallo Welt.", "voice_description": "deep calm voice", "lang": "German"})
+    if endpoint == "/clone":
+        return c.post("/clone", data={"text": "Hallo Welt.", "lang": "German"}, files=_upload())
+    if endpoint == "/clone-with-ref-text":
+        return c.post("/clone-with-ref-text", data={
+            "text": "Hallo Welt.", "ref_text": "Hallo.", "lang": "German"}, files=_upload())
+    if endpoint == "/voices/save":
+        return c.post("/voices/save", data={
+            "name": "wrong-model", "ref_text": "Hallo."}, files=_upload())
+    raise AssertionError(endpoint)
+
+
+WRONG_MODEL = [
+    # (endpoint, loaded variant, model name the refusal must mention, status)
+    ("/clone", "custom_voice", CUSTOM_17, "1.7B CustomVoice", 400),
+    ("/clone", "voice_design", DESIGN_17, "1.7B VoiceDesign", 400),
+    ("/clone-with-ref-text", "custom_voice", CUSTOM_17, "1.7B CustomVoice", 400),
+    ("/clone-with-ref-text", "voice_design", DESIGN_17, "1.7B VoiceDesign", 400),
+    ("/voices/save", "custom_voice", CUSTOM_17, "1.7B CustomVoice", 400),
+    ("/voices/save", "voice_design", DESIGN_17, "1.7B VoiceDesign", 400),
+    ("/voice_design", "base", BASE_06, "0.6B Base", 400),
+    ("/voice_design", "custom_voice", CUSTOM_17, "1.7B CustomVoice", 400),
+    ("/tts", "base", BASE_06, "0.6B Base", 409),
+    ("/tts", "voice_design", DESIGN_17, "1.7B VoiceDesign", 409),
+]
+
+
+@pytest.mark.parametrize("endpoint,kind,model_name,label,status", WRONG_MODEL)
+def test_the_wrong_variant_is_refused_with_the_fix_before_the_model_is_used(
+        endpoint, kind, model_name, label, status):
+    m = load_app()
+    model = install_model(m, FakeQwenModel(kind), model_name)
+    r = _call(client(m), endpoint)
+
+    assert r.status_code == status, r.text
+    detail = r.json()["detail"]
+    assert label in detail, "the refusal does not say which model is loaded"
+    assert "switch to" in detail.lower()
+    assert model.calls == [], "the model was asked to do work its variant cannot"
+
+
+@pytest.mark.parametrize("endpoint,kind,model_name", [
+    ("/tts", "custom_voice", CUSTOM_17),
+    ("/voice_design", "voice_design", DESIGN_17),
+    ("/clone", "base", BASE_06),
+    ("/clone-with-ref-text", "base", BASE_06),
 ])
-def test_handler_checks_the_declared_capability(handler: str, capability: str):
-    source = _function_source(handler)
-    assert "_require_capability" in source, (
-        f"{handler} does not check the loaded model's declared capabilities, so "
-        f"the wrong variant produces a 500 instead of an actionable 400"
-    )
-    assert f'"{capability}"' in source or f"'{capability}'" in source
+def test_the_right_variant_is_served(monkeypatch, endpoint, kind, model_name):
+    m = load_app()
+    capture_wav(monkeypatch, m)
+    model = install_model(m, FakeQwenModel(kind), model_name)
+    r = _call(client(m), endpoint)
+
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"] == "audio/wav"
+    assert model.calls, "the endpoint never reached the model"
 
 
-@pytest.mark.parametrize("handler", [
-    "clone_voice", "clone_voice_with_ref_text", "save_voice",
-    "tts_with_saved_voice", "voice_design",
-])
-def test_no_handler_probes_generation_methods_with_hasattr(handler: str):
-    """The trap /tts's own comment warns about: the variants share a class, so
-    the attribute exists everywhere and only raises when called."""
-    source = _function_source(handler)
-    assert "hasattr" not in source, (
-        f"{handler} uses hasattr to decide what the model can do. Every variant "
-        f"has the method; only some of them work. Route on AVAILABLE_MODELS."
-    )
+def test_a_model_name_outside_the_registry_is_refused_not_waved_through():
+    m = load_app()
+    model = install_model(m, FakeQwenModel("base"), "someone/else-Base")
+    r = _call(client(m), "/clone")
+    assert r.status_code == 400 and "does not support" in r.json()["detail"]
+    assert model.calls == []
 
 
 # --- bounded generation batches ----------------------------------------------
