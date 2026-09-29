@@ -17,7 +17,7 @@ tokenizers>=0.13.0
 # huggingface-hub 1.x replaced `requests` with httpx. faster-whisper 1.2.1 no
 # longer imports requests itself, but its model download has only been exercised
 # against hub 0.x, so the cap stays until that is checked against 1.x.
-huggingface-hub>=0.23,<1.0
+huggingface-hub>=2.0.0,<3.0
 # Still needed by huggingface-hub 0.x; declared so the cap above and this line
 # are lifted together.
 requests>=2.31.0
