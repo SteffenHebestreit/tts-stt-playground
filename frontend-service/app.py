@@ -1451,7 +1451,10 @@ def _build_provider_registry() -> dict:
                 # checkpoint (the service lists them at /languages). The checkpoint
                 # holds more, but NeMo would read those with English rules.
                 "languages": [
-                    {"value": "auto", "label": "Automatic (service default)"},
+                    # No label on purpose: app.js then names the default the service
+                    # reports (/speakers `default_language`), "Automatic - server
+                    # decides (default: German)", instead of a fixed text.
+                    {"value": "auto"},
                     {"value": "de", "label": "German"},
                     {"value": "en", "label": "English"},
                     {"value": "es", "label": "Spanish"},
@@ -1467,7 +1470,9 @@ def _build_provider_registry() -> dict:
                 "show_status": True,
                 "tab_label": "Text-to-Speech",
                 "messages": {
-                    "tts_generation": _build_basic_tts_messages(),
+                    # "auto" is MAGPIE_DEFAULT_SPEAKER, one fixed voice, not a choice
+                    # made for the text the way Piper's "auto" is.
+                    "tts_generation": {**_build_basic_tts_messages(), "voice_auto_option": "Service default voice"},
                 },
                 "sections": {
                     "tts": {
@@ -2041,12 +2046,24 @@ def _upstream_error_detail(payload: Any) -> Any:
     return detail
 
 
+def _numeric_retry_after(response: httpx.Response) -> Optional[str]:
+    """The backend's Retry-After when it is a number of seconds, else None."""
+    value = (response.headers.get("retry-after") or "").strip()
+    return value if value.isascii() and value.isdigit() else None
+
+
 def _build_error_from_response(response: httpx.Response) -> HTTPException:
     """Convert an upstream HTTP error into a frontend HTTPException.
 
     The status is the backend's own; the message is what `_client_safe_detail`
-    lets through (4xx only) or a generic sentence with a request id. The raw body
-    is logged, never returned.
+    lets through (4xx, and a designed 503, below) or a generic sentence with a
+    request id. The raw body is logged, never returned.
+
+    A 503 that carries a numeric Retry-After is a backend's designed answer, not
+    a crash: the queue is full, the request waited its time for a turn, or the GPU
+    ran out of memory. Its sentence is written for the caller ("The service is
+    busy ... Retry shortly."), so it is passed on with the Retry-After, which the
+    UI and OpenAI clients act on. Every other 5xx stays generic.
     """
     status = response.status_code
     raw = response.text or ""
@@ -2056,9 +2073,11 @@ def _build_error_from_response(response: httpx.Response) -> HTTPException:
     except Exception:
         pass
 
-    safe = _client_safe_detail(detail) if status < 500 else None
+    retry_after = _numeric_retry_after(response) if status == 503 else None
+    safe = _client_safe_detail(detail) if status < 500 or retry_after else None
     if safe is not None:
-        return HTTPException(status_code=status, detail=safe)
+        headers = {"Retry-After": retry_after} if retry_after else None
+        return HTTPException(status_code=status, detail=safe, headers=headers)
 
     request_id = _new_request_id()
     try:
@@ -2070,18 +2089,40 @@ def _build_error_from_response(response: httpx.Response) -> HTTPException:
     return HTTPException(status_code=status, detail=_generic_upstream_detail(status, request_id))
 
 
+def _request_of(exc: httpx.RequestError) -> Optional[httpx.Request]:
+    """The request an httpx error belongs to (httpx raises RuntimeError when none is attached)."""
+    try:
+        return exc.request
+    except RuntimeError:
+        return None
+
+
 def _build_upstream_request_error(service_name: str, exc: httpx.RequestError) -> HTTPException:
     """Convert an upstream transport failure into a 503 frontend HTTPException.
 
     The client learns which service is down, not where it lives: the internal URL
     and the transport error are logged under the request id in the message.
+
+    A read timeout is not a service that is down: the backend accepted the
+    request and has not answered within the read budget, and it may well still be
+    generating. Calling that "unavailable" sent people looking for a dead
+    container, so it is said as it is, with the budget that ran out.
     """
     request_id = _new_request_id()
-    request_url = getattr(getattr(exc, "request", None), "url", None)
+    request = _request_of(exc)
+    request_url = getattr(request, "url", None)
+    timed_out = isinstance(exc, httpx.ReadTimeout)
     logger.warning(
-        "%s is unreachable [request id %s]: %s: %s (%s)",
-        service_name, request_id, type(exc).__name__, exc, request_url or "no url")
-    detail = f"{service_name} is unavailable. Request id: {request_id}."
+        "%s %s [request id %s]: %s: %s (%s)",
+        service_name, "timed out" if timed_out else "is unreachable", request_id,
+        type(exc).__name__, exc, request_url or "no url")
+    if timed_out:
+        read_budget = ((getattr(request, "extensions", None) or {}).get("timeout") or {}).get("read")
+        budget = f" (read timeout {read_budget:g} s)" if isinstance(read_budget, (int, float)) else ""
+        detail = (f"{service_name} did not finish in time{budget}; it may still be working on the "
+                  f"request. Request id: {request_id}.")
+    else:
+        detail = f"{service_name} is unavailable. Request id: {request_id}."
     # /v1 may only swap providers when the request never got to a backend. A
     # read timeout means one accepted the audio and is still working on it, so
     # repeating the job elsewhere would run it twice (minutes of GPU time).
@@ -2375,6 +2416,22 @@ class FrontendTTSRequest(BaseModel):
     output_format: str = Field(default="wav", max_length=16)
 
 
+_CJK_LANGUAGE_CODES = frozenset({"zh", "ja"})
+_CJK_LANGUAGE_NAMES = frozenset({"chinese", "mandarin", "japanese"})
+
+
+def _is_cjk_language(language: Optional[str]) -> bool:
+    """True for a Chinese or Japanese tag or name ("zh", "zh-CN", "ja_JP", "Chinese").
+
+    Magpie needs about three times the seconds per character for these. "auto" is
+    not one of them: it means MAGPIE_DEFAULT_LANGUAGE, which the gateway does not
+    know, so a deployment whose default is zh gets the shorter budget for text sent
+    without a language.
+    """
+    value = (language or "").strip().lower().replace("_", "-")
+    return value.split("-", 1)[0] in _CJK_LANGUAGE_CODES or value in _CJK_LANGUAGE_NAMES
+
+
 def _build_tts_payload(
     provider_id: str,
     provider: dict,
@@ -2429,7 +2486,9 @@ def _build_tts_payload(
 
     if provider_id == "chatterbox":
         # No speed control in the chatterbox API; "auto" resolves to
-        # CHATTERBOX_DEFAULT_LANGUAGE service-side.
+        # CHATTERBOX_DEFAULT_LANGUAGE service-side. /api/tts streams from its
+        # /tts-stream, so these 300 s are the longest wait between two chunks there,
+        # not a budget for the whole text.
         return {"text": text, "language": language or "auto"}, 300.0
 
     if provider_id == "magpie":
@@ -2438,7 +2497,18 @@ def _build_tts_payload(
         # to MAGPIE_DEFAULT_LANGUAGE / MAGPIE_DEFAULT_SPEAKER service-side; the gateway
         # must not fill either in itself. An unknown speaker or an unsupported
         # language is the service's 400, listing what it can do.
-        return {"text": text, "language": language or "auto", "speaker": voice or "auto"}, 300.0
+        payload = {"text": text, "language": language or "auto", "speaker": voice or "auto"}
+        # Magpie declares no `tts_stream`: its /tts answers once every group of
+        # sentences is done, so this read timeout bounds the whole job. A fixed 300 s
+        # cut long texts off while the GPU was still on them (and was answered as
+        # "unavailable"). 180 s cover the wait for a turn (TTS_QUEUE_TIMEOUT_S, 60 s),
+        # a model reload (about 40-50 s) and a language's first-use text normalizer
+        # (up to 48 s); then 0.1 s per character for de/en/es/fr (measured 0.04-0.05
+        # on an RTX 4080, with headroom for a 5060 Ti) and 0.25 s for zh/ja (measured
+        # 0.12-0.16). Never below the 600 s /v1 always gave it. /v1 takes
+        # max(this, 600 s), so both routes get the same number.
+        per_char = 0.25 if _is_cjk_language(language) else 0.1
+        return payload, max(600.0, 180.0 + per_char * len(text))
 
     if provider_id == "qwen3":
         return {
@@ -3175,7 +3245,7 @@ async def frontend_stt(request: Request):
 
 
 @app.post("/api/tts")
-async def frontend_tts(request: FrontendTTSRequest):
+async def frontend_tts(request: FrontendTTSRequest, http_request: Request):
     """Synthesize speech through a normalized frontend TTS adapter."""
     provider = _get_provider(request.provider, kind="tts")
 
@@ -3201,14 +3271,17 @@ async def frontend_tts(request: FrontendTTSRequest):
     # buffering here would throw the entire benefit away.
     path = "/tts-stream" if "tts_stream" in provider.get("contracts", {}) else "/tts"
 
-    return await _stream_upstream(
+    # Raced against the browser leaving (a closed tab, a reload): until the backend
+    # answers, nothing else would notice, and a non-streaming backend generates the
+    # whole text first. Cancelling closes the upstream connection.
+    return await openai_router.unless_client_gone(http_request, _stream_upstream(
         "POST",
         f"{provider['internal_url']}{path}",
         display_name=provider.get("display_name", request.provider),
         json=payload,
         read_timeout=read_timeout,
         extra_headers={"X-Provider": request.provider},
-    )
+    ))
 
 
 @app.get("/api/training/deployment-targets")

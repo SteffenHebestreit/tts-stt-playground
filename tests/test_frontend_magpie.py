@@ -5,9 +5,14 @@
   service to resolve: a gateway that filled in a language or a speaker itself would
   override MAGPIE_DEFAULT_LANGUAGE / MAGPIE_DEFAULT_SPEAKER on every request;
 * the five speakers reach the voice selector through the existing `speaker-catalog-v1`
-  contract, so the browser needs no code of its own for them.
+  contract; the panel lists them by name and shows Magpie none of Piper's other controls
+  (quality, gender, speed, custom voices), which app.js reads from this registry
+  (test_frontend_ui_logic.py runs that half);
+* /tts answers only when the whole text is done, so the gateway's read budget covers the
+  whole job, and a caller who hangs up has the backend call cancelled.
 """
 
+import asyncio
 import json
 
 import httpx
@@ -61,14 +66,53 @@ def test_an_enabled_magpie_is_a_tts_provider_with_the_generic_panel(monkeypatch)
     assert module.PROVIDER_REGISTRY["ui"]["enable_magpie_tts"] is True
 
 
+def _language_options(module):
+    return [item["value"] for item in module.PROVIDER_REGISTRY["providers"]["magpie"]["settings"]["languages"]]
+
+
 def test_the_language_options_are_only_ones_the_service_can_speak(monkeypatch):
-    """NeMo 3.0.x reads any other language with English rules; offering them would invite a wrong 200."""
+    """The service refuses any other language with a 400 (NeMo 3.0.x would read it with
+    English rules), so offering one would only lead the user into that error. Compared
+    with the service's own list rather than a literal, so the two cannot drift apart in
+    either direction."""
     module, _, _ = _gateway(monkeypatch, _wav, ENABLED)
 
-    options = [item["value"] for item in module.PROVIDER_REGISTRY["providers"]["magpie"]["settings"]["languages"]]
+    options = _language_options(module)
 
-    assert options == ["auto", "de", "en", "es", "fr", "ja", "zh"]
+    assert options[0] == "auto"
+    assert options[1:] == list(magpie_loader.load_support().DOCUMENTED_LANGUAGES)
     assert module.PROVIDER_REGISTRY["providers"]["magpie"]["settings"]["defaults"]["language"] == "auto"
+
+
+def test_the_language_options_are_what_the_service_lists_before_a_load(monkeypatch):
+    magpie_loader.install_nemo(monkeypatch)
+    listed = TestClient(magpie_loader.load_app().app).get("/languages").json()["languages"]
+    module, _, _ = _gateway(monkeypatch, _wav, ENABLED)
+
+    assert _language_options(module)[1:] == listed
+
+
+def test_the_automatic_language_has_no_label_of_its_own(monkeypatch):
+    """app.js keeps a label the registry chose; without one it names the default the
+    service reports ("Automatic - server decides (default: German)")."""
+    module, _, _ = _gateway(monkeypatch, _wav, ENABLED)
+
+    assert module.PROVIDER_REGISTRY["providers"]["magpie"]["settings"]["languages"][0] == {"value": "auto"}
+
+
+def test_the_automatic_voice_is_called_what_it_is(monkeypatch):
+    """Magpie's "auto" is MAGPIE_DEFAULT_SPEAKER, one fixed voice; "Auto-Select Best Voice"
+    promised a choice made for the text, which is what Piper's "auto" is."""
+    module, _, _ = _gateway(monkeypatch, _wav, ENABLED)
+    providers = module.PROVIDER_REGISTRY["providers"]
+
+    magpie = providers["magpie"]["ui"]["messages"]["tts_generation"]
+    piper = providers["piper"]["ui"]["messages"]["tts_generation"]
+
+    assert magpie["voice_auto_option"] == "Service default voice"
+    assert piper["voice_auto_option"] == "Auto-Select Best Voice"
+    assert {key: value for key, value in magpie.items() if key != "voice_auto_option"} == {
+        key: value for key, value in piper.items() if key != "voice_auto_option"}
 
 
 def test_the_service_url_is_configurable(monkeypatch):
@@ -160,7 +204,8 @@ def test_the_five_speakers_reach_the_voice_selector_through_the_speaker_catalog(
     assert stub.calls[-1][1] == "http://magpie-tts-service:5008/speakers"
     assert [v["id"] for v in body["voices"]] == payload["speakers"]
     assert all(v["kind"] == "builtin" for v in body["voices"])
-    assert body["default_language"] == "de", "the UI names the service's default in the Automatic option"
+    assert body["default_language"] == "de", (
+        "the gateway must pass on the language 'auto' means; app.js names it in the Automatic option")
 
 
 def test_the_speaker_catalog_is_exactly_what_the_real_service_answers(monkeypatch):
@@ -206,3 +251,139 @@ def test_unload_is_proxied(monkeypatch):
 
     assert r.status_code == 200 and r.json()["provider"] == "magpie"
     assert stub.calls[-1][1] == "http://magpie-tts-service:5008/unload"
+
+
+# --- how long the gateway waits for Magpie ----------------------------------------------
+#
+# Magpie has no streaming route: /tts answers once every group of sentences is done, so the
+# gateway's read timeout is the budget for the whole job. It was a flat 300 s, which a long
+# German text overran on the GPU the gateway then reported as "unavailable". Pinned here so
+# nobody aligns it back with Chatterbox's 300 s (the gap between two streamed chunks).
+
+GERMAN = ("Das ist ein ganz gewöhnlicher Satz. " * 200)[:5000]
+CHINESE = ("这是一个很普通的句子。" * 600)[:5000]
+
+
+def _read_timeout(stub):
+    return stub.calls[-1][2]["timeout"].read
+
+
+@pytest.mark.parametrize("text,language,expected", [
+    ("Guten Tag.", "de", 600.0),          # never below the 600 s /v1 always gave it
+    (GERMAN, "de", 680.0),                # 180 s + 0.1 s per character
+    (CHINESE, "zh", 1430.0),              # 180 s + 0.25 s per character
+    (CHINESE, "zh-CN", 1430.0),
+    (CHINESE, "Chinese", 1430.0),
+], ids=["short", "de-5000", "zh-5000", "zh-CN-5000", "Chinese-5000"])
+def test_the_read_budget_covers_the_whole_text(monkeypatch, text, language, expected):
+    _, stub, client = _gateway(monkeypatch, _wav, ENABLED)
+
+    r = client.post("/api/tts", json={"provider": "magpie", "text": text, "language": language})
+
+    assert r.status_code == 200
+    assert len(text) in (len("Guten Tag."), 5000)
+    assert _read_timeout(stub) == pytest.approx(expected)
+
+
+def test_v1_waits_exactly_as_long_as_api_tts(monkeypatch):
+    text = CHINESE[:4000]                 # /v1 takes at most 4096 characters
+    _, stub, client = _gateway(monkeypatch, _wav, {**ENABLED, "DEFAULT_TTS_PROVIDER": "magpie"})
+
+    assert client.post("/v1/audio/speech", json={
+        "input": text, "language": "zh", "response_format": "wav"}).status_code == 200
+    via_v1 = _read_timeout(stub)
+    client.post("/api/tts", json={"provider": "magpie", "text": text, "language": "zh"})
+
+    assert via_v1 == _read_timeout(stub) == pytest.approx(180.0 + 0.25 * 4000)
+
+
+def test_a_read_timeout_says_magpie_did_not_finish_not_that_it_is_down(monkeypatch):
+    def slow(method, url, kwargs):
+        request = httpx.Request(method, url, extensions={"timeout": kwargs["timeout"].as_dict()})
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    _, _, client = _gateway(monkeypatch, slow, ENABLED)
+
+    r = client.post("/api/tts", json={"provider": "magpie", "text": "Guten Tag.", "language": "de"})
+
+    assert r.status_code == 503
+    assert "did not finish in time (read timeout 600 s)" in r.json()["detail"]
+    assert "unavailable" not in r.json()["detail"]
+
+
+# --- a caller who hangs up ------------------------------------------------------------------
+#
+# uvicorn never cancels a handler whose client went away; it only answers the next receive()
+# with http.disconnect. So these drive the ASGI app the way a server does: the body, then a
+# hang-up while the backend call is in flight. (TestClient sends its disconnect only after
+# the response, and frontend_loader.asgi_call sends it at once.)
+
+
+def _scope(path: str, body: bytes) -> dict:
+    return {
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "POST",
+        "scheme": "http", "path": path, "raw_path": path.encode(), "query_string": b"", "root_path": "",
+        "headers": [(b"host", b"testserver"), (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode())],
+        "client": ("127.0.0.1", 50000), "server": ("testserver", 80),
+    }
+
+
+def _hang_up_while_magpie_works(monkeypatch, path, payload, env):
+    """POST *payload*, hang up once the gateway waits for Magpie; returns what happened."""
+    started, cancelled = [], []
+
+    async def magpie_still_generating(method, url, kwargs):
+        started.append(url)
+        try:
+            await asyncio.Event().wait()           # never answers on its own
+        except asyncio.CancelledError:
+            cancelled.append(url)
+            raise
+
+    module, _, _ = _gateway(monkeypatch, magpie_still_generating, env)
+    body = json.dumps(payload).encode()
+
+    async def main():
+        hang_up = asyncio.Event()
+        delivered = False
+        sent = []
+
+        async def receive():
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            await hang_up.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            sent.append(message)
+
+        handler = asyncio.create_task(module.app(_scope(path, body), receive, send))
+        for _ in range(500):
+            if started:
+                break
+            await asyncio.sleep(0.01)
+        answered_before_the_hang_up = list(sent)
+        hang_up.set()
+        await asyncio.wait_for(handler, 5)
+        return answered_before_the_hang_up, sent
+
+    before, sent = asyncio.run(main())
+    status = next(m["status"] for m in sent if m["type"] == "http.response.start")
+    return started, cancelled, before, status
+
+
+@pytest.mark.parametrize("path,payload,env", [
+    ("/api/tts", {"provider": "magpie", "text": "Ein langer Text.", "language": "de"}, ENABLED),
+    ("/v1/audio/speech", {"input": "Ein langer Text.", "response_format": "wav"},
+     {**ENABLED, "DEFAULT_TTS_PROVIDER": "magpie"}),
+], ids=["api-tts", "v1-speech"])
+def test_a_caller_who_hangs_up_has_the_magpie_call_cancelled(monkeypatch, path, payload, env):
+    started, cancelled, before, status = _hang_up_while_magpie_works(monkeypatch, path, payload, env)
+
+    assert started == ["http://magpie-tts-service:5008/tts"]
+    assert before == [], "the gateway answered before Magpie did"
+    assert cancelled == started, "the request to Magpie was left running for a caller who had gone"
+    assert status == 499

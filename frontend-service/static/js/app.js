@@ -330,6 +330,20 @@ function applyTrainingProviderCopy() {
     setElementText('model-deployment-target-label', modelManagementForm.fields?.deployment_target?.label);
 }
 
+/**
+ * True when the shared TTS text box holds nothing the user wrote: it is empty, or
+ * still holds the template's text or one of the providers' samples. Checked
+ * against every sample rather than the last one written, so a value the browser
+ * restores on reload is judged the same way.
+ */
+function ttsTextIsPageSample(value) {
+    const text = String(value ?? '').trim();
+    if (!text) return true;
+    if (text === String(document.getElementById('tts-text')?.defaultValue ?? '').trim()) return true;
+    return Object.values(providerRegistry.providers || {}).some(
+        (provider) => String(provider?.ui?.sections?.tts?.text_sample ?? '').trim() === text);
+}
+
 function applyTTSProviderCopy(providerId) {
     const ui = getProviderUI(providerId);
     const copy = ui?.sections?.tts || {};
@@ -337,7 +351,11 @@ function applyTTSProviderCopy(providerId) {
     setElementText('tts-title', copy.title);
     setElementText('tts-description', copy.description);
     setInputPlaceholder('tts-text', copy.text_placeholder);
-    setInputValue('tts-text', copy.text_sample);
+    // The engines share one text box. A sample follows the engine; text the user
+    // typed stays, so the same text can be compared across engines.
+    if (ttsTextIsPageSample(document.getElementById('tts-text')?.value)) {
+        setInputValue('tts-text', copy.text_sample);
+    }
     setElementText('custom-voices-title', copy.custom_voices_title);
     setElementText('custom-voices-description', copy.custom_voices_description);
 }
@@ -501,9 +519,42 @@ function noteServerDefaultLanguage(providerId, language) {
     }
 }
 
+/**
+ * Which optional controls of the generic TTS panel the provider really has.
+ *
+ * Registry-driven, like everything else on the panel: a provider whose settings
+ * define no qualities, genders or speed (Chatterbox, Magpie) gets neither the
+ * control nor the request field; only a provider with a voice catalog lists
+ * voices (Chatterbox, asked for one, answered 400); and only the one that manages
+ * trained voices (Piper) shows the Custom Voices panel, which under the other
+ * engines showed Piper's voices or "Is the PiperTTS service running?".
+ */
+function ttsPanelControls(providerId) {
+    const settings = getProviderSettings(providerId);
+    return {
+        quality: Array.isArray(settings.qualities) && settings.qualities.length > 0,
+        gender: Array.isArray(settings.genders) && settings.genders.length > 0,
+        speed: Boolean(settings.speed),
+        voices: Boolean(getProviderContract(providerId, 'voice_catalog')),
+        customVoices: Boolean(getProviderContract(providerId, 'managed_voices')),
+    };
+}
+
+/** Show or hide a whole form group by id (a missing element is a no-op). */
+function setGroupVisible(elementId, visible) {
+    const element = document.getElementById(elementId);
+    if (element) element.style.display = visible ? '' : 'none';
+}
+
 function applyTTSProviderSettings(providerId) {
     const settings = getProviderSettings(providerId);
     const defaults = settings.defaults || {};
+    const controls = ttsPanelControls(providerId);
+    setGroupVisible('tts-quality-group', controls.quality);
+    setGroupVisible('tts-gender-group', controls.gender);
+    setGroupVisible('tts-speed-group', controls.speed);
+    setGroupVisible('tts-voice-group', controls.voices);
+    setGroupVisible('custom-voices-panel', controls.customVoices);
     populateSelectOptions('tts-language-select', ttsLanguageOptions(providerId), defaults.language || 'auto');
     populateSelectOptions('tts-quality-select', settings.qualities, defaults.quality || 'medium');
     populateSelectOptions('tts-gender-select', settings.genders, defaults.gender || 'any');
@@ -674,10 +725,26 @@ function getSelectedTrainingDeploymentTarget(selectId) {
 // TTS Engine Switching
 /** Switch the visible UI panels to the selected TTS engine family. */
 function switchTTSEngine(engine) {
+    const previousEngine = currentTTSEngine;
     currentTTSEngine = engine;
     const family = getProviderFamily(engine);
     applyTTSProviderSettings(engine);
     applyTTSProviderCopy(engine);
+    if (family === 'piper' && engine !== previousEngine) {
+        // The voice list belongs to the provider that filled it: never offer (and
+        // send) one provider's voice ids to another while the new list loads.
+        // Magpie answers a Piper voice with a 400; Piper quietly picks another voice.
+        const messages = getProviderMessages(engine)?.tts_generation || {};
+        setSingleSelectOption(document.getElementById('tts-voice-select'),
+            messages.voice_auto_option || 'Auto-Select Best Voice', 'auto');
+        const controls = ttsPanelControls(engine);
+        if (controls.voices) refreshTTSVoices();
+        // The panel was hidden (and never filled) under an engine without one;
+        // showTab fills it when the tab is opened, so only an open tab needs it now.
+        if (controls.customVoices && document.getElementById('tts-tab')?.classList.contains('active')) {
+            refreshCustomVoices();
+        }
+    }
 
     const piperElements = document.querySelectorAll('.piper-only');
     const qwen3Elements = document.querySelectorAll('.qwen3-only');
@@ -776,7 +843,7 @@ function initializeApp() {
     setupLiveRegions();
     setupFileDragDrop();
     setupRangeSliders();
-    refreshTTSVoices();
+    if (ttsPanelControls(currentTTSEngine).voices) refreshTTSVoices();
     loadQwen3BuiltinSpeakers();
     loadTrainingDeploymentTargets();
     switchTTSEngine(currentTTSEngine);
@@ -886,8 +953,10 @@ function showTab(tabId) {
         refreshModels();
         refreshTrainingJobs();
     } else if (tabId === 'tts-tab') {
-        refreshTTSVoices();
-        refreshCustomVoices();
+        // Only the lists the current engine has: the others are hidden.
+        const controls = ttsPanelControls(currentTTSEngine);
+        if (controls.voices) refreshTTSVoices();
+        if (controls.customVoices) refreshCustomVoices();
     } else if (tabId === 'qwen3-tts-tab') {
         updateQwen3TTSStatus();
         loadQwen3Models();
@@ -1202,6 +1271,7 @@ async function generateTTS() {
     const audioPlayer = document.getElementById('tts-audio-player');
     const providerId = currentTTSEngine;
     const messages = getProviderMessages(providerId)?.tts_generation || {};
+    const controls = ttsPanelControls(providerId);
 
     if (!text) {
         showStatus('tts-result-status', 'error', messages.validation_text || 'Please enter some text to synthesize');
@@ -1217,18 +1287,16 @@ async function generateTTS() {
         );
         audioPlayer.innerHTML = '';
 
-        const requestData = {
-            provider: providerId,
-            text,
-            speed,
-            output_format: 'wav',
-            instructions: '',
-        };
-        if (voice !== 'auto') requestData.voice = voice;
+        // Only the fields the provider's settings define (Piper: all of them, in the
+        // order it always got them). A hidden control's value is not a choice.
+        const requestData = { provider: providerId, text };
+        if (controls.speed) requestData.speed = speed;
+        requestData.output_format = 'wav';
+        requestData.instructions = '';
+        if (controls.voices && voice && voice !== 'auto') requestData.voice = voice;
         requestData.language = language;
-        // Providers without a quality/gender setting leave those selects empty.
-        if (quality && quality !== 'medium') requestData.quality = quality;
-        if (gender && gender !== 'any') requestData.gender = gender;
+        if (controls.quality && quality && quality !== 'medium') requestData.quality = quality;
+        if (controls.gender && gender && gender !== 'any') requestData.gender = gender;
 
         const response = await fetch('/api/tts', {
             method: 'POST',
@@ -1314,9 +1382,13 @@ async function refreshTTSVoices() {
                 const tier = getVoiceQuality(voice);
                 const quality = tier ? ` (${tier})` : '';
                 const description = voice.description ? ` - ${voice.description}` : '';
-                option.textContent = voice.language
-                    ? `${voice.language} - ${voice.name}${quality}`
-                    : `${voice.name}${description}`;
+                // A built-in speaker (speaker-catalog-v1) speaks every language the
+                // provider offers; "multilingual - Leo" said nothing the name did not.
+                option.textContent = voice.kind === 'builtin'
+                    ? voice.name
+                    : voice.language
+                        ? `${voice.language} - ${voice.name}${quality}`
+                        : `${voice.name}${description}`;
                 voiceSelect.appendChild(option);
             });
         }

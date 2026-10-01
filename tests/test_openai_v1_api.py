@@ -546,6 +546,99 @@ def test_speech_refuses_a_provider_with_no_tts_contract(whisper_app, monkeypatch
     assert r.json()["error"]["type"] == "server_error"
 
 
+# --- what /v1 makes of a backend's error answer ---------------------------------------
+#
+# Every backend error used to become a 502 server_error, which OpenAI's SDKs retry. A
+# refusal of the request itself (Magpie: a speaker it does not have, a language it cannot
+# speak, text over its limit) then came back the same on every retry. Those are the
+# caller's 400 now (413 for size). A busy backend's designed 503 keeps its sentence and
+# its Retry-After as `server_busy`. Everything else is still the 502.
+
+MAGPIE_UNKNOWN_SPEAKER = ("Speaker 'de_DE-thorsten-medium' is not available. Use a name or an index: "
+                          "0 = Aria, 1 = Jason, 2 = John, 3 = Leo, 4 = Sofia.")
+MAGPIE_BUSY = ("The service is busy: 5 requests are already in progress or waiting "
+               "(TTS_MAX_CONCURRENCY + TTS_MAX_QUEUE). Retry shortly.")
+VALIDATION_422 = [{"type": "string_too_long", "loc": ["body", "text"], "input": "x" * 6000,
+                   "msg": "String should have at most 5000 characters", "ctx": {"max_length": 5000}}]
+
+
+def _magpie_answering(monkeypatch, status, detail, headers=None):
+    module = load_frontend_app({"ENABLE_MAGPIE_TTS": "true", "DEFAULT_TTS_PROVIDER": "magpie"})
+    install_stub(monkeypatch, module, lambda method, url, kwargs: httpx.Response(
+        status, json={"detail": detail}, headers=headers or {}))
+    return TestClient(module.app).post("/v1/audio/speech", json={
+        "model": "tts-1", "input": "Hallo.", "voice": "de_DE-thorsten-medium", "response_format": "wav"})
+
+
+@pytest.mark.parametrize("backend,expected,detail,shown", [
+    (400, 400, MAGPIE_UNKNOWN_SPEAKER, MAGPIE_UNKNOWN_SPEAKER),
+    (413, 413, "Text is 6000 characters; the limit is 5000 (raise it with MAX_TEXT_CHARS).",
+     "Text is 6000 characters; the limit is 5000 (raise it with MAX_TEXT_CHARS)."),
+    (422, 400, VALIDATION_422, "text: String should have at most 5000 characters"),
+], ids=["400", "413", "422"])
+def test_a_backend_refusing_the_request_is_the_callers_error(monkeypatch, backend, expected, detail, shown):
+    r = _magpie_answering(monkeypatch, backend, detail)
+    assert r.status_code == expected
+    error = r.json()["error"]
+    assert error["type"] == "invalid_request_error", "OpenAI's SDKs would retry a server_error"
+    assert error["message"] == f"Speech backend rejected the request: {shown}"
+    assert "retry-after" not in r.headers
+
+
+def test_the_unknown_speaker_400_names_the_voices_there_are(monkeypatch):
+    r = _magpie_answering(monkeypatch, 400, MAGPIE_UNKNOWN_SPEAKER)
+    assert all(name in r.json()["error"]["message"] for name in ("Aria", "Jason", "John", "Leo", "Sofia"))
+
+
+@pytest.mark.parametrize("backend", [401, 403, 404, 409, 500, 502, 503])
+def test_any_other_backend_error_stays_a_502(monkeypatch, backend):
+    r = _magpie_answering(monkeypatch, backend, "Model is in use; retry when idle")
+    assert r.status_code == 502
+    error = r.json()["error"]
+    assert (error["type"], error["code"]) == ("server_error", None)
+    assert error["message"].startswith("Speech backend failed: ")
+    assert "retry-after" not in r.headers
+
+
+def test_a_busy_backend_is_a_503_the_client_can_wait_out(monkeypatch):
+    r = _magpie_answering(monkeypatch, 503, MAGPIE_BUSY, {"Retry-After": "5"})
+    assert r.status_code == 503
+    assert r.headers["retry-after"] == "5"
+    error = r.json()["error"]
+    assert (error["type"], error["code"]) == ("server_error", "server_busy")
+    assert error["message"] == f"Speech backend is busy: {MAGPIE_BUSY}"
+
+
+def test_a_busy_status_with_a_traceback_is_still_a_generic_502(monkeypatch):
+    traceback = 'Traceback (most recent call last):\n  File "/app/app.py", line 1\nRuntimeError: /root/x'
+    r = _magpie_answering(monkeypatch, 503, traceback, {"Retry-After": "5"})
+    assert r.status_code == 502
+    assert "Traceback" not in r.text and "/app/" not in r.text and "/root/" not in r.text
+    assert "retry-after" not in r.headers
+
+
+@pytest.mark.parametrize("backend,headers,expected,error_type,code", [
+    (422, {}, 400, "invalid_request_error", None),
+    (503, {"Retry-After": "5"}, 503, "server_error", "server_busy"),
+    (500, {}, 502, "server_error", None),
+], ids=["422", "busy", "500"])
+def test_transcription_maps_a_backend_answer_the_same_way(monkeypatch, backend, headers, expected, error_type, code):
+    detail = ("Unsupported language 'xx'. Use a Whisper language code such as 'de' or 'en', or 'auto'."
+              if backend == 422 else MAGPIE_BUSY)
+    module = load_frontend_app()
+    install_stub(monkeypatch, module, lambda method, url, kwargs: httpx.Response(
+        backend, json={"detail": detail}, headers=headers))
+    r = TestClient(module.app).post("/v1/audio/transcriptions", data={"model": "whisper-1", "language": "xx"},
+                                    files={"file": ("a.wav", wav_bytes(), "audio/wav")})
+    assert r.status_code == expected
+    error = r.json()["error"]
+    assert (error["type"], error["code"]) == (error_type, code)
+    if backend == 422:
+        assert error["message"] == f"Transcription backend rejected the request: {detail}"
+    if expected == 503:
+        assert r.headers["retry-after"] == "5"
+
+
 # --- backwards compatibility ------------------------------------------------
 
 
