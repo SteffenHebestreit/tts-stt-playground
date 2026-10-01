@@ -16,7 +16,7 @@ shows it when `ENABLE_MAGPIE_TTS=true` is set on the frontend.
 
 | | |
 |---|---|
-| `POST /tts` | `{"text": "...", "language": "auto", "speaker": "Sofia"}` returns `audio/wav`. `language` is a code (`de`, `de-DE`) or a name (`German`); `auto` or blank is `MAGPIE_DEFAULT_LANGUAGE`. `speaker` is a name (any case) or an index; blank is `MAGPIE_DEFAULT_SPEAKER`. Response headers: `X-Sample-Rate`, `X-Language`, `X-Speaker`, `X-Chunk-Count` (the generations joined; a group generated again in two halves counts twice), `X-Generation-Time`. |
+| `POST /tts` | `{"text": "...", "language": "auto", "speaker": "Sofia"}` returns `audio/wav`. `language` is a code (`de`, `de-DE`) or a name (`German`); `auto` or blank is `MAGPIE_DEFAULT_LANGUAGE`. `speaker` is a name (any case) or an index; blank is `MAGPIE_DEFAULT_SPEAKER`. Response headers: `X-Sample-Rate`, `X-Language`, `X-Speaker`, `X-Chunk-Count` (the generations joined; a group generated again counts once per piece), `X-Generation-Time`. |
 | `GET /speakers` | The speakers, in the `speaker-catalog-v1` shape the gateway turns into the voice list. |
 | `GET /languages` | The languages this deployment can speak and the default. |
 | `GET /health`, `GET /ready`, `GET /status` | Liveness, readiness (`loading` / `load_failed` as 503), details with GPU memory. |
@@ -64,9 +64,10 @@ generating; a request still waiting for its turn leaves the queue at once.
   still answered 200.
 * **A group that NeMo cuts off is generated again.** NeMo stops decoding a call at 500 frames, 23.2 s
   of audio. A group that reaches that limit (number-dense text, which normalization makes much longer,
-  can) is split in two and the halves are generated instead, with a warning in the log; if it cannot
-  be split, or a half reaches the limit too, that audio is kept as it is, again with a warning, rather
-  than failing the request.
+  can) is cut again, at sentence ends where it can, into pieces of at most half its length (usually
+  two or three), which are generated instead, with a warning in the log; if it cannot be cut, or a
+  piece reaches the limit too, that audio is kept as it is, again with a warning, rather than failing
+  the request.
 
 ## Settings
 

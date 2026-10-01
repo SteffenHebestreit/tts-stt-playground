@@ -246,7 +246,10 @@ def group_text(text: str, language: str, max_chars: int) -> list[str]:
 
 
 def halve_group(text: str, language: str) -> list[str]:
-    """*text* cut in about half at its best boundaries; a single piece means it cannot be cut.
+    """*text* cut again at its best boundaries into pieces of at most half its length; a single piece means it cannot be cut.
+
+    That is usually two or three pieces, not always two: a piece ends at a sentence (or
+    clause) boundary the splitter picks, and those seldom fall at the middle.
 
     For a group whose generation filled the decoder's frame limit. Usually that is text
     full of numbers, which normalization writes out: 62 characters of 7-digit numbers
