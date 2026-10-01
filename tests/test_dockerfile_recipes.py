@@ -10,12 +10,16 @@ friends replaced by recorders, or, for the torch check, against a stand-in `torc
       resolver held numpy, scipy, scikit-learn and onnxruntime back);
 * D3  the STT images pin torch/torchaudio through ARGs like every other image, and the CUDA
       one checks for Blackwell kernels at build time;
-* D4  NeMo is installed with torch held by a constraint file (parakeet, canary);
-* D5  the Piper release asset name survives a builder that does not set TARGETARCH.
+* D4  NeMo is installed with torch held by a constraint file (parakeet, canary, magpie), and
+      no NeMo layer leaves pip's wheel cache in /root/.cache, where the model-cache volume is;
+* D5  the Piper release asset name survives a builder that does not set TARGETARCH;
+* D6  the Magpie build fails when the NeMo it installed cannot do what the service imports it
+      for, and bakes in the Japanese dictionary pyopenjtalk would otherwise download at runtime.
 """
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import shlex
@@ -28,10 +32,12 @@ from pathlib import Path
 import pytest
 from compose_helpers import REPO_ROOT, load_compose
 from packaging.version import Version
+from test_nemo3_dependencies import NEMO_EXTRA  # the one table of NeMo images and their extras
 
 STT = REPO_ROOT / "stt-service"
 STT_CUDA, STT_ROCM = STT / "Dockerfile", STT / "Dockerfile.rocm"
-NEMO_IMAGES = [REPO_ROOT / "parakeet-asr-service" / "Dockerfile", REPO_ROOT / "canary-asr-service" / "Dockerfile"]
+NEMO_IMAGES = [REPO_ROOT / service / "Dockerfile" for service in NEMO_EXTRA]
+MAGPIE = REPO_ROOT / "magpie-tts-service" / "Dockerfile"
 PIPER_TTS = REPO_ROOT / "piper-tts-service" / "Dockerfile"
 
 
@@ -263,6 +269,8 @@ def test_the_nemo_install_holds_torch_and_torchaudio_with_a_constraint_file(dock
     """A later NeMo whose requirements ask for another torch fails the resolver at the install,
     not at the post-check after gigabytes of a different wheel."""
     command = next(run for run in _runs(dockerfile) if "requirements.app.txt" in run)
+    assert "rm" not in shlex.split(command), \
+        "this test runs the NeMo install RUN on the test host with only pip3 and python3 stubbed; put a cleanup in a RUN of its own"
     constraints = tmp_path / "torch-constraints.txt"
     (tmp_path / "requirements.txt").write_text((dockerfile.parent / "requirements.txt").read_text(encoding="utf-8"))
     torch, audio = _arg_default(dockerfile, "TORCH_VERSION"), _arg_default(dockerfile, "TORCHAUDIO_VERSION")
@@ -276,10 +284,11 @@ def test_the_nemo_install_holds_torch_and_torchaudio_with_a_constraint_file(dock
 
     assert done.returncode == 0, done.stderr
     argv = (tmp_path / "pip-argv").read_text().split("\n")
+    nemo = f"nemo_toolkit[{NEMO_EXTRA[dockerfile.parent.name]}]>=3.0.0,<3.1"
     assert argv[argv.index("-c") + 1] == str(constraints)
     assert constraints.read_text().split() == [f"torch=={torch}", f"torchaudio=={audio}"]
-    assert "nemo_toolkit[asr]>=3.0.0,<3.1" in argv, "the NeMo spec is unchanged"
-    assert argv.index("-c") < argv.index("nemo_toolkit[asr]>=3.0.0,<3.1"), "-c must apply to the whole install"
+    assert nemo in argv, "the NeMo spec is unchanged"
+    assert argv.index("-c") < argv.index(nemo), "-c must apply to the whole install"
     assert argv[argv.index("-r") + 1] == "requirements.app.txt"
 
 
@@ -287,6 +296,29 @@ def test_the_nemo_install_holds_torch_and_torchaudio_with_a_constraint_file(dock
 def test_the_nemo_defaults_are_untouched(dockerfile):
     assert _arg_default(dockerfile, "NEMO_TOOLKIT_SPEC") == ">=3.0.0,<3.1"
     assert _arg_default(dockerfile, "TORCH_VERSION") == _arg_default(dockerfile, "TORCHAUDIO_VERSION") == "2.11.0"
+
+
+@pytest.mark.parametrize("dockerfile", NEMO_IMAGES, ids=lambda p: p.parent.name)
+def test_the_nemo_layer_leaves_no_pip_cache_in_the_model_cache_directory(dockerfile):
+    """pip does not pass `--no-cache-dir` on to the pip subprocess that installs a source
+    package's build requirements, but that subprocess inherits PIP_NO_CACHE_DIR. Magpie's NeMo
+    layer kept 75 MB of downloads in /root/.cache/pip, and Docker copies an image's /root/.cache
+    into every new model-cache volume mounted there.
+
+    An ARG, so the variable is set for the RUN but not in the running container, and declared
+    after the torch layer: an ARG changes the cache key of every RUN after it, and the torch
+    download is the one worth keeping.
+    """
+    steps = _instructions(dockerfile)
+    declared = [i for i, (k, args) in enumerate(steps) if k == "ARG" and args.split("=", 1)[0] == "PIP_NO_CACHE_DIR"]
+    torch_at = next(i for i, (k, args) in enumerate(steps) if k == "RUN" and "download.pytorch.org/whl/" in args)
+    nemo_at = next(i for i, (k, args) in enumerate(steps) if k == "RUN" and "requirements.app.txt" in args)
+
+    assert len(declared) == 1, f"{dockerfile.parent.name}: the NeMo layer's source builds fill /root/.cache/pip"
+    assert _arg_default(dockerfile, "PIP_NO_CACHE_DIR") == "1"
+    assert torch_at < declared[0] < nemo_at
+    assert not any(k == "ENV" and "PIP_NO_CACHE_DIR" in args for k, args in steps), \
+        "as ENV it would stay set in the running container"
 
 
 # --- D5: the Piper release asset without BuildKit ---------------------------------------------------------------------
@@ -329,3 +361,167 @@ def test_an_empty_targetarch_is_treated_as_unset(tmp_path):
 def test_buildkits_value_wins_over_the_hosts_architecture(tmp_path, targetarch, machine):
     """A cross-build under BuildKit: the target, not the host, names the asset."""
     assert _piper_download(tmp_path, targetarch=targetarch, machine=machine) == BASE + f"piper_{targetarch}.tar.gz"
+
+
+# --- D6: what the Magpie build proves before it ships ---------------------------------------------------------------
+#
+# CI cannot build a NeMo image, so these run the build-time programs against stand-in packages,
+# never the RUN itself: each RUN ends in `rm -rf /root/.cache`.
+
+
+def _build_time_checks(dockerfile: Path) -> list[str]:
+    """The RUN steps after the NeMo install and before `COPY app.py`.
+
+    They run whenever the NeMo layer is rebuilt, and an edit to the service code does not repeat them.
+    They must be RUNs of their own: a test executes the NeMo install RUN on the test host.
+    """
+    steps = _instructions(dockerfile)
+    nemo = next(i for i, (k, args) in enumerate(steps) if k == "RUN" and "requirements.app.txt" in args)
+    app = next(i for i, (k, args) in enumerate(steps) if k == "COPY" and args.split()[0] == "app.py")
+    assert nemo < app
+    return [args for k, args in steps[nemo + 1:app] if k == "RUN"]
+
+
+def _python_step(run: str) -> tuple[dict[str, str], str, list[str]]:
+    """(the variables set for python3, its -c program, the commands after it) of a `RUN python3 -c ...`."""
+    argv = shlex.split(run)
+    at = argv.index("python3")
+    assert argv[at + 1] == "-c"
+    return dict(token.split("=", 1) for token in argv[:at]), argv[at + 2], argv[at + 3:]
+
+
+def _magpie_check(marker: str) -> tuple[dict[str, str], str, list[str]]:
+    runs = [run for run in _build_time_checks(MAGPIE) if marker in run]
+    assert len(runs) == 1, f"the Magpie image needs one build-time check that uses {marker}, after the NeMo install"
+    return _python_step(runs[0])
+
+
+def _assert_the_check_decides_the_build_and_cleans_up(after: list[str]) -> None:
+    """`check && rm -rf ...`: with `;` or `|| true` in between, the RUN's status would be the cleanup's."""
+    assert after[:2] == ["&&", "rm"], f"the check must decide the RUN's exit status, not {' '.join(after)!r}"
+    assert "/root/.cache" in after, "what it leaves in /root/.cache would be copied into every new model-cache volume"
+    assert "||" not in after and ";" not in after
+
+
+def _imports(source: str) -> set[tuple[str, str]]:
+    """(module, name) for each `from module import name`, (module, "") for each `import module`."""
+    found: set[tuple[str, str]] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            found |= {(node.module, alias.name) for alias in node.names}
+        elif isinstance(node, ast.Import):
+            found |= {(alias.name, "") for alias in node.names}
+    return found
+
+
+def _run_program(program: str, packages: Path):
+    return subprocess.run(
+        [sys.executable, "-c", program], cwd=packages, env={"PYTHONPATH": str(packages), "PATH": ""},
+        capture_output=True, text=True, timeout=30, stdin=subprocess.PIPE,
+    )
+
+
+def test_the_magpie_build_imports_everything_the_service_imports_from_nemo():
+    """NeMo 2.7.3 installs, imports and has MagpieTTSModel, but not LANGUAGE_TOKENIZER_MAP, which
+    app.py imports while it loads the model: an image built on the 2.x line passed its build and
+    failed its first request. NeMo also swallows a broken nemo_text_processing (pynini) and then
+    drops every digit from the text, so the build imports the normalizer too.
+    """
+    env, program, after = _magpie_check("MagpieTTSModel")
+    service: set[tuple[str, str]] = set()
+    for module in sorted(MAGPIE.parent.glob("*.py")):
+        service |= {pair for pair in _imports(module.read_text(encoding="utf-8")) if pair[0].split(".")[0] == "nemo"}
+    checked = _imports(program)
+
+    assert service, "the service imports nothing from NeMo any more, so this check checks nothing"
+    assert service <= checked, f"the build does not try {sorted(service - checked)}, which the service imports"
+    assert ("nemo_text_processing.text_normalization.normalize", "Normalizer") in checked
+    assert env.get("PYTORCH_JIT") == "0", \
+        "torch 2.11's TorchScript compiler segfaults on a NeMo import, and the image's ENV is set later"
+    _assert_the_check_decides_the_build_and_cleans_up(after)
+
+
+def _stand_in_nemo(root: Path, *, nemo_3: bool = True, magpie: bool = True, pynini: bool = True) -> None:
+    files = {
+        "nemo/collections/tts/models/__init__.py": "class MagpieTTSModel:\n    pass\n" if magpie else "",
+        # NeMo 2.7.3 has this module, but not the map
+        "nemo/collections/tts/parts/utils/tts_dataset_utils.py":
+            "LANGUAGE_TOKENIZER_MAP = {'de': ['german_phoneme']}\n" if nemo_3 else "def stack_tensors():\n    pass\n",
+        "nemo_text_processing/text_normalization/normalize.py": "import pynini\n\n\nclass Normalizer:\n    pass\n",
+    }
+    if pynini:
+        files["pynini.py"] = ""
+    for name, body in files.items():
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text(body, encoding="utf-8")
+    for directory in [path for path in root.rglob("*") if path.is_dir()]:
+        (directory / "__init__.py").touch()
+
+
+@pytest.mark.parametrize("kwargs, error", [
+    pytest.param({}, None, id="nemo 3.0"),
+    pytest.param({"nemo_3": False}, "LANGUAGE_TOKENIZER_MAP", id="nemo 2.7.3"),
+    pytest.param({"magpie": False}, "MagpieTTSModel", id="a nemo without magpie"),
+    pytest.param({"pynini": False}, "pynini", id="nemo_text_processing without a working pynini"),
+])
+def test_the_magpie_import_check_passes_on_nemo_3_and_fails_the_build_otherwise(tmp_path, kwargs, error):
+    _, program, _ = _magpie_check("MagpieTTSModel")
+    _stand_in_nemo(tmp_path, **kwargs)
+
+    done = _run_program(program, tmp_path)
+
+    if error is None:
+        assert done.returncode == 0, done.stderr
+    else:
+        assert done.returncode != 0, "the image would have shipped"
+        assert error in done.stderr
+
+
+def test_the_magpie_build_bakes_in_the_openjtalk_dictionary():
+    """pyopenjtalk 0.4.1, which nemo_toolkit[tts] pulls in for Japanese, downloads its 22.6 MB
+    dictionary on the first g2p call. In the service that was the first Japanese request: under
+    the single-flight model lock, through an urlopen with no timeout, into the container layer
+    (lost with every recreation), and never on a host without egress. Called at build time, it
+    puts the dictionary into pyopenjtalk's package directory, in the image.
+    """
+    env, program, after = _magpie_check("pyopenjtalk")
+
+    assert "pyopenjtalk.g2p(" in program and "OPEN_JTALK_DICT_DIR" in program
+    assert program.isascii(), "spell the katakana with escapes, so the Dockerfile stays ASCII"
+    assert "OPEN_JTALK_DICT_DIR" not in env and not any(
+        k == "ENV" and "OPEN_JTALK_DICT_DIR" in args for k, args in _instructions(MAGPIE)), \
+        "the dictionary belongs in the image, not under /root/.cache, which the TrueNAS bind mount hides"
+    _assert_the_check_decides_the_build_and_cleans_up(after)
+
+
+def _stand_in_pyopenjtalk(root: Path, *, phonemes: str, dictionary: bool) -> None:
+    dictionary_dir = root / "open_jtalk_dic_utf_8-1.11"
+    if dictionary:
+        dictionary_dir.mkdir()
+    (root / "pyopenjtalk.py").write_text(textwrap.dedent(f"""
+        # pyopenjtalk 0.4.1 keeps the path as bytes, and fetches the dictionary on the first g2p call
+        OPEN_JTALK_DICT_DIR = {str(dictionary_dir).encode("utf-8")!r}
+
+        def g2p(text):
+            # phonemes for Japanese (kana, kanji); nothing for, say, an escape that reached Python unprocessed
+            japanese = bool(text) and all(0x3040 <= ord(c) <= 0x30FF or 0x4E00 <= ord(c) <= 0x9FFF for c in text)
+            return {phonemes!r} if japanese else ""
+    """), encoding="utf-8")
+
+
+@pytest.mark.parametrize("phonemes, dictionary, error", [
+    pytest.param("t e s u t o", True, None, id="dictionary and g2p work"),
+    pytest.param("", True, "g2p returned nothing", id="g2p returns nothing"),
+    pytest.param("t e s u t o", False, "no OpenJTalk dictionary", id="no dictionary where pyopenjtalk looks"),
+])
+def test_the_dictionary_check_fails_the_build_without_a_working_dictionary(tmp_path, phonemes, dictionary, error):
+    _, program, _ = _magpie_check("pyopenjtalk")
+    _stand_in_pyopenjtalk(tmp_path, phonemes=phonemes, dictionary=dictionary)
+
+    done = _run_program(program, tmp_path)
+
+    if error is None:
+        assert done.returncode == 0, done.stderr
+    else:
+        assert done.returncode != 0, "the image would have shipped"
+        assert error in done.stderr
