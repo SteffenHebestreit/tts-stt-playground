@@ -12,7 +12,7 @@ pydantic==2.13.5
 # numpy 1.24 has no Python 3.12 wheels. onnxruntime 1.30 and librosa 0.11 both work
 # with numpy 2 (the training service that exports these voices verifies its ONNX
 # with onnxruntime 1.30 too).
-numpy==2.4.6
+numpy==2.5.3
 librosa==0.11.0
 soundfile==0.14.0
 phonemizer==3.4.0
