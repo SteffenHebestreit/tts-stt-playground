@@ -679,10 +679,13 @@ services:
     build:
       context: ./magpie-tts-service
       dockerfile: Dockerfile
-      # NeMo 3.0.x on torch 2.11 (cu128): the only line the Magpie model loads on here
-      # (NeMo 2.x has no MagpieTTSModel). Same pins as the NeMo ASR images.
+      # NeMo 3.0.x on torch 2.11 (cu128). NeMo 2.7.3 has MagpieTTSModel but not
+      # tts_dataset_utils.LANGUAGE_TOKENIZER_MAP, which app.py imports, so Magpie has no 2.x
+      # line and its own variable: the ASR rollback NEMO_TOOLKIT_SPEC='>=2.7.3,<3' does not
+      # reach it. Override with MAGPIE_NEMO_TOOLKIT_SPEC (e.g. '>=3.0.0,<4'); the torch
+      # pins are the NeMo ASR images' (NEMO_TORCH_VERSION / NEMO_TORCHAUDIO_VERSION).
       args:
-        - NEMO_TOOLKIT_SPEC=${NEMO_TOOLKIT_SPEC:->=3.0.0,<3.1}
+        - NEMO_TOOLKIT_SPEC=${MAGPIE_NEMO_TOOLKIT_SPEC:->=3.0.0,<3.1}
         - TORCH_VERSION=${NEMO_TORCH_VERSION:-2.11.0}
         - TORCHAUDIO_VERSION=${NEMO_TORCHAUDIO_VERSION:-2.11.0}
     ports:
@@ -697,8 +700,13 @@ services:
       MAGPIE_DEFAULT_LANGUAGE: ${MAGPIE_DEFAULT_LANGUAGE:-de}
       # Aria, Jason, John, Leo or Sofia (or an index 0-4).
       MAGPIE_DEFAULT_SPEAKER: ${MAGPIE_DEFAULT_SPEAKER:-Sofia}
-      # More languages to warm at load, comma-separated (e.g. en,fr). The first request in a
-      # language builds its text normalizer: 12 s de, 18 s en, 37 s fr, 48 s es, measured.
+      # Speaker names in baked-embedding order, comma-separated, for a MAGPIE_MODEL that
+      # orders or names them differently. Empty = Aria,Jason,John,Leo,Sofia.
+      MAGPIE_SPEAKERS: ${MAGPIE_SPEAKERS:-}
+      # More languages to warm at the first load, comma-separated (e.g. en,fr). The first
+      # request in a language builds its text normalizer: 12 s de, 18 s en, 37 s fr, 48 s es,
+      # measured. A built normalizer stays in host RAM across idle unloads (a few hundred MB
+      # per language, no VRAM), so a reload repeats neither the warm-up nor a build.
       MAGPIE_WARM_LANGUAGES: ${MAGPIE_WARM_LANGUAGES:-}
       # Text normalization. Off, the model's tokenizer silently drops every digit
       # ("12,50 Euro um 14:30 Uhr" would be read as "Euro um Uhr").
@@ -706,12 +714,14 @@ services:
       # Classifier-free guidance: better speech for roughly twice the compute.
       MAGPIE_USE_CFG: ${MAGPIE_USE_CFG:-true}
       # Long text is generated in groups of whole sentences of at most this many
-      # characters, joined with MAGPIE_GROUP_GAP_MS of silence.
+      # characters (40-250; Chinese and Japanese groups are a third of it), joined with
+      # MAGPIE_GROUP_GAP_MS of silence.
       MAGPIE_MAX_GROUP_CHARS: ${MAGPIE_MAX_GROUP_CHARS:-200}
       MAGPIE_GROUP_GAP_MS: ${MAGPIE_GROUP_GAP_MS:-150}
       MAX_TEXT_CHARS: ${MAGPIE_MAX_TEXT_CHARS:-5000}
-      # Unload the ~3 GB model after this many idle seconds so it can share a 12 GB
-      # card with the STT/ASR stack. >0 seconds | 0 = unload immediately | -1 = never.
+      # Unload the model (~4.2 GB, measured at the card) after this many idle seconds so it
+      # can share a 12 GB card with the STT/ASR stack.
+      # >0 seconds | 0 = unload immediately | -1 = never.
       TTS_MODEL_TTL: ${TTS_MODEL_TTL:-300}
       # Global fallback the code reads when the specific TTL is unset.
       MODEL_TTL: ${MODEL_TTL:-300}

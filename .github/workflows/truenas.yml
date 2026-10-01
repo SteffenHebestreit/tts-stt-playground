@@ -155,7 +155,8 @@ jobs:
           render --set use_gpu=false
           render --set use_gpu=false --set enable_whisper_cpp=true
           render --set enable_canary=true --set enable_parakeet=true --set enable_chatterbox=true \
-                 --set enable_training=true --set enable_whisper_cpp=true --set expose_backend_ports=true
+                 --set enable_magpie=true --set enable_training=true --set enable_whisper_cpp=true \
+                 --set expose_backend_ports=true
           render --set image_tag=latest --set pull_policy=always
           # An API key with characters that YAML and Compose treat specially must survive.
           # shellcheck disable=SC2016

@@ -186,7 +186,7 @@ downloads in the background.
 
 - **Settings file** (recommended if you will edit settings often). TrueNAS keeps only the parsed
   YAML, so comments and your edit history are gone after Save, and a change of release means
-  editing the tag in 11 places. With a settings file the pasted YAML is fixed and the release
+  editing the tag on every `image:` line. With a settings file the pasted YAML is fixed and the release
   is one line:
 
   ```bash

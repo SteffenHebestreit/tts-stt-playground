@@ -10,7 +10,7 @@ The services are correct today. This is a static check that keeps them that way,
 because the failure is silent and would only show up as "TTL doesn't work".
 
 Static source analysis rather than importing the apps: the point is to catch the
-call being *written*, and this needs no torch/CUDA stubs for seven services.
+call being *written*, and this needs no torch/CUDA stubs for any of the services.
 """
 
 import ast
@@ -25,6 +25,7 @@ SERVICES = [
     "qwen3-asr-service",
     "qwen3-tts-service",
     "chatterbox-tts-service",
+    "magpie-tts-service",
     "piper-tts-service",
     "parakeet-asr-service",
     "canary-asr-service",

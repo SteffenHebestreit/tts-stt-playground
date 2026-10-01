@@ -476,7 +476,7 @@ Notes:
 - Busy is **503 + `Retry-After`**, never a hang: `qwen3`, `chatterbox` and `magpie` admit `TTS_MAX_CONCURRENCY + TTS_MAX_QUEUE` requests and refuse the next at once, and refuse one that waited `TTS_QUEUE_TIMEOUT_S`; Piper refuses a request when no synthesis slot frees up within `PIPER_TIMEOUT_S`.
 - An unexpected failure is a `500` with a generic message and a request id (also in an `X-Request-ID` header on Piper, Qwen3-TTS, Chatterbox and Magpie); the detail is in the service log under that id.
 - Qwen3 does not natively expose this exact payload. The frontend adapter translates the shared fields into the provider's native `lang`, `speaker`, and `instruct` request schema for basic TTS.
-- Magpie takes `text`, `language` and `speaker` and nothing else: the adapter maps `voice` to `speaker` and sends `auto` for a missing language or voice (also what `/v1` sends for one of OpenAI's own voice names), which the service resolves to `MAGPIE_DEFAULT_LANGUAGE` and `MAGPIE_DEFAULT_SPEAKER`. A language it cannot speak, or an unknown speaker, is a `400` that lists what is available.
+- Magpie takes `text`, `language` and `speaker` and nothing else: the adapter maps `voice` to `speaker` and sends `auto` for a missing language or voice (also what `/v1` sends for one of OpenAI's own voice names), which the service resolves to `MAGPIE_DEFAULT_LANGUAGE` and `MAGPIE_DEFAULT_SPEAKER`. A language it cannot speak, or an unknown speaker, is a `400` that lists what is available, on `/api/tts` and on `/v1/audio/speech` alike (there as `400` `invalid_request_error`).
 
 Response:
 
@@ -487,9 +487,14 @@ Response:
 `voice-catalog-v1` (Piper): `GET /voices` lists the **installed** voices grouped by language, plus
 `default_language`, `default_voice` and `catalog_only` (true when the image ships no voices);
 `POST /refresh_voices` rescans the models directory and also returns `default_voices`. The gateway's
-`GET /api/providers/piper/voices` normalises it. `speaker-catalog-v1` (Qwen3-TTS): `GET /speakers`,
-which is empty on the Base models (they clone voices; built-in speakers need a CustomVoice variant)
-and reports `speakers_source`.
+`GET /api/providers/piper/voices` normalises it.
+
+`speaker-catalog-v1` (Qwen3-TTS, Magpie): `GET /speakers` returns the provider's built-in `speakers`,
+optionally with the `languages` they speak and the `default_language` that `auto` resolves to. The
+gateway's `GET /api/providers/<id>/voices` turns each speaker into a voice of kind `builtin` and
+forwards `default_language` when the service reports one. Qwen3-TTS: the list is empty on the Base
+models (they clone voices; built-in speakers need a CustomVoice variant), and `speakers_source` says
+where it came from. Magpie lists its five built-in speakers (`Aria`, `Jason`, `John`, `Leo`, `Sofia`).
 
 ### `saved-voice-library-v1`
 

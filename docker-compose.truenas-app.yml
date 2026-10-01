@@ -566,8 +566,13 @@ services:
       # NeMo 3.0.x speaks de, en, es, fr, ja and zh; any other language is refused.
       MAGPIE_DEFAULT_LANGUAGE: ${MAGPIE_DEFAULT_LANGUAGE:-de}
       MAGPIE_DEFAULT_SPEAKER: ${MAGPIE_DEFAULT_SPEAKER:-Sofia}
+      # Speaker names in baked-embedding order, for a MAGPIE_MODEL that orders them
+      # differently. Empty = Aria,Jason,John,Leo,Sofia.
+      MAGPIE_SPEAKERS: ${MAGPIE_SPEAKERS:-}
       # The first request in a language builds its text normalizer (12 s de, 18 s en,
-      # 37 s fr, 48 s es); list more languages here to pay that at start instead.
+      # 37 s fr, 48 s es); languages listed here are built by the first model load instead.
+      # A built one stays in RAM across idle unloads, so a reload after TTS_MODEL_TTL
+      # repeats neither the warm-up nor a build.
       MAGPIE_WARM_LANGUAGES: ${MAGPIE_WARM_LANGUAGES:-}
       # Off, the model silently drops every digit.
       MAGPIE_APPLY_TN: ${MAGPIE_APPLY_TN:-true}

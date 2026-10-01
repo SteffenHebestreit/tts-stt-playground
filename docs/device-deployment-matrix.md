@@ -68,8 +68,10 @@ and only one spans the set:
 | ggml (whisper.cpp) | ✅ NEON | ✅ CUDA | ✅ CUDA | ✅ Vulkan + HIP |
 | NeMo (parakeet/canary) | ❌ | ✅ | ✅ | ❌ no AMD backend |
 
-The NeMo images default to NeMo 3.0.x on torch 2.11 (cu128), with a one-argument rollback to 2.7.x
-(`NEMO_TOOLKIT_SPEC='>=2.7.3,<3'`, or the prebuilt `-nemo2` images via `NEMO_IMAGE_SUFFIX=-nemo2`).
+The NeMo images default to NeMo 3.0.x on torch 2.11 (cu128). Parakeet and Canary have a
+one-argument rollback to 2.7.x (`NEMO_TOOLKIT_SPEC='>=2.7.3,<3'`, or the prebuilt `-nemo2` images via
+`NEMO_IMAGE_SUFFIX=-nemo2`); Magpie-TTS does not (NeMo 2.7.3 lacks the language map the service
+imports), and its own `MAGPIE_NEMO_TOOLKIT_SPEC` keeps that rollback away from it.
 PyTorch publishes cu128 wheels for 2.7 through 2.11 only, which is what caps torch there for a
 Blackwell card; a newer torch needs a CUDA 13 wheel and a newer driver. The ROCm parakeet image stays
 on NeMo 2.x and torch 2.5.1. No NeMo 3 run on a GPU has happened yet **(unverified)**; the

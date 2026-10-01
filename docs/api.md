@@ -98,8 +98,11 @@ conversions behind `/v1/audio/speech` (`mp3`, resampled `pcm`); the next request
 `Retry-After: 2`. The OpenAI SDKs retry a 503 on their own. The model backends bound their queue the
 same way (see [Limits per service](#limits-per-service)): a request that finds no room, or waits
 `ASR_QUEUE_TIMEOUT_S` / `TTS_QUEUE_TIMEOUT_S` (60 s) for its turn, is answered **503** with a
-`Retry-After` instead of hanging. The gateway relays a backend's 503 as a 503 but does not forward the
-backend's own `Retry-After` header, so back off on your own.
+`Retry-After` instead of hanging. The gateway relays such a designed answer (a backend's 503 with a
+numeric `Retry-After` and a one-line sentence, such as Magpie's "The service is busy: …" or an
+out-of-memory message) as **503** with that sentence and that `Retry-After`: in `detail` on `/api/*`,
+and on `/v1` as `error.code: "server_busy"`, which the SDKs retry. Any other backend 5xx keeps the
+generic sentence and request id described under [Errors](#errors) (a 502 on `/v1`).
 
 ---
 
@@ -126,6 +129,7 @@ client = OpenAI(base_url="http://your-host:3000/v1", api_key="unused")
 with open("audio.wav", "rb") as f:
     print(client.audio.transcriptions.create(model="whisper-1", file=f).text)
 
+# de_DE-thorsten-medium is a Piper voice (DEFAULT_TTS_PROVIDER=piper); see "On voice" below.
 speech = client.audio.speech.create(model="tts-1", voice="de_DE-thorsten-medium",
                                     input="Guten Tag.", response_format="wav")
 speech.write_to_file("out.wav")
@@ -139,6 +143,7 @@ speech.write_to_file("out.wav")
 curl http://your-host:3000/v1/audio/transcriptions \
   -F file=@audio.wav -F model=whisper-1 -F language=de
 
+# a Piper voice again; with another DEFAULT_TTS_PROVIDER use one of its voices
 curl http://your-host:3000/v1/audio/speech \
   -H 'Content-Type: application/json' \
   -d '{"model":"tts-1","voice":"de_DE-thorsten-medium","input":"Guten Tag.","response_format":"mp3"}' \
@@ -197,7 +202,7 @@ JSON body (**not** multipart).
 |---|---|---|
 | `model` | — | **Required** by the spec; advisory here. |
 | `input` | — | **Required.** Max 4096 characters (400 `string_above_max_length`). |
-| `voice` | — | **Required** by the spec. Never validated against a list — see below. |
+| `voice` | — | **Required** by the spec. Goes to `DEFAULT_TTS_PROVIDER`; what it may be depends on that provider — see below. |
 | `response_format` | `mp3` | `mp3`, `wav` or `pcm`. |
 | `speed` | `1.0` | 0.25–4.0. |
 
@@ -205,10 +210,20 @@ Returns raw audio bytes: `audio/mpeg`, `audio/wav`, or headerless 16-bit mono PC
 The response carries `X-Provider`.
 
 **On `voice`:** OpenAI's own spec is internally inconsistent here (its prose names 13 voices, its
-`VoiceIdsShared` enum has 10, and the schema accepts any string), so this deployment never 404s on
-a voice name. OpenAI's placeholder names (`alloy`, `nova`, …) are recognised and mapped to the
-deployment default; anything else is passed through as one of *your* voices, e.g.
-`de_DE-thorsten-medium`. List them at `GET /api/providers/piper/voices`.
+`VoiceIdsShared` enum has 10, and the schema accepts any string), so the gateway never 404s on a voice
+name and keeps no list of its own. OpenAI's placeholder names (`alloy`, `nova`, …) are recognised and
+mean the provider's default voice; anything else goes to `DEFAULT_TTS_PROVIDER` as one of *its*
+voices, and what happens to a name it does not have depends on that provider:
+
+| `DEFAULT_TTS_PROVIDER` | Its voices | A name it does not have |
+|---|---|---|
+| `piper` (the default) | the installed voices, e.g. `de_DE-thorsten-medium` | another installed voice is picked by language (the service logs a warning) |
+| `qwen3` | the built-in speakers of a CustomVoice model; a Base model has none (`/tts` answers `409` there, reported as `502`) | **400** listing the speakers |
+| `magpie` | `Aria`, `Jason`, `John`, `Leo`, `Sofia` (any case) or `0` to `4` | **400** listing the speakers |
+| `chatterbox` | none: `voice` is ignored and it speaks in its default voice | — |
+
+List a provider's voices at `GET /api/providers/<id>/voices`. A backend's 400 reaches the caller as a
+**400** `invalid_request_error` with the backend's sentence (see [Errors](#errors)).
 
 **On `mp3`:** it is the spec default, and the TTS backends emit WAV, so the gateway transcodes with
 ffmpeg (asynchronously, killed after 120 s). If ffmpeg is missing the endpoint returns **501**
@@ -261,11 +276,21 @@ which FastAPI would otherwise answer with `{"detail": …}`:
 | 429 | `rate_limit_error` | — |
 | 5xx | `server_error` | `server_busy` (503, with `Retry-After`) |
 
+**A backend's error on `/v1`** is mapped onto this table, not passed through. A backend that refuses
+the request is the caller's error: its **400** and **422** become **400** and its **413** stays
+**413**, `invalid_request_error` with the backend's sentence (`Speech backend rejected the request:
+Speaker 'x' is not available. …`, or `Transcription backend rejected the request: …`), which the SDKs
+do not retry. A busy backend (**503** with `Retry-After`) is **503** `server_busy` with the same
+`Retry-After`, which they do retry. Everything else is **502** `server_error` with a sentence and a
+request id: a backend that cannot be reached or does not finish in time, a 5xx, a 401 or 403 on the
+internal hop, Piper's 404 when it has no voice at all, and Qwen3's 409 for `/tts` on a Base model.
+
 `/api/*` keeps FastAPI's `{"detail": …}`. A backend that fails is reported by name:
-**503** when it cannot be reached, **502** when it answers 200 with something that is not the JSON
-it promised, and any status a backend answers with (400, 409, 413, 422, 503, …) is relayed. Path ids
-(`job_id`, `voice_id`) are restricted to `[A-Za-z0-9_-]{1,128}`; anything else is 422 and never
-reaches a backend.
+**503** when it cannot be reached or does not answer within its read timeout (the detail then says
+it did not finish in time and may still be working), **502** when it answers 200 with something
+that is not the JSON it promised, and any status a backend answers with (400, 409, 413, 422, 503, …)
+is relayed. Path ids (`job_id`, `voice_id`) are restricted to `[A-Za-z0-9_-]{1,128}`; anything else
+is 422 and never reaches a backend.
 
 **Errors do not leak internals, and carry a request id.** A backend's error body and connection
 errors contain file paths, tracebacks and internal URLs, so a client gets a status-appropriate
@@ -278,8 +303,10 @@ sentence plus a request id, and the detail goes to the gateway log under that id
 Quote the id to the operator (`docker compose logs frontend-service | grep 3f9a1c2b7d4e`). A backend
 answer in the 4xx range that is one short line of prose (a validation message such as `text is 5001
 characters; the limit is 5000`) still passes through, because the UI shows it; one that contains a
-traceback, a filesystem path or a URL is treated like a 5xx. The backends themselves answer an
-unexpected failure with a generic message and a request id too; the Piper, Qwen3-TTS, Chatterbox and Magpie
+traceback, a filesystem path or a URL is treated like a 5xx. A backend's **503** that carries a
+numeric `Retry-After` and such a one-line sentence (busy, out of memory) passes through as well,
+together with that header; every other 5xx gets the generic sentence. The backends themselves answer
+an unexpected failure with a generic message and a request id too; the Piper, Qwen3-TTS, Chatterbox and Magpie
 services also put it in an `X-Request-ID` response header, and the exception text is in their log
 under the same id.
 
@@ -291,7 +318,7 @@ under the same id.
 | **403** | a foreign `Origin` on a state-changing request (`cross_origin_blocked`), or a `Host` the gateway does not accept (`host_not_allowed`, fix with `TRUSTED_HOSTS`); on a backend port, a foreign `Origin` |
 | **409** | Piper: an upload named like a built-in voice, or past `PIPER_MAX_CUSTOM_VOICES`; every model service: `/unload` while a request is in flight |
 | **413** | a body, text or upload over a limit (see [Limits per service](#limits-per-service)), including a custom-voice total past `PIPER_MAX_CUSTOM_MB`, a recording longer than `PIPER_ANALYZE_MAX_SECONDS` and a reference clip longer than `QWEN3_TTS_REF_MAX_SECONDS` |
-| **503** | no room: too many uploads or conversions at the gateway, a full or timed-out queue at a model backend, a second Piper voice upload while one is running; always with `Retry-After` when the service itself answers |
+| **503** | no room: too many uploads or conversions at the gateway, a full or timed-out queue at a model backend, a second Piper voice upload while one is running; always with `Retry-After` when the service itself answers, and the gateway relays it with the service's sentence |
 
 ---
 

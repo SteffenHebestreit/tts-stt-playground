@@ -209,5 +209,6 @@ services:
 
   # NOTE: canary-asr-service, chatterbox-tts-service and magpie-tts-service have NO Dockerfile.rocm,
   # so they are deliberately absent here rather than silently building a CUDA
-  # image. canary is NeMo (same caveat as above); run them on CPU, or use the
-  # Vulkan whisper-cpp path for AMD speech-to-text.
+  # image. canary is NeMo (same caveat as above). canary and chatterbox may run on
+  # CPU; magpie-tts-service is NVIDIA-only. For AMD speech-to-text use the Vulkan
+  # whisper-cpp path.

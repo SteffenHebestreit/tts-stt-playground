@@ -434,6 +434,7 @@ services:
       MAGPIE_MODEL: "nvidia/magpie_tts_multilingual_357m"
       MAGPIE_DEFAULT_LANGUAGE: "de"
       MAGPIE_DEFAULT_SPEAKER: "Sofia"
+      MAGPIE_SPEAKERS: ""
       MAGPIE_WARM_LANGUAGES: ""
       MAGPIE_APPLY_TN: "true"
       MAGPIE_USE_CFG: "true"
