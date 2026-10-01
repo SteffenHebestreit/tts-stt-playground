@@ -1,8 +1,12 @@
-"""Offline tests for the chatterbox streaming text splitter.
+"""Offline tests for the chatterbox streaming text splitter, and magpie's copy of it.
 
 `_split_sentences` decides time-to-first-audio for the streaming TTS endpoint,
 and `/tts-stream` indexes `sentences[0]` directly — so a bad return value here is
 either a 500 or a silent reversion to full-text latency.
+
+magpie-tts-service/text_splitting.py carries a copy (each service builds its image
+from its own directory); every test here runs against both, and
+tests/test_magpie_support.py fails when the two copies' code drifts apart.
 
 The model stack is stubbed; these are pure-function tests.
 """
@@ -20,12 +24,16 @@ FIRST = 40
 from chatterbox_loader import load_app  # noqa: E402  (after the numpy importorskip above)
 
 
-@pytest.fixture(scope="module")
-def split():
+@pytest.fixture(scope="module", params=["chatterbox", "magpie"])
+def split(request):
     # The shared loader imports a fresh copy of the service under torch / soundfile /
     # uvicorn stand-ins that exist only while it imports (they used to be installed into
     # sys.modules here and left there for the rest of the run).
-    return load_app()._split_sentences
+    if request.param == "chatterbox":
+        return load_app()._split_sentences
+    from magpie_loader import load_support
+
+    return load_support().text_splitting._split_sentences
 
 
 # --- Inputs that must never hang or crash ----------------------------------
@@ -185,12 +193,13 @@ def test_german_text_survives_splitting_at_realistic_floors(split):
 
 
 @pytest.mark.parametrize("text", [
-    "a" * 2500 + " b. c. d. e. " * 200,      # a long unbroken token, then many candidate periods
-    "." * 5000,                                # punctuation runs
-    ".!?;:" * 1000,
-    "a." + '"' * 4998,                         # closing quotes
-    "12. " * 1250,                             # ordinal candidates
-    "z. B. " * 830,
+    # a long unbroken token, then many candidate periods
+    pytest.param("a" * 2500 + " b. c. d. e. " * 200, id="token-then-periods"),
+    pytest.param("." * 5000, id="periods"),  # punctuation runs
+    pytest.param(".!?;:" * 1000, id="marks"),
+    pytest.param("a." + '"' * 4998, id="quotes"),  # closing quotes
+    pytest.param("12. " * 1250, id="ordinals"),  # ordinal candidates
+    pytest.param("z. B. " * 830, id="abbreviations"),
 ])
 def test_the_splitter_is_linear_on_hostile_input(split, text):
     """It runs on the event loop, on caller-controlled text. A regex that searched back over

@@ -35,13 +35,15 @@ BACKENDS = (
     "piper-tts-service",
     "piper-training-service",
     "chatterbox-tts-service",
+    "magpie-tts-service",
     "qwen3-tts-service",
     "qwen3-asr-service",
     "parakeet-asr-service",
     "canary-asr-service",
 )
 
-# What each backend calls a multipart upload it accepts, and a state-changing route
+# What each backend calls a multipart upload it accepts (None: it takes no uploads at all,
+# like magpie-tts-service), and a state-changing route
 # that needs no body, so a request that gets past the origin guard visibly reaches
 # the handler (any status but 403) without doing any work.
 #   upload:  (method, path, file field name)
@@ -56,6 +58,7 @@ ROUTES = {
                                "json": "/prepare-dataset"},
     "chatterbox-tts-service": {"upload": ("POST", "/clone", "file"), "probe": ("POST", "/unload"),
                                "json": "/tts"},
+    "magpie-tts-service": {"upload": None, "probe": ("POST", "/unload"), "json": "/tts"},
     "qwen3-tts-service": {"upload": ("POST", "/clone", "file"), "probe": ("POST", "/unload"),
                           "json": "/tts"},
     "qwen3-asr-service": {"upload": ("POST", "/transcribe", "audio"), "probe": ("POST", "/unload"),
@@ -107,6 +110,11 @@ def load_backend(name: str, monkeypatch, tmp_path: Path, stack: contextlib.ExitS
     elif name == "chatterbox-tts-service":
         from chatterbox_loader import load_app
         module = load_app(**env)
+    elif name == "magpie-tts-service":
+        import magpie_loader
+        # Only what the service reads: the loader restores exactly its own managed variables, so a
+        # setting meant for the upload-taking backends (MAX_UPLOAD_MB) must not be left in os.environ.
+        module = magpie_loader.load_app(**{k: v for k, v in env.items() if k in magpie_loader.MANAGED_ENV})
     elif name == "qwen3-tts-service":
         from qwen3_tts_loader import load_app
         module = load_app(voices_dir=str(tmp_path / "voices"), **env)

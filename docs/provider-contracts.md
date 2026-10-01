@@ -54,6 +54,7 @@ This repository now exposes a frontend provider registry that describes which se
 | `piper` | tts | `piper-tts-service` | always | `tts: simple-json-tts-v1`, `voice_catalog: voice-catalog-v1`, `managed_voices: custom-voice-library-v1` |
 | `qwen3` | tts | `qwen3-tts-service` | always | `tts: simple-json-tts-v1`, `voice_catalog: speaker-catalog-v1`, `model_catalog`, `model_selection`, `runtime_status`, `saved_voices: saved-voice-library-v1`, `voice_clone`, `voice_design` |
 | `chatterbox` | tts | `chatterbox-tts-service` | `ENABLE_CHATTERBOX_TTS=true` | `tts: simple-json-tts-v1`, `voice_clone: voice-clone-tts-v1`, `tts_stream: chunked-wav-stream-v1` |
+| `magpie` | tts | `magpie-tts-service` | `ENABLE_MAGPIE_TTS=true` | `tts: simple-json-tts-v1`, `voice_catalog: speaker-catalog-v1` |
 | `whisper` | stt | `stt-service` | always | `transcribe: stt-form-v1`, `detect_language: stt-detect-language-v1` (also live transcription over `/ws/stt`) |
 | `qwen3-asr` | stt | `qwen3-asr-service` | always | `transcribe: stt-form-v1`, `detect_language: stt-detect-language-v1` |
 | `parakeet` | stt | `parakeet-asr-service` | `ENABLE_PARAKEET_ASR=true` | `transcribe: stt-form-v1` |
@@ -461,6 +462,7 @@ Used by:
 - `piper`
 - `qwen3` for basic built-in speaker synthesis via frontend adapter mapping
 - `chatterbox`
+- `magpie` for built-in speaker synthesis via frontend adapter mapping (`language`, `speaker`)
 
 Request:
 
@@ -471,9 +473,10 @@ Request:
 Notes:
 
 - Every TTS backend exposes `GET /health` (liveness) and `GET /ready` (Piper: 503 without an installed voice; the model backends: 503 while the first load runs or after it failed).
-- Busy is **503 + `Retry-After`**, never a hang: `qwen3` and `chatterbox` admit `TTS_MAX_CONCURRENCY + TTS_MAX_QUEUE` requests and refuse the next at once, and refuse one that waited `TTS_QUEUE_TIMEOUT_S`; Piper refuses a request when no synthesis slot frees up within `PIPER_TIMEOUT_S`.
-- An unexpected failure is a `500` with a generic message and a request id (also in an `X-Request-ID` header on Piper, Qwen3-TTS and Chatterbox); the detail is in the service log under that id.
+- Busy is **503 + `Retry-After`**, never a hang: `qwen3`, `chatterbox` and `magpie` admit `TTS_MAX_CONCURRENCY + TTS_MAX_QUEUE` requests and refuse the next at once, and refuse one that waited `TTS_QUEUE_TIMEOUT_S`; Piper refuses a request when no synthesis slot frees up within `PIPER_TIMEOUT_S`.
+- An unexpected failure is a `500` with a generic message and a request id (also in an `X-Request-ID` header on Piper, Qwen3-TTS, Chatterbox and Magpie); the detail is in the service log under that id.
 - Qwen3 does not natively expose this exact payload. The frontend adapter translates the shared fields into the provider's native `lang`, `speaker`, and `instruct` request schema for basic TTS.
+- Magpie takes `text`, `language` and `speaker` and nothing else: the adapter maps `voice` to `speaker` and sends `auto` for a missing language or voice (also what `/v1` sends for one of OpenAI's own voice names), which the service resolves to `MAGPIE_DEFAULT_LANGUAGE` and `MAGPIE_DEFAULT_SPEAKER`. A language it cannot speak, or an unknown speaker, is a `400` that lists what is available, on `/api/tts` and on `/v1/audio/speech` alike (there as `400` `invalid_request_error`).
 
 Response:
 
@@ -484,9 +487,14 @@ Response:
 `voice-catalog-v1` (Piper): `GET /voices` lists the **installed** voices grouped by language, plus
 `default_language`, `default_voice` and `catalog_only` (true when the image ships no voices);
 `POST /refresh_voices` rescans the models directory and also returns `default_voices`. The gateway's
-`GET /api/providers/piper/voices` normalises it. `speaker-catalog-v1` (Qwen3-TTS): `GET /speakers`,
-which is empty on the Base models (they clone voices; built-in speakers need a CustomVoice variant)
-and reports `speakers_source`.
+`GET /api/providers/piper/voices` normalises it.
+
+`speaker-catalog-v1` (Qwen3-TTS, Magpie): `GET /speakers` returns the provider's built-in `speakers`,
+optionally with the `languages` they speak and the `default_language` that `auto` resolves to. The
+gateway's `GET /api/providers/<id>/voices` turns each speaker into a voice of kind `builtin` and
+forwards `default_language` when the service reports one. Qwen3-TTS: the list is empty on the Base
+models (they clone voices; built-in speakers need a CustomVoice variant), and `speakers_source` says
+where it came from. Magpie lists its five built-in speakers (`Aria`, `Jason`, `John`, `Leo`, `Sofia`).
 
 ### `saved-voice-library-v1`
 
@@ -585,8 +593,8 @@ Notes:
 
 ## Behaviour every backend shares
 
-These hold for all eight backend services (`stt-service`, `qwen3-asr`, `parakeet`, `canary`,
-`piper-tts`, `qwen3-tts`, `chatterbox`, `piper-training`), independent of the contract they
+These hold for all nine backend services (`stt-service`, `qwen3-asr`, `parakeet`, `canary`,
+`piper-tts`, `qwen3-tts`, `chatterbox`, `magpie`, `piper-training`), independent of the contract they
 implement. `whisper-cpp` is the unmodified upstream server and has none of them.
 
 - **Closed to browsers by default.** `ALLOWED_ORIGINS` (compose: `BACKEND_ALLOWED_ORIGINS`) is empty

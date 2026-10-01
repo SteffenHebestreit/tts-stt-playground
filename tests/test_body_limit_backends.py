@@ -30,6 +30,7 @@ UPLOAD_ROUTES = {
     "piper-tts-service": ["/upload_model", "/analyze_audio"],
     "piper-training-service": ["/train", "/test-upload"],
     "chatterbox-tts-service": ["/clone", "/clone-with-ref-text"],
+    "magpie-tts-service": [],
     "qwen3-tts-service": ["/clone", "/clone-with-ref-text", "/voices/save"],
     "qwen3-asr-service": ["/transcribe", "/detect_language", "/transcribe-batch"],
     "parakeet-asr-service": ["/transcribe", "/v1/audio/transcriptions", "/detect_language", "/transcribe-batch"],
@@ -56,6 +57,13 @@ def _small(name, monkeypatch, tmp_path, stack):
 
 @pytest.fixture(params=BACKENDS)
 def backend(request, monkeypatch, tmp_path):
+    with contextlib.ExitStack() as stack:
+        yield _small(request.param, monkeypatch, tmp_path, stack)
+
+
+@pytest.fixture(params=[name for name in BACKENDS if UPLOAD_ROUTES[name]])
+def uploading_backend(request, monkeypatch, tmp_path):
+    """The backends that take uploads: the tests that send a multipart body need a route to send it to."""
     with contextlib.ExitStack() as stack:
         yield _small(request.param, monkeypatch, tmp_path, stack)
 
@@ -94,7 +102,8 @@ def test_a_chunked_upload_is_cut_off_at_the_limit_and_leaves_nothing_behind(uplo
     assert backend.leftovers() == [], "a spooled upload was left behind"
 
 
-def test_an_understated_content_length_does_not_bypass_the_limit(backend):
+def test_an_understated_content_length_does_not_bypass_the_limit(uploading_backend):
+    backend = uploading_backend
     path = backend.routes["upload"][1]
     handler = spy_on_route(backend.app, path)
     body = multipart_head("file") + b"\0" * (13 * MIB)
@@ -128,7 +137,8 @@ def test_a_declared_oversize_upload_is_refused_before_any_of_it_is_read(upload_c
     assert handler == [] and backend.leftovers() == []
 
 
-def test_the_refusal_is_a_small_json_413_that_closes_the_connection(backend):
+def test_the_refusal_is_a_small_json_413_that_closes_the_connection(uploading_backend):
+    backend = uploading_backend
     path = backend.routes["upload"][1]
 
     async def scenario():
@@ -188,7 +198,8 @@ def test_a_route_that_takes_no_body_never_reads_one(backend):
 
 # --- what must keep working --------------------------------------------------------------
 
-def test_a_small_chunked_upload_is_not_mistaken_for_an_attack(backend):
+def test_a_small_chunked_upload_is_not_mistaken_for_an_attack(uploading_backend):
+    backend = uploading_backend
     """No Content-Length is normal for some clients (streaming uploads); under the limit it must reach the app."""
     path = backend.routes["upload"][1]
     field = backend.routes["upload"][2]
@@ -249,6 +260,15 @@ def test_tts_reference_uploads_get_max_upload_mb_and_json_routes_a_text_sized_li
         upload, json_route = _limit(m, "/clone"), _limit(m, "/tts")
     assert 20 * MIB < upload < 22 * MIB
     assert json_route < MIB
+
+
+def test_magpie_has_no_upload_route_and_a_text_sized_limit_everywhere(monkeypatch, tmp_path):
+    """Nothing there takes a file, so no path may be given an upload-sized limit."""
+    with contextlib.ExitStack() as stack:
+        m = load_backend("magpie-tts-service", monkeypatch, tmp_path, stack, MAX_TEXT_CHARS="5000").module
+        limits = {p: _limit(m, p) for p in ("/tts", "/unload", "/clone", "/transcribe")}
+    assert set(limits.values()) == {5000 * 12 * 2 + 64 * 1024}
+    assert limits["/tts"] < MIB
 
 
 @pytest.mark.parametrize("name", ["parakeet-asr-service", "canary-asr-service", "qwen3-asr-service"])

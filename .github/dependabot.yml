@@ -117,6 +117,16 @@ updates:
     ignore:
       - {dependency-name: setuptools}
 
+  - package-ecosystem: pip
+    directory: /magpie-tts-service
+    schedule: {interval: weekly, day: monday}
+    groups:
+      minor-and-patch: {patterns: ["*"], update-types: [minor, patch]}
+    commit-message: {prefix: "build(deps)"}
+    # The NeMo line (3.0.x) is chosen by a build ARG.
+    ignore:
+      - {dependency-name: nemo-toolkit}
+
   # --- Dockerfiles (one entry per directory that holds one) -------------------------------
   # Only the Python and Debian/Ubuntu-flavoured bases that are safe to move are
   # left in; see the header for what is ignored.
@@ -208,6 +218,15 @@ updates:
 
   - package-ecosystem: docker
     directory: /chatterbox-tts-service
+    schedule: {interval: weekly, day: monday}
+    groups:
+      docker: {patterns: ["*"]}
+    commit-message: {prefix: "build(docker)"}
+    ignore:
+      - {dependency-name: nvidia/cuda}
+
+  - package-ecosystem: docker
+    directory: /magpie-tts-service
     schedule: {interval: weekly, day: monday}
     groups:
       docker: {patterns: ["*"]}

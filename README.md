@@ -16,6 +16,7 @@ A self-hosted, Docker-based platform for text-to-speech synthesis, speech-to-tex
 | **Parakeet-ASR** | 5005 | Optional realtime STT — 25 EU languages (NeMo) |
 | **Canary-ASR** | 5006 | Optional fastest STT — en/de/es/fr with punctuation (NeMo) |
 | **Chatterbox-TTS** | 5007 | Optional multilingual TTS + voice cloning (MIT, watermarked) |
+| **Magpie-TTS** | 5008 | Optional multilingual TTS with five built-in voices, reads numbers and dates correctly (NVIDIA NeMo) |
 
 Only the **Frontend** is meant to be reached over the network: it proxies every backend call, the live
 microphone WebSocket included. The backend ports are published on `127.0.0.1` only (for `curl`, benchmarks
@@ -38,23 +39,26 @@ ENABLE_WHISPER_CPP=true docker compose --profile whisper-cpp --profile frontend 
 # Optional extras (heavy images, off by default; the UI also needs the matching ENABLE_* flag)
 ENABLE_WHISPER_CPP=true docker compose --profile all --profile whisper-cpp up -d       # plus whisper.cpp
 ENABLE_CHATTERBOX_TTS=true docker compose --profile all --profile chatterbox-tts up -d # plus Chatterbox
+ENABLE_MAGPIE_TTS=true docker compose --profile all --profile magpie-tts up -d         # plus NVIDIA Magpie
 
 # Check status
 docker compose ps
 docker compose logs -f
 curl -fsS http://127.0.0.1:5001/ready       # is the Whisper model loaded? 503 with a reason until it is
 
-# Stop everything
-docker compose down
+# Stop everything, whichever profiles started it; the model caches stay. Every service belongs
+# to a profile, so a bare `docker compose down` stops nothing. Never add -v to this one: with
+# --profile "*" it deletes every model cache. (Or name the profiles you started, as for up.)
+docker compose --profile "*" down
 ```
 
 Open **http://localhost:3000** for the web interface. The first start downloads the models in the
 background (several GB), so containers report healthy long before they can transcribe or speak; the UI
 shows each backend's state, and `GET /ready` on a backend says whether it can serve a request yet.
 
-`whisper-cpp`, Parakeet, Canary and Chatterbox are opt-in. Starting a profile alone is not enough for the
+`whisper-cpp`, Parakeet, Canary, Chatterbox and Magpie are opt-in. Starting a profile alone is not enough for the
 service to appear in the frontend; set the matching `ENABLE_WHISPER_CPP`, `ENABLE_PARAKEET_ASR`,
-`ENABLE_CANARY_ASR` or `ENABLE_CHATTERBOX_TTS=true` for the frontend service as well.
+`ENABLE_CANARY_ASR`, `ENABLE_CHATTERBOX_TTS` or `ENABLE_MAGPIE_TTS=true` for the frontend service as well.
 
 Images are pulled from GHCR as `ghcr.io/steffenhebestreit/tts-stt-*:${IMAGE_TAG}` (`latest` by default, which
 follows the newest release or master build). Pin `IMAGE_TAG=X.Y.Z` where a deployment has to be reproducible,
@@ -87,6 +91,7 @@ Different services support different GPU backends. Choose based on your hardware
 | Parakeet-ASR | ✓ (slow) | ✓ | ✓ (NeMo 2.x image) | — |
 | Canary-ASR | ✓ (slow) | ✓ | — | — |
 | Chatterbox-TTS | ✓ (slow) | ✓ | — | — |
+| Magpie-TTS | — | ✓ | — | — |
 | PiperTTS | CPU only | — | — | — |
 
 The CUDA images are built for Blackwell (RTX 50 series, sm_120) as well as older cards: CUDA 12.8 and
@@ -266,7 +271,7 @@ Use smaller models (`WHISPER_MODEL_SIZE=small`, `WHISPER_MODEL=small`) to improv
 
 ### Speech Recognition — Parakeet and Canary (NeMo, optional)
 - Parakeet (`parakeet-tdt-0.6b-v3`, 25 European languages incl. German) and Canary (`canary-180m-flash`, en/de/es/fr with punctuation)
-- Images default to NeMo 3.0.x on torch 2.11 (cu128), with a one-argument rollback to NeMo 2.x (`NEMO_TOOLKIT_SPEC`, or the prebuilt `-nemo2` images via `NEMO_IMAGE_SUFFIX=-nemo2`)
+- Images default to NeMo 3.0.x on torch 2.11 (cu128), with a one-argument rollback to NeMo 2.x (`NEMO_TOOLKIT_SPEC`, or the prebuilt `-nemo2` images via `NEMO_IMAGE_SUFFIX=-nemo2`). The rollback is for these two only: Magpie needs NeMo 3 and has its own `MAGPIE_NEMO_TOOLKIT_SPEC`
 - A local `.nemo` checkpoint (for example a German fine-tune) can be used through `PARAKEET_ASR_MODEL` / `CANARY_ASR_MODEL`
 - Opt-in: profile `parakeet-asr` / `canary-asr` plus `ENABLE_PARAKEET_ASR` / `ENABLE_CANARY_ASR` on the frontend
 
@@ -275,6 +280,12 @@ Use smaller models (`WHISPER_MODEL_SIZE=small`, `WHISPER_MODEL=small`) to improv
 - Long texts are generated in chunks (up to `CHATTERBOX_MAX_TEXT_CHARS`, 5000, then HTTP 413) and can be streamed sentence by sentence (`/tts-stream`)
 - The image installs the multilingual v3 checkpoint's code from a pinned GitHub commit; the PyPI release has no v3
 - Opt-in: profile `chatterbox-tts` plus `ENABLE_CHATTERBOX_TTS` on the frontend
+
+### Text-to-Speech — Magpie (NVIDIA, optional)
+- NVIDIA's Magpie-TTS Multilingual (`magpie_tts_multilingual_357m`) through NeMo 3: five built-in voices (Aria, Jason, John, Leo, Sofia) in German, English, Spanish, French, Japanese and Chinese. No voice cloning and no streaming. NVIDIA Open Model License, a custom license: read it before relying on it
+- Digits, dates and times are spoken (text normalization is on; without it the model silently drops every number), though German numbers written with thousands dots ("1.200") are read digit by digit; see the Magpie README. A language it cannot speak is a 400, never English with a 200
+- About 4.2 GB of VRAM, about 7 GB of host RAM and a first-start download of about 2.5 GB. The first request in a language other than German waits 18 to 48 s while its text normalizer is built (`MAGPIE_WARM_LANGUAGES` builds it during the first model load instead). Normalizers stay in host RAM across idle unloads (a few hundred MB per language, no VRAM), so a reload after `TTS_MODEL_TTL` repeats neither that wait nor the warm-up; `/ready` answers 503 `loading` during the first load only
+- Opt-in: profile `magpie-tts` plus `ENABLE_MAGPIE_TTS` on the frontend. Details: [magpie-tts-service/README.md](magpie-tts-service/README.md)
 
 ### Model memory
 Every GPU model is released after `MODEL_TTL` seconds without use (300 by default; per-service `STT_MODEL_TTL`,
@@ -399,6 +410,16 @@ clone voices (`/clone`, `/voices/save`). No language means German (`QWEN3_DEFAUL
 | GET | `/ready` | Readiness (503 while the model loads or after a failed load) |
 | GET | `/health` | Health check |
 
+### Magpie-TTS (port 5008)
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/tts` | `{"text", "language", "speaker"}` returns WAV (long text is generated in sentence groups; `X-Chunk-Count` reports how many) |
+| GET | `/speakers`, `/languages` | The five built-in speakers and the languages this deployment can speak |
+| POST | `/unload` | Free the VRAM now (409 while a request is running) |
+| GET | `/status` | Model, supported languages, queue and GPU memory |
+| GET | `/ready` | Readiness (503 while the model loads or after a failed load) |
+| GET | `/health` | Health check |
+
 ---
 
 ## Configuration
@@ -418,7 +439,7 @@ the per-service limits; the ones most people touch:
 | `STT_DEFAULT_LANGUAGE` | (empty: auto-detect) | Language `stt-service` uses when a request names none; the web UI sends `auto` itself |
 | `FORCE_ACCELERATION` | (empty: auto-detect) | Only `rocm` changes behaviour (faster-whisper on AMD); use `USE_CUDA=false` to force the CPU |
 | `WHISPER_CPP_PORT` | `5003` | Host port for whisper-cpp |
-| `ENABLE_WHISPER_CPP`, `ENABLE_PARAKEET_ASR`, `ENABLE_CANARY_ASR`, `ENABLE_CHATTERBOX_TTS` | `false` | Expose the optional backend in the frontend provider registry and status checks |
+| `ENABLE_WHISPER_CPP`, `ENABLE_PARAKEET_ASR`, `ENABLE_CANARY_ASR`, `ENABLE_CHATTERBOX_TTS`, `ENABLE_MAGPIE_TTS` | `false` | Expose the optional backend in the frontend provider registry and status checks |
 | `DEFAULT_STT_PROVIDER`, `DEFAULT_TTS_PROVIDER` | `whisper`, `piper` | Engine the UI preselects; the ARM64 and Strix Halo presets use `whisper-cpp` because `stt-service` does not run there |
 | `GGML_VULKAN_DEVICE` | `0` | Vulkan GPU device index |
 | `HIP_VISIBLE_DEVICES` | `0` | ROCm GPU device index |
@@ -431,9 +452,9 @@ the per-service limits; the ones most people touch:
 | `ALLOWED_ORIGINS` | (empty: same origin only) | Extra origins that may call the gateway from a browser; `*` opens it to any page. Behind a reverse proxy that rewrites `Host`, set `TRUSTED_ORIGINS` |
 | `TRUSTED_HOSTS` | (empty) | Host names the gateway may be reached by, besides IP addresses, `localhost`, `*.local`, `*.lan`, `*.internal` and single-label names such as `truenas`, which need nothing. A real domain (reverse proxy) or a Tailscale name must be listed (`voice.example.com,*.tail1234.ts.net`), else every request is `403 host_not_allowed` (DNS-rebinding guard). `ALLOWED_HOSTS=*` switches the check off |
 | `API_KEY` | (empty: open) | Optional shared secret required as `Authorization: Bearer` on `/v1/*`, on state-changing `/api/*` calls and on the `/ws/stt` upgrade. No exemption for the web UI: it asks for the key once per browser tab |
-| `MAX_UPLOAD_MB`, `MAX_TTS_CHARS` | `512`, `5000` | Gateway limits (`5000` is what Qwen3-TTS and Chatterbox accept; a Piper-only setup can raise it). Each backend has its own (`ASR_MAX_UPLOAD_MB`, `PIPER_MAX_UPLOAD_MB`, `CHATTERBOX_MAX_TEXT_CHARS`, ... see `.env.example`) |
+| `MAX_UPLOAD_MB`, `MAX_TTS_CHARS` | `512`, `5000` | Gateway limits (`5000` is what Qwen3-TTS, Chatterbox and Magpie accept; a Piper-only setup can raise it). Each backend has its own (`ASR_MAX_UPLOAD_MB`, `PIPER_MAX_UPLOAD_MB`, `CHATTERBOX_MAX_TEXT_CHARS`, ... see `.env.example`) |
 | `MAX_CONCURRENT_UPLOADS`, `MAX_CONCURRENT_FFMPEG` | `4`, `4` | Per gateway worker: uploads forwarded at once and `ffmpeg` conversions for `/v1/audio/speech`; the next request gets `503` + `Retry-After` |
-| `ASR_MAX_QUEUE`, `ASR_QUEUE_TIMEOUT_S` | (empty: 4 x `ASR_MAX_CONCURRENCY`), `60` | Requests that may wait for the one inference slot of Qwen3-ASR, Parakeet and Canary (`0` = nobody waits) and how long; beyond either the answer is `503` + `Retry-After`. `TTS_MAX_QUEUE` and `TTS_QUEUE_TIMEOUT_S` do the same for Qwen3-TTS and Chatterbox |
+| `ASR_MAX_QUEUE`, `ASR_QUEUE_TIMEOUT_S` | (empty: 4 x `ASR_MAX_CONCURRENCY`), `60` | Requests that may wait for the one inference slot of Qwen3-ASR, Parakeet and Canary (`0` = nobody waits) and how long; beyond either the answer is `503` + `Retry-After`. `TTS_MAX_QUEUE` and `TTS_QUEUE_TIMEOUT_S` do the same for Qwen3-TTS, Chatterbox and Magpie |
 | `PIPER_MAX_CUSTOM_VOICES`, `PIPER_MAX_CUSTOM_MB` | `20`, `2048` | Most uploaded Piper voices (`0` = no upload; `409` beyond it) and their total size (`413`); a new voice must also load and answer a test request within `PIPER_ONNX_VALIDATE_TIMEOUT_S` (30) |
 | `BACKEND_ALLOWED_ORIGINS` | (empty: closed) | CORS for the backends' own ports. Empty means no CORS headers and foreign-Origin POST/DELETE requests are refused (`403`); `*` must be set explicitly (each service logs a warning) |
 | `ALLOW_CREDENTIALS` | `false` | Enables CORS credentials only when origins are explicit |
@@ -469,6 +490,7 @@ tts-stt-playground/
 ├── parakeet-asr-service/        # Parakeet STT (NeMo), optional
 ├── canary-asr-service/          # Canary STT (NeMo), optional
 ├── chatterbox-tts-service/      # Chatterbox TTS + cloning, optional
+├── magpie-tts-service/          # Magpie TTS (NVIDIA NeMo), optional
 │                                #   each service dir: app.py, Dockerfile (CUDA), Dockerfile.rocm where one exists
 ├── benchmarks/                  # German ASR evaluation (WER, latency, significance test)
 ├── scripts/                     # sync_openapi.py, plan_publish.py, check_no_skips.py, scripts/truenas/*
@@ -494,6 +516,7 @@ curl http://localhost:5004/ready    # Qwen3-TTS
 curl http://localhost:5005/ready    # Parakeet-ASR (optional)
 curl http://localhost:5006/ready    # Canary-ASR (optional)
 curl http://localhost:5007/ready    # Chatterbox-TTS (optional)
+curl http://localhost:5008/ready    # Magpie-TTS (optional)
 curl http://localhost:8080/ready    # Piper Training (names unwritable directories, a wrong PyTorch build, low disk)
 curl http://localhost:5003/         # whisper-cpp (any HTTP response = up)
 curl http://localhost:3000/health   # Frontend
@@ -591,7 +614,7 @@ hardware has room.
 - For training: reduce batch size
 
 **Port conflicts**
-Default ports: 3000, 5000-5007, 8080. Override with env vars: `FRONTEND_PORT`, `PIPER_TTS_PORT`, `STT_PORT`, `QWEN3_ASR_PORT`, `WHISPER_CPP_PORT`, `QWEN3_TTS_PORT`, `PARAKEET_ASR_PORT`, `CANARY_ASR_PORT`, `CHATTERBOX_TTS_PORT`, `TRAINING_PORT`.
+Default ports: 3000, 5000-5008, 8080. Override with env vars: `FRONTEND_PORT`, `PIPER_TTS_PORT`, `STT_PORT`, `QWEN3_ASR_PORT`, `WHISPER_CPP_PORT`, `QWEN3_TTS_PORT`, `PARAKEET_ASR_PORT`, `CANARY_ASR_PORT`, `CHATTERBOX_TTS_PORT`, `MAGPIE_TTS_PORT`, `TRAINING_PORT`.
 
 ---
 
@@ -680,7 +703,7 @@ instead, and an optional `diun` service sends notifications only. Details are in
 - An NVIDIA driver that supports CUDA 12.8 for the GPU services (R570 or newer; RTX 50 series
   cards require it), installed from Apps → Settings → Install NVIDIA Drivers.
 - The default set (Whisper `large-v3-turbo`, Qwen3-ASR, Qwen3-TTS 0.6B) is about 8 GB of VRAM
-  resident; optional services add more (Canary, Parakeet, Chatterbox, training). Every GPU model is
+  resident; optional services add more (Canary, Parakeet, Chatterbox, Magpie, training). Every GPU model is
   freed after `MODEL_TTL` seconds idle (300), so the sum need not fit at once. Budget against what
   `nvidia-smi` reports for your card; the per-service table is in the guide.
 - Remote browser access needs nothing beyond port 3000 (`ALLOWED_ORIGINS` stays empty) as long as you

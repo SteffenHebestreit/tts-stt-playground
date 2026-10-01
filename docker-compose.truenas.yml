@@ -91,3 +91,10 @@ services:
     environment:
       CUDA_VISIBLE_DEVICES: "0"
       NVIDIA_VISIBLE_DEVICES: "0"
+
+  # Optional (--profile magpie-tts, plus ENABLE_MAGPIE_TTS=true for the UI).
+  magpie-tts-service:
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-magpie-tts:${IMAGE_TAG:-0.2.0}
+    environment:
+      CUDA_VISIBLE_DEVICES: "0"
+      NVIDIA_VISIBLE_DEVICES: "0"

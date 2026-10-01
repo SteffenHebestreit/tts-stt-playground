@@ -273,11 +273,13 @@ def test_tts_limit_can_be_raised_for_backends_that_take_more(monkeypatch):
 def test_gateway_default_does_not_exceed_the_smallest_tts_backend_default():
     """The two numbers live in different services; this is the check that they stay ordered."""
     import chatterbox_loader
+    import magpie_loader
     import qwen3_tts_loader
 
     gateway = load_frontend_app().MAX_TTS_CHARS
     backends = {
         "chatterbox": chatterbox_loader.load_app().MAX_TEXT_CHARS,
+        "magpie-tts": magpie_loader.load_app().MAX_TEXT_CHARS,
         "qwen3-tts": qwen3_tts_loader.load_app().MAX_TEXT_CHARS,
     }
     assert gateway <= min(backends.values()), (

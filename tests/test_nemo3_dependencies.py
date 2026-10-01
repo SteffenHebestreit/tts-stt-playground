@@ -1,4 +1,4 @@
-"""What the parakeet / canary images install: NeMo line, torch pin, and the build-time torch check.
+"""What the NeMo images (parakeet, canary, magpie) install: NeMo line, torch pin, and the build-time torch check.
 
 Background (nemo_toolkit 3.0.0, published 2026-08-07): ``nemo_toolkit[asr]>=2.0.0``
 already resolves to it, and torch was unpinned, so a rebuild changed the NeMo
@@ -27,10 +27,11 @@ from packaging.requirements import Requirement
 from packaging.version import Version
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-CUDA_IMAGES = [
-    (service, REPO_ROOT / service / "Dockerfile")
-    for service in ("parakeet-asr-service", "canary-asr-service")
-]
+# Every cu128 NeMo image and the nemo_toolkit extra it installs. Each guard below runs
+# for each of them, and test_every_nemo_3_image_is_in_the_table_and_nothing_else keeps
+# this table and the Dockerfiles in step. test_dockerfile_recipes.py reads it too.
+NEMO_EXTRA = {"parakeet-asr-service": "asr", "canary-asr-service": "asr", "magpie-tts-service": "tts"}
+CUDA_IMAGES = [(service, REPO_ROOT / service / "Dockerfile") for service in NEMO_EXTRA]
 ROCM_IMAGE = REPO_ROOT / "parakeet-asr-service" / "Dockerfile.rocm"
 
 
@@ -86,7 +87,7 @@ def test_requirements_and_dockerfile_default_to_the_same_nemo_line(service, dock
     from_requirements = _requirements(service)["nemo-toolkit"]
     default = _arg_default(dockerfile, "NEMO_TOOLKIT_SPEC")
 
-    assert from_requirements.extras == {"asr"}
+    assert from_requirements.extras == {NEMO_EXTRA[service]}
     assert str(from_requirements.specifier) == str(Requirement(f"nemo_toolkit{default}").specifier), (
         "requirements.txt and the NEMO_TOOLKIT_SPEC default disagree; the build argument replaces the "
         "requirements line, so whichever is stale is the one that silently stops mattering"
@@ -116,6 +117,8 @@ def test_the_rocm_image_stays_on_2x_because_its_torch_is_below_nemo_3s_floor():
 )
 def test_the_build_argument_replaces_the_requirements_line_instead_of_conflicting_with_it(dockerfile, tmp_path):
     """Run the Dockerfile's own filter on the real requirements.txt."""
+    service = dockerfile.parent.name
+    extra = NEMO_EXTRA[service]
     install = next(run for run in _run_lines(dockerfile) if "requirements.app.txt" in run)
     filter_command = install.split("&&")[0].strip()
     assert filter_command.startswith("grep")
@@ -127,11 +130,16 @@ def test_the_build_argument_replaces_the_requirements_line_instead_of_conflictin
     kept = (tmp_path / "requirements.app.txt").read_text(encoding="utf-8")
     names = {Requirement(line.split("#", 1)[0].strip()).name for line in kept.splitlines()
              if line.split("#", 1)[0].strip()}
-    assert "nemo_toolkit" not in {n.replace("-", "_").lower() for n in names}, \
+    normalized = {n.lower().replace("_", "-") for n in names}
+    assert "nemo-toolkit" not in normalized, \
         "pip would see two nemo_toolkit requirements and fail to resolve the overridden one"
-    assert {"fastapi", "librosa", "soundfile", "numpy"} <= names
+    assert normalized == set(_requirements(service)) - {"nemo-toolkit"}, \
+        "the filter must drop the nemo_toolkit line and nothing else"
+    assert {"fastapi", "soundfile", "numpy"} <= names
+    if extra == "asr":
+        assert "librosa" in names
     # the ARG is what supplies NeMo instead
-    assert 'nemo_toolkit[asr]${NEMO_TOOLKIT_SPEC}' in install
+    assert f"nemo_toolkit[{extra}]${{NEMO_TOOLKIT_SPEC}}" in install
 
 
 # --- torch ----------------------------------------------------------------------------------
@@ -266,3 +274,145 @@ def test_no_build_step_asks_torch_for_its_arch_list_through_the_gpu_api(dockerfi
         f"which is empty on a GPU-less build host, so the build would fail: use "
         f"torch._C._cuda_getArchFlags().split()"
     )
+
+
+# --- Python: NeMo 3 unpacks .nemo files with tarfile's filter= argument ---------------------------------------
+
+def _nemo3_dockerfiles() -> list[Path]:
+    """Every image whose default NeMo line admits 3.x, so the next NeMo service is covered the day it appears."""
+    found = []
+    for path in _all_dockerfiles():
+        if "nemo_toolkit" not in path.read_text(encoding="utf-8"):
+            continue
+        try:
+            spec = Requirement(f"nemo_toolkit{_arg_default(path, 'NEMO_TOOLKIT_SPEC')}").specifier
+        except AssertionError:
+            continue
+        if Version("3.0.0") in spec:
+            found.append(path)
+    return found
+
+
+NEMO3_IMAGES = _nemo3_dockerfiles()
+_NEMO3_IDS = lambda d: f"{d.parent.name}/{d.name}"  # noqa: E731
+
+
+def _data_filter_checks(dockerfile: Path) -> list[tuple[int, str]]:
+    """(index among the RUN steps, python program) for each RUN that tests for tarfile.data_filter."""
+    checks = []
+    for index, run in enumerate(_run_lines(dockerfile)):
+        argv = shlex.split(run)
+        for i, token in enumerate(argv[:-1]):
+            if token == "-c" and "data_filter" in argv[i + 1]:
+                checks.append((index, argv[i + 1]))
+    return checks
+
+
+def test_the_python_guard_covers_parakeet_and_canary_and_not_the_2x_rocm_image():
+    names = {d.parent.name for d in NEMO3_IMAGES}
+    assert {"parakeet-asr-service", "canary-asr-service"} <= names
+    assert ROCM_IMAGE not in NEMO3_IMAGES, "the ROCm image stays on NeMo 2.x, which has no such requirement"
+
+
+def test_every_nemo_3_image_is_in_the_table_and_nothing_else():
+    """NEMO3_IMAGES is found by scanning the Dockerfiles, CUDA_IMAGES comes from NEMO_EXTRA.
+
+    The guards in this file are split between the two lists, so an image missing from either
+    one (a new NeMo service nobody added to the table, or a renamed NEMO_TOOLKIT_SPEC) would
+    silently lose half of them. Magpie was missing from the hand-written list that preceded
+    the table, so none of the requirements, torch and cuda-bindings guards ran for it.
+    """
+    assert set(NEMO3_IMAGES) == {dockerfile for _, dockerfile in CUDA_IMAGES}
+
+
+@pytest.mark.parametrize("dockerfile", NEMO3_IMAGES, ids=_NEMO3_IDS)
+def test_python_3_11_comes_from_deadsnakes_because_ubuntu_22_04s_is_a_release_candidate(dockerfile):
+    """Ubuntu 22.04's python3.11 package is 3.11.0~rc1, which has no tarfile.data_filter.
+
+    NeMo 3.0 passes ``filter="data"`` to ``TarFile.extract`` for every .nemo checkpoint it
+    restores, so on the stock package every model load fails with a TypeError. The images
+    built that way were published before anyone loaded a model in them.
+    """
+    runs = _run_lines(dockerfile)
+    install = next(run for run in runs if "python3.11 " in run + " " and "apt-get install" in run)
+    ppa = next((i for i, run in enumerate(runs) if "add-apt-repository" in run and "ppa:deadsnakes/ppa" in run), None)
+
+    assert ppa is not None, f"{dockerfile.parent.name} installs Ubuntu's python3.11 (3.11.0~rc1), which NeMo 3 cannot run on"
+    assert ppa <= runs.index(install)
+    if runs[ppa] == install:
+        assert install.index("ppa:deadsnakes/ppa") < install.index("python3.11")
+
+
+@pytest.mark.parametrize("dockerfile", NEMO3_IMAGES, ids=_NEMO3_IDS)
+def test_the_ppa_setup_cannot_stop_to_ask_for_a_time_zone(dockerfile):
+    """The python3.11 install pulls in tzdata, which prompts "Geographic area:" unless told not to.
+
+    An unattended build then waits on stdin until the CI job times out. The variable is set
+    on each command rather than as ENV, so it does not end up in the running container.
+    """
+    setup = next(run for run in _run_lines(dockerfile) if "add-apt-repository" in run)
+
+    assert setup.count("apt-get install") >= 2
+    assert setup.count("apt-get install") == setup.count("DEBIAN_FRONTEND=noninteractive apt-get install")
+    assert not any(k == "ENV" and "DEBIAN_FRONTEND" in args for k, args in _instructions(dockerfile)), \
+        "as ENV it would stay set in the running container; scope it to the RUN"
+
+
+@pytest.mark.parametrize("dockerfile", NEMO3_IMAGES, ids=_NEMO3_IDS)
+def test_the_ppa_tooling_is_purged_before_python_3_11_and_pip_arrive(dockerfile):
+    """software-properties-common is needed for add-apt-repository only.
+
+    It brings about 25 of Ubuntu's Python 3.10 packages into /usr/lib/python3/dist-packages,
+    which python3.11 has on its sys.path too: a distutils-era blinker 1.4 that pip cannot
+    uninstall, six and more-itertools that pip takes instead of installing its own, and a
+    pygobject that fails `pip check`. Purging it right after the PPA is added removes them
+    before pip first runs. gpg-agent and ca-certificates stay (the CUDA base's gnupg2 depends
+    on gpg-agent), and so do the PPA's list and key, which no package owns.
+    """
+    setup = next(run for run in _run_lines(dockerfile) if "add-apt-repository" in run)
+    steps = [step.strip() for step in setup.split("&&")]
+    ppa = next(i for i, step in enumerate(steps)
+               if step.startswith("add-apt-repository") and "ppa:deadsnakes/ppa" in step)
+    python = next(i for i, step in enumerate(steps) if "apt-get install" in step and "python3.11" in shlex.split(step))
+    purges = [i for i, step in enumerate(steps) if "apt-get purge" in step]
+
+    assert len(purges) == 1, f"{dockerfile.parent.name} keeps software-properties-common and its Python 3.10 packages"
+    assert ppa < purges[0] < python, "purge once the PPA is added, and before python3.11 and pip are installed"
+    argv = shlex.split(steps[purges[0]])
+    assert argv[:3] == ["DEBIAN_FRONTEND=noninteractive", "apt-get", "purge"], \
+        "a purge can stop to ask questions too; scope DEBIAN_FRONTEND to it like the installs"
+    assert "-y" in argv
+    assert "--auto-remove" in argv, "without it the Python 3.10 packages it pulled in stay behind"
+    assert [a for a in argv[3:] if not a.startswith("-")] == ["software-properties-common"], \
+        "only the PPA tool goes: the CUDA base's gnupg2 depends on gpg-agent, and TLS needs ca-certificates"
+
+
+@pytest.mark.parametrize("dockerfile", NEMO3_IMAGES, ids=_NEMO3_IDS)
+def test_the_build_fails_before_the_big_layers_when_python_cannot_unpack_a_nemo_file(dockerfile):
+    checks = _data_filter_checks(dockerfile)
+    assert len(checks) == 1, f"{dockerfile.parent.name} must check tarfile.data_filter exactly once"
+    index, _ = checks[0]
+    runs = _run_lines(dockerfile)
+
+    assert index > next(i for i, r in enumerate(runs) if "ln -sf /usr/bin/python3.11 /usr/bin/python3" in r), \
+        "the check must run against the python3 that pip and uvicorn use, so after the symlink"
+    assert index < next(i for i, r in enumerate(runs) if "download.pytorch.org" in r), \
+        "fail before the multi-GB torch layer, not after it"
+
+
+@pytest.mark.parametrize("dockerfile", NEMO3_IMAGES, ids=_NEMO3_IDS)
+def test_the_python_check_passes_with_data_filter_and_fails_the_build_without_it(dockerfile):
+    import tarfile
+
+    program = _data_filter_checks(dockerfile)[0][1]
+    if not hasattr(tarfile, "data_filter"):
+        pytest.skip("this interpreter is itself older than 3.11.4")
+
+    ok = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True, timeout=30)
+    assert ok.returncode == 0, ok.stderr
+
+    # the interpreter Ubuntu 22.04 ships: same module, without the attribute
+    stripped = "import tarfile\ndel tarfile.data_filter\n" + program
+    bad = subprocess.run([sys.executable, "-c", stripped], capture_output=True, text=True, timeout=30)
+    assert bad.returncode != 0, "a Python without tarfile.data_filter would have shipped"
+    assert "FATAL" in bad.stderr and "3.11.4" in bad.stderr and "NeMo 3" in bad.stderr

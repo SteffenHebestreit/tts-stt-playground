@@ -44,6 +44,7 @@ SERVICE_IMAGE = {
     "canary-asr-service": "canary-asr",
     "parakeet-asr-service": "parakeet-asr",
     "chatterbox-tts-service": "chatterbox-tts",
+    "magpie-tts-service": "magpie-tts",
     "piper-training-service": "piper-training",
     "whisper-cpp": "whisper-cpp",
 }

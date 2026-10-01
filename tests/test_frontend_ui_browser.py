@@ -15,6 +15,7 @@ against the previous UI code to show that they fail there.
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
@@ -217,22 +218,35 @@ class Ui:
         self.page.click("label.radio-label:has(input[name=tts-engine][value=qwen3])")
         self.page.wait_for_selector("#qwen3-tts-tab-button", state="visible")
 
+    def use_engine(self, provider_id):
+        self.page.click(f"label.radio-label:has(input[name=tts-engine][value={provider_id}])")
+        self.page.wait_for_function(
+            "(id) => document.querySelector(`input[name=tts-engine][value=${id}]`).checked", arg=provider_id)
 
-@pytest.fixture
-def ui(browser, gateway_url):
+
+@contextlib.contextmanager
+def _ui_session(browser, base):
     context = browser.new_context(accept_downloads=False)
     page = context.new_page()
     page.set_default_timeout(TIMEOUT_MS)
     api, live = Api(), Live()
-    harness = Ui(page, api, live, gateway_url)
+    harness = Ui(page, api, live, base)
     page.on("pageerror", lambda err: harness.console.append(f"pageerror: {err}"))
     page.on("console", lambda m: harness.console.append(f"{m.type}: {m.text}") if m.type == "error" else None)
     page.on("dialog", lambda dialog: dialog.accept())
     page.route("**/favicon.ico", lambda route: route.fulfill(status=204))
     page.route("**/api/**", api.handle)
     page.route_web_socket("**/ws/stt**", live.handler)
-    yield harness
-    context.close()
+    try:
+        yield harness
+    finally:
+        context.close()
+
+
+@pytest.fixture
+def ui(browser, gateway_url):
+    with _ui_session(browser, gateway_url) as harness:
+        yield harness
 
 
 # --- loading and wiring ------------------------------------------------------
@@ -378,6 +392,95 @@ def test_the_stt_language_list_keeps_its_auto_detect_label(ui):
     ui.open()
     labels = ui.page.evaluate("Array.from(document.querySelectorAll('#stt-language option')).map(o => o.textContent)")
     assert any("Auto-Detect" in label for label in labels)
+
+
+# --- one panel, three engines: Piper, Magpie and Chatterbox ----------------------
+#
+# A second gateway with both optional engines enabled. The panel used to show Piper's
+# controls (and send their values) for all three, keep Piper's voice list after a
+# switch, and ask Magpie and Chatterbox for Piper's custom voices.
+
+SPEAKERS = ["Aria", "Jason", "John", "Leo", "Sofia"]
+PANEL_GROUPS = ["#tts-quality-group", "#tts-gender-group", "#tts-speed-group", "#tts-voice-group",
+                "#custom-voices-panel"]
+
+
+@pytest.fixture(scope="module")
+def three_engine_gateway_url():
+    module = load_frontend_app({"ENABLE_MAGPIE_TTS": "true", "ENABLE_CHATTERBOX_TTS": "true"})
+    server, thread, port = _serve(module)
+    yield f"http://127.0.0.1:{port}"
+    server.should_exit = True
+    thread.join(timeout=10)
+
+
+@pytest.fixture
+def engines_ui(browser, three_engine_gateway_url):
+    with _ui_session(browser, three_engine_gateway_url) as harness:
+        # What the gateway answers for Magpie's /speakers (speaker-catalog-v1).
+        harness.api.on("GET", "/api/providers/magpie/voices", {
+            "provider": "magpie", "contract": "speaker-catalog-v1", "default_language": "de",
+            "voices": [{"id": name, "name": name, "language": "multilingual", "kind": "builtin",
+                        "description": "Built-in speaker. Languages: de, en, es, fr..."} for name in SPEAKERS],
+        })
+        yield harness
+
+
+def _visible_groups(ui):
+    return [group for group in PANEL_GROUPS if ui.page.is_visible(group)]
+
+
+def test_the_panel_shows_each_engine_only_the_controls_it_has(engines_ui):
+    ui = engines_ui
+    ui.open()
+    ui.page.click("#tts-tab-button")
+    assert _visible_groups(ui) == PANEL_GROUPS
+    ui.use_engine("magpie")
+    assert _visible_groups(ui) == ["#tts-voice-group"]
+    ui.page.wait_for_function(
+        "Array.from(document.querySelectorAll('#tts-voice-select option')).some(o => o.value === 'Aria')")
+    ui.use_engine("chatterbox")
+    assert _visible_groups(ui) == []
+    ui.use_engine("piper")
+    assert _visible_groups(ui) == PANEL_GROUPS
+    assert ui.api.unmocked == [], "an engine was asked for a list it does not have"
+    assert ui.errors() == []
+
+
+def test_a_piper_voice_is_not_sent_to_magpie(engines_ui):
+    ui = engines_ui
+    ui.open()
+    ui.page.click("#tts-tab-button")
+    ui.page.wait_for_function("document.querySelectorAll('#tts-voice-select option').length > 1")
+    ui.page.select_option("#tts-voice-select", "de_DE-thorsten-medium")
+    ui.use_engine("magpie")
+    ui.page.click("#generate-tts-button")
+    ui.wait_text("#tts-result-status", "Speech generated")
+    body = json.loads(ui.api.calls_to("POST", "/api/tts")[-1]["body"])
+    assert body["provider"] == "magpie"
+    assert not {"voice", "speed", "quality", "gender"} & set(body), body
+
+    ui.page.wait_for_function(
+        "Array.from(document.querySelectorAll('#tts-voice-select option')).some(o => o.value === 'Aria')")
+    labels = ui.page.evaluate("Array.from(document.querySelectorAll('#tts-voice-select option')).map(o => o.textContent)")
+    assert labels == ["Service default voice", *SPEAKERS]
+
+
+def test_switching_back_to_piper_on_the_open_tab_fills_its_custom_voices(engines_ui):
+    ui = engines_ui
+    ui.api.on("GET", "/api/providers/piper/custom-voices", {"voices": [
+        {"id": "luna", "name": "luna", "language": "de_DE", "kind": "custom", "description": "high",
+         "raw": {"quality": "high", "language": "de_DE"}}]})
+    ui.open()
+    ui.use_engine("magpie")
+    ui.page.click("#tts-tab-button")
+    ui.page.wait_for_function(
+        "Array.from(document.querySelectorAll('#tts-voice-select option')).some(o => o.value === 'Aria')")
+    assert not ui.page.is_visible("#custom-voices-panel")
+    assert ui.api.calls_to("GET", "/api/providers/piper/custom-voices") == []
+    ui.use_engine("piper")
+    ui.wait_text("#custom-voices-list", "luna")
+    assert ui.page.is_visible("#custom-voices-panel")
 
 
 # --- request paths and text safety ------------------------------------------
