@@ -406,10 +406,38 @@ def _assert_the_check_decides_the_build_and_cleans_up(after: list[str]) -> None:
     assert "||" not in after and ";" not in after
 
 
+_IMPORT_ERRORS = {"ImportError", "ModuleNotFoundError"}
+
+
+def _catches_import_error(handler: ast.ExceptHandler) -> bool:
+    caught = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+    return any(isinstance(name, ast.Name) and name.id in _IMPORT_ERRORS for name in caught)
+
+
+def _optional_imports(tree: ast.AST) -> set[int]:
+    """ids of the imports in the body of a `try` that catches ImportError or ModuleNotFoundError by name."""
+    optional: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Try) and any(_catches_import_error(handler) for handler in node.handlers):
+            for statement in node.body:
+                optional |= {id(sub) for sub in ast.walk(statement) if isinstance(sub, (ast.Import, ast.ImportFrom))}
+    return optional
+
+
 def _imports(source: str) -> set[tuple[str, str]]:
-    """(module, name) for each `from module import name`, (module, "") for each `import module`."""
+    """(module, name) for each `from module import name`, (module, "") for each `import module`.
+
+    An import the code can do without is left out: one in the body of a `try` that catches
+    ImportError or ModuleNotFoundError by name (Magpie's skip of the codec's speaker-encoder
+    download warns and loads the model anyway). `except Exception` does not make an import
+    optional: _load_magpie catches that only to log it, and raises it again.
+    """
+    tree = ast.parse(source)
+    optional = _optional_imports(tree)
     found: set[tuple[str, str]] = set()
-    for node in ast.walk(ast.parse(source)):
+    for node in ast.walk(tree):
+        if id(node) in optional:
+            continue
         if isinstance(node, ast.ImportFrom) and node.module:
             found |= {(node.module, alias.name) for alias in node.names}
         elif isinstance(node, ast.Import):
@@ -442,6 +470,23 @@ def test_the_magpie_build_imports_everything_the_service_imports_from_nemo():
     assert env.get("PYTORCH_JIT") == "0", \
         "torch 2.11's TorchScript compiler segfaults on a NeMo import, and the image's ENV is set later"
     _assert_the_check_decides_the_build_and_cleans_up(after)
+
+
+def test_only_an_import_the_code_can_do_without_is_left_out_of_the_build_requirements():
+    source = textwrap.dedent("""
+        def load():
+            try:
+                from nemo.a import Required
+            except Exception:
+                raise
+            try:
+                from nemo.b import optional
+            except (ImportError, AttributeError):
+                return
+            from nemo.c import AlsoRequired
+    """)
+
+    assert _imports(source) == {("nemo.a", "Required"), ("nemo.c", "AlsoRequired")}
 
 
 def _stand_in_nemo(root: Path, *, nemo_3: bool = True, magpie: bool = True, pynini: bool = True) -> None:
