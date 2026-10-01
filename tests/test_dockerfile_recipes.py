@@ -120,11 +120,16 @@ def test_a_custom_piper_voices_reaches_both_builds_in_the_real_compose_parser():
 
 
 def _apt_packages(dockerfile: Path) -> list[str]:
+    """Every package named by any `apt-get install` step.
+
+    A Dockerfile may install the tools that add a PPA first and its real packages second
+    (the NeMo images take python3.11 from deadsnakes), so the first step is not enough.
+    """
+    packages: list[str] = []
     for run in _runs(dockerfile):
-        if "apt-get install" in run:
-            after = run.split("apt-get install", 1)[1]
-            return [t for t in shlex.split(after.split("&&")[0]) if not t.startswith("-")]
-    return []
+        for step in run.split("apt-get install")[1:]:
+            packages += [t for t in shlex.split(step.split("&&")[0]) if not t.startswith("-")]
+    return packages
 
 
 @pytest.mark.parametrize("dockerfile", [STT_CUDA, STT_ROCM], ids=lambda p: p.name)
