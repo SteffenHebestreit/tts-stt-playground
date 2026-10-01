@@ -23,6 +23,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application files
 COPY app.py .
 COPY openai_router.py .
+# The Settings page: what it may change, the store for its files, and the
+# vendored Public Suffix List its host-name check reads. The folder it saves to
+# (/app/settings) is a bind mount from the app's dataset and is deliberately not
+# created here: a folder in the image would take saves that vanish with the
+# container.
+COPY settings_schema.py settings_store.py public_suffix.py public_suffix_list.dat ./
 COPY entrypoint.sh .
 COPY templates/ templates/
 COPY static/ static/

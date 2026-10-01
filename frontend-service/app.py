@@ -16,6 +16,8 @@ from starlette.datastructures import Headers, MutableHeaders
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 import openai_router
+import settings_schema
+import settings_store
 from openai_router import (
     UpstreamUnavailable,
     build_router as build_openai_router,
@@ -24,14 +26,18 @@ from openai_router import (
     openai_error,
     validation_error_response as openai_validation_error_response,
 )
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+from pydantic_core import PydanticCustomError
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Optional
+from types import MappingProxyType
+from typing import Any, Mapping, Optional
 from urllib.parse import urlsplit
 import asyncio
 import base64
 import binascii
+import copy
 import hashlib
 import hmac
 import httpx
@@ -108,6 +114,21 @@ app = FastAPI(title="TTS-STT Frontend Service", version="2.0.0", lifespan=_lifes
 # So the default is now same-origin only. Cross-origin access is opt-in, either
 # for browsers (ALLOWED_ORIGINS) or for hosts that sit in front of the UI under a
 # different name (TRUSTED_ORIGINS).
+#
+# Every setting below is read from the environment (the app YAML) once, here. The
+# Settings page can override the ones in settings_schema.PREFERENCE_KEYS: the
+# "live settings" section at the end of this module overlays the saved values and
+# sets the module attributes (MAX_UPLOAD_MB, TRUST_PROXY_HEADERS, ENABLE_*, ...)
+# and the access policy from the result, on the next request in every worker.
+# With nothing saved they keep exactly the values read here.
+
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    """An on/off switch from the environment; unset or empty means `default`."""
+    raw = os.getenv(name, "").strip().lower()
+    return default if not raw else raw in _TRUTHY
 
 
 def _env_number(name: str, default, cast):
@@ -136,30 +157,33 @@ def _split_origins(raw: str) -> list[str]:
 
 # Empty (or unset) means "no CORS at all", NOT "*": the old code turned an empty
 # value into a wildcard, so the one setting that should have meant "closed" opened
-# everything.
-allowed_origins = _split_origins(os.getenv("ALLOWED_ORIGINS", ""))
-allow_credentials = os.getenv("ALLOW_CREDENTIALS", "false").strip().lower() in {"1", "true", "yes", "on"}
-if "*" in allowed_origins:
+# everything. A '*' can only come from here, never from the Settings page.
+_ENV_ALLOWED_ORIGINS = tuple(_split_origins(os.getenv("ALLOWED_ORIGINS", "")))
+# Only matters for cookies, which the app sets none of; always off next to a '*'.
+ALLOW_CREDENTIALS = _env_flag("ALLOW_CREDENTIALS", False)
+if "*" in _ENV_ALLOWED_ORIGINS:
     logger.warning(
         "ALLOWED_ORIGINS contains '*': any web page open in a browser that can reach this "
         "service may call it, including the delete/unload/training endpoints. Leave it empty "
         "for same-origin only, or list the origins that need access.")
-    allow_credentials = False
 
 # Extra origins that are this UI under another name (a reverse proxy that does
 # not preserve Host). They pass the state-changing Origin check but get no CORS
 # headers: a page served from them is same-origin from the browser's point of
 # view, so none are needed.
-trusted_origins = set(_split_origins(os.getenv("TRUSTED_ORIGINS", "")))
+_ENV_TRUSTED_ORIGINS = tuple(dict.fromkeys(_split_origins(os.getenv("TRUSTED_ORIGINS", ""))))
 
 # X-Forwarded-Host is only believed when a proxy we control sets it; on an
 # exposed port anyone can send it, which would let a forged request name itself
-# same-origin.
-TRUST_PROXY_HEADERS = os.getenv("TRUST_PROXY_HEADERS", "false").strip().lower() in {"1", "true", "yes", "on"}
+# same-origin. (The guard reads the access policy; this mirrors its value.)
+TRUST_PROXY_HEADERS = _env_flag("TRUST_PROXY_HEADERS", False)
 
-# Optional shared secret. Unset keeps the service open on the LAN as before. Set,
-# it is required on every /v1 call and on every state-changing /api call, from the
-# bundled UI as well (which asks for it once per browser tab, see app.js).
+# Optional shared secret, "the deployment key". Unset keeps the service open on
+# the LAN as before (unless the Settings page requires a key). Set, it is
+# required on every /v1 call and on every state-changing /api call, from the
+# bundled UI as well (which asks for it once per browser tab, see app.js). It is
+# only ever compared as a SHA-256 digest, next to the keys made in the Settings
+# page, and the page can neither change nor remove it.
 API_KEY = os.getenv("API_KEY", "").strip()
 
 # Upload cap for anything that is not JSON or the OpenAI transcription route.
@@ -188,8 +212,34 @@ UPLOAD_RETRY_AFTER_S = 5
 # what the smallest backend accepts (chatterbox, magpie-tts and qwen3-tts: MAX_TEXT_CHARS=5000);
 # a larger value only moves the failure from an early, clear 422 here to a 413
 # from the backend after the request has already been queued. Keep it <= the
-# smallest MAX_TEXT_CHARS of the TTS backends in use.
+# smallest MAX_TEXT_CHARS of the TTS backends in use. Checked per request (see
+# FrontendTTSRequest), so a value saved in the Settings page applies at once.
 MAX_TTS_CHARS = _env_number("MAX_TTS_CHARS", 5000, int)
+
+# Which optional engines the UI and the API offer. Offering one does not start
+# it: its container is installed separately (a `profiles:` line in the YAML).
+ENABLE_WHISPER_CPP = _env_flag("ENABLE_WHISPER_CPP", False)
+ENABLE_PARAKEET_ASR = _env_flag("ENABLE_PARAKEET_ASR", False)
+ENABLE_CANARY_ASR = _env_flag("ENABLE_CANARY_ASR", False)
+ENABLE_CHATTERBOX_TTS = _env_flag("ENABLE_CHATTERBOX_TTS", False)
+ENABLE_MAGPIE_TTS = _env_flag("ENABLE_MAGPIE_TTS", False)
+# Voice training is on unless switched off: installs without the training
+# container (the TrueNAS app, the RK3588) would otherwise show a permanently red
+# status dot and a tab that cannot work.
+ENABLE_TRAINING = _env_flag("ENABLE_TRAINING", True)
+_TRAINING_PROVIDER = os.getenv("TRAINING_PROVIDER", "piper-training")
+
+# The Settings page's own switches; only the app YAML holds them. Off (or a
+# SAFE-MODE file in the settings folder) means the saved gateway.json is ignored.
+# The keys in keys.json stay enforced either way, so recovery never opens the API.
+ENABLE_SETTINGS_UI = _env_flag("ENABLE_SETTINGS_UI", True)
+# Keys whose app YAML value wins over a saved one (the page shows them read-only).
+SETTINGS_LOCKED_KEYS, _unknown_locked_keys = settings_schema.parse_locked_keys(
+    os.getenv("SETTINGS_LOCKED_KEYS", ""))
+if _unknown_locked_keys:
+    logger.warning(
+        "SETTINGS_LOCKED_KEYS names %s, which the Settings page does not have; ignored.",
+        ", ".join(repr(name[:64]) for name in _unknown_locked_keys[:10]))
 
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
@@ -220,32 +270,41 @@ def _host_key(host: str, scheme: str) -> Optional[tuple[str, int]]:
         return None
 
 
-def _request_host(headers: Headers) -> Optional[str]:
-    if TRUST_PROXY_HEADERS:
+# The functions below read the access policy in force (`_policy`, swapped as a
+# whole when a setting changes) unless they are handed one: the guard passes the
+# one it started with, and the Settings page's lockout check a candidate.
+
+
+def _request_host(headers: Headers, policy: Optional["_AccessPolicy"] = None) -> Optional[str]:
+    policy = _policy if policy is None else policy
+    if policy.trust_proxy_headers:
         forwarded = headers.get("x-forwarded-host")
         if forwarded:
             return forwarded.split(",")[0]
     return headers.get("host")
 
 
-def _is_same_origin(origin: str, headers: Headers) -> bool:
+def _is_same_origin(origin: str, headers: Headers, policy: Optional["_AccessPolicy"] = None) -> bool:
     """Does this Origin name the host the request was addressed to?"""
+    policy = _policy if policy is None else policy
     key = _origin_key(origin)
     if key is None:
         return False
-    if _normalize_origin(origin) in trusted_origins:
+    if _normalize_origin(origin) in policy.trusted_origins:
         return True
-    host = _request_host(headers)
+    host = _request_host(headers, policy)
     if not host:
         return False
     return _host_key(host, urlsplit(origin.strip()).scheme) == key
 
 
-def _origin_permitted(origin: str, headers: Headers) -> bool:
+def _origin_permitted(origin: str, headers: Headers, policy: Optional["_AccessPolicy"] = None) -> bool:
     """Same origin as this service, or one the operator explicitly allowed."""
-    if "*" in allowed_origins or _normalize_origin(origin) in allowed_origins:
+    policy = _policy if policy is None else policy
+    allowed = policy.allowed_origins
+    if "*" in allowed or _normalize_origin(origin) in allowed:
         return True
-    return _is_same_origin(origin, headers)
+    return _is_same_origin(origin, headers, policy)
 
 
 # --- host validation (DNS rebinding) --------------------------------------------
@@ -321,20 +380,13 @@ if ALLOW_ANY_HOST:
         "its own DNS name at this service (DNS rebinding) is treated as same-origin. Prefer "
         "listing the names you use in TRUSTED_HOSTS.")
 
-_trusted_hosts = set(_split_hosts(os.getenv("TRUSTED_HOSTS", "")))
-# A TRUSTED_ORIGINS entry says "this UI is also reachable as https://tts.example.com",
-# which is also a statement about the Host it arrives with.
-for _origin in trusted_origins:
-    _key = _origin_key(_origin)
-    if _key:
-        _trusted_hosts.add(_key[0])
-_trusted_host_names = frozenset(h for h in _trusted_hosts if not h.startswith("*."))
-_trusted_host_suffixes = tuple(f".{h[2:]}" for h in _trusted_hosts if h.startswith("*."))
+_ENV_TRUSTED_HOSTS = tuple(dict.fromkeys(_split_hosts(os.getenv("TRUSTED_HOSTS", ""))))
 
 
-def _host_allowed(host_header: Optional[str]) -> bool:
+def _host_allowed(host_header: Optional[str], policy: Optional["_AccessPolicy"] = None) -> bool:
     """May a request addressed to this Host reach the service at all?"""
-    if ALLOW_ANY_HOST or not host_header:
+    policy = _policy if policy is None else policy
+    if policy.allow_any_host or not host_header:
         # No Host header at all is an HTTP/1.0 client, never a rebinding browser.
         return True
     host = _parse_host_header(host_header)
@@ -348,22 +400,144 @@ def _host_allowed(host_header: Optional[str]) -> bool:
     if "." not in host:
         return True
     return (
-        host in _trusted_host_names
+        host in policy.trusted_host_names
         or host.endswith(_LOCAL_HOST_SUFFIXES)
-        or host.endswith(_trusted_host_suffixes)
+        or host.endswith(policy.trusted_host_suffixes)
     )
 
 
-def _bearer_key_ok(headers: Headers) -> bool:
+# --- the access policy and the keys ----------------------------------------------
+#
+# Everything the guard decides on, built from the effective settings and replaced
+# as a whole (`_policy`, `_keyring`) when one of them changes. A change is applied
+# without an `await` in between, so no request ever sees half of one.
+
+
+@dataclass(frozen=True)
+class _AccessPolicy:
+    allowed_origins: tuple[str, ...]          # CORS and the Origin check; '*' only from the app YAML
+    allow_credentials: bool
+    trusted_origins: frozenset                # this UI under another name (normalized origins)
+    trust_proxy_headers: bool                 # believe X-Forwarded-Host
+    trusted_host_names: frozenset
+    trusted_host_suffixes: tuple[str, ...]    # ".example.com" for "*.example.com"
+    allow_any_host: bool                      # ALLOWED_HOSTS='*' (the app YAML only)
+    require_key: bool                         # /v1, mutating /api and /ws/stt need a key
+
+
+def _build_access_policy(values: Mapping[str, Any]) -> _AccessPolicy:
+    """The policy for a set of effective values (settings_schema's keys)."""
+    allowed = tuple(dict.fromkeys(_normalize_origin(o) for o in values["ALLOWED_ORIGINS"] if o.strip()))
+    trusted_origins = frozenset(_normalize_origin(o) for o in values["TRUSTED_ORIGINS"] if o.strip())
+    hosts = {h.strip().lower() for h in values["TRUSTED_HOSTS"] if h.strip()}
+    # A TRUSTED_ORIGINS entry says "this UI is also reachable as https://tts.example.com",
+    # which is also a statement about the Host it arrives with.
+    for origin in trusted_origins:
+        key = _origin_key(origin)
+        if key:
+            hosts.add(key[0])
+    return _AccessPolicy(
+        allowed_origins=allowed,
+        allow_credentials=ALLOW_CREDENTIALS and "*" not in allowed,
+        trusted_origins=trusted_origins,
+        trust_proxy_headers=bool(values["TRUST_PROXY_HEADERS"]),
+        trusted_host_names=frozenset(h for h in hosts if not h.startswith("*.")),
+        trusted_host_suffixes=tuple(sorted(f".{h[2:]}" for h in hosts if h.startswith("*."))),
+        allow_any_host=ALLOW_ANY_HOST,
+        require_key=bool(values["require_key"]),
+    )
+
+
+@dataclass(frozen=True)
+class _Credential:
+    """Whose key a request presented: the app YAML's API_KEY, or a key made in the Settings page."""
+
+    name: str                       # settings_store.DEPLOYMENT_KEY, or the page key's name
+    role: str                       # "admin" (API and settings) or "client" (API only)
+    key_id: Optional[str] = None    # a page key's id; None for the deployment key
+
+
+def _key_digest(key: str) -> bytes:
+    return hashlib.sha256(key.encode("utf-8")).digest()
+
+
+@dataclass(frozen=True)
+class _KeyRing:
+    """The SHA-256 digest of every accepted key, and whose key it is."""
+
+    entries: tuple[tuple[bytes, _Credential], ...] = ()
+
+    def match(self, candidate: str) -> Optional[_Credential]:
+        # Digests of one length, compared in constant time and against every entry:
+        # neither the time taken nor an early exit tells a guess how close it came.
+        # (Comparing the plain strings, as this used to, leaked the key's length.)
+        digest = _key_digest(candidate)
+        found = None
+        for expected, credential in self.entries:
+            if hmac.compare_digest(digest, expected) and found is None:
+                found = credential
+        return found
+
+
+_API_KEY_DIGEST = _key_digest(API_KEY) if API_KEY else None
+
+
+def _build_key_ring(page_keys, deployment_role: str) -> _KeyRing:
+    """The deployment key (when the YAML sets one) in `deployment_role`, then the page keys."""
+    entries = []
+    if _API_KEY_DIGEST is not None:
+        entries.append((_API_KEY_DIGEST, _Credential(settings_store.DEPLOYMENT_KEY, deployment_role)))
+    for record in page_keys:
+        entries.append((bytes.fromhex(record.sha256), _Credential(record.name, record.role, record.id)))
+    return _KeyRing(tuple(entries))
+
+
+def _key_matches(candidate: str) -> Optional[_Credential]:
+    """Whose key `candidate` is (truthy), or None."""
+    return _keyring.match(candidate)
+
+
+def _bearer_credential(headers: Headers) -> Optional[_Credential]:
+    """The credential an `Authorization: Bearer <key>` header carries, or None."""
     scheme, _, token = headers.get("authorization", "").partition(" ")
-    if scheme.lower() != "bearer" or not API_KEY:
-        return False
+    if scheme.lower() != "bearer":
+        return None
     return _key_matches(token.strip())
 
 
-def _key_matches(candidate: str) -> bool:
-    # Constant time: a plain == leaks how much of a guess was right.
-    return hmac.compare_digest(candidate.encode("utf-8"), API_KEY.encode("utf-8"))
+def _bearer_key_ok(headers: Headers) -> bool:
+    return _bearer_credential(headers) is not None
+
+
+# The app YAML's value of every setting the Settings page has, in the page's
+# representation (lists as tuples): what applies while nothing is saved, and what
+# "Reset to YAML" goes back to.
+_ENV_VALUES: Mapping[str, Any] = MappingProxyType({
+    "TRUSTED_HOSTS": _ENV_TRUSTED_HOSTS,
+    "TRUSTED_ORIGINS": _ENV_TRUSTED_ORIGINS,
+    "TRUST_PROXY_HEADERS": TRUST_PROXY_HEADERS,
+    "ALLOWED_ORIGINS": _ENV_ALLOWED_ORIGINS,
+    "ENABLE_CANARY_ASR": ENABLE_CANARY_ASR,
+    "ENABLE_PARAKEET_ASR": ENABLE_PARAKEET_ASR,
+    "ENABLE_CHATTERBOX_TTS": ENABLE_CHATTERBOX_TTS,
+    "ENABLE_MAGPIE_TTS": ENABLE_MAGPIE_TTS,
+    "ENABLE_WHISPER_CPP": ENABLE_WHISPER_CPP,
+    "ENABLE_TRAINING": ENABLE_TRAINING,
+    "DEFAULT_TTS_PROVIDER": os.getenv("DEFAULT_TTS_PROVIDER", "piper"),
+    "DEFAULT_STT_PROVIDER": os.getenv("DEFAULT_STT_PROVIDER", "whisper"),
+    "MAX_UPLOAD_MB": MAX_UPLOAD_MB,
+    "MAX_TTS_CHARS": MAX_TTS_CHARS,
+    "MAX_CONCURRENT_UPLOADS": MAX_CONCURRENT_UPLOADS,
+    # openai_router reads this one itself (once, at its import) for its ffmpeg slots.
+    "MAX_CONCURRENT_FFMPEG": openai_router.MAX_CONCURRENT_FFMPEG,
+})
+# The settings the environment actually names (the rest are code defaults).
+_ENV_SET = frozenset(key for key in settings_schema.PREFERENCE_KEYS if os.getenv(key, "").strip())
+
+# Until the live-settings section at the end of this module overlays what the
+# Settings page saved, this is exactly the app YAML's policy.
+_policy = _build_access_policy({**_ENV_VALUES, "require_key": bool(API_KEY)})
+_keyring = _build_key_ring((), settings_schema.ROLE_ADMIN)
 
 
 def _guard_verdict(method: str, path: str, headers: Headers) -> Optional[tuple[int, str, str]]:
@@ -372,8 +546,9 @@ def _guard_verdict(method: str, path: str, headers: Headers) -> Optional[tuple[i
         # A CORS preflight: carries no credentials and changes nothing.
         return None
 
-    host = _request_host(headers)
-    if not _host_allowed(host):
+    policy = _policy
+    host = _request_host(headers, policy)
+    if not _host_allowed(host, policy):
         return (
             403,
             f"Host {(host or '')[:100]!r} is not allowed. If this is the name you use to reach "
@@ -383,7 +558,7 @@ def _guard_verdict(method: str, path: str, headers: Headers) -> Optional[tuple[i
 
     if method not in _SAFE_METHODS:
         origin = headers.get("origin")
-        if origin is not None and not _origin_permitted(origin, headers):
+        if origin is not None and not _origin_permitted(origin, headers, policy):
             return (
                 403,
                 f"Cross-origin request from {origin!r} refused. Add it to ALLOWED_ORIGINS "
@@ -391,7 +566,7 @@ def _guard_verdict(method: str, path: str, headers: Headers) -> Optional[tuple[i
                 "cross_origin_blocked",
             )
 
-    if API_KEY:
+    if policy.require_key:
         # No exemption for "the request looks like it came from the UI": Origin,
         # Host and Sec-Fetch-Site are all under a rebinding page's control, so
         # none of them says who is calling. The UI sends the key like any client.
@@ -629,20 +804,63 @@ class _UploadSlotMiddleware:
             _upload_slots.release()
 
 
+def _is_settings_path(path: str) -> bool:
+    """The Settings page and its API, which never get CORS headers."""
+    return path in ("/settings", "/api/settings") or path.startswith(("/settings/", "/api/settings/"))
+
+
+class _SettingsMiddleware:
+    """Outermost: picks up saved settings, then applies CORS.
+
+    For every HTTP and WebSocket scope it first stats the settings files and
+    applies a change before anything else looks at the request (`_settings_tick`,
+    in the live-settings section below). There is deliberately no time throttle:
+    every worker applies a change at the start of its very next request, so a
+    client never meets a worker that still has the old rules (a just-replaced key
+    answered 401 by a stale worker would make the page forget the new key).
+
+    CORS is a starlette CORSMiddleware around the rest of the stack, rebuilt when
+    the allowed origins change; with none (the default) the request passes through
+    untouched, exactly as when no CORSMiddleware was installed. The Settings page
+    and its API never get CORS headers.
+    """
+
+    def __init__(self, app):
+        self.app = app
+        self._cors_for = None
+        self._cors = None
+
+    def _cors_handler(self, policy: _AccessPolicy):
+        key = (policy.allowed_origins, policy.allow_credentials)
+        if key != self._cors_for:
+            self._cors = CORSMiddleware(
+                self.app,
+                allow_origins=list(policy.allowed_origins),
+                allow_credentials=policy.allow_credentials,
+                allow_methods=["*"],
+                allow_headers=["*"],
+            ) if policy.allowed_origins else None
+            self._cors_for = key
+        return self._cors
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] in ("http", "websocket"):
+            _settings_tick()
+        if scope["type"] == "http" and not _is_settings_path(scope["path"]):
+            cors = self._cors_handler(_policy)
+            if cors is not None:
+                await cors(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
 # Outermost last: CORS must wrap everything so even a 403/413 carries the CORS
 # headers the calling page needs in order to read it.
 app.add_middleware(_UploadSlotMiddleware)
 app.add_middleware(_BodyLimitMiddleware)
 app.add_middleware(_RequestGuardMiddleware)
 app.add_middleware(_SecurityHeadersMiddleware)
-if allowed_origins:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=allowed_origins,
-        allow_credentials=allow_credentials,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+app.add_middleware(_SettingsMiddleware)
 
 
 # `/v1` promises the OpenAI error envelope for every failure, but FastAPI answers
@@ -692,13 +910,6 @@ CHATTERBOX_TTS_SERVICE_URL = os.getenv("CHATTERBOX_TTS_SERVICE_URL", "http://cha
 MAGPIE_TTS_SERVICE_URL = os.getenv("MAGPIE_TTS_SERVICE_URL", "http://magpie-tts-service:5008")
 WHISPER_CPP_SERVICE_URL = os.getenv("WHISPER_CPP_SERVICE_URL", "http://whisper-cpp:8080")
 
-# Browser-facing URLs (host ports, used by client-side JavaScript)
-ENABLE_WHISPER_CPP = os.getenv("ENABLE_WHISPER_CPP", "false").strip().lower() in {"1", "true", "yes", "on"}
-ENABLE_PARAKEET_ASR = os.getenv("ENABLE_PARAKEET_ASR", "false").strip().lower() in {"1", "true", "yes", "on"}
-ENABLE_CANARY_ASR = os.getenv("ENABLE_CANARY_ASR", "false").strip().lower() in {"1", "true", "yes", "on"}
-ENABLE_CHATTERBOX_TTS = os.getenv("ENABLE_CHATTERBOX_TTS", "false").strip().lower() in {"1", "true", "yes", "on"}
-ENABLE_MAGPIE_TTS = os.getenv("ENABLE_MAGPIE_TTS", "false").strip().lower() in {"1", "true", "yes", "on"}
-
 
 def _build_basic_tts_messages() -> dict:
     """Return shared metadata-driven messages for the generic TTS flow."""
@@ -733,8 +944,36 @@ def _build_stt_messages() -> dict:
 _BUILT_ENTRIES: dict = {}
 
 
-def _build_provider_registry() -> dict:
-    """Build the browser-facing provider registry for the frontend UI."""
+_NO_OVERRIDE = object()
+
+
+def _parse_registry_override(raw: str) -> Any:
+    """PROVIDER_REGISTRY_JSON, parsed once at start; malformed JSON stops the start.
+
+    Anything but an object (`null` too) stops it as well, at the first build below.
+    """
+    raw = (raw or "").strip()
+    return json.loads(raw) if raw else _NO_OVERRIDE
+
+
+_REGISTRY_OVERRIDE = _parse_registry_override(os.getenv("PROVIDER_REGISTRY_JSON", ""))
+
+
+def _registry_override_providers() -> frozenset:
+    """Provider ids PROVIDER_REGISTRY_JSON defines: the operator's entries, which no flag removes."""
+    if not isinstance(_REGISTRY_OVERRIDE, dict) or not isinstance(_REGISTRY_OVERRIDE.get("providers"), dict):
+        return frozenset()
+    return frozenset(_REGISTRY_OVERRIDE["providers"])
+
+
+def _build_provider_registry(flags: Mapping[str, Any], defaults: Mapping[str, Any]) -> dict:
+    """Build the browser-facing provider registry for the frontend UI.
+
+    `flags` holds the effective ENABLE_* values and `defaults` the effective
+    DEFAULT_TTS_PROVIDER / DEFAULT_STT_PROVIDER (both: settings_schema keys). Every
+    call builds new objects, so a registry handed out earlier is never changed by a
+    later build.
+    """
     providers = {
         "piper": {
             "kind": "tts",
@@ -1298,7 +1537,12 @@ def _build_provider_registry() -> dict:
         },
     }
 
-    if ENABLE_PARAKEET_ASR:
+    # Voice training is offered unless ENABLE_TRAINING says otherwise. Without the
+    # entry the training routes answer 404 and the UI shows no training status.
+    if not flags["ENABLE_TRAINING"]:
+        del providers["piper-training"]
+
+    if flags["ENABLE_PARAKEET_ASR"]:
         providers["parakeet"] = {
             "kind": "stt",
             "display_name": "Parakeet-TDT (realtime, 25 EU langs)",
@@ -1337,7 +1581,7 @@ def _build_provider_registry() -> dict:
             },
         }
 
-    if ENABLE_CANARY_ASR:
+    if flags["ENABLE_CANARY_ASR"]:
         providers["canary"] = {
             "kind": "stt",
             "display_name": "Canary-180M (realtime, en/de/es/fr)",
@@ -1375,7 +1619,7 @@ def _build_provider_registry() -> dict:
             },
         }
 
-    if ENABLE_CHATTERBOX_TTS:
+    if flags["ENABLE_CHATTERBOX_TTS"]:
         providers["chatterbox"] = {
             "kind": "tts",
             "display_name": "Chatterbox (Multilingual, MIT)",
@@ -1426,7 +1670,7 @@ def _build_provider_registry() -> dict:
             },
         }
 
-    if ENABLE_MAGPIE_TTS:
+    if flags["ENABLE_MAGPIE_TTS"]:
         providers["magpie"] = {
             "kind": "tts",
             "display_name": "Magpie TTS (NVIDIA, 5 voices)",
@@ -1485,7 +1729,7 @@ def _build_provider_registry() -> dict:
             },
         }
 
-    if ENABLE_WHISPER_CPP:
+    if flags["ENABLE_WHISPER_CPP"]:
         providers["whisper-cpp"] = {
             "kind": "stt",
             "display_name": "whisper.cpp (OpenAI-compatible)",
@@ -1530,14 +1774,15 @@ def _build_provider_registry() -> dict:
     registry = {
         "providers": providers,
         "ui": {
-            "default_tts_provider": os.getenv("DEFAULT_TTS_PROVIDER", "piper"),
-            "default_stt_provider": os.getenv("DEFAULT_STT_PROVIDER", "whisper"),
-            "training_provider": os.getenv("TRAINING_PROVIDER", "piper-training"),
-            "enable_whisper_cpp": ENABLE_WHISPER_CPP,
-            "enable_parakeet_asr": ENABLE_PARAKEET_ASR,
-            "enable_canary_asr": ENABLE_CANARY_ASR,
-            "enable_chatterbox_tts": ENABLE_CHATTERBOX_TTS,
-            "enable_magpie_tts": ENABLE_MAGPIE_TTS,
+            "default_tts_provider": defaults["DEFAULT_TTS_PROVIDER"],
+            "default_stt_provider": defaults["DEFAULT_STT_PROVIDER"],
+            "training_provider": _TRAINING_PROVIDER,
+            "enable_whisper_cpp": flags["ENABLE_WHISPER_CPP"],
+            "enable_parakeet_asr": flags["ENABLE_PARAKEET_ASR"],
+            "enable_canary_asr": flags["ENABLE_CANARY_ASR"],
+            "enable_chatterbox_tts": flags["ENABLE_CHATTERBOX_TTS"],
+            "enable_magpie_tts": flags["ENABLE_MAGPIE_TTS"],
+            "enable_training": flags["ENABLE_TRAINING"],
             "copy": {
                 "app_subtitle": "Neural Text-to-Speech with Voice Training & Cloning + Speech-to-Text",
                 "stt_tab_label": "Speech-to-Text",
@@ -1551,16 +1796,22 @@ def _build_provider_registry() -> dict:
     # supplied is theirs, and nothing may rewrite it from what a backend reports.
     _BUILT_ENTRIES["canary"] = providers.get("canary")
 
-    override = os.getenv("PROVIDER_REGISTRY_JSON", "").strip()
-    if override:
-        parsed = json.loads(override)
+    if _REGISTRY_OVERRIDE is not _NO_OVERRIDE:
+        # A copy per build: the operator's entries in one registry are never the
+        # objects of another (the canary refresh and tests change entries in place).
+        parsed = copy.deepcopy(_REGISTRY_OVERRIDE)
         registry["providers"].update(parsed.get("providers", {}))
         registry["ui"].update(parsed.get("ui", {}))
 
     return registry
 
 
-PROVIDER_REGISTRY = _build_provider_registry()
+# The one registry object for the life of the process: the /v1 router holds it,
+# and a settings change replaces its contents (`_apply`), never the object.
+PROVIDER_REGISTRY = _build_provider_registry(_ENV_VALUES, _ENV_VALUES)
+# The engine settings PROVIDER_REGISTRY was last built from.
+_ENGINE_KEYS = (*settings_schema.ENGINE_FLAGS, "DEFAULT_TTS_PROVIDER", "DEFAULT_STT_PROVIDER")
+_registry_built_from = {key: _ENV_VALUES[key] for key in _ENGINE_KEYS}
 
 
 # --- settings the backends report ---------------------------------------------------
@@ -2398,6 +2649,28 @@ async def _proxy_training_form_post(path: str, request: Request, timeout: float 
     return await _upstream_call(provider, "training service", "POST", path, timeout, **_form_kwargs(data, files))
 
 
+def _tts_text_schema(schema: dict) -> None:
+    """The OpenAPI `maxLength` of a TTS text: the limit in force when the document is made."""
+    schema["maxLength"] = MAX_TTS_CHARS
+
+
+def _tts_text_within_limit(text: str) -> str:
+    """`Field(max_length=MAX_TTS_CHARS)`, but with the limit in force now, not at import.
+
+    Raises exactly what pydantic raises for max_length (type, message with its
+    singular for 1, context), so the 422 body is the same byte for byte, and
+    `_tts_text_schema` keeps the OpenAPI document as it was.
+    """
+    limit = MAX_TTS_CHARS
+    if len(text) > limit:
+        raise PydanticCustomError(
+            "string_too_long",
+            "String should have at most {max_length} character" + ("" if limit == 1 else "s"),
+            {"max_length": limit},
+        )
+    return text
+
+
 class FrontendTTSRequest(BaseModel):
     """Normalized text-to-speech request accepted by the frontend adapter.
 
@@ -2406,7 +2679,7 @@ class FrontendTTSRequest(BaseModel):
     """
 
     provider: str = Field(max_length=64)
-    text: str = Field(max_length=MAX_TTS_CHARS)
+    text: str = Field(json_schema_extra=_tts_text_schema)
     voice: Optional[str] = Field(default=None, max_length=256)
     language: str = Field(default="auto", max_length=64)
     quality: Optional[str] = Field(default=None, max_length=32)
@@ -2414,6 +2687,11 @@ class FrontendTTSRequest(BaseModel):
     speed: Optional[float] = None
     instructions: Optional[str] = Field(default=None, max_length=4000)
     output_format: str = Field(default="wav", max_length=16)
+
+    @field_validator("text")
+    @classmethod
+    def text_within_limit(cls, value: str) -> str:
+        return _tts_text_within_limit(value)
 
 
 _CJK_LANGUAGE_CODES = frozenset({"zh", "ja"})
@@ -2532,10 +2810,15 @@ class ProviderModelSelectionRequest(BaseModel):
 class ProviderVoiceDesignRequest(BaseModel):
     """Request body for provider-scoped voice design."""
 
-    text: str = Field(max_length=MAX_TTS_CHARS)
+    text: str = Field(json_schema_extra=_tts_text_schema)
     voice_description: str = Field(max_length=4000)
     # Forwarded verbatim; "auto" is resolved by the service (QWEN3_DEFAULT_LANGUAGE).
     lang: str = Field(default="auto", max_length=64)
+
+    @field_validator("text")
+    @classmethod
+    def text_within_limit(cls, value: str) -> str:
+        return _tts_text_within_limit(value)
 
 
 async def _build_frontend_stt_payload(provider_id: str, form, contract: str) -> tuple[str, dict, list[tuple[str, tuple[str, bytes, str]]]]:
@@ -2721,7 +3004,13 @@ async def providers():
 HEALTH_CACHE_TTL_S = float(os.getenv("HEALTH_CACHE_TTL", "2"))
 # Injectable so tests can move time instead of sleeping.
 _health_clock = time.monotonic
-_health_cache: dict = {"at": None, "value": None, "inflight": None}
+# `epoch` counts registry changes: a round that started before one is not stored.
+_health_cache: dict = {"at": None, "value": None, "inflight": None, "epoch": 0}
+
+
+def _reset_provider_health() -> None:
+    """Forget the cached round and stop joining a running one (the engines changed)."""
+    _health_cache.update(at=None, value=None, inflight=None, epoch=_health_cache["epoch"] + 1)
 
 
 def _reported_default_language(payload: Any) -> Optional[str]:
@@ -2804,10 +3093,13 @@ async def _cached_provider_health() -> dict:
     if task is None or task.done() or task.get_loop() is not loop:
         task = loop.create_task(_probe_all_providers())
         cache["inflight"] = task
+        epoch = cache["epoch"]
 
         def _store(finished: "asyncio.Task") -> None:
             if cache["inflight"] is finished:
                 cache["inflight"] = None
+            if cache["epoch"] != epoch:
+                return  # probed the engines offered before a settings change
             if not finished.cancelled() and finished.exception() is None:
                 cache["value"] = finished.result()
                 cache["at"] = _health_clock()
@@ -3105,12 +3397,13 @@ async def frontend_ws_stt(websocket: WebSocket):
     # Clients that send no Origin (scripts) are not a browser-borne risk.
     # The Host check applies here too: under DNS rebinding the page's Origin
     # equals its Host, so the Origin rule below cannot tell it from the real UI.
-    if not _host_allowed(_request_host(websocket.headers)):
+    policy = _policy
+    if not _host_allowed(_request_host(websocket.headers, policy), policy):
         await websocket.close(code=1008)
         return
 
     origin = websocket.headers.get("origin")
-    if origin and not _origin_permitted(origin, websocket.headers):
+    if origin and not _origin_permitted(origin, websocket.headers, policy):
         await websocket.close(code=1008)  # policy violation
         return
 
@@ -3119,7 +3412,7 @@ async def frontend_ws_stt(websocket: WebSocket):
     # close before accept becomes a bare HTTP 403, which a browser reports as
     # code 1006 with no reason, and the UI could not tell "needs the key" from
     # "server down".
-    if API_KEY and not _websocket_key_ok(websocket):
+    if policy.require_key and not _websocket_key_ok(websocket):
         await websocket.accept(subprotocol=_websocket_subprotocol(websocket))
         await websocket.close(code=1008, reason="A valid API key is required")
         return
@@ -3352,6 +3645,155 @@ async def frontend_training_cancel_job(job_id: str = _job_id_param()):
     """Cancel a training job through the frontend adapter."""
     response = await _proxy_training_delete(f"/job/{job_id}")
     return _training_json(response)
+
+
+# --- live settings (the Settings page's files) ---------------------------------------
+#
+# settings_store.py reads the folder /app/settings (TTS_STT_SETTINGS_DIR in tests):
+# gateway.json holds the values saved in the Settings page, keys.json the API keys
+# made there and whether a key is required. Per setting, the first that applies wins:
+#   1. SETTINGS_LOCKED_KEYS names it: the app YAML value;
+#   2. a valid value in gateway.json, unless ENABLE_SETTINGS_UI=false or a SAFE-MODE
+#      file in the folder says to ignore that file;
+#   3. the app YAML (`_ENV_VALUES`), which falls back to the code default.
+# keys.json counts in every mode, and a damaged one fails closed: a key is required
+# and only the YAML key is accepted, as a client.
+#
+# `_settings_tick()` runs first on every HTTP and WebSocket request
+# (_SettingsMiddleware), so a change saved by any worker, or by hand, is in force
+# from the next request on, in every worker, without a restart.
+
+_settings_store = settings_store.SettingsStore.from_environment()
+# What `_apply` last put in force: the store state it was given and its effective values.
+_applied_state: Optional[settings_store.SettingsState] = None
+_applied_values: Mapping[str, Any] = MappingProxyType({})
+
+
+def _file_values_in_force(state: settings_store.SettingsState) -> dict[str, Any]:
+    """The saved gateway.json values that apply now: none while the file is to be ignored."""
+    if not ENABLE_SETTINGS_UI or state.safe_mode:
+        return {}
+    return {key: value for key, value in state.preferences.values.items() if key not in SETTINGS_LOCKED_KEYS}
+
+
+def _access_in_force(keys: settings_store.KeysState) -> tuple[bool, str]:
+    """(whether a key is required, the deployment key's role), from keys.json and the YAML."""
+    if keys.fail_closed:
+        return True, settings_schema.ROLE_CLIENT
+    require = keys.require_key and "require_key" not in SETTINGS_LOCKED_KEYS
+    role = (settings_schema.ROLE_ADMIN if "deployment_key_role" in SETTINGS_LOCKED_KEYS
+            else keys.deployment_key_role)
+    return require or bool(API_KEY), role
+
+
+def _effective(state: settings_store.SettingsState) -> dict[str, Any]:
+    """Every setting's value in force: the 16 of gateway.json, require_key and deployment_key_role."""
+    values = dict(_ENV_VALUES)
+    values.update(_file_values_in_force(state))
+    values["require_key"], values["deployment_key_role"] = _access_in_force(state.keys)
+    return values
+
+
+def _apply(state: settings_store.SettingsState, *, initial: bool = False) -> None:
+    """Put the values of `state` in force in this worker.
+
+    Everything is built first and then assigned without an `await` in between, so
+    no request sees half of a change. A request already running keeps what it
+    started with: the policy and the registry's entries are replaced, never
+    changed in place, and the registry object itself (which the /v1 router holds)
+    has its contents swapped.
+    """
+    global _policy, _keyring, _applied_state, _applied_values, _registry_built_from
+    global TRUST_PROXY_HEADERS, MAX_UPLOAD_MB, MAX_REQUEST_BYTES, MAX_TTS_CHARS, MAX_CONCURRENT_UPLOADS
+    global ENABLE_WHISPER_CPP, ENABLE_PARAKEET_ASR, ENABLE_CANARY_ASR, ENABLE_CHATTERBOX_TTS
+    global ENABLE_MAGPIE_TTS, ENABLE_TRAINING
+
+    values = _effective(state)
+    policy = _build_access_policy(values)
+    keyring = _build_key_ring(state.keys.keys, values["deployment_key_role"])
+    engines = {key: values[key] for key in _ENGINE_KEYS}
+    rebuild = any(not settings_schema.same_value(engines[key], _registry_built_from[key]) for key in _ENGINE_KEYS)
+    registry = _build_provider_registry(values, values) if rebuild else None
+    previous, previous_keyring, previous_tts_chars = _applied_values, _keyring, MAX_TTS_CHARS
+
+    _policy, _keyring = policy, keyring
+    TRUST_PROXY_HEADERS = policy.trust_proxy_headers
+    MAX_UPLOAD_MB = float(values["MAX_UPLOAD_MB"])
+    MAX_REQUEST_BYTES = int(MAX_UPLOAD_MB * 1024 * 1024)
+    MAX_TTS_CHARS = int(values["MAX_TTS_CHARS"])
+    MAX_CONCURRENT_UPLOADS = int(values["MAX_CONCURRENT_UPLOADS"])
+    _upload_slots.limit = MAX_CONCURRENT_UPLOADS
+    openai_router._ffmpeg_slots.limit = int(values["MAX_CONCURRENT_FFMPEG"])
+    ENABLE_WHISPER_CPP = values["ENABLE_WHISPER_CPP"]
+    ENABLE_PARAKEET_ASR = values["ENABLE_PARAKEET_ASR"]
+    ENABLE_CANARY_ASR = values["ENABLE_CANARY_ASR"]
+    ENABLE_CHATTERBOX_TTS = values["ENABLE_CHATTERBOX_TTS"]
+    ENABLE_MAGPIE_TTS = values["ENABLE_MAGPIE_TTS"]
+    ENABLE_TRAINING = values["ENABLE_TRAINING"]
+    if registry is not None:
+        PROVIDER_REGISTRY.clear()
+        PROVIDER_REGISTRY.update(registry)
+        _registry_built_from = engines
+        _canary_languages["next_at"] = None
+        _reset_provider_health()
+    if MAX_TTS_CHARS != previous_tts_chars:
+        app.openapi_schema = None   # regenerated with the new maxLength when next asked for
+    _applied_state, _applied_values = state, MappingProxyType(values)
+
+    if not initial:
+        changed = [key for key in values if not settings_schema.same_value(previous.get(key), values[key])]
+        if keyring != previous_keyring:
+            changed.append("API keys")
+        if changed:
+            logger.info("settings: now in force in this worker: %s", ", ".join(changed))
+
+
+def _settings_tick() -> None:
+    """Apply what changed in the settings folder, and undo an overdue unconfirmed change.
+
+    Stats the files and re-reads only one that changed (settings_store). Never
+    raises: if anything fails, the settings in force stay as they are.
+    """
+    try:
+        _settings_store.refresh()
+        _settings_store.expire_pending()
+        state = _settings_store.state
+        if state is not _applied_state:
+            _apply(state)
+    except Exception:
+        logger.exception("settings: could not apply the saved settings; the ones in force stay")
+
+
+def _log_settings_at_start(state: settings_store.SettingsState) -> None:
+    """Say which values come from the Settings page instead of the app YAML, and why any are ignored."""
+    folder = state.mount.directory
+    saved = list(state.preferences.values)
+    in_force = list(_file_values_in_force(state))
+    if saved and not ENABLE_SETTINGS_UI:
+        logger.warning("ENABLE_SETTINGS_UI=false: %s saved in the Settings page %s ignored; the app YAML "
+                       "applies. API keys made there stay in force.", ", ".join(saved),
+                       "is" if len(saved) == 1 else "are")
+    elif saved and state.safe_mode:
+        logger.warning("%s exists: %s saved in the Settings page %s ignored; the app YAML applies. API keys "
+                       "made there stay in force.", os.path.join(folder, settings_store.SAFE_MODE_FILE),
+                       ", ".join(saved), "is" if len(saved) == 1 else "are")
+    if in_force:
+        logger.info("settings: %s from %s (revision %d), not from the app YAML",
+                    ", ".join(in_force), os.path.join(folder, settings_schema.FILE_PREFERENCES),
+                    state.preferences.revision)
+    locked = [key for key in saved if key in SETTINGS_LOCKED_KEYS]
+    if locked and ENABLE_SETTINGS_UI and not state.safe_mode:
+        logger.info("settings: SETTINGS_LOCKED_KEYS keeps the app YAML value of %s", ", ".join(locked))
+    if state.keys.keys:
+        logger.info("settings: %d API key(s) from %s", len(state.keys.keys),
+                    os.path.join(folder, settings_schema.FILE_KEYS))
+    if not state.mount.writable:
+        logger.info("settings: the Settings page cannot save here (%s)", state.mount.detail)
+
+
+# One read at start, and everything put in force before the first request.
+_apply(_settings_store.state, initial=True)
+_log_settings_at_start(_settings_store.state)
 
 
 # --- OpenAI-compatible /v1 surface ------------------------------------------
