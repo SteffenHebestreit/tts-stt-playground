@@ -254,6 +254,58 @@ def test_a_number_is_not_cut_at_its_separator():
     assert splitter.split_cjk(text, 15) == ["价格是1,000元，", "然后是2,000元，", "最后是3,000元的东西"]
 
 
+# Sentences longer than the 66-character ceiling whose last clause mark in the cut window
+# is the separator inside the number, ASCII or full-width (a Chinese or Japanese IME types
+# "14：30" and "１，０００"). Cut there, NeMo's normalizer read "下午14：" and "30请" as two
+# numbers with the pause between groups, where the whole "14：30" is a time.
+ZH_PRICE = "根据公司最新发布的价格调整通知，从下个月开始，本店所有普通会员卡和高级会员卡的年费将统一上调到{}元并且不再提供任何形式的折扣或者优惠"
+ZH_TIME = "根据公司最新发布的会议安排通知，从下个月开始，本部门所有普通员工和高级员工的例会将统一改在每周三下午{}举行并且不再另行通知任何人"
+JA_PRICE = "誠に勝手ながら来月より当店の会員カードの年会費は一律で{}円に改定させていただきますのでご了承ください何卒よろしくお願い申し上げます"
+
+
+@pytest.mark.parametrize("template, language, number", [
+    (ZH_PRICE, "zh", "1,000"), (ZH_PRICE, "zh", "1\uff0c000"), (ZH_PRICE, "zh", "\uff11\uff0c\uff10\uff10\uff10"),
+    (ZH_TIME, "zh", "14:30"), (ZH_TIME, "zh", "14\uff1a30"), (ZH_TIME, "zh", "\uff11\uff14\uff1a\uff13\uff10"),
+    (JA_PRICE, "ja", "1\uff0c000"), (JA_PRICE, "ja", "\uff11\uff0c\uff10\uff10\uff10"),
+], ids=["zh-1,000", "zh-1-fw-comma-000", "zh-fullwidth-1000", "zh-14:30", "zh-14-fw-colon-30", "zh-fullwidth-1430",
+        "ja-1-fw-comma-000", "ja-fullwidth-1000"])
+def test_a_number_with_a_full_width_separator_is_not_cut_either(template, language, number):
+    text = template.format(number)
+    assert len(text) > CJK_CEILING
+
+    groups = support.group_text(text, language, 200)
+
+    assert len(groups) > 1 and all(len(g) <= CJK_CEILING for g in groups)
+    assert any(number in g for g in groups), f"{number!r} was cut: {groups}"
+    assert "".join(groups) == text
+
+
+def test_without_a_clause_mark_to_cut_at_a_sentence_is_cut_before_a_number_not_inside_a_word():
+    """The separator inside the price is no place to cut, and there is no other mark: a hard cut fell inside "申し上げます"."""
+    text = JA_PRICE.format("1,000")
+
+    groups = support.group_text(text, "ja", 200)
+
+    assert groups == [text[:text.index("1,000")], text[text.index("1,000"):]]
+
+
+# A timetable joined by nothing but the colons of its times.
+TIMETABLE = ("上午9\uff1a30开会10\uff1a02休息10\uff1a15讨论11\uff1a45午饭13\uff1a00出发14\uff1a20到达"
+             "15\uff1a30参观16\uff1a30返回17\uff1a30结束18\uff1a00晚饭19\uff1a30散会")
+
+
+@pytest.mark.parametrize("cut", [
+    pytest.param(lambda: support.group_text(TIMETABLE, "zh", 200), id="grouped"),
+    pytest.param(lambda: support.split_cut_off_group(TIMETABLE, "zh"), id="cut-off"),
+])
+def test_a_timetable_is_cut_between_two_times_not_inside_one(cut):
+    groups = cut()
+
+    assert len(groups) > 1 and "".join(groups) == TIMETABLE
+    for before, after in zip(groups, groups[1:]):
+        assert not before[-1].isdigit() and before[-1] != "\uff1a", f"cut inside a time: {before!r} | {after!r}"
+        assert after[:1].isdigit(), f"not cut before a time: {after!r}"
+
 
 @pytest.mark.parametrize("language", ["zh", "ja"])
 @pytest.mark.parametrize("text", [

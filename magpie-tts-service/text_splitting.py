@@ -295,7 +295,12 @@ _CJK_TERMINAL = "\u3002\uff01\uff1f\u2026!?"  # 。 ！ ？ … !?
 _CJK_CLOSERS = "\u300d\u300f\uff09\u3011\u3015\u3009\u300b\u201d\u2019\"')]"  # 」 』 ） 】 〕 〉 》 ” ’ "')]
 # Where a sentence longer than the ceiling may be cut.
 _CJK_CLAUSE = "\uff0c\u3001\uff1b\uff1a,;:"  # ， 、 ； ： ,;:
-_ASCII_CLAUSE = ",;:"
+# Between two digits these are part of a number, a time or an amount ("14:30", "14：30",
+# "1,000", "１，０００"), not a clause mark: cut there, the halves are read
+# as two numbers. 、 is left out: between digits it separates the items of a list.
+_NUMBER_SEPARATORS = ",;:\uff0c\uff1a"  # , ; : ， ：
+# What joins the parts of one number: those, and a decimal point.
+_NUMBER_JOINERS = _NUMBER_SEPARATORS + ".\uff0e"  # and . ．
 
 
 def _add_span(spans: list, text: str, start: int, end: int) -> None:
@@ -337,19 +342,26 @@ def _cjk_sentence_spans(text: str) -> list:
 def _cjk_cut(text: str, start: int, limit: int, floor: int) -> int:
     """Where a piece that begins at *start* ends: by *limit*, and at least *floor* characters on.
 
-    After the last clause mark in that range (an ASCII one between two digits, as in
-    "14:30" or "1,000", does not count), else at the last whitespace (a Latin word is
-    not cut in two), else hard at *limit*. Looks at no more than ``limit - start``
-    characters.
+    After the last clause mark in that range (one of ,;:，： between two digits, as in
+    "14:30", "14：30" or "１，０００", does not count), else at the last whitespace (a
+    Latin word is not cut in two), else before the last number that starts in the range
+    (a timetable joined by nothing but the colons of its times is cut between two times,
+    not inside one or inside a word), else hard at *limit*. Looks at no more than
+    ``limit - start`` characters, three times.
     """
     lowest = start + floor
     for i in range(limit - 1, lowest - 2, -1):
         if text[i] in _CJK_CLAUSE and not (
-            text[i] in _ASCII_CLAUSE and i > start and text[i - 1].isdigit() and text[i + 1].isdigit()
+            text[i] in _NUMBER_SEPARATORS and i > start and text[i - 1].isdigit() and text[i + 1].isdigit()
         ):
             return i + 1
     for i in range(limit, lowest - 1, -1):
         if text[i].isspace():
+            return i
+    for i in range(limit, lowest - 1, -1):
+        if text[i].isdigit() and not text[i - 1].isdigit() and not (
+            text[i - 1] in _NUMBER_JOINERS and i - 1 > start and text[i - 2].isdigit()
+        ):
             return i
     return limit
 
@@ -358,8 +370,9 @@ def split_cjk(text: str, max_chars: int) -> list[str]:
     """Groups of whole sentences for text without spaces between words, each at most *max_chars* long.
 
     A sentence longer than *max_chars* is cut after its last clause mark (，、；：,;:)
-    that keeps at least a third of *max_chars* before the cut; failing that at
-    whitespace, failing that hard at *max_chars*. Neighbouring pieces are then joined
+    that keeps at least a third of *max_chars* before the cut and is not inside a number;
+    failing that at whitespace, failing that before a number, failing that hard at
+    *max_chars* (see ``_cjk_cut``). Neighbouring pieces are then joined
     while the group stays within *max_chars*: directly where they touched in the text,
     with one space where whitespace separated them. Pieces lose whitespace only at
     their ends, so text without whitespace comes back whole (``"".join(groups) == text``).
