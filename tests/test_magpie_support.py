@@ -4,12 +4,16 @@ Every rule here was measured on nvidia/magpie_tts_multilingual_357m with nemo_to
 3.0.0; the module docstring of magpie_support.py says what and why.
 """
 
+import ast
+import time
+
 import numpy as np
 import pytest
 
-from magpie_loader import CHECKPOINT_TOKENIZERS, LANGUAGE_TOKENIZER_MAP, load_support
+from magpie_loader import CHECKPOINT_TOKENIZERS, LANGUAGE_TOKENIZER_MAP, REPO, SERVICE_DIR, load_support
 
 support = load_support()
+splitter = support.text_splitting  # the copy magpie_support itself imported
 
 
 # --- languages ------------------------------------------------------------------------
@@ -74,12 +78,24 @@ def test_a_blank_speaker_is_the_default(value):
     assert support.resolve_speaker(value, LABELS, default_index=3) == 3
 
 
-@pytest.mark.parametrize("value", ["Bob", 5, "5", -1, "-1", 99, True, "Sofia2"])
+@pytest.mark.parametrize("value", [
+    "Bob", 5, "5", -1, "-1", 99, True, "Sofia2",
+    # str.isdigit() is true for these, but int() refuses them: they must be a 400, not a 500.
+    "²", "⑤", "1²",
+    # int() refuses more than sys.get_int_max_str_digits() (4300) digits.
+    pytest.param("9" * 5000, id="5000-digits"),
+])
 def test_an_unknown_speaker_is_refused_and_the_message_lists_the_valid_ones(value):
     """An out-of-range index is a ValueError inside the model; the caller should be told what is valid."""
     with pytest.raises(support.SpeakerNotFound) as exc:
         support.resolve_speaker(value, LABELS, default_index=0)
     assert "0 = Aria" in str(exc.value) and "4 = Sofia" in str(exc.value)
+    assert len(str(exc.value)) < 200, "the message echoes the whole value back"
+
+
+def test_a_name_of_digit_like_characters_int_cannot_read_is_looked_up_as_a_name():
+    """isdecimal(), not isdigit(): "⑤" is no index, so it can only be the name of a speaker."""
+    assert support.resolve_speaker("⑤", ["Aria", "⑤"], default_index=0) == 1
 
 
 def test_speaker_names_are_parsed_in_order_without_duplicates():
@@ -87,6 +103,18 @@ def test_speaker_names_are_parsed_in_order_without_duplicates():
     assert support.parse_speakers(None) == support.DEFAULT_SPEAKERS
     assert support.parse_speakers("  ") == support.DEFAULT_SPEAKERS
     assert support.parse_speakers(" , ,") == support.DEFAULT_SPEAKERS
+
+
+def test_speaker_names_may_also_be_one_per_line():
+    """A YAML block scalar (`MAGPIE_SPEAKERS: |`) gives one name per line and a trailing line break."""
+    assert support.parse_speakers("Aria\nJason\nJohn\nLeo\nSofia\n") == support.DEFAULT_SPEAKERS
+    assert support.parse_speakers("Aria\r\nJason\r\n") == ("Aria", "Jason")
+
+
+def test_a_control_character_is_removed_from_a_name_and_the_name_keeps_its_place():
+    """The position is the speaker index: dropping the name would move every later speaker to the wrong voice."""
+    assert support.parse_speakers("Aria,Ja\x07son,John\x00,\x1bLeo,Sofia\x7f") == support.DEFAULT_SPEAKERS
+    assert support.parse_speakers("A,\tB\t,C") == ("A", "B", "C")
 
 
 def test_labels_follow_the_models_speaker_count():
@@ -102,6 +130,14 @@ def test_a_default_speaker_that_names_nobody_falls_back_to_the_first(caplog):
         assert support.default_speaker_index("Nobody", LABELS) == 0
     assert "MAGPIE_DEFAULT_SPEAKER" in caplog.text
     assert support.default_speaker_index("Leo", LABELS) == 3
+
+
+@pytest.mark.parametrize("value", ["²", "⑤", pytest.param("9" * 5000, id="5000-digits")])
+def test_a_default_speaker_int_cannot_read_falls_back_to_the_first_instead_of_failing_the_import(value, caplog):
+    """app.py resolves MAGPIE_DEFAULT_SPEAKER at import: a ValueError there would stop the service."""
+    with caplog.at_level("WARNING"):
+        assert support.default_speaker_index(value, LABELS) == 0
+    assert "MAGPIE_DEFAULT_SPEAKER" in caplog.text
 
 
 # --- text grouping --------------------------------------------------------------------
@@ -131,17 +167,189 @@ def test_groups_hold_whole_sentences_and_lose_nothing():
     assert all(g.rstrip().endswith("Textes.") for g in groups)
 
 
-@pytest.mark.parametrize("language", ["zh", "ja"])
-def test_chinese_and_japanese_go_through_whole_because_nemo_has_sentence_rules_for_them(language):
-    """They have no spaces and end sentences with marks the splitter does not know; cutting would cut mid-sentence."""
-    text = "这是第一句话。这是第二句话。" * 40
-    assert support.group_text(text, language, 60) == [text]
-
-
 def test_blank_text_makes_no_groups_and_other_text_always_makes_one():
     assert support.group_text("   \n ", "de", 200) == []
     assert support.group_text("Hallo", "de", 200) == ["Hallo"]
     assert support.group_text("...", "de", 200) == ["..."]
+    assert support.group_text("   \n ", "zh", 200) == []
+    assert support.group_text("你好", "zh", 200) == ["你好"]
+
+
+# --- Chinese and Japanese -------------------------------------------------------------
+#
+# NeMo 3.0.0 splits them only at 。？！… and only above 100 characters / 80 words, so a
+# long sentence joined by commas was one chunk, cut off at the decoder's 500 frames.
+# group_text(text, "zh"/"ja", 200) groups them at a third of the ceiling.
+
+CJK_CEILING = 66
+
+# One sentence of 173 characters whose clauses are joined by "，" alone.
+LONG_COMMA_SENTENCE = "，".join([
+    "随着城市化进程的不断加快", "越来越多的年轻人离开家乡来到大城市工作和生活", "他们在追求更好发展机会的同时",
+    "也面临着住房成本高涨和通勤时间过长等诸多现实问题", "而这些问题如果长期得不到有效解决",
+    "不仅会影响个人的身心健康和生活质量", "还可能对整个社会的稳定与可持续发展产生深远的负面影响",
+    "因此政府和企业以及社会各界都应当共同努力", "积极探索切实可行的解决方案",
+]) + "。"
+
+
+@pytest.mark.parametrize("language", ["zh", "ja"])
+@pytest.mark.parametrize("text", [
+    pytest.param("这是第一句话。这是第二句话。" * 40, id="full-stops"),
+    pytest.param(LONG_COMMA_SENTENCE, id="one-sentence-of-commas"),
+])
+def test_chinese_and_japanese_are_grouped_at_their_own_sentence_and_clause_marks(text, language):
+    groups = support.group_text(text, language, 200)
+
+    assert len(groups) > 1
+    assert all(len(g) <= CJK_CEILING for g in groups), [len(g) for g in groups]
+    assert all(g[-1] in "。，" for g in groups), "a group ends inside a clause"
+    assert "".join(groups) == text, "text without spaces comes back whole"
+
+
+@pytest.mark.parametrize("language", ["zh", "ja"])
+@pytest.mark.parametrize("text, expected", [
+    pytest.param("他说：「今天天气很好。」我们出去吧，然后去公园散步！",
+                 ["他说：「今天天气很好。」", "我们出去吧，然后去公园散步！"], id="corner-brackets"),
+    pytest.param("她问：“你明天来不来？”我说：“一定来，不见不散！”",
+                 ["她问：“你明天来不来？”", "我说：“一定来，不见不散！”"], id="curly-quotes"),
+])
+def test_a_closing_quote_stays_with_the_sentence_mark_before_it(text, expected, language):
+    assert support.group_text(text, language, 60) == expected
+
+
+@pytest.mark.parametrize("language", ["zh", "ja"])
+def test_a_decimal_point_is_not_a_sentence_end_but_a_full_stop_before_a_space_is(language):
+    assert support.group_text("版本3.5很好。" * 3, language, 60) == ["版本3.5很好。版本3.5很好。", "版本3.5很好。"]
+    assert support.group_text("This is the end. 这是另一个很长的句子，它有很多的字。", language, 60) == [
+        "This is the end.", "这是另一个很长的句子，它有很多的字。"]
+
+
+@pytest.mark.parametrize("language", ["zh", "ja"])
+def test_a_line_break_ends_a_sentence_and_becomes_a_space_inside_a_group(language):
+    assert support.group_text("第一行\n第二行\r\n第三行。", language, 200) == ["第一行 第二行 第三行。"]
+
+
+@pytest.mark.parametrize("language", ["zh", "ja"])
+def test_a_run_without_any_mark_is_cut_hard_and_loses_nothing(language):
+    text = "字" * 300
+
+    groups = support.group_text(text, language, 200)
+
+    assert [len(g) for g in groups] == [66, 66, 66, 66, 36]
+    assert "".join(groups) == text
+
+
+def test_an_over_long_sentence_is_cut_at_a_space_rather_than_inside_a_latin_word():
+    text = "我们使用 Kubernetes 和 Docker 来部署 microservices architecture 以便快速迭代并且保证系统的稳定性和可扩展性"
+
+    groups = support.group_text(text, "zh", 200)
+
+    assert groups[0].endswith("architecture") and len(groups) == 2
+    assert " ".join(groups) == text
+
+
+def test_a_number_is_not_cut_at_its_separator():
+    """A clause cut after the ':' of "14:30" or the ',' of "1,000" would have them read as two numbers."""
+    text = "价格是1,000元，然后是2,000元，最后是3,000元的东西"
+    assert splitter.split_cjk(text, 15) == ["价格是1,000元，", "然后是2,000元，", "最后是3,000元的东西"]
+
+
+@pytest.mark.parametrize("language", ["zh", "ja"])
+@pytest.mark.parametrize("text", [
+    pytest.param("。" * 5000, id="5000-stops"),
+    pytest.param("，" * 5000, id="5000-commas"),
+    pytest.param("字" * 5000, id="5000-unmarked"),
+])
+def test_grouping_chinese_and_japanese_is_linear(text, language):
+    """It runs on the event loop, on caller-controlled text of up to MAX_TEXT_CHARS."""
+    started = time.perf_counter()
+    groups = support.group_text(text, language, 200)
+    assert time.perf_counter() - started < 1.0
+    assert all(len(g) <= CJK_CEILING for g in groups) and "".join(groups) == text
+
+
+# --- a group that filled the decoder's frame limit --------------------------------------
+
+@pytest.mark.parametrize("language, text, halves", [
+    ("de", "Das ist der erste Satz. Das ist der zweite Satz.", ["Das ist der erste Satz.", "Das ist der zweite Satz."]),
+    ("en", "one two three four five six seven eight nine ten", ["one two three four five", "six seven eight nine ten"]),
+    ("zh", "这是第一句话，这是第二句话。这是第三句话，这是第四句话。", ["这是第一句话，这是第二句话。", "这是第三句话，这是第四句话。"]),
+    ("ja", "字" * 30, ["字" * 15, "字" * 15]),
+])
+def test_a_group_is_halved_at_its_best_boundaries(language, text, halves):
+    assert support.halve_group(text, language) == halves
+
+
+@pytest.mark.parametrize("language, text", [("de", "Hallo Welt."), ("zh", "你好。")])
+def test_a_short_group_cannot_be_halved(language, text):
+    assert support.halve_group(text, language) == [text]
+
+
+# --- the splitter is chatterbox's, and stays linear ---------------------------------------
+
+# What text_splitting.py shares with chatterbox-tts-service/app.py, by name.
+SHARED_SPLITTER = (
+    "_CLOSERS", "_OPENERS", "_TERMINAL", "_WHITESPACE", "_ABBREVIATIONS", "_AMBIGUOUS_ABBREVIATIONS",
+    "_ORDINAL_FOLLOWERS", "_dot_ends_sentence", "_sentences", "_split_sentences",
+)
+
+
+def _definitions(path):
+    """Module-level functions (signature and body, docstring left out) and assigned values, as AST dumps by name."""
+    found = {}
+    for node in ast.parse(path.read_text(encoding="utf-8")).body:
+        if isinstance(node, ast.FunctionDef):
+            body = node.body[1:] if ast.get_docstring(node) is not None else node.body
+            returns = ast.dump(node.returns) if node.returns is not None else ""
+            found[node.name] = ast.dump(node.args) + returns + "".join(ast.dump(statement) for statement in body)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    found[target.id] = ast.dump(node.value)
+    return found
+
+
+def test_the_sentence_rules_are_chatterboxs_and_not_a_fork_of_them():
+    """test_chatterbox_chunking.py pins magpie's copy of the splitter only while its code is chatterbox's.
+
+    The copy exists because each service builds its image from its own directory, not
+    because the two may behave differently: a fix to one (an abbreviation, the linear
+    back-scan that keeps a 5000-character text from holding the event loop for 20 s)
+    belongs in both. Docstrings may differ.
+    """
+    magpie = _definitions(SERVICE_DIR / "text_splitting.py")
+    chatterbox = _definitions(REPO / "chatterbox-tts-service" / "app.py")
+
+    missing = [name for name in SHARED_SPLITTER if name not in magpie or name not in chatterbox]
+    assert not missing, f"not defined in both copies: {missing}"
+    diverged = [name for name in SHARED_SPLITTER if magpie[name] != chatterbox[name]]
+    assert not diverged, (
+        f"{diverged} differ between magpie-tts-service/text_splitting.py and chatterbox-tts-service/app.py: "
+        "make the same change in both."
+    )
+
+
+@pytest.mark.parametrize("language", ["de", "zh"])
+@pytest.mark.parametrize("max_chars", [40, 200])
+@pytest.mark.parametrize("text", [
+    pytest.param("a" * 2400 + " b. c. d. e. " * 200, id="token-then-periods"),  # 5000 characters
+    pytest.param("." * 5000, id="periods"),
+    pytest.param(".!?;:" * 1000, id="marks"),
+    pytest.param("a." + '"' * 4998, id="quotes"),
+    pytest.param("12. " * 1250, id="ordinals"),
+    pytest.param("z. B. " * 833, id="abbreviations"),
+    pytest.param("。" * 5000, id="cjk-stops"),
+    pytest.param("，" * 5000, id="cjk-commas"),
+])
+def test_grouping_is_linear_on_hostile_input(text, max_chars, language):
+    """/tts calls group_text on the event loop, with caller-controlled text of up to MAX_TEXT_CHARS (5000)."""
+    ceiling = max(20, max_chars // 3) if language == "zh" else max_chars
+
+    started = time.perf_counter()
+    groups = support.group_text(text, language, max_chars)
+
+    assert time.perf_counter() - started < 3.0
+    assert groups and max(len(g) for g in groups) <= ceiling
 
 
 # --- audio ----------------------------------------------------------------------------
@@ -183,6 +391,18 @@ def test_a_junk_number_costs_the_knob_not_the_service(monkeypatch, caplog):
     assert support.env_number("X_NUM", 7, cast=int, minimum=1) == 12
     monkeypatch.delenv("X_NUM")
     assert support.env_number("X_NUM", 7, cast=int) == 7
+
+
+def test_a_number_above_its_maximum_falls_back_to_the_default_with_a_warning(monkeypatch, caplog):
+    """MAGPIE_MAX_GROUP_CHARS above 250 would let NeMo chunk an English group by force again."""
+    monkeypatch.setenv("X_NUM", "1000")
+    with caplog.at_level("WARNING"):
+        assert support.env_number("X_NUM", 200, cast=int, minimum=40, maximum=250) == 200
+    assert "X_NUM" in caplog.text and "250" in caplog.text
+    monkeypatch.setenv("X_NUM", "250")
+    assert support.env_number("X_NUM", 200, cast=int, minimum=40, maximum=250) == 250
+    monkeypatch.setenv("X_NUM", "39")
+    assert support.env_number("X_NUM", 200, cast=int, minimum=40, maximum=250) == 200
 
 
 @pytest.mark.parametrize("raw, expected", [("1", True), ("true", True), (" YES ", True), ("on", True),

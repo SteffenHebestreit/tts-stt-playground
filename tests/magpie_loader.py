@@ -13,9 +13,20 @@ nvidia/magpie_tts_multilingual_357m) that the service depends on, each measured 
 real model:
 
 * ``do_tts(transcript, language, apply_TN, use_cfg, speaker_index)`` returns a (1, T)
-  array and its length; a speaker index outside the baked range is a ``ValueError``;
+  tensor and its (1,) length, both on the model's device: the fake's are CUDA tensors
+  whose ``numpy()`` refuses until ``.cpu()`` (``FakeDeviceTensor``). A speaker index
+  outside the baked range is a ``ValueError``;
 * with ``apply_TN=False`` the tokenizer DROPS digits, so a digit-only text yields no
   audio at all (the fake does the same);
+* with ``apply_TN=True`` a language's text normalizer is built on its first use and
+  cached on the instance in ``_text_normalizers``; a build that failed is cached as
+  None, and the language's digits are dropped from then on, as without normalization
+  (``package.normalizer_builds`` records every build, ``install_nemo(failing_normalizers=...)``
+  makes a first build fail, ``normalizer_cache=False`` models a NeMo without the cache);
+* the decoder stops after ``inference_parameters.max_decoder_steps`` frames of
+  ``codec_model_samples_per_frame`` samples and returns what it has, with no error
+  (``install_nemo(decoder_cap=...)``; without it the fake has no limit and no such
+  attributes);
 * the real ``LANGUAGE_TOKENIZER_MAP`` lists tokenizers by name, and the checkpoint holds
   Italian, Vietnamese and Hindi tokenizers under names that map does not list. The fake
   map reproduces that gap, so ``it``, ``vi`` and ``hi`` are not routable even though a
@@ -87,7 +98,7 @@ def _torch_stub() -> types.ModuleType:
     """A torch stand-in with what the service touches at import and in /status."""
     torch = types.ModuleType("torch")
     torch.__version__ = "0.0.0-stub"
-    torch.is_tensor = lambda x: False
+    torch.is_tensor = lambda x: isinstance(x, FakeDeviceTensor)
     torch.cuda = types.SimpleNamespace(
         is_available=lambda: False,
         empty_cache=lambda: None,
@@ -187,6 +198,44 @@ def load_support():
 
 # --- The fake library ----------------------------------------------------------------
 
+class FakeDeviceTensor:
+    """Just enough of a torch tensor on the GPU: ``numpy()`` refuses until ``.cpu()`` was called.
+
+    Always on "cuda:0", whatever the fake model's device: the stubbed torch has no CUDA,
+    so following ``model.device`` would hand the service CPU tensors, and the conversion
+    every real request goes through would go untested.
+    """
+
+    def __init__(self, array, device: str = "cuda:0"):
+        self._array = np.asarray(array)
+        self.device = device
+
+    def detach(self) -> "FakeDeviceTensor":
+        return self
+
+    def float(self) -> "FakeDeviceTensor":
+        return FakeDeviceTensor(self._array.astype(np.float32), self.device)
+
+    def cpu(self) -> "FakeDeviceTensor":
+        return FakeDeviceTensor(self._array, "cpu")
+
+    def numpy(self) -> np.ndarray:
+        if self.device != "cpu":
+            raise TypeError(
+                f"can't convert {self.device} device type tensor to numpy. "
+                "Use Tensor.cpu() to copy the tensor to host memory first."
+            )
+        return self._array
+
+    def __array__(self, dtype=None, copy=None):
+        array = self.numpy()
+        return array if dtype is None else array.astype(dtype)
+
+
+def _without_digits(text: str) -> str:
+    return "".join(c for c in text if not c.isdigit())
+
+
 class FakeMagpie:
     """Behaves like MagpieTTSModel where the service depends on it."""
 
@@ -206,6 +255,26 @@ class FakeMagpie:
         # real library is used by a worker thread).
         self.gate: Optional[threading.Event] = None
         self.entered = threading.Event()
+        if package.normalizer_cache:
+            # MagpieTTSModel.__init__ (NeMo 3.0.0): `self._text_normalizers: Dict[str, Any] = {}`.
+            self._text_normalizers: dict = {}
+        if package.decoder_cap is not None:
+            # One frame is one character's worth of fake audio.
+            self.inference_parameters = types.SimpleNamespace(max_decoder_steps=package.decoder_cap)
+            self.codec_model_samples_per_frame = SAMPLES_PER_CHAR
+
+    def _normalized(self, transcript: str, language: str) -> str:
+        """``MagpieTTSModel._get_normalized_text``, minus the normalizing: the fake speaks digits as they are."""
+        cache = getattr(self, "_text_normalizers", None)
+        if cache is None:
+            self.package.normalizer_builds.append(language)
+            return transcript
+        if language not in cache:
+            self.package.normalizer_builds.append(language)
+            failing = self.package.failing_normalizers
+            cache[language] = None if language in failing else object()
+            failing.discard(language)  # only the first build of it fails
+        return transcript if cache[language] is not None else _without_digits(transcript)
 
     def eval(self):
         return self
@@ -239,10 +308,12 @@ class FakeMagpie:
                     f"speaker_indices values must be in range [0, {self.num_baked_speakers - 1}], "
                     f"got min={index}, max={index}"
                 )
-            spoken = transcript if apply_TN else "".join(c for c in transcript if not c.isdigit())
+            spoken = self._normalized(transcript, language) if apply_TN else _without_digits(transcript)
             samples = len(spoken.strip()) * SAMPLES_PER_CHAR
+            if self.package.decoder_cap is not None:
+                samples = min(samples, self.package.decoder_cap * SAMPLES_PER_CHAR)
             audio = np.full((1, samples), 0.1 * (index + 1), dtype=np.float32)
-            return audio, np.array([samples])
+            return FakeDeviceTensor(audio), FakeDeviceTensor(np.array([samples], dtype=np.int64))
         finally:
             with self.lock:
                 self.running -= 1
@@ -252,17 +323,23 @@ class FakeNemo:
     """What `install_nemo` registered, for assertions."""
 
     def __init__(self, speakers: int, tokenizers, load_error: Optional[Exception], generate_error: Optional[Exception],
-                 generate_error_calls: Optional[int]):
+                 generate_error_calls: Optional[int], decoder_cap: Optional[int] = None,
+                 failing_normalizers=(), normalizer_cache: bool = True):
         self.speakers = speakers
         self.tokenizers = tokenizers
         self.load_error = load_error
         self.generate_error = generate_error
         # None: every do_tts call raises generate_error; N: only the first N calls do.
         self.generate_error_calls = generate_error_calls
+        self.decoder_cap = decoder_cap
+        self.failing_normalizers = set(failing_normalizers)
+        self.normalizer_cache = normalizer_cache
         self.loads = 0
         self.load_names: list = []
         self.models: list = []
         self.calls: list = []
+        # The language of every text-normalizer build, in order, across all model instances.
+        self.normalizer_builds: list = []
 
     @property
     def model(self) -> FakeMagpie:
@@ -280,9 +357,17 @@ class FakeNemo:
 
 def install_nemo(monkeypatch, *, speakers: int = 5, tokenizers=CHECKPOINT_TOKENIZERS,
                  load_error: Optional[Exception] = None, generate_error: Optional[Exception] = None,
-                 generate_error_calls: Optional[int] = None) -> FakeNemo:
-    """Register a fake ``nemo.collections.tts`` (removed again by monkeypatch)."""
-    package = FakeNemo(speakers, tokenizers, load_error, generate_error, generate_error_calls)
+                 generate_error_calls: Optional[int] = None, decoder_cap: Optional[int] = None,
+                 failing_normalizers=(), normalizer_cache: bool = True) -> FakeNemo:
+    """Register a fake ``nemo.collections.tts`` (removed again by monkeypatch).
+
+    ``decoder_cap``: the decoder's frame limit (NeMo's max_decoder_steps), counted in
+    characters' worth of fake audio; longer speech comes back cut to it.
+    ``failing_normalizers``: languages whose first text-normalizer build fails.
+    ``normalizer_cache=False``: a model without NeMo 3.0's ``_text_normalizers``.
+    """
+    package = FakeNemo(speakers, tokenizers, load_error, generate_error, generate_error_calls,
+                       decoder_cap, failing_normalizers, normalizer_cache)
 
     class MagpieTTSModel:
         @classmethod

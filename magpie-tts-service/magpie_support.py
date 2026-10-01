@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 from typing import Iterable, Mapping, Optional, Sequence, Union
 
 import numpy as np
@@ -35,10 +36,17 @@ DEFAULT_SPEAKERS = ("Aria", "Jason", "John", "Leo", "Sofia")
 # model has been loaded (and therefore before its tokenizers can be read).
 DOCUMENTED_LANGUAGES = ("de", "en", "es", "fr", "ja", "zh")
 
-# Text in these languages has no spaces and ends sentences with marks the splitter
-# does not know, so cutting it into groups would cut mid-sentence. NeMo has its own
-# sentence rules for them (tts_dataset_utils._SENTENCE_ENDINGS); the text goes through whole.
-SELF_CHUNKED_LANGUAGES = frozenset({"ja", "zh"})
+# Written without spaces between words, and with their own sentence marks. NeMo 3.0.0
+# splits such text only above 100 characters (Chinese) or 80 words (Japanese), and only
+# at 。？！…, so a long sentence joined by commas went through as one chunk and was cut
+# off at the decoder's 500 frames (~23 s). They are grouped like every other language,
+# by text_splitting.split_cjk, at a third of the ceiling: 66 characters at the default
+# 200, 14-16 s of speech at the 4.2-4.6 characters per second measured.
+SPACELESS_LANGUAGES = frozenset({"ja", "zh"})
+
+# What no HTTP header value may contain (h11 refuses the response, which then never
+# reaches the caller).
+_CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
 
 # Written-out names an operator or a caller is likely to use for a language.
 LANGUAGE_NAMES = {
@@ -68,12 +76,15 @@ class SpeakerNotFound(ValueError):
         self.requested = requested
         self.labels = list(labels)
         listing = ", ".join(f"{i} = {name}" for i, name in enumerate(self.labels))
-        super().__init__(f"Speaker {requested!r} is not available. Use a name or an index: {listing}.")
+        shown = repr(requested)
+        if len(shown) > 60:  # the value comes from the caller: do not echo kilobytes of it
+            shown = f"{shown[:57]}..."
+        super().__init__(f"Speaker {shown} is not available. Use a name or an index: {listing}.")
 
 
 # --- configuration -------------------------------------------------------------------
 
-def env_number(name: str, default, *, cast=float, minimum=None):
+def env_number(name: str, default, *, cast=float, minimum=None, maximum=None):
     """Parse a numeric env var; junk or out-of-range input falls back to *default*.
 
     A typo in a tuning knob should cost the knob, not stop the service at import.
@@ -86,8 +97,14 @@ def env_number(name: str, default, *, cast=float, minimum=None):
     except ValueError:
         logger.warning("Ignoring invalid %s=%r; using %s", name, raw, default)
         return default
-    if not math.isfinite(value) or (minimum is not None and value < minimum):
-        logger.warning("Ignoring %s=%r (not usable); using %s", name, raw, default)
+    if (
+        not math.isfinite(value)
+        or (minimum is not None and value < minimum)
+        or (maximum is not None and value > maximum)
+    ):
+        limits = ([f">= {minimum}"] if minimum is not None else []) + ([f"<= {maximum}"] if maximum is not None else [])
+        logger.warning("Ignoring %s=%r (must be a finite number%s); using %s",
+                       name, raw, "".join(f", {limit}" for limit in limits), default)
         return default
     return value
 
@@ -152,12 +169,18 @@ def resolve_language(value: Optional[str], default: str, supported: Sequence[str
 # --- speakers ------------------------------------------------------------------------
 
 def parse_speakers(raw: Optional[str]) -> tuple[str, ...]:
-    """Comma-separated speaker names, in baked-embedding order; blank means the checkpoint's own five."""
+    """Speaker names in baked-embedding order; blank means the checkpoint's own five.
+
+    Names are separated by commas or line breaks, so a YAML block scalar with one name per
+    line works as well as ``Aria,Jason,...``. A control character inside a name is removed,
+    not the name: its position is its speaker index, and a response header (X-Speaker)
+    cannot carry the character.
+    """
     if raw is None or not raw.strip():
         return DEFAULT_SPEAKERS
     names: list[str] = []
-    for item in raw.split(","):
-        name = item.strip()
+    for item in re.split(r"[,\r\n]", raw):
+        name = _CONTROL_CHARACTERS.sub("", item).strip()
         if name and name.lower() not in {n.lower() for n in names}:
             names.append(name)
     return tuple(names) or DEFAULT_SPEAKERS
@@ -171,13 +194,21 @@ def speaker_labels(names: Sequence[str], count: Optional[int]) -> list[str]:
 
 
 def resolve_speaker(value: Union[str, int, None], labels: Sequence[str], default_index: int) -> int:
-    """The baked-speaker index for a name (any case) or an index (an int or digits); ``SpeakerNotFound`` otherwise."""
+    """The baked-speaker index for a name (any case) or an index (an int or digits); ``SpeakerNotFound`` otherwise.
+
+    "Digits" means ``str.isdecimal()``: ``isdigit()`` is also true for "²" and "⑤", which
+    ``int()`` refuses (a 500 instead of the 400 that lists the speakers).
+    """
     if value is None or (isinstance(value, str) and value.strip().lower() in ("", "auto")):
         return default_index
     if isinstance(value, bool):
         raise SpeakerNotFound(value, labels)
-    if isinstance(value, int) or (isinstance(value, str) and value.strip().isdigit()):
-        index = int(value)
+    if isinstance(value, int) or (isinstance(value, str) and value.strip().isdecimal()):
+        try:
+            index = int(value)
+        except ValueError:
+            # More digits than int() reads (sys.get_int_max_str_digits(), 4300 by default).
+            raise SpeakerNotFound(value, labels) from None
         if 0 <= index < len(labels):
             return index
         raise SpeakerNotFound(value, labels)
@@ -200,13 +231,31 @@ def default_speaker_index(name: str, labels: Sequence[str]) -> int:
 # --- text and audio ------------------------------------------------------------------
 
 def group_text(text: str, language: str, max_chars: int) -> list[str]:
-    """Whole-sentence groups, each short enough for one single-chunk generation; never empty for non-blank text."""
+    """Whole-sentence groups, each short enough for one single-chunk generation; never empty for non-blank text.
+
+    Chinese and Japanese groups get a third of *max_chars*: 66 characters at the default
+    200, 14-16 s of speech, and below NeMo's own thresholds for them (100 characters, 80
+    words), so NeMo never chunks a group again.
+    """
     text = text.strip()
     if not text:
         return []
-    if language in SELF_CHUNKED_LANGUAGES:
-        return [text]
+    if language in SPACELESS_LANGUAGES:
+        return text_splitting.split_cjk(text, max(20, int(max_chars) // 3)) or [text]
     return text_splitting.split_for_synthesis(text, max_chars) or [text]
+
+
+def halve_group(text: str, language: str) -> list[str]:
+    """*text* cut in about half at its best boundaries; a single piece means it cannot be cut.
+
+    For a group whose generation filled the decoder's frame limit. Usually that is text
+    full of numbers, which normalization writes out: 62 characters of 7-digit numbers
+    took 233 of the 250 decoder steps (measured).
+    """
+    text = text.strip()
+    if language in SPACELESS_LANGUAGES:
+        return text_splitting.split_cjk(text, max(10, len(text) // 2)) or [text]
+    return text_splitting.split_for_synthesis(text, max(20, len(text) // 2)) or [text]
 
 
 def join_audio(parts: Sequence[np.ndarray], sample_rate: int, gap_ms: int) -> np.ndarray:
