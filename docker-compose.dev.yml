@@ -83,6 +83,15 @@ services:
       - "./chatterbox-tts-service/origin_guard.py:/app/origin_guard.py"
       - "./chatterbox-tts-service/model_lifecycle.py:/app/model_lifecycle.py"
 
+  magpie-tts-service:
+    volumes:
+      - "./magpie-tts-service/app.py:/app/app.py"
+      - "./magpie-tts-service/magpie_support.py:/app/magpie_support.py"
+      - "./magpie-tts-service/text_splitting.py:/app/text_splitting.py"
+      - "./magpie-tts-service/body_limit.py:/app/body_limit.py"
+      - "./magpie-tts-service/origin_guard.py:/app/origin_guard.py"
+      - "./magpie-tts-service/model_lifecycle.py:/app/model_lifecycle.py"
+
   qwen3-tts-service:
     volumes:
       - "./qwen3-tts-service/app.py:/app/app.py"

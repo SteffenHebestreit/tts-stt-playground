@@ -18,10 +18,11 @@ card you select (`GPU_DEVICE_ID`).
 - `parakeet-asr-service`: 25 European languages including German, heavy NeMo image.
 - `canary-asr-service`: the fastest German STT, also NeMo.
 - `chatterbox-tts-service`: streaming German TTS.
+- `magpie-tts-service`: NVIDIA TTS with five built-in voices that reads numbers and dates correctly.
 - `whisper-cpp`: CPU-only STT alternative; not needed while `stt-service` runs.
 
 The web UI only shows a backend when its `ENABLE_*` flag is true on `frontend-service`
-(`ENABLE_PARAKEET_ASR`, `ENABLE_CANARY_ASR`, `ENABLE_CHATTERBOX_TTS`, `ENABLE_WHISPER_CPP`);
+(`ENABLE_PARAKEET_ASR`, `ENABLE_CANARY_ASR`, `ENABLE_CHATTERBOX_TTS`, `ENABLE_MAGPIE_TTS`, `ENABLE_WHISPER_CPP`);
 training has no flag.
 
 ## Modes

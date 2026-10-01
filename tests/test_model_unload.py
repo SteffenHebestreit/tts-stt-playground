@@ -32,6 +32,7 @@ UNLOAD_SERVICES = {
     "qwen3-asr": "qwen3-asr-service",
     "qwen3": "qwen3-tts-service",
     "chatterbox": "chatterbox-tts-service",
+    "magpie": "magpie-tts-service",
     "parakeet": "parakeet-asr-service",
     "canary": "canary-asr-service",
 }
@@ -88,6 +89,7 @@ def declared_capabilities() -> dict[str, list[str]]:
         "ENABLE_PARAKEET_ASR": "true",
         "ENABLE_CANARY_ASR": "true",
         "ENABLE_CHATTERBOX_TTS": "true",
+        "ENABLE_MAGPIE_TTS": "true",
     }
     previous_env = {k: os.environ.get(k) for k in optional}
     previous_cwd = Path.cwd()

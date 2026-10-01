@@ -61,6 +61,7 @@ SERVICES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("parakeet-asr", "./parakeet-asr-service", ("amd64",)),
     ("canary-asr", "./canary-asr-service", ("amd64",)),
     ("chatterbox-tts", "./chatterbox-tts-service", ("amd64",)),
+    ("magpie-tts", "./magpie-tts-service", ("amd64",)),
     ("piper-training", "./piper-training-service", ("amd64",)),
 )
 

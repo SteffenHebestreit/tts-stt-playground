@@ -43,7 +43,8 @@ name: tts-stt
 #   Always : frontend-service (web UI + gateway), piper-tts-service (CPU TTS),
 #            stt-service (Whisper, GPU), qwen3-asr-service (GPU), qwen3-tts-service (GPU)
 #   Off    : canary-asr-service, parakeet-asr-service, chatterbox-tts-service,
-#            piper-training-service, whisper-cpp (CPU STT), diun (update notices)
+#            magpie-tts-service, piper-training-service, whisper-cpp (CPU STT),
+#            diun (update notices)
 #
 # ENABLE AN OPTIONAL SERVICE (two edits, both required):
 #   1. Delete its `profiles:` line.
@@ -138,11 +139,13 @@ services:
       PARAKEET_ASR_SERVICE_URL: http://parakeet-asr-service:5005
       CANARY_ASR_SERVICE_URL: http://canary-asr-service:5006
       CHATTERBOX_TTS_SERVICE_URL: http://chatterbox-tts-service:5007
+      MAGPIE_TTS_SERVICE_URL: http://magpie-tts-service:5008
       WHISPER_CPP_SERVICE_URL: http://whisper-cpp:8080
       # Show these backends in the UI. Set true only together with the service.
       ENABLE_PARAKEET_ASR: ${ENABLE_PARAKEET_ASR:-false}
       ENABLE_CANARY_ASR: ${ENABLE_CANARY_ASR:-false}
       ENABLE_CHATTERBOX_TTS: ${ENABLE_CHATTERBOX_TTS:-false}
+      ENABLE_MAGPIE_TTS: ${ENABLE_MAGPIE_TTS:-false}
       ENABLE_WHISPER_CPP: ${ENABLE_WHISPER_CPP:-false}
       # Empty = same-origin only, which is what the web UI needs, also over
       # http://<ip>:3000. List origins only for scripts in other web pages.
@@ -537,6 +540,65 @@ services:
     stop_grace_period: 30s
     healthcheck:
       test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:5007/health"]
+      interval: 15s
+      timeout: 10s
+      start_period: 900s
+      retries: 4
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${GPU_DEVICE_ID:-0}"]
+              capabilities: [gpu]
+    networks: [tts-stt-network]
+
+  # Magpie-TTS: NVIDIA's multilingual TTS with five built-in voices (no cloning, no streaming).
+  # NVIDIA Open Model License: read it before relying on it. Needs NeMo 3, so no -nemo2 image.
+  magpie-tts-service:
+    profiles: ["magpie-tts"]
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-magpie-tts:${IMAGE_TAG:-0.2.0}
+    pull_policy: ${PULL_POLICY:-missing}
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ${GPU_DEVICE_ID:-0}
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      MAGPIE_MODEL: ${MAGPIE_MODEL:-nvidia/magpie_tts_multilingual_357m}
+      # NeMo 3.0.x speaks de, en, es, fr, ja and zh; any other language is refused.
+      MAGPIE_DEFAULT_LANGUAGE: ${MAGPIE_DEFAULT_LANGUAGE:-de}
+      MAGPIE_DEFAULT_SPEAKER: ${MAGPIE_DEFAULT_SPEAKER:-Sofia}
+      # Speaker names in baked-embedding order, for a MAGPIE_MODEL that orders them
+      # differently. Empty = Aria,Jason,John,Leo,Sofia.
+      MAGPIE_SPEAKERS: ${MAGPIE_SPEAKERS:-}
+      # The first request in a language builds its text normalizer (12 s de, 18 s en,
+      # 37 s fr, 48 s es); languages listed here are built by the first model load instead.
+      # A built one stays in RAM across idle unloads, so a reload after TTS_MODEL_TTL
+      # repeats neither the warm-up nor a build.
+      MAGPIE_WARM_LANGUAGES: ${MAGPIE_WARM_LANGUAGES:-}
+      # Off, the model silently drops every digit.
+      MAGPIE_APPLY_TN: ${MAGPIE_APPLY_TN:-true}
+      MAGPIE_USE_CFG: ${MAGPIE_USE_CFG:-true}
+      # Longest group of whole sentences per generation call: 40-250, another value falls
+      # back to 200 with a warning. Chinese and Japanese groups are a third of it.
+      MAGPIE_MAX_GROUP_CHARS: ${MAGPIE_MAX_GROUP_CHARS:-200}
+      MAGPIE_GROUP_GAP_MS: ${MAGPIE_GROUP_GAP_MS:-150}
+      MAX_TEXT_CHARS: ${MAGPIE_MAX_TEXT_CHARS:-5000}
+      TTS_MODEL_TTL: ${TTS_MODEL_TTL:-300}
+      MODEL_TTL: ${MODEL_TTL:-300}
+      TTS_MAX_CONCURRENCY: ${TTS_MAX_CONCURRENCY:-1}
+      # Waiting requests (empty = 4 x TTS_MAX_CONCURRENCY, 0 = nobody waits) and how
+      # long one waits; beyond either the answer is 503 + Retry-After.
+      TTS_MAX_QUEUE: ${TTS_MAX_QUEUE:-}
+      TTS_QUEUE_TIMEOUT_S: ${TTS_QUEUE_TIMEOUT_S:-60}
+      PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-}
+      ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
+    volumes:
+      - "${APP_DATA_DIR:?set dataset path}/cache:/root/.cache"
+    labels: {diun.enable: "true", diun.watch_repo: "true", diun.sort_tags: semver, diun.max_tags: "3", diun.include_tags: '^\d+\.\d+\.\d+$$'}
+    restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:5008/health"]
       interval: 15s
       timeout: 10s
       start_period: 900s

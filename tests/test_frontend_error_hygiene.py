@@ -174,14 +174,88 @@ def test_streamed_tts_errors_are_generic_as_well(monkeypatch, caplog):
     assert _logged(caplog, _request_id(r.json()["detail"]), "FileNotFoundError")
 
 
-def test_a_read_timeout_is_a_503_without_the_url_too(monkeypatch):
+def test_a_read_timeout_is_a_503_without_the_url_too(monkeypatch, caplog):
+    """A backend that took the request and has not answered is not down: it may still be
+    generating. The answer says so, with the budget that ran out, and still no URL."""
     def slow(method, url, kwargs):
-        raise httpx.ReadTimeout("timed out", request=httpx.Request(method, url))
+        # The way httpx raises it: the request carries the timeouts it was sent with.
+        request = httpx.Request(method, url, extensions={"timeout": kwargs["timeout"].as_dict()})
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    _, _, client = _gateway(monkeypatch, slow)
+    with caplog.at_level(logging.WARNING):
+        r = client.post("/api/tts", json={"provider": "piper", "text": "hi"})
+    assert r.status_code == 503
+    detail = r.json()["detail"]
+    _assert_clean(detail)
+    assert detail.startswith("PiperTTS (Local Training) did not finish in time (read timeout 120 s); "
+                             "it may still be working on the request."), detail
+    assert "unavailable" not in detail
+    assert _logged(caplog, _request_id(detail), "timed out")
+
+
+def test_a_read_timeout_without_a_request_attached_is_still_answered(monkeypatch):
+    """httpx raises RuntimeError from `exc.request` when no request was attached."""
+    def slow(method, url, kwargs):
+        raise httpx.ReadTimeout("timed out")
 
     _, _, client = _gateway(monkeypatch, slow)
     r = client.post("/api/tts", json={"provider": "piper", "text": "hi"})
     assert r.status_code == 503
-    _assert_clean(r.json()["detail"])
+    assert "did not finish in time; it may still be working" in r.json()["detail"]
+
+
+# --- a backend's designed 503 "busy" is relayed with its sentence and Retry-After --------
+#
+# A queue that is full, a request that waited its time for a turn, a GPU out of memory: the
+# backends answer those 503 with Retry-After and a sentence written for the caller. The
+# gateway turned every one into "failed to handle the request (HTTP 503)" and dropped the
+# Retry-After, so the UI could not say "busy, try again" and clients could not wait it out.
+
+BUSY = ("The service is busy: this request waited 60 s for its turn "
+        "(TTS_QUEUE_TIMEOUT_S). Retry shortly.")
+
+
+def _answer(status, detail, headers=None):
+    return lambda method, url, kwargs: httpx.Response(status, json={"detail": detail}, headers=headers or {})
+
+
+@pytest.mark.parametrize("call", [
+    lambda c: c.post("/api/tts", json={"provider": "piper", "text": "hi"}),
+    lambda c: c.post("/api/stt", data={"provider": "whisper"},
+                     files={"audio": ("a.wav", wav_bytes(), "audio/wav")}),
+    lambda c: c.get("/api/providers/qwen3/saved-voices"),
+], ids=["tts", "stt", "saved-voices"])
+def test_a_designed_busy_answer_keeps_its_sentence_and_retry_after(monkeypatch, call):
+    _, _, client = _gateway(monkeypatch, _answer(503, BUSY, {"Retry-After": "5"}))
+    r = call(client)
+    assert r.status_code == 503
+    assert r.json() == {"detail": BUSY}
+    assert r.headers["retry-after"] == "5"
+
+
+def test_the_streamed_route_relays_a_busy_answer_too(monkeypatch):
+    _, _, client = _gateway(monkeypatch, _answer(503, BUSY, {"Retry-After": "5"}), {"ENABLE_CHATTERBOX_TTS": "true"})
+    r = client.post("/api/tts", json={"provider": "chatterbox", "text": "hi"})
+    assert (r.status_code, r.json(), r.headers.get("retry-after")) == (503, {"detail": BUSY}, "5")
+
+
+@pytest.mark.parametrize("status,detail,headers", [
+    (503, TRACEBACK, {"Retry-After": "5"}),          # a busy status cannot carry a traceback out
+    (503, BUSY, {}),                                 # no Retry-After: not the designed answer
+    (503, BUSY, {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}),   # only seconds count
+    (500, BUSY, {"Retry-After": "5"}),               # any other 5xx stays a failure
+], ids=["traceback", "no-retry-after", "date-retry-after", "500"])
+def test_every_other_5xx_stays_generic(monkeypatch, caplog, status, detail, headers):
+    _, _, client = _gateway(monkeypatch, _answer(status, detail, headers))
+    with caplog.at_level(logging.WARNING):
+        r = client.post("/api/tts", json={"provider": "piper", "text": "hi"})
+    assert r.status_code == status
+    text = r.json()["detail"]
+    assert f"failed to handle the request (HTTP {status})" in text
+    _assert_clean(text)
+    assert "retry-after" not in r.headers
+    _request_id(text)
 
 
 # --- 4xx: the backend's explanation of a bad request still reaches the caller -----------

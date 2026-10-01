@@ -137,15 +137,28 @@ def test_slot_is_wired_with_the_documented_ttl_names(service: str):
     assert "on_unload=" in source, f"{service}: ModelSlot built without an unload hook"
 
 
+# Every service that ships a copy of the ModelSlot module. The copies are found by glob,
+# so a new one cannot escape the comparison and a missing one cannot pass it silently.
+LIFECYCLE_SERVICES = {
+    "parakeet-asr-service", "canary-asr-service", "qwen3-asr-service",
+    "chatterbox-tts-service", "magpie-tts-service",
+}
+
+
 def test_the_lifecycle_module_is_not_forked_per_service():
-    """Four copies of a concurrency primitive is four places for it to drift."""
+    """Every copy of a concurrency primitive is one more place for it to drift."""
     copies = {
-        service: (REPO_ROOT / service / "model_lifecycle.py").read_text(encoding="utf-8")
-        for service in NEMO_SERVICES
-        + ["qwen3-asr-service", "chatterbox-tts-service"]
+        path.parent.name: path.read_text(encoding="utf-8")
+        for path in REPO_ROOT.glob("*-service/model_lifecycle.py")
     }
+    assert set(copies) == LIFECYCLE_SERVICES, (
+        f"model_lifecycle.py is copied into {sorted(copies)}, but this test expects exactly "
+        f"{sorted(LIFECYCLE_SERVICES)}. Add a new copy to LIFECYCLE_SERVICES, or find out "
+        f"where a listed one went."
+    )
+    # The copy tests/test_model_lifecycle.py exercises.
     reference = copies["chatterbox-tts-service"]
-    diverged = [name for name, text in copies.items() if text != reference]
+    diverged = sorted(name for name, text in copies.items() if text != reference)
     assert not diverged, (
         f"model_lifecycle.py differs in {diverged}. The copies exist because each "
         f"service builds its own image from its own context, not because they are "

@@ -60,6 +60,10 @@ STATE_CHANGING = {
         ("POST", "/clone", "/clone"),
         ("POST", "/unload", "/unload"),
     ],
+    "magpie-tts-service": [
+        ("POST", "/tts", "/tts"),
+        ("POST", "/unload", "/unload"),
+    ],
     "stt-service": [
         ("POST", "/transcribe", "/transcribe"),
         ("POST", "/unload", "/unload"),
@@ -271,13 +275,16 @@ def test_an_unlisted_origin_is_refused_everywhere(listed):
 
 def test_a_refusal_from_the_body_limit_still_carries_the_cors_headers_of_a_listed_origin(listed):
     """CORS is the outermost layer: without its headers the page reads a 413 as a network error."""
-    path = listed.routes["upload"][1]
+    # A backend without uploads is probed through its JSON route: the 413 is the same layer.
+    upload = listed.routes["upload"]
+    path = upload[1] if upload else listed.routes["json"]
+    content_type = multipart_content_type() if upload else {"content-type": "application/json"}
 
     async def scenario():
         async with listed.client() as client:
             return await client.post(
                 path, content=b"x", headers={"Origin": UI, "content-length": str(10 * 1024 ** 3),
-                                             **multipart_content_type()})
+                                             **content_type})
 
     response = _run(scenario())
 

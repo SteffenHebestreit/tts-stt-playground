@@ -362,6 +362,114 @@ def backend_detail(exc: Any) -> str:
     return detail if isinstance(detail, str) and detail.strip() else "The backend could not complete the request."
 
 
+# A backend refusal that is about what the caller asked for (an unknown speaker, a
+# language the model cannot speak, text with nothing to say, a text limit) is the
+# caller's to fix. OpenAI answers those 400 `invalid_request_error` (413 for size),
+# and its SDKs do not retry them; a 502 made them retry the same request. Everything
+# else stays a 502, which they do retry: 5xx, an unreachable backend, and 4xx answers
+# about the backend's own state or the internal hop (Piper's 404 "no voice installed
+# at all", Qwen3's 409 "another model is loaded", a 401/403 between the services).
+_CALLER_FAULT_STATUS = {400: 400, 413: 413, 422: 400}
+
+
+def _retry_after(exc: Any) -> Optional[str]:
+    """A numeric Retry-After carried by an HTTPException, else None."""
+    for key, value in (getattr(exc, "headers", None) or {}).items():
+        if key.lower() == "retry-after":
+            text = str(value).strip()
+            return text if text.isascii() and text.isdigit() else None
+    return None
+
+
+def backend_error(what: str, exc: Any) -> JSONResponse:
+    """The /v1 answer for a backend that answered with an error (`what`: "Speech", "Transcription").
+
+    The message keeps the backend's sentence, which the gateway has already reduced
+    to something a client may see. A busy backend's 503 (its queue is full, the
+    request waited its time for a turn, the GPU is out of memory) comes with a
+    Retry-After; that stays a 503 `server_busy` with the header, which OpenAI
+    clients wait out and retry, like the gateway's own ffmpeg refusal. Its sentence
+    says what is wrong itself ("The service is busy: ...", "GPU out of memory ..."),
+    so it is only prefixed with the backend it came from.
+    """
+    status = _CALLER_FAULT_STATUS.get(getattr(exc, "status_code", None))
+    if status is not None:
+        return openai_error(status, f"{what} backend rejected the request: {backend_detail(exc)}")
+    retry_after = _retry_after(exc) if getattr(exc, "status_code", None) == 503 else None
+    if retry_after is not None:
+        busy = openai_error(503, f"{what} backend: {backend_detail(exc)}", code="server_busy")
+        busy.headers["Retry-After"] = retry_after
+        return busy
+    return openai_error(502, f"{what} backend failed: {backend_detail(exc)}")
+
+
+# --- a caller that hangs up --------------------------------------------------------
+
+
+class ClientDisconnected(HTTPException):
+    """The caller closed the connection before the backend answered (499, nginx's code for it).
+
+    The answer never goes out and nothing logs its status: uvicorn drops whatever is
+    sent after a disconnect, before its access-log line (and the gateway runs with
+    --no-access-log). The hang-up is recorded by the INFO line in `unless_client_gone`.
+    A class of its own so that a handler turning a backend's HTTPException into a 502
+    can let it through.
+    """
+
+
+async def client_gone(request: Request) -> None:
+    """Return once the client has closed the connection; never return otherwise.
+
+    Nothing else notices a caller who leaves while a handler waits for a backend:
+    uvicorn and Starlette never cancel a handler (only a StreamingResponse listens
+    for the disconnect), so a non-streaming request kept the backend working for
+    nobody until it finished. Call it only after the body has been read: it takes
+    the request's remaining ASGI messages.
+    """
+    try:
+        while True:
+            message = await request.receive()
+            if message["type"] == "http.disconnect":
+                return
+    except Exception as exc:     # the connection state cannot be read: wait for the backend alone
+        logger.debug("cannot watch the client connection: %s", exc)
+        await asyncio.Event().wait()
+
+
+async def unless_client_gone(request: Request, awaitable: Any) -> Any:
+    """Await *awaitable*, unless the caller hangs up first.
+
+    Then the awaitable is cancelled, which makes httpx close the upstream connection
+    (a backend that watches for that stops generating), and `ClientDisconnected`
+    (499) is raised. Only the wait for the backend's answer is raced: once a
+    StreamingResponse exists, Starlette's own disconnect handling takes over.
+    """
+    work = asyncio.ensure_future(awaitable)
+    gone = asyncio.ensure_future(client_gone(request))
+    try:
+        await asyncio.wait({work, gone}, return_when=asyncio.FIRST_COMPLETED)
+    except BaseException:             # this handler itself was cancelled (shutdown)
+        work.cancel()
+        work.add_done_callback(_retrieved)
+        raise
+    finally:
+        gone.cancel()
+    if work.done():
+        return work.result()
+    work.cancel()
+    await asyncio.wait({work})        # let it unwind: that closes the upstream connection
+    _retrieved(work)
+    logger.info("the caller of %s %s hung up before the backend answered; the backend call was cancelled",
+                request.method, request.url.path)
+    raise ClientDisconnected(status_code=499, detail="Client closed the request.")
+
+
+def _retrieved(task: "asyncio.Future") -> None:
+    """Mark a finished task's outcome as seen, so an error it ended with is not logged as lost."""
+    if not task.cancelled():
+        task.exception()
+
+
 def _number(value: Any, default: float) -> float:
     """A finite float from whatever a backend put in a numeric field."""
     try:
@@ -627,9 +735,21 @@ def build_router(
             try:
                 upstream = await transcribe_with(alternative, get_provider(alternative, kind="stt"))
             except HTTPException as fallback_exc:
-                return openai_error(502, f"Transcription backend failed: {backend_detail(fallback_exc)}")
+                if getattr(fallback_exc, "status_code", None) in _CALLER_FAULT_STATUS:
+                    # The stand-in's own limits (a language it cannot do, a shorter audio
+                    # cap), not a verdict on the request: the default was never asked and
+                    # may well take it once it is back. A 502, which the SDKs retry, as
+                    # when there is no stand-in at all.
+                    failed = openai_error(502, (
+                        f"Transcription fallback '{alternative}' (the default '{provider_id}' "
+                        f"is unreachable) rejected the request: {backend_detail(fallback_exc)}"))
+                else:
+                    failed = backend_error("Transcription", fallback_exc)
+                failed.headers["X-Provider"] = alternative
+                failed.headers["X-Provider-Fallback"] = f"{provider_id}->{alternative}"
+                return failed
         except HTTPException as exc:
-            return openai_error(502, f"Transcription backend failed: {backend_detail(exc)}")
+            return backend_error("Transcription", exc)
 
         try:
             payload = upstream.json()
@@ -711,9 +831,11 @@ def build_router(
         except HTTPException as exc:
             return openai_error(503, f"No text-to-speech provider available: {exc.detail}")
 
-        # `voice` is never validated against a list. The spec's own prose and its
-        # VoiceIdsShared enum disagree, and the schema accepts any string — so an
-        # unknown voice falls back to the deployment default rather than 404.
+        # `voice` is not validated against a list here. The spec's own prose and its
+        # VoiceIdsShared enum disagree, and the schema accepts any string, so the
+        # name goes to the default provider as it is: Piper picks another voice for
+        # one it does not have, Chatterbox has no voices to pick from, and Qwen3 and
+        # Magpie answer 400 listing theirs (a 400 here too, see backend_error).
         voice = str(body.get("voice") or "").strip()
         if voice.lower() in OPENAI_PLACEHOLDER_VOICES:
             # One of OpenAI's own names, which resolves to nothing here.
@@ -739,10 +861,14 @@ def build_router(
                 503, f"Text-to-speech provider '{provider_id}' cannot serve this request: {exc.detail}")
 
         try:
-            upstream = await post_json(provider_id, "/tts", payload,
-                                       timeout=max(read_timeout, 600.0))
+            # Raced against the caller hanging up: a non-streaming /tts answers only
+            # when the whole text is done, which can be many minutes of GPU time.
+            upstream = await unless_client_gone(request, post_json(
+                provider_id, "/tts", payload, timeout=max(read_timeout, 600.0)))
+        except ClientDisconnected:
+            raise
         except HTTPException as exc:
-            return openai_error(502, f"Speech backend failed: {backend_detail(exc)}")
+            return backend_error("Speech", exc)
 
         audio = upstream.content
         headers = {"X-Provider": provider_id}

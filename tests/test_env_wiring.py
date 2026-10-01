@@ -46,7 +46,7 @@ EXEMPT: dict[str, str] = {
     # Port mappings: consumed by the ports: section, not by the app.
     **{f"{name}_PORT": "compose ports mapping" for name in (
         "FRONTEND", "PIPER_TTS", "STT", "QWEN3_ASR", "WHISPER_CPP",
-        "QWEN3_TTS", "PARAKEET_ASR", "CANARY_ASR", "CHATTERBOX_TTS", "TRAINING",
+        "QWEN3_TTS", "PARAKEET_ASR", "CANARY_ASR", "CHATTERBOX_TTS", "MAGPIE_TTS", "TRAINING",
     )},
 }
 
@@ -432,6 +432,7 @@ def test_the_limit_knobs_are_forwarded_with_the_code_default_everywhere():
             "QWEN3_TTS_REF_MAX_SECONDS": "60", "TTS_MAX_QUEUE": "", "TTS_QUEUE_TIMEOUT_S": "60",
         },
         "chatterbox-tts-service": {"TTS_MAX_QUEUE": "", "TTS_QUEUE_TIMEOUT_S": "60"},
+        "magpie-tts-service": {"TTS_MAX_QUEUE": "", "TTS_QUEUE_TIMEOUT_S": "60"},
     }
     problems: list[str] = []
     for compose in (COMPOSE, TRUENAS_APP):

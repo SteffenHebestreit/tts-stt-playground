@@ -1588,16 +1588,18 @@ def test_registry_strings_cannot_close_the_script_element(monkeypatch):
 # --- entrypoint -----------------------------------------------------------------
 
 
-def _run_entrypoint(tmp_path, workers, *extra):
+def _run_entrypoint(tmp_path, workers, *extra, extra_env=None):
     import subprocess
 
     out = tmp_path / "argv"
     fake = tmp_path / "bin"
     fake.mkdir(exist_ok=True)
     python = fake / "python"
-    python.write_text('#!/bin/sh\necho "$$" > "$OUT.pid"\nfor a in "$@"; do echo "$a"; done > "$OUT"\n')
+    # The fake server records its pid, the libuv pool size it was started with, and its argv.
+    python.write_text('#!/bin/sh\necho "$$" > "$OUT.pid"\necho "${UV_THREADPOOL_SIZE:-unset}" > "$OUT.uv"\n'
+                      'for a in "$@"; do echo "$a"; done > "$OUT"\n')
     python.chmod(0o755)
-    env = {"PATH": f"{fake}:/usr/bin:/bin", "OUT": str(out)}
+    env = {"PATH": f"{fake}:/usr/bin:/bin", "OUT": str(out), **(extra_env or {})}
     if workers is not None:
         env["FRONTEND_WORKERS"] = workers
     script = Path(__file__).resolve().parents[1] / "frontend-service" / "entrypoint.sh"
@@ -1644,6 +1646,22 @@ def test_entrypoint_execs_so_signals_reach_uvicorn(tmp_path):
 def test_entrypoint_passes_extra_arguments_through(tmp_path):
     _, _, argv, _ = _run_entrypoint(tmp_path, "2", "--log-level", "debug")
     assert argv[-2:] == ["--log-level", "debug"]
+
+
+def test_entrypoint_widens_libuv_dns_pool(tmp_path):
+    """uvloop resolves names on libuv's pool, of which only half may resolve at once.
+
+    With libuv's default of 4 threads, the lookups of providers that are not running
+    (2.5 to 4 s each on Docker Desktop for Windows) held a running provider's lookup past
+    the gateway's 3 s connect timeout, and a healthy service was reported unavailable.
+    """
+    _run_entrypoint(tmp_path, "2")
+    assert (tmp_path / "argv.uv").read_text().strip() == "32"
+
+
+def test_entrypoint_keeps_an_operators_libuv_pool_size(tmp_path):
+    _run_entrypoint(tmp_path, "2", extra_env={"UV_THREADPOOL_SIZE": "8"})
+    assert (tmp_path / "argv.uv").read_text().strip() == "8"
 
 
 def test_dockerfile_ships_and_runs_the_entrypoint():

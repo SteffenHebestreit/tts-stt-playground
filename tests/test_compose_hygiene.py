@@ -217,6 +217,7 @@ def test_the_documented_shutdown_wait_fits_inside_the_grace_period():
 MODEL_SERVICES = (
     "stt-service", "qwen3-asr-service", "qwen3-tts-service",
     "parakeet-asr-service", "canary-asr-service", "chatterbox-tts-service",
+    "magpie-tts-service",
 )
 
 
@@ -305,6 +306,67 @@ def test_pins_stay_in_the_dockerfile_not_in_compose():
                     f"{name}: compose defaults {key} to {resolved!r} but the Dockerfile "
                     f"says {defaults[key]!r}")
     assert not problems, "\n".join(problems)
+
+
+def _build_args(service: dict) -> dict[str, str]:
+    """A service's build args as {name: raw value}, before substitution, whichever form the file used."""
+    args = (service.get("build") or {}).get("args") or {}
+    if isinstance(args, dict):
+        return {key: "" if value is None else str(value) for key, value in args.items()}
+    return {key: value for key, _, value in (str(entry).partition("=") for entry in args)}
+
+
+def _plan_publish():
+    """scripts/plan_publish.py, which names the images that have a NeMo 2.x rollback line."""
+    import importlib.util
+    import sys
+
+    name = "compose_hygiene_plan_publish"
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(name, REPO_ROOT / "scripts" / "plan_publish.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module  # its dataclass resolves annotations through sys.modules
+        spec.loader.exec_module(module)
+    return sys.modules[name]
+
+
+def test_only_the_asr_images_follow_the_nemo_2_rollback_variable():
+    """NEMO_TOOLKIT_SPEC='>=2.7.3,<3' is the documented rollback for Parakeet and Canary.
+
+    Magpie read the same variable, so that rollback also built a Magpie image that cannot
+    load its model: NeMo 2.7.3 has MagpieTTSModel but not the
+    tts_dataset_utils.LANGUAGE_TOKENIZER_MAP the service imports. Magpie takes its NeMo
+    spec from MAGPIE_NEMO_TOOLKIT_SPEC, and unset it is the Dockerfile's own pin.
+    """
+    plan = _plan_publish()
+    contexts = {image: context for image, context, _ in plan.SERVICES}
+    rollback = {contexts[image].lstrip("./") for image in plan.NEMO2_SERVICES}
+    assert rollback == {"parakeet-asr-service", "canary-asr-service"}, rollback
+
+    services = _services()
+    spec_args = {}  # service -> its raw NEMO_TOOLKIT_SPEC build arg
+    for name, service in services.items():
+        args = _build_args(service)
+        if "NEMO_TOOLKIT_SPEC" in args:
+            spec_args[name] = args["NEMO_TOOLKIT_SPEC"]
+    assert set(spec_args) == rollback | {"magpie-tts-service"}, spec_args
+    follows = {name for name, raw in spec_args.items() if "${NEMO_TOOLKIT_SPEC" in raw}
+    assert follows == rollback, (
+        f"{sorted(follows)} interpolate ${{NEMO_TOOLKIT_SPEC}}, but only {sorted(rollback)} have a "
+        "NeMo 2.x line (scripts/plan_publish.py NEMO2_SERVICES)")
+    assert spec_args["magpie-tts-service"].startswith("${MAGPIE_NEMO_TOOLKIT_SPEC:-"), spec_args
+
+    build = services["magpie-tts-service"]["build"]
+    dockerfile = (REPO_ROOT / build["context"].lstrip("./") / build.get("dockerfile", "Dockerfile"))
+    pin = re.search(r'^\s*ARG\s+NEMO_TOOLKIT_SPEC=["\']?([^"\'\s]+)', dockerfile.read_text(encoding="utf-8"),
+                    flags=re.M).group(1)
+    assert interpolate(spec_args["magpie-tts-service"]) == pin
+    rolled_back = {name: interpolate(raw, {"NEMO_TOOLKIT_SPEC": ">=2.7.3,<3"}) for name, raw in spec_args.items()}
+    assert rolled_back == {
+        "parakeet-asr-service": ">=2.7.3,<3", "canary-asr-service": ">=2.7.3,<3", "magpie-tts-service": pin,
+    }, rolled_back
+    own = interpolate(spec_args["magpie-tts-service"], {"MAGPIE_NEMO_TOOLKIT_SPEC": ">=3.0.0,<4"})
+    assert own == ">=3.0.0,<4", "MAGPIE_NEMO_TOOLKIT_SPEC does not reach the Magpie build"
 
 
 def test_the_rocm_overlay_does_not_inherit_the_cuda_build_args():

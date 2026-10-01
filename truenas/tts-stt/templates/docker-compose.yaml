@@ -101,10 +101,12 @@ services:
       PARAKEET_ASR_SERVICE_URL: "http://parakeet-asr-service:5005"
       CANARY_ASR_SERVICE_URL: "http://canary-asr-service:5006"
       CHATTERBOX_TTS_SERVICE_URL: "http://chatterbox-tts-service:5007"
+      MAGPIE_TTS_SERVICE_URL: "http://magpie-tts-service:5008"
       WHISPER_CPP_SERVICE_URL: "http://whisper-cpp:8080"
       ENABLE_PARAKEET_ASR: "{{ (values.use_gpu and values.enable_parakeet) | lower }}"
       ENABLE_CANARY_ASR: "{{ (values.use_gpu and values.enable_canary) | lower }}"
       ENABLE_CHATTERBOX_TTS: "{{ (values.use_gpu and values.enable_chatterbox) | lower }}"
+      ENABLE_MAGPIE_TTS: "{{ (values.use_gpu and values.enable_magpie) | lower }}"
       ENABLE_WHISPER_CPP: "{{ values.enable_whisper_cpp | lower }}"
       ALLOWED_ORIGINS: {{ q(values.allowed_origins) }}
       ALLOW_CREDENTIALS: "false"
@@ -412,6 +414,46 @@ services:
     restart: unless-stopped
     stop_grace_period: 30s
     {{ healthcheck(5007, 900) | indent(4) }}
+    {%- if values.use_gpu %}
+    {{ gpu_deploy() | indent(4) }}
+    {%- endif %}
+    networks: [tts-stt-network]
+  {%- endif %}
+
+  {%- if values.use_gpu and values.enable_magpie %}
+
+  magpie-tts-service:
+    image: {{ reg }}/tts-stt-magpie-tts:{{ tag }}
+    pull_policy: "{{ values.pull_policy }}"
+    {%- if values.expose_backend_ports %}
+    ports: ["127.0.0.1:5008:5008"]
+    {%- endif %}
+    environment:
+      NVIDIA_VISIBLE_DEVICES: {{ q(values.gpu_device_id) }}
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      MAGPIE_MODEL: "nvidia/magpie_tts_multilingual_357m"
+      MAGPIE_DEFAULT_LANGUAGE: "de"
+      MAGPIE_DEFAULT_SPEAKER: "Sofia"
+      MAGPIE_SPEAKERS: ""
+      MAGPIE_WARM_LANGUAGES: ""
+      MAGPIE_APPLY_TN: "true"
+      MAGPIE_USE_CFG: "true"
+      MAGPIE_MAX_GROUP_CHARS: "200"
+      MAGPIE_GROUP_GAP_MS: "150"
+      MAX_TEXT_CHARS: "5000"
+      TTS_MODEL_TTL: "{{ values.model_ttl }}"
+      MODEL_TTL: "{{ values.model_ttl }}"
+      TTS_MAX_CONCURRENCY: "1"
+      TTS_MAX_QUEUE: ""
+      TTS_QUEUE_TIMEOUT_S: "60"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+      ALLOWED_ORIGINS: ""
+      ALLOW_CREDENTIALS: "false"
+    volumes:
+      - "{{ data }}/cache:/root/.cache"
+    restart: unless-stopped
+    stop_grace_period: 30s
+    {{ healthcheck(5008, 900) | indent(4) }}
     {%- if values.use_gpu %}
     {{ gpu_deploy() | indent(4) }}
     {%- endif %}

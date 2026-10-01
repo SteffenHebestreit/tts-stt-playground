@@ -22,8 +22,9 @@ import textwrap
 from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient
 
-from frontend_loader import SERVICE_DIR
+from frontend_loader import SERVICE_DIR, install_stub, load_frontend_app
 
 APP_JS = SERVICE_DIR / "static" / "js" / "app.js"
 NODE = shutil.which("node") or ("/opt/node22/bin/node" if Path("/opt/node22/bin/node").exists() else None)
@@ -90,6 +91,30 @@ const harness = {
     el: (id) => {
         if (!elements.has(id)) elements.set(id, new FakeElement('div', id));
         return elements.get(id);
+    },
+    // Opt-in: make an element behave like a single <select> where the code relies on
+    // it. `options` are its children, `value` is the selected option's (the first one
+    // once the selected option is gone, as in a browser), assigning `value` selects
+    // the option that has it, and `innerHTML = ''` empties it.
+    select: (id) => {
+        const el = harness.el(id);
+        let selected = null;
+        const current = () => {
+            if (!el.children.includes(selected)) selected = el.children[0] || null;
+            return selected;
+        };
+        Object.defineProperty(el, 'options', { get: () => el.children, configurable: true });
+        Object.defineProperty(el, 'value', {
+            get: () => (current() ? current().value : ''),
+            set: (v) => { selected = el.children.find((o) => o.value === String(v)) || null; },
+            configurable: true,
+        });
+        Object.defineProperty(el, 'innerHTML', {
+            get: () => '',
+            set: (v) => { if (String(v) === '') el.children = []; },
+            configurable: true,
+        });
+        return el;
     },
     status: (id) => {
         const box = harness.el(id).children[0];
@@ -556,6 +581,216 @@ def test_a_deliberate_registry_label_for_auto_is_kept(tmp_path):
     registry["providers"]["piper"]["settings"]["languages"][0]["label"] = "Ask the server"
     out = run_js(tmp_path, "return ttsLanguageOptions('piper')[0].label;", registry)
     assert out == "Ask the server"
+
+
+# --- the generic TTS panel: Piper, Magpie and Chatterbox share it ---------------------
+#
+# The panel showed Piper's quality, gender and speed controls for all three engines and
+# sent what they held, kept the voice list of whichever engine filled it last (so a
+# Piper voice id went to Magpie, which answers it with a 400), and asked Chatterbox and
+# Magpie for Piper's lists. What each engine has is in the gateway's registry, so these
+# run against the registry the gateway really embeds in the page.
+
+PANEL_GROUPS = ["tts-quality-group", "tts-gender-group", "tts-speed-group", "tts-voice-group", "custom-voices-panel"]
+SPEAKERS = ["Aria", "Jason", "John", "Leo", "Sofia"]
+
+
+def _gateway_registry(env=None):
+    """The gateway's registry with Magpie and Chatterbox enabled, minus the status row.
+
+    `show_status` is dropped so the health poll every engine switch starts is not one
+    more request in the lists these tests compare.
+    """
+    module = load_frontend_app({"ENABLE_MAGPIE_TTS": "true", "ENABLE_CHATTERBOX_TTS": "true", **(env or {})})
+    registry = json.loads(json.dumps(module.PROVIDER_REGISTRY))
+    for provider in registry["providers"].values():
+        provider.get("ui", {}).pop("show_status", None)
+    return registry
+
+
+def _magpie_voice_answer(monkeypatch):
+    """What the gateway's /api/providers/magpie/voices answers for the service's /speakers."""
+    module = load_frontend_app({"ENABLE_MAGPIE_TTS": "true"})
+    install_stub(monkeypatch, module, lambda method, url, kwargs: {
+        "speakers": SPEAKERS, "languages": ["de", "en", "es", "fr", "ja", "zh"], "default_language": "de"})
+    return TestClient(module.app).get("/api/providers/magpie/voices").json()
+
+
+def test_the_panel_shows_only_the_controls_the_engine_has(tmp_path):
+    out = run_js(tmp_path, f"""
+        const groups = {json.dumps(PANEL_GROUPS)};
+        const seen = [];
+        for (const engine of ['piper', 'magpie', 'chatterbox', 'piper']) {{
+            switchTTSEngine(engine);
+            seen.push(groups.filter((id) => harness.el(id).style.display !== 'none'));
+        }}
+        return seen;
+    """, _gateway_registry())
+    piper, magpie, chatterbox, piper_again = out
+    assert piper == PANEL_GROUPS and piper_again == PANEL_GROUPS
+    assert magpie == ["tts-voice-group"], "Magpie has its five speakers and nothing else of Piper's panel"
+    assert chatterbox == []
+
+
+def test_generate_sends_only_the_fields_the_engine_has(tmp_path):
+    """The hidden controls still hold Piper's values; they must not reach another engine."""
+    out = run_js(tmp_path, """
+        const bodies = {};
+        for (const engine of ['piper', 'magpie', 'chatterbox']) {
+            switchTTSEngine(engine);
+            harness.el('tts-text').value = 'Hallo Welt.';
+            harness.el('tts-language-select').value = 'de';
+            harness.el('tts-quality-select').value = 'high';
+            harness.el('tts-gender-select').value = 'female';
+            harness.el('tts-speed').value = '1.5';
+            harness.el('tts-voice-select').value = 'auto';
+            const mark = harness.requests.length;
+            await generateTTS();
+            bodies[engine] = JSON.parse(harness.requests.slice(mark).find((r) => r.url === '/api/tts').body);
+        }
+        return bodies;
+    """, _gateway_registry())
+    assert list(out["piper"].items()) == [
+        ("provider", "piper"), ("text", "Hallo Welt."), ("speed", 1.5), ("output_format", "wav"),
+        ("instructions", ""), ("language", "de"), ("quality", "high"), ("gender", "female"),
+    ], "Piper's body (and its key order) is what it always was"
+    for engine in ("magpie", "chatterbox"):
+        assert out[engine] == {"provider": engine, "text": "Hallo Welt.", "output_format": "wav",
+                               "instructions": "", "language": "de"}, engine
+
+
+def test_switching_engines_never_offers_or_sends_the_previous_engines_voices(tmp_path, monkeypatch):
+    magpie = _magpie_voice_answer(monkeypatch)
+    out = run_js(tmp_path, f"""
+        const voices = harness.select('tts-voice-select');
+        const urls = (from) => harness.requests.slice(from).map((r) => r.url);
+        harness.fetchQueue.push(harness.json({{ voices: [{{ id: 'de_DE-thorsten-medium', name: 'thorsten',
+            language: 'de_DE', kind: 'default', raw: {{ quality: 'medium' }} }}] }}));
+        await refreshTTSVoices();
+        voices.value = 'de_DE-thorsten-medium';
+        const picked = voices.value;
+
+        // Magpie's catalog is still on its way while the user generates.
+        let answer;
+        harness.fetchQueue.push(() => new Promise((resolve) => {{ answer = resolve; }}));
+        let mark = harness.requests.length;
+        switchTTSEngine('magpie');
+        const whileLoading = {{ options: voices.options.map((o) => o.value), value: voices.value, requests: urls(mark) }};
+        harness.el('tts-text').value = 'Hallo.';
+        mark = harness.requests.length;
+        await generateTTS();
+        const sent = JSON.parse(harness.requests.slice(mark).find((r) => r.url === '/api/tts').body);
+
+        answer(harness.json({json.dumps(magpie)}));
+        await harness.flush();
+        const loaded = voices.options.map((o) => [o.value, o.textContent]);
+
+        mark = harness.requests.length;
+        switchTTSEngine(currentTTSEngine);       // what initializeApp does: not a switch
+        const sameEngine = {{ requests: urls(mark), options: voices.options.length }};
+
+        mark = harness.requests.length;
+        switchTTSEngine('chatterbox');
+        const chatterbox = {{ options: voices.options.map((o) => o.value), requests: urls(mark) }};
+        return {{ picked, whileLoading, sent, loaded, sameEngine, chatterbox }};
+    """, _gateway_registry())
+    assert out["picked"] == "de_DE-thorsten-medium"
+    assert out["whileLoading"] == {"options": ["auto"], "value": "auto", "requests": ["/api/providers/magpie/voices"]}
+    assert "voice" not in out["sent"], "a Piper voice id was sent to Magpie, which refuses it with a 400"
+    assert out["loaded"] == [["auto", "Service default voice"], *[[name, name] for name in SPEAKERS]], (
+        "a built-in speaker is listed by its name, and 'auto' says it is one fixed voice")
+    assert out["sameEngine"] == {"requests": [], "options": 1 + len(SPEAKERS)}
+    assert out["chatterbox"] == {"options": ["auto"], "requests": []}, "Chatterbox has no voice catalog to ask for"
+
+
+def test_the_custom_voices_panel_is_filled_for_piper_and_only_for_piper(tmp_path):
+    """Under Magpie the panel stayed at 'Loading custom voices...' (or showed 'Is the
+    PiperTTS service running?'), and a switch back to Piper on the open tab never filled it."""
+    out = run_js(tmp_path, """
+        const urls = (from) => harness.requests.slice(from).map((r) => r.url);
+        let mark = harness.requests.length;
+        switchTTSEngine('magpie');
+        switchTTSEngine('piper');             // the tab is not open: showTab fills it later
+        const tabClosed = urls(mark);
+        await harness.flush();
+
+        switchTTSEngine('magpie');
+        await harness.flush();
+        mark = harness.requests.length;
+        showTab('tts-tab');
+        await harness.flush();
+        const tabUnderMagpie = urls(mark);
+
+        harness.fetchQueue.push(harness.json({ voices: [] }), harness.json({ voices: [] }));
+        mark = harness.requests.length;
+        switchTTSEngine('piper');
+        await harness.flush();
+        return { tabClosed, tabUnderMagpie, toPiper: urls(mark), list: harness.el('custom-voices-list').textContent };
+    """, _gateway_registry())
+    assert out["tabClosed"] == ["/api/providers/magpie/voices", "/api/providers/piper/voices"]
+    assert out["tabUnderMagpie"] == ["/api/providers/magpie/voices"]
+    assert out["toPiper"] == ["/api/providers/piper/voices", "/api/providers/piper/custom-voices"]
+    assert "No custom trained voices" in out["list"]
+
+
+def _two_engine_registry():
+    registry = json.loads(json.dumps(REGISTRY))
+    registry["providers"]["piper"]["ui"]["sections"] = {"tts": {"text_sample": "Piper sample."}}
+    registry["providers"]["magpie"] = {
+        "kind": "tts",
+        "ui": {"family": "piper", "sections": {"tts": {"text_sample": "Magpie Beispiel."}}},
+        "settings": {"languages": [{"value": "auto", "label": "Automatic"}]},
+    }
+    return registry
+
+
+def test_switching_engines_keeps_the_text_the_user_typed(tmp_path):
+    """The TTS engines share one text box; comparing two engines on one text must
+    not lose that text to the next engine's sample."""
+    out = run_js(tmp_path, """
+        const box = document.getElementById('tts-text');
+        box.value = 'Mein eigener Text.';
+        switchTTSEngine('magpie');
+        const afterMagpie = box.value;
+        switchTTSEngine('qwen3');
+        switchTTSEngine('piper');
+        return { afterMagpie, afterPiper: box.value };
+    """, _two_engine_registry())
+    assert out == {"afterMagpie": "Mein eigener Text.", "afterPiper": "Mein eigener Text."}
+
+
+def test_an_untouched_or_empty_box_takes_the_new_engines_sample(tmp_path):
+    out = run_js(tmp_path, """
+        const box = document.getElementById('tts-text');
+        box.value = '';
+        switchTTSEngine('piper');
+        const fromEmpty = box.value;
+        switchTTSEngine('magpie');
+        const fromSample = box.value;
+        box.value = '  ';
+        switchTTSEngine('piper');
+        return { fromEmpty, fromSample, fromBlank: box.value };
+    """, _two_engine_registry())
+    assert out == {"fromEmpty": "Piper sample.", "fromSample": "Magpie Beispiel.", "fromBlank": "Piper sample."}
+
+
+def test_magpies_automatic_language_names_the_default_the_service_reports(tmp_path, monkeypatch):
+    """The registry labelled it "Automatic (service default)", a label app.js keeps as one
+    chosen on purpose, so the German the service reports was never named."""
+    magpie = _magpie_voice_answer(monkeypatch)
+    assert magpie["default_language"] == "de"
+    out = run_js(tmp_path, f"""
+        const languages = harness.select('tts-language-select');
+        const auto = () => languages.options.find((o) => o.value === 'auto').textContent;
+        harness.fetchQueue.push(harness.json({json.dumps(magpie)}));
+        switchTTSEngine('magpie');
+        const beforeTheAnswer = auto();
+        await harness.flush();
+        return {{ beforeTheAnswer, after: auto(), selected: languages.value }};
+    """, _gateway_registry())
+    assert out["beforeTheAnswer"] == "Automatic - server decides"
+    assert out["after"] == "Automatic - server decides (default: German)"
+    assert out["selected"] == "auto"
 
 
 # --- text safety -------------------------------------------------------------

@@ -46,7 +46,7 @@ Usage: preflight.sh --data-dir PATH [options]
   --data-dir PATH         the dataset you will use as APP_DATA_DIR (default: $APP_DATA_DIR)
   --create                create the data subdirectories (the dataset itself must already exist)
   --with LIST             optional services to plan for, comma separated:
-                          canary-asr, parakeet-asr, chatterbox-tts, training, whisper-cpp
+                          canary-asr, parakeet-asr, chatterbox-tts, magpie-tts, training, whisper-cpp
   --whisper-model NAME    stt-service model (default: large-v3-turbo)
   --qwen3-tts-model NAME  qwen3-tts model (default: Qwen/Qwen3-TTS-12Hz-0.6B-Base)
   --gpu-id ID             GPU index or UUID the app will use (default: 0)
@@ -118,7 +118,7 @@ if [ -n "$WITH" ]; then
     svc=$(ts_service_for_profile "$item")
     [ -z "$svc" ] && [ -n "$(ts_field "$item" 1)" ] && svc=$item
     if [ -z "$svc" ]; then
-      echo "unknown optional service: $item (try: canary-asr, parakeet-asr, chatterbox-tts, training, whisper-cpp)" >&2
+      echo "unknown optional service: $item (try: canary-asr, parakeet-asr, chatterbox-tts, magpie-tts, training, whisper-cpp)" >&2
       exit 2
     fi
     SELECTED+=("$svc")
@@ -364,7 +364,7 @@ if [ "$DOCKER_OK" = 1 ] && wants_gpu; then
     else
       ok "$free GB free under the Docker root $docker_root (images need about $need GB)"
     fi
-    info "optional NeMo, Chatterbox and training images are large as well; leave extra room for each."
+    info "optional NeMo, Chatterbox, Magpie and training images are large as well; leave extra room for each."
   fi
 fi
 

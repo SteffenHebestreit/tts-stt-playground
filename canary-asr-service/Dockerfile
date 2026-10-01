@@ -12,12 +12,22 @@ WORKDIR /app
 # The tarfile check below makes the build fail instead of the first model load.
 #
 # DEBIAN_FRONTEND is set per command, not as ENV, so it does not leak into the
-# running container. Without it, software-properties-common pulls in tzdata, which
-# stops to ask "Geographic area:" and an unattended build hangs until it times out.
+# running container. Without it, the python3.11 install pulls in tzdata (deadsnakes'
+# libpython3.11-stdlib depends on it), which stops to ask "Geographic area:" and an
+# unattended build hangs until it times out.
+#
+# software-properties-common is needed for add-apt-repository only, and it brings
+# about 25 of Ubuntu's Python 3.10 packages into /usr/lib/python3/dist-packages,
+# which is on python3.11's sys.path too: pip cannot uninstall the distutils-era
+# blinker 1.4 from there, takes six and more-itertools from there instead of
+# installing its own, and `pip check` fails on pygobject. So it is purged as soon as
+# the PPA is added. The PPA's list and key stay, and so do gpg-agent (the CUDA
+# base's gnupg2 depends on it) and ca-certificates.
 RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         software-properties-common gpg-agent ca-certificates && \
     add-apt-repository -y ppa:deadsnakes/ppa && \
+    DEBIAN_FRONTEND=noninteractive apt-get purge -y --auto-remove software-properties-common && \
     apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y \
         python3.11 \
@@ -67,6 +77,11 @@ RUN pip3 install --no-cache-dir "torch==${TORCH_VERSION}" "torchaudio==${TORCHAU
 # failing only at the check below.
 COPY requirements.txt .
 ARG NEMO_TOOLKIT_SPEC=">=3.0.0,<3.1"
+# pip builds a package that ships only as source in a subprocess that ignores
+# --no-cache-dir but reads this variable; without it this layer kept about 1 MB of
+# wheels in /root/.cache/pip, which Docker copies into every new canary-asr-cache
+# volume. An ARG, so the running container does not have it.
+ARG PIP_NO_CACHE_DIR=1
 RUN grep -viE '^[[:space:]]*nemo[-_]toolkit' requirements.txt > requirements.app.txt && \
     printf 'torch==%s\ntorchaudio==%s\n' "${TORCH_VERSION}" "${TORCHAUDIO_VERSION}" > /tmp/torch-constraints.txt && \
     pip3 install --no-cache-dir -c /tmp/torch-constraints.txt "nemo_toolkit[asr]${NEMO_TOOLKIT_SPEC}" -r requirements.app.txt && \

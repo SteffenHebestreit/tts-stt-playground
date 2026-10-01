@@ -18,17 +18,17 @@ The target architecture is:
 Status as of 2026-09-29. What exists, and what is still hardcoded:
 
 - **Registry and contracts (phase 1): done.** The gateway builds a provider registry (`GET /providers`),
-  the contracts are written down in [provider-contracts.md](provider-contracts.md), and nine providers
-  are registered: Piper, Qwen3-TTS and Chatterbox (TTS), faster-whisper, Qwen3-ASR, Parakeet, Canary
-  and whisper.cpp (STT), and Piper training. `PROVIDER_REGISTRY_JSON`, `TRAINING_PROVIDER` and
+  the contracts are written down in [provider-contracts.md](provider-contracts.md), and ten providers
+  are registered: Piper, Qwen3-TTS, Chatterbox and Magpie (TTS), faster-whisper, Qwen3-ASR, Parakeet,
+  Canary and whisper.cpp (STT), and Piper training. `PROVIDER_REGISTRY_JSON`, `TRAINING_PROVIDER` and
   `DEFAULT_*_PROVIDER` shape it at deploy time.
 - **STT is generalised.** Five providers speak `stt-form-v1` (four of them) or
   `openai-audio-transcriptions-v1` (whisper.cpp). The OpenAI-compatible `/v1` surface returns one response shape whichever backend
   answers, and falls back to the single healthy alternative when the default cannot be reached.
 - **Model services share one lifecycle contract.** `/health` (liveness, never loads a model),
   `/ready` (503 while the first load runs or after it failed), `POST /unload` (409 while busy) and an
-  idle TTL, implemented once in `model_lifecycle.ModelSlot` and shared by four of the six model
-  services (Qwen3-ASR, Parakeet, Canary, Chatterbox; `stt-service` has its own residency module and
+  idle TTL, implemented once in `model_lifecycle.ModelSlot` and shared by five of the seven model
+  services (Qwen3-ASR, Parakeet, Canary, Chatterbox, Magpie; `stt-service` has its own residency module and
   Qwen3-TTS a bespoke reaper).
 - **Contract tests exist for the gateway, not yet for the backends.** `tests/test_openai_v1_api.py`
   asserts the identical response shape across providers and the gateway adapters have unit suites; a
@@ -36,7 +36,8 @@ Status as of 2026-09-29. What exists, and what is still hardcoded:
 - **The OpenAPI specs are generated** from the apps (`scripts/sync_openapi.py`) and CI fails when a
   committed spec is stale, so the training spec can no longer describe routes that do not exist.
 - **TTS and training are still Piper- and Qwen3-specific in the UI**, although adding Chatterbox
-  needed only registry data, one adapter mapping and no change to the general TTS request path.
+  and then Magpie needed only registry data, one adapter mapping and no change to the general TTS request path
+  or to the browser code.
 - **Provider metadata is mostly static, and the exceptions are narrow.** Canary's language list and
   display name are refreshed from the service's `/status`, so they follow `CANARY_ASR_MODEL`
   (fallback en/de/es/fr while it is unreachable); `/api/providers/piper/voices` passes on the
@@ -103,7 +104,7 @@ Exit criteria:
 - basic TTS providers can be added without editing the general TTS request path
 - advanced provider-specific features remain isolated behind explicit capability checks
 
-Status: **partial.** `simple-json-tts-v1` is shared by Piper, Qwen3-TTS and Chatterbox, and
+Status: **partial.** `simple-json-tts-v1` is shared by Piper, Qwen3-TTS, Chatterbox and Magpie, and
 `chunked-wav-stream-v1` and `saved-voice-library-v1` isolate the advanced features. Qwen3-TTS still
 needs its payload translated by the adapter.
 

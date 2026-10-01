@@ -79,7 +79,7 @@ def test_the_release_is_a_plain_semantic_version_and_the_catalog_version_follows
 
 def test_the_custom_app_file_defaults_every_image_to_the_release():
     images = our_images(COMPOSE_APP)
-    assert len(images) >= 10, sorted(images)  # 5 default + 5 optional services + the seed job
+    assert len(images) >= 12, sorted(images)  # 5 default + 6 optional services + the seed job
     wrong = {name: image for name, (image, _) in images.items() if tag_of(image) != release()}
     assert not wrong, f"images that do not default to {release()}: {wrong}"
 
@@ -114,7 +114,8 @@ def test_the_catalog_form_defaults_to_the_release_and_to_pulling_only_what_is_mi
 def test_the_catalog_template_renders_the_release_into_every_image():
     answers = render_catalog.default_answers(render_catalog.load_questions(), {
         "host_path": "/mnt/tank/apps/tts-stt", "enable_canary": "true", "enable_parakeet": "true",
-        "enable_chatterbox": "true", "enable_training": "true", "enable_whisper_cpp": "true"})
+        "enable_chatterbox": "true", "enable_magpie": "true", "enable_training": "true",
+        "enable_whisper_cpp": "true"})
     rendered = yaml.safe_load(render_catalog.render(answers))
     tags = {n: tag_of(s["image"]) for n, s in rendered["services"].items()}
     assert set(tags.values()) == {release()}, tags

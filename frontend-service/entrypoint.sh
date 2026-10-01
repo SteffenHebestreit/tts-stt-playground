@@ -19,6 +19,18 @@ if ! [ "$workers" -ge 1 ] 2>/dev/null; then
     workers=2
 fi
 
+# Every upstream name lookup runs on libuv's thread pool. uvicorn[standard]'s
+# --loop auto picks uvloop, which resolves names on that pool; libuv lets only
+# half of the pool resolve at once (2 of the default 4 threads), and a lookup
+# whose caller has timed out still holds its thread until it finishes. On Docker
+# Desktop for Windows a provider that is not running takes 2.5 to 4 s to fail to
+# resolve (LLMNR/NetBIOS), so one health round over the absent providers queued a
+# running provider's lookup past the gateway's 3 s connect timeout: ConnectTimeout,
+# and 503 "is unavailable" for a healthy service. 32 threads allow 16 lookups at
+# once; 16 threads were measured as marginal (with 9 absent providers, Magpie's
+# lookup waited 2577 of its 3000 ms). A value set in the environment wins.
+export UV_THREADPOOL_SIZE="${UV_THREADPOOL_SIZE:-32}"
+
 # exec: uvicorn becomes PID 1 and receives SIGTERM directly.
 exec python -m uvicorn app:app \
     --host 0.0.0.0 --port 3000 \

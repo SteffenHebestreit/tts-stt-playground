@@ -320,11 +320,14 @@ def test_static_ids_app_js_looks_up_exist_in_the_template(source: str):
     lookups = set()
     for pattern in (
         r"getElementById\(\s*'([^']+)'",
-        r"(?:setElementText|setElementFormattedText|setInputPlaceholder|setInputValue|showStatus|populateSelectOptions|applyInputNumberConfig|getSelectedTrainingDeploymentTarget)\(\s*'([^']+)'",
+        r"(?:setElementText|setElementFormattedText|setInputPlaceholder|setInputValue|showStatus|populateSelectOptions|applyInputNumberConfig|getSelectedTrainingDeploymentTarget|setGroupVisible)\(\s*'([^']+)'",
     ):
         lookups.update(re.findall(pattern, source))
     missing = sorted(lookups - template_ids - created_by_script)
     assert not missing, f"app.js looks up ids that index.html does not define: {missing}"
+    # The TTS panel hides what an engine does not have by these wrappers' ids.
+    assert {"tts-quality-group", "tts-gender-group", "tts-speed-group", "tts-voice-group",
+            "custom-voices-panel"} <= lookups, "the engine-dependent groups are no longer looked up"
 
 
 # --- script/template DOM contracts -------------------------------------------
