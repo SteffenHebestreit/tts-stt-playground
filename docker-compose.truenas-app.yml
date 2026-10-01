@@ -577,6 +577,8 @@ services:
       # Off, the model silently drops every digit.
       MAGPIE_APPLY_TN: ${MAGPIE_APPLY_TN:-true}
       MAGPIE_USE_CFG: ${MAGPIE_USE_CFG:-true}
+      # Longest group of whole sentences per generation call: 40-250, another value falls
+      # back to 200 with a warning. Chinese and Japanese groups are a third of it.
       MAGPIE_MAX_GROUP_CHARS: ${MAGPIE_MAX_GROUP_CHARS:-200}
       MAGPIE_GROUP_GAP_MS: ${MAGPIE_GROUP_GAP_MS:-150}
       MAX_TEXT_CHARS: ${MAGPIE_MAX_TEXT_CHARS:-5000}

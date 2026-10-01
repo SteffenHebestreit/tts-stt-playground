@@ -63,8 +63,12 @@ RUN pip3 install --no-cache-dir "torch==${TORCH_VERSION}" "torchaudio==${TORCHAU
 
 # Install application dependencies (NeMo is large; this layer is slow on first build).
 # NEMO_TOOLKIT_SPEC replaces the nemo_toolkit line of requirements.txt, so the release
-# line is a build argument, not an edit. The `tts` extra brings nemo_text_processing,
-# which the text normalization (digits, dates, times) depends on.
+# line is a build argument, not an edit. docker-compose.yml fills it from
+# MAGPIE_NEMO_TOOLKIT_SPEC, not from the NEMO_TOOLKIT_SPEC that rolls the ASR images
+# back to NeMo 2.x, so that variable does not reach this image (an explicit
+# `docker compose build --build-arg NEMO_TOOLKIT_SPEC=...` still does). The `tts`
+# extra brings nemo_text_processing, which the text normalization (digits, dates,
+# times) depends on.
 # The torch check runs again because installing NeMo must not swap the wheel, and torch
 # and torchaudio are HELD during the install by a constraint file: a NeMo release that
 # wants another torch then fails the resolver right here, instead of downloading several

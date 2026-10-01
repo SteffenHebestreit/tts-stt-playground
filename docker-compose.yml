@@ -714,8 +714,9 @@ services:
       # Classifier-free guidance: better speech for roughly twice the compute.
       MAGPIE_USE_CFG: ${MAGPIE_USE_CFG:-true}
       # Long text is generated in groups of whole sentences of at most this many
-      # characters (40-250; Chinese and Japanese groups are a third of it), joined with
-      # MAGPIE_GROUP_GAP_MS of silence.
+      # characters, joined with MAGPIE_GROUP_GAP_MS of silence. 40-250; another value
+      # falls back to 200 with a warning (above 250 NeMo would chunk an English group
+      # itself again). Chinese and Japanese groups are a third of it.
       MAGPIE_MAX_GROUP_CHARS: ${MAGPIE_MAX_GROUP_CHARS:-200}
       MAGPIE_GROUP_GAP_MS: ${MAGPIE_GROUP_GAP_MS:-150}
       MAX_TEXT_CHARS: ${MAGPIE_MAX_TEXT_CHARS:-5000}

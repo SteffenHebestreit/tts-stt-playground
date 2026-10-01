@@ -16,7 +16,7 @@ shows it when `ENABLE_MAGPIE_TTS=true` is set on the frontend.
 
 | | |
 |---|---|
-| `POST /tts` | `{"text": "...", "language": "auto", "speaker": "Sofia"}` returns `audio/wav`. `language` is a code (`de`, `de-DE`) or a name (`German`); `auto` or blank is `MAGPIE_DEFAULT_LANGUAGE`. `speaker` is a name (any case) or an index; blank is `MAGPIE_DEFAULT_SPEAKER`. Response headers: `X-Sample-Rate`, `X-Language`, `X-Speaker`, `X-Chunk-Count`, `X-Generation-Time`. |
+| `POST /tts` | `{"text": "...", "language": "auto", "speaker": "Sofia"}` returns `audio/wav`. `language` is a code (`de`, `de-DE`) or a name (`German`); `auto` or blank is `MAGPIE_DEFAULT_LANGUAGE`. `speaker` is a name (any case) or an index; blank is `MAGPIE_DEFAULT_SPEAKER`. Response headers: `X-Sample-Rate`, `X-Language`, `X-Speaker`, `X-Chunk-Count` (the generations joined; a group generated again in two halves counts twice), `X-Generation-Time`. |
 | `GET /speakers` | The speakers, in the `speaker-catalog-v1` shape the gateway turns into the voice list. |
 | `GET /languages` | The languages this deployment can speak and the default. |
 | `GET /health`, `GET /ready`, `GET /status` | Liveness, readiness (`loading` / `load_failed` as 503), details with GPU memory. |
@@ -25,6 +25,12 @@ shows it when `ENABLE_MAGPIE_TTS=true` is set on the frontend.
 An unsupported language or an unknown speaker is `400` and names what is available. A full queue, or
 a wait longer than `TTS_QUEUE_TIMEOUT_S`, is `503` with `Retry-After`. The gateway passes both on with
 their sentence (on `/v1` as `400` `invalid_request_error` and `503` `server_busy`).
+
+`/tts` answers only once the whole text is done, so the gateway waits for it up to
+max(600 s, 180 s + 0.1 s per character), or 0.25 s per character for a request in Chinese or Japanese
+(`auto` counts as neither, even when `MAGPIE_DEFAULT_LANGUAGE` is `zh` or `ja`). When that runs out, or
+its caller hangs up, the gateway closes its connection to Magpie, and Magpie stops after the group it is
+generating; a request still waiting for its turn leaves the queue at once.
 
 ## Things measured on the real model (nemo_toolkit 3.0.0, RTX 4080)
 
@@ -48,15 +54,19 @@ their sentence (on `/v1` as `400` `invalid_request_error` and `503` `server_busy
   trailing token at the points where it ended a chunk by force. Groups of whole sentences (at most
   `MAGPIE_MAX_GROUP_CHARS`, 200 by default) transcribed back word for word.
   Chinese and Japanese are grouped too, in groups of at most a third of that (66 characters by default,
-  about 15 s of speech): a sentence ends after 。！？… (or `!`, `?`, a `.` before a space, a line break),
-  a longer sentence is cut after a clause mark (，、；：), and only text without one is cut at the limit.
-  NeMo 3.0.0 splits these languages itself only above 100 characters and only at 。？！…, so a long
-  sentence joined only by commas used to be one chunk, cut off by the decoder at about 23 s while the
-  request still answered 200.
-* **A group that NeMo cuts off is generated again.** NeMo stops decoding a call at about 23 s of audio.
-  A group that reaches that limit (number-dense text, which normalization makes much longer, can) is
-  split in two and the halves are generated instead; if it cannot be split, or a half reaches the limit
-  too, that audio is kept as it is and the service logs a warning rather than failing the request.
+  14 to 16 s of speech at the measured 4.2 to 4.6 characters per second). A sentence ends after 。！？…
+  or `!` `?` (closing marks such as 」 stay with it), at a `.` only before a space or the end of the
+  text (so `3.5` stays whole), and at a line break. A longer sentence is cut after its last clause mark
+  (，、；： or `,;:`, but not inside `14:30` or `1,000`) that leaves at least a third of the limit before
+  the cut, else at a space, and only else hard at the limit. NeMo 3.0.0 splits these languages itself
+  only above 100 characters (Chinese) or 80 words (Japanese), and only at 。？！…, so a long sentence
+  joined only by commas used to be one chunk, cut off by the decoder at about 23 s while the request
+  still answered 200.
+* **A group that NeMo cuts off is generated again.** NeMo stops decoding a call at 500 frames, 23.2 s
+  of audio. A group that reaches that limit (number-dense text, which normalization makes much longer,
+  can) is split in two and the halves are generated instead, with a warning in the log; if it cannot
+  be split, or a half reaches the limit too, that audio is kept as it is, again with a warning, rather
+  than failing the request.
 
 ## Settings
 
@@ -65,7 +75,7 @@ their sentence (on `/v1` as `400` `invalid_request_error` and `503` `server_busy
 | `MAGPIE_MODEL` | `nvidia/magpie_tts_multilingual_357m` | A Hub id, or the path of a `.nemo` file on a mounted volume. |
 | `MAGPIE_DEFAULT_LANGUAGE` | `de` | What `auto` means. Must be one of the supported languages or requests without a language are refused. |
 | `MAGPIE_DEFAULT_SPEAKER` | `Sofia` | |
-| `MAGPIE_SPEAKERS` | empty (= `Aria,Jason,John,Leo,Sofia`) | Names in baked-embedding order, comma-separated, for a `MAGPIE_MODEL` that orders or names them differently. |
+| `MAGPIE_SPEAKERS` | empty (= `Aria,Jason,John,Leo,Sofia`) | Names in baked-embedding order, for a `MAGPIE_MODEL` that orders or names them differently: comma- or line-separated (a YAML block scalar works). A control character is removed from a name, which keeps its position. |
 | `MAGPIE_WARM_LANGUAGES` | empty | More languages to warm at the first load, comma-separated (the default language is always warmed). `/ready` answers 503 `loading` until that first load is done; a reload after an idle unload needs no warm-up (see above). |
 | `MAGPIE_APPLY_TN` | `true` | Text normalization; see above. |
 | `MAGPIE_USE_CFG` | `true` | Classifier-free guidance: better speech, roughly twice the compute. |
@@ -117,5 +127,8 @@ the NeMo 2.x rollback of the ASR images (`NEMO_TOOLKIT_SPEC='>=2.7.3,<3'`) does 
 has `MagpieTTSModel` but not the language map (`LANGUAGE_TOKENIZER_MAP`) the service imports. The build
 imports both, and NeMo's text normalizer: an incompatible NeMo, or a missing or broken
 `nemo_text_processing` (which NeMo would swallow, and then drop every digit), fails the build instead of
-the first model load. The Japanese OpenJTalk dictionary is built in (about 107 MB), so the first Japanese
-request downloads nothing and works on a host without internet access.
+the first model load; NeMo 2.x stops it with `cannot import name 'LANGUAGE_TOKENIZER_MAP'`. The Japanese
+OpenJTalk dictionary is built in (about 107 MB, in pyopenjtalk's package directory), so the first Japanese
+request downloads nothing and works on a host without internet access. Building the image therefore
+needs access to github.com (the dictionary is a release asset of `r9y9/open_jtalk`) as well as to PyPI
+and download.pytorch.org.

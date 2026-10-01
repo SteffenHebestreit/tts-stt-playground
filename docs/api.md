@@ -500,6 +500,13 @@ is refused the same way. The `*_MAX_QUEUE` variables are empty by default, which
 concurrency (4 with the default of 1). A synthesis that itself runs longer than `PIPER_TIMEOUT_S` is
 killed and answered `504`.
 
+A caller that hangs up while `/api/tts` or `/v1/audio/speech` waits for a backend's answer does not
+leave the work running: the gateway cancels its backend call, which closes its connection to the
+backend, and logs that the caller hung up. Piper then kills its synthesis process, and Magpie stops
+after the group of sentences it is generating (a request still waiting for its turn leaves the queue
+at once); the gateway's own read timeout closes the connection the same way. Once a streamed answer
+has started (Chatterbox on `/api/tts`), Starlette's own disconnect handling applies instead.
+
 ---
 
 ## Not implemented
