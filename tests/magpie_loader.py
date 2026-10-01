@@ -29,6 +29,11 @@ real model:
   attributes). The real model seldom gets that far: it ends speech that needs more room
   itself, a little before the limit (decoder step 234 of 250), and ``early_end`` makes
   the fake do the same;
+* loading the model loads its audio codec, which NeMo 3.0.0 gives a training-only
+  speaker encoder whose checkpoint it downloads from huggingface.co on every load
+  (``audio_codec_modules.ResNetSpeakerEncoder.load_checkpoint``); the fake records each
+  such download in ``package.speaker_encoder_downloads`` (``codec_modules=False``: a NeMo
+  without that module);
 * the real ``LANGUAGE_TOKENIZER_MAP`` lists tokenizers by name, and the checkpoint holds
   Italian, Vietnamese and Hindi tokenizers under names that map does not list. The fake
   map reproduces that gap, so ``it``, ``vi`` and ``hi`` are not routable even though a
@@ -72,6 +77,8 @@ MANAGED_ENV = (
 )
 
 SAMPLE_RATE = 22050
+# What NeMo 3.0.0's AudioCodecModel downloads for its speaker encoder on every load.
+SPEAKER_ENCODER_URL = "https://huggingface.co/Edresson/Speaker_Encoder_H_ASP/resolve/main/pytorch_model.bin"
 # Samples the fake produces per character of input.
 SAMPLES_PER_CHAR = 10
 
@@ -346,6 +353,10 @@ class FakeNemo:
         self.calls: list = []
         # The language of every text-normalizer build, in order, across all model instances.
         self.normalizer_builds: list = []
+        # The checkpoint URL of every speaker-encoder download a codec load made.
+        self.speaker_encoder_downloads: list = []
+        # The fake nemo.collections.tts.modules.audio_codec_modules, when there is one.
+        self.codec_modules: Optional[types.ModuleType] = None
 
     @property
     def model(self) -> FakeMagpie:
@@ -354,6 +365,10 @@ class FakeNemo:
     def _new(self, name: str) -> FakeMagpie:
         self.loads += 1
         self.load_names.append(name)
+        if self.codec_modules is not None:
+            # AudioCodecModel.__init__ with use_scl_loss, as the released codec is configured;
+            # the class attribute is looked up now, so a patch the service made applies.
+            self.codec_modules.ResNetSpeakerEncoder().load_checkpoint(SPEAKER_ENCODER_URL, strict=False)
         if self.load_error is not None:
             raise self.load_error
         model = FakeMagpie(self, self.speakers, self.tokenizers)
@@ -364,7 +379,8 @@ class FakeNemo:
 def install_nemo(monkeypatch, *, speakers: int = 5, tokenizers=CHECKPOINT_TOKENIZERS,
                  load_error: Optional[Exception] = None, generate_error: Optional[Exception] = None,
                  generate_error_calls: Optional[int] = None, decoder_cap: Optional[int] = None,
-                 early_end: int = 0, failing_normalizers=(), normalizer_cache: bool = True) -> FakeNemo:
+                 early_end: int = 0, failing_normalizers=(), normalizer_cache: bool = True,
+                 codec_modules: bool = True) -> FakeNemo:
     """Register a fake ``nemo.collections.tts`` (removed again by monkeypatch).
 
     ``decoder_cap``: the decoder's frame limit (NeMo's max_decoder_steps), counted in
@@ -373,6 +389,7 @@ def install_nemo(monkeypatch, *, speakers: int = 5, tokenizers=CHECKPOINT_TOKENI
     decoder step 234 of 250: 32 of 500 frames before the limit).
     ``failing_normalizers``: languages whose first text-normalizer build fails.
     ``normalizer_cache=False``: a model without NeMo 3.0's ``_text_normalizers``.
+    ``codec_modules=False``: a NeMo without ``audio_codec_modules.ResNetSpeakerEncoder``.
     """
     package = FakeNemo(speakers, tokenizers, load_error, generate_error, generate_error_calls,
                        decoder_cap, failing_normalizers, normalizer_cache, early_end)
@@ -404,6 +421,15 @@ def install_nemo(monkeypatch, *, speakers: int = 5, tokenizers=CHECKPOINT_TOKENI
     )
     root.collections, collections.tts = collections, tts
     tts.models, tts.parts, parts.utils, utils.tts_dataset_utils = models, parts, utils, dataset_utils
+    if codec_modules:
+        class ResNetSpeakerEncoder:
+            def load_checkpoint(self, checkpoint_path, strict=True):
+                package.speaker_encoder_downloads.append(checkpoint_path)
+
+        tts.modules = module("nemo.collections.tts.modules")
+        package.codec_modules = module(
+            "nemo.collections.tts.modules.audio_codec_modules", ResNetSpeakerEncoder=ResNetSpeakerEncoder)
+        tts.modules.audio_codec_modules = package.codec_modules
     return package
 
 

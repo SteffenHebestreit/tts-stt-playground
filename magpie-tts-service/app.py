@@ -234,6 +234,35 @@ def _share_text_normalizers(model) -> None:
         model._text_normalizers = _TEXT_NORMALIZERS
 
 
+def _skip_codec_speaker_encoder() -> None:
+    """Keep the audio codec from downloading its training-only speaker encoder at every load.
+
+    The released codec (nvidia/nemo-nano-codec-22khz-1.89kbps-21.5fps) is configured with
+    use_scl_loss, a training loss, and NeMo 3.0.0's AudioCodecModel then builds a speaker
+    encoder and fills it with ``ResNetSpeakerEncoder.load_checkpoint(<huggingface.co URL>)``:
+    an uncached read that moved ~600 MiB, took ~22 s of every ~35 s load (the first one and
+    every reload after an idle unload or /unload), and fails without internet access.
+    Only the codec's training and validation steps use those weights, and its
+    state_dict/load_state_dict leave them out. MagpieTTSModel itself turns use_scl_loss off
+    for a codec given as a local path ("disable loading of loss modules not needed during
+    inference"), but not for one named by its Hub id, which is how the checkpoint names it.
+    So the download is replaced by a log line, for this process. A NeMo without that
+    class (another layout) is left alone, with a warning: loads are then slow again.
+    """
+    try:
+        from nemo.collections.tts.modules import audio_codec_modules
+
+        encoder = audio_codec_modules.ResNetSpeakerEncoder
+    except (ImportError, AttributeError) as e:
+        logger.warning("Cannot skip the audio codec's training-only speaker encoder (%s); every load downloads it.", e)
+        return
+
+    def load_checkpoint(self, checkpoint_path, strict=True):
+        logger.info("Not loading the audio codec's speaker encoder (%s): only training uses it.", checkpoint_path)
+
+    encoder.load_checkpoint = load_checkpoint
+
+
 def _load_magpie():
     """Load the model onto the active device and warm it (called by the slot, in a worker thread)."""
     global tts_model, model_loaded, _supported, _speaker_count
@@ -244,6 +273,7 @@ def _load_magpie():
         from nemo.collections.tts.models import MagpieTTSModel
         from nemo.collections.tts.parts.utils.tts_dataset_utils import LANGUAGE_TOKENIZER_MAP
 
+        _skip_codec_speaker_encoder()
         if os.path.isfile(MODEL_NAME):
             model = MagpieTTSModel.restore_from(restore_path=MODEL_NAME)
         else:

@@ -17,7 +17,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from magpie_loader import (
-    SAMPLE_RATE, SAMPLES_PER_CHAR, decode_audio, install_nemo, load_app, speakers_in, wait_until, wait_until_async,
+    SAMPLE_RATE, SAMPLES_PER_CHAR, SPEAKER_ENCODER_URL, decode_audio, install_nemo, load_app, speakers_in, wait_until,
+    wait_until_async,
 )
 from test_piper_tts_harness import asgi_post_json
 
@@ -638,6 +639,36 @@ def test_a_model_that_keeps_no_normalizers_where_the_service_sees_them_warms_up_
     assert _tts(client).status_code == 200
 
     assert [c["text"] for c in package.calls] == ["Hallo.", TEXT, "Hallo.", TEXT]
+
+
+# NeMo 3.0.0's audio codec builds a speaker encoder for a training loss and downloads its
+# checkpoint (44.6 MB, ~600 MiB moved) from huggingface.co on every load: ~22 s of each
+# ~35 s load, and a load that fails without internet access.
+
+def test_no_load_downloads_the_codecs_training_only_speaker_encoder(monkeypatch, caplog):
+    package = install_nemo(monkeypatch)
+    client = TestClient(load_app().app)
+
+    with caplog.at_level("INFO"):
+        assert _tts(client).status_code == 200
+        assert client.post("/unload").status_code == 200
+        assert _tts(client).status_code == 200
+
+    assert package.loads == 2
+    assert package.speaker_encoder_downloads == [], "a load downloaded the speaker encoder"
+    assert caplog.text.count(f"Not loading the audio codec's speaker encoder ({SPEAKER_ENCODER_URL})") == 2
+
+
+def test_a_nemo_without_the_speaker_encoder_class_still_loads(monkeypatch, caplog):
+    """Skipping the download is an optimisation: another NeMo layout must not stop the load."""
+    package = install_nemo(monkeypatch, codec_modules=False)
+    client = TestClient(load_app().app)
+
+    with caplog.at_level("WARNING"):
+        response = _tts(client)
+
+    assert response.status_code == 200 and package.loads == 1
+    assert "Cannot skip the audio codec's training-only speaker encoder" in caplog.text
 
 
 def test_a_checkpoint_with_no_baked_speakers_is_a_load_failure_with_a_helpful_log(monkeypatch, caplog):
