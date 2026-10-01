@@ -14,6 +14,6 @@ kaldialign
 # NeMo resolves the newest release, 13.x.
 cuda-bindings>=12.8,<13
 fastapi>=0.104.0
-uvicorn[standard]>=0.24.0
+uvicorn[standard]>=0.54.0
 soundfile>=0.12.0
 numpy>=1.24.0
