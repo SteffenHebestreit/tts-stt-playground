@@ -26,7 +26,7 @@ Usage: pull-images.sh --tag TAG [options]
   --tag TAG         release to pull, e.g. 0.2.0 (default: the version of this checkout, if any)
   --registry REG    image registry/owner (default: ghcr.io/steffenhebestreit)
   --with LIST       also pull optional services: canary-asr, parakeet-asr, chatterbox-tts,
-                    training, whisper-cpp
+                    magpie-tts, training, whisper-cpp
   --only LIST       pull just these services (names as in the compose file)
   --dry-run         print what would be pulled
   -h, --help        this text

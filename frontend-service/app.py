@@ -185,7 +185,7 @@ UPLOAD_RETRY_AFTER_S = 5
 
 # Longest text a TTS request may carry (Piper and Qwen3 both synthesise a whole
 # request in one go; an unbounded string is an unbounded GPU job). The default is
-# what the smallest backend accepts (chatterbox and qwen3-tts: MAX_TEXT_CHARS=5000);
+# what the smallest backend accepts (chatterbox, magpie-tts and qwen3-tts: MAX_TEXT_CHARS=5000);
 # a larger value only moves the failure from an early, clear 422 here to a 413
 # from the backend after the request has already been queued. Keep it <= the
 # smallest MAX_TEXT_CHARS of the TTS backends in use.
@@ -689,6 +689,7 @@ QWEN3_ASR_SERVICE_URL = os.getenv("QWEN3_ASR_SERVICE_URL", "http://qwen3-asr-ser
 PARAKEET_ASR_SERVICE_URL = os.getenv("PARAKEET_ASR_SERVICE_URL", "http://parakeet-asr-service:5005")
 CANARY_ASR_SERVICE_URL = os.getenv("CANARY_ASR_SERVICE_URL", "http://canary-asr-service:5006")
 CHATTERBOX_TTS_SERVICE_URL = os.getenv("CHATTERBOX_TTS_SERVICE_URL", "http://chatterbox-tts-service:5007")
+MAGPIE_TTS_SERVICE_URL = os.getenv("MAGPIE_TTS_SERVICE_URL", "http://magpie-tts-service:5008")
 WHISPER_CPP_SERVICE_URL = os.getenv("WHISPER_CPP_SERVICE_URL", "http://whisper-cpp:8080")
 
 # Browser-facing URLs (host ports, used by client-side JavaScript)
@@ -696,6 +697,7 @@ ENABLE_WHISPER_CPP = os.getenv("ENABLE_WHISPER_CPP", "false").strip().lower() in
 ENABLE_PARAKEET_ASR = os.getenv("ENABLE_PARAKEET_ASR", "false").strip().lower() in {"1", "true", "yes", "on"}
 ENABLE_CANARY_ASR = os.getenv("ENABLE_CANARY_ASR", "false").strip().lower() in {"1", "true", "yes", "on"}
 ENABLE_CHATTERBOX_TTS = os.getenv("ENABLE_CHATTERBOX_TTS", "false").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_MAGPIE_TTS = os.getenv("ENABLE_MAGPIE_TTS", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _build_basic_tts_messages() -> dict:
@@ -1424,6 +1426,60 @@ def _build_provider_registry() -> dict:
             },
         }
 
+    if ENABLE_MAGPIE_TTS:
+        providers["magpie"] = {
+            "kind": "tts",
+            "display_name": "Magpie TTS (NVIDIA, 5 voices)",
+            "short_name": "Magpie",
+            "internal_url": MAGPIE_TTS_SERVICE_URL,
+            "health_endpoint": "/health",
+            "capabilities": ["tts", "voice_catalog", "model_unload"],
+            "contracts": {
+                "tts": "simple-json-tts-v1",
+                # Five built-in speakers, listed by the service's /speakers.
+                "voice_catalog": "speaker-catalog-v1",
+            },
+            "settings": {
+                "defaults": {
+                    # "auto" reaches magpie-tts-service as-is and resolves there to
+                    # MAGPIE_DEFAULT_LANGUAGE (German unless the operator says
+                    # otherwise); naming a language here would override that setting
+                    # on every request the UI makes.
+                    "language": "auto",
+                },
+                # The languages NeMo 3.0.x can really route to a tokenizer of the
+                # checkpoint (the service lists them at /languages). The checkpoint
+                # holds more, but NeMo would read those with English rules.
+                "languages": [
+                    {"value": "auto", "label": "Automatic (service default)"},
+                    {"value": "de", "label": "German"},
+                    {"value": "en", "label": "English"},
+                    {"value": "es", "label": "Spanish"},
+                    {"value": "fr", "label": "French"},
+                    {"value": "ja", "label": "Japanese"},
+                    {"value": "zh", "label": "Chinese"},
+                ],
+            },
+            "ui": {
+                # Uses the generic TTS panel (same family as Piper and Chatterbox)
+                "family": "piper",
+                "selectable_as_engine": True,
+                "show_status": True,
+                "tab_label": "Text-to-Speech",
+                "messages": {
+                    "tts_generation": _build_basic_tts_messages(),
+                },
+                "sections": {
+                    "tts": {
+                        "title": "Text-to-Speech (Magpie)",
+                        "description": "Generate multilingual speech with NVIDIA Magpie-TTS and one of its five built-in voices. There is no voice cloning, and the audio arrives when the whole text is done.",
+                        "text_placeholder": "Enter the text you want to convert to speech...",
+                        "text_sample": "Hallo! Dies ist ein Test von NVIDIA Magpie. Am 3. Mai 2026 kostet das Ticket 12,50 Euro.",
+                    }
+                },
+            },
+        }
+
     if ENABLE_WHISPER_CPP:
         providers["whisper-cpp"] = {
             "kind": "stt",
@@ -1476,6 +1532,7 @@ def _build_provider_registry() -> dict:
             "enable_parakeet_asr": ENABLE_PARAKEET_ASR,
             "enable_canary_asr": ENABLE_CANARY_ASR,
             "enable_chatterbox_tts": ENABLE_CHATTERBOX_TTS,
+            "enable_magpie_tts": ENABLE_MAGPIE_TTS,
             "copy": {
                 "app_subtitle": "Neural Text-to-Speech with Voice Training & Cloning + Speech-to-Text",
                 "stt_tab_label": "Speech-to-Text",
@@ -2374,6 +2431,14 @@ def _build_tts_payload(
         # No speed control in the chatterbox API; "auto" resolves to
         # CHATTERBOX_DEFAULT_LANGUAGE service-side.
         return {"text": text, "language": language or "auto"}, 300.0
+
+    if provider_id == "magpie":
+        # No speed or instruction control in the Magpie API. "auto" (and a missing
+        # voice, which is what /v1 sends for one of OpenAI's own voice names) resolves
+        # to MAGPIE_DEFAULT_LANGUAGE / MAGPIE_DEFAULT_SPEAKER service-side; the gateway
+        # must not fill either in itself. An unknown speaker or an unsupported
+        # language is the service's 400, listing what it can do.
+        return {"text": text, "language": language or "auto", "speaker": voice or "auto"}, 300.0
 
     if provider_id == "qwen3":
         return {

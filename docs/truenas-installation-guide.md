@@ -23,6 +23,7 @@ Commands in a `code block` run in the TrueNAS shell (System -> Shell, or SSH) as
 | `qwen3-asr-service` | Multilingual speech recognition | yes | yes |
 | `qwen3-tts-service` | Voice cloning and high-quality TTS | yes | yes |
 | `chatterbox-tts-service` | Streaming German TTS: speech starts before the text is finished | yes | opt-in |
+| `magpie-tts-service` | NVIDIA TTS with five built-in voices; reads numbers and dates correctly | yes | opt-in |
 | `canary-asr-service` | Fastest German speech recognition (180M parameters) | yes | opt-in |
 | `parakeet-asr-service` | Speech recognition for 25 European languages | yes | opt-in |
 | `piper-training-service` | Train your own voice from recordings | yes | opt-in |
@@ -168,6 +169,7 @@ indicator; a service without its flag runs but never shows in the UI):
 | Canary (fast German STT) | `canary-asr-service` | `ENABLE_CANARY_ASR` |
 | Parakeet (25 languages) | `parakeet-asr-service` | `ENABLE_PARAKEET_ASR` |
 | Chatterbox (streaming TTS) | `chatterbox-tts-service` | `ENABLE_CHATTERBOX_TTS` |
+| Magpie (NVIDIA TTS, 5 voices) | `magpie-tts-service` | `ENABLE_MAGPIE_TTS` |
 | whisper.cpp (CPU STT) | `whisper-cpp` | `ENABLE_WHISPER_CPP` |
 | Voice training | `piper-training-service` | none |
 
@@ -338,6 +340,7 @@ start downloads), not measurements on your hardware. `preflight.sh` uses this ta
 | `canary-asr-service` | 2 GB | 1 GB | Estimate: 182M parameters at 4 bytes |
 | `parakeet-asr-service` | 3 GB | 2.5 GB | Estimate: 0.6B parameters at 4 bytes |
 | `chatterbox-tts-service` | 4 GB | 3 GB | Streaming German TTS |
+| `magpie-tts-service` | 4.2 GB | 2.5 GB | NVIDIA TTS, five built-in voices. Measured on an RTX 4080: 4.2 GB of the card with the model loaded, 2.5 GB downloaded |
 | `piper-training-service` | 4 GB | 2 GB | On demand only. Download column is a data and checkpoint reserve |
 | `whisper-cpp` | 0 GB | 0.6 GB | CPU only; estimate for the q5_0 model |
 
@@ -357,7 +360,7 @@ Unloading is reference counted, so a request in flight is never freed underneath
 |---|---|---|
 | 8 GB | `frontend`, `piper`, `stt` (turbo) and at most one more service | 2 to 6 GB |
 | 12 GB | the default set, with `MODEL_TTL` at 120 if you add one optional service | 8.1 GB, up to about 10 GB |
-| 16 GB | the default set plus `chatterbox` or `canary` | about 10 to 12 GB |
+| 16 GB | the default set plus `chatterbox`, `magpie` or `canary` | about 10 to 12 GB |
 | Training | free the VRAM of `qwen3-tts-service` first (`POST /api/providers/qwen3/unload`, or stop the service), then enable `piper-training-service` | training wants several GB |
 
 **Lower latency** (set on `stt-service`; tune against the `decode NNN ms` readout in the live
@@ -533,7 +536,7 @@ updates on its own, which is why it is not used here.
   listed in `TRUSTED_HOSTS`, or every request answers `403 host_not_allowed` (see Troubleshooting).
 - **`API_KEY` has no UI exemption any more.** With a key set, the web UI prompts for it once per
   browser tab; `/ws/stt` needs it too.
-- **`MAX_TTS_CHARS` defaults to 5000** (it was 20000): what Qwen3-TTS and Chatterbox accept. A
+- **`MAX_TTS_CHARS` defaults to 5000** (it was 20000): what Qwen3-TTS, Chatterbox and Magpie accept. A
   Piper-only install can raise it.
 - **`pcm` speech is 24 kHz** (`X-Sample-Rate: 24000`), as OpenAI documents, instead of the voice's
   own rate.

@@ -102,7 +102,7 @@ jobs:
             echo "--- $*"
             docker compose "$@" config -q
           }
-          OPTIONAL=(--profile canary-asr --profile parakeet-asr --profile chatterbox-tts
+          OPTIONAL=(--profile canary-asr --profile parakeet-asr --profile chatterbox-tts --profile magpie-tts
                     --profile training --profile whisper-cpp --profile update-watch)
           for env in .env.truenas.example .env.truenas.production.example; do
             check --env-file "$env" -f docker-compose.truenas-app.yml
@@ -137,7 +137,7 @@ jobs:
           set -e
           docker compose --env-file .env.truenas.example \
             --profile all --profile training --profile canary-asr --profile parakeet-asr \
-            --profile chatterbox-tts --profile whisper-cpp \
+            --profile chatterbox-tts --profile magpie-tts --profile whisper-cpp \
             -f docker-compose.yml -f docker-compose.truenas.yml config -q
 
       # The catalog template is plain Jinja2. Render it with the answers a user could give and let

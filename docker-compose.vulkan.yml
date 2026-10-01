@@ -25,7 +25,7 @@
 #
 # Scope: this overlay covers whisper-cpp ONLY, and that is deliberate.
 #   PyTorch's Vulkan backend is no longer maintained, so the PyTorch services
-#   (stt, qwen3-*, parakeet, canary, chatterbox) cannot use Vulkan at all.
+#   (stt, qwen3-*, parakeet, canary, chatterbox, magpie) cannot use Vulkan at all.
 #   Only ggml-based services can. Use docker-compose.rocm.yml for those.
 
 # Vulkan device passthrough shared by all services in this overlay

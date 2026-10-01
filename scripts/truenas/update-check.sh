@@ -29,7 +29,7 @@ Usage: update-check.sh [options]
   --registry REG    image registry/owner (default: ghcr.io/steffenhebestreit)
   --tag TAG         do not inspect containers; check that TAG exists for every image
   --with LIST       with --tag: also check optional services (canary-asr, parakeet-asr,
-                    chatterbox-tts, training, whisper-cpp)
+                    chatterbox-tts, magpie-tts, training, whisper-cpp)
   --offline         list what runs, contact no registry
   --quiet           print only updates and problems
   -h, --help        this text

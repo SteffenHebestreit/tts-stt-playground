@@ -28,6 +28,7 @@ qwen3-tts-service|qwen3-tts|5004|core||2.5|2.5
 canary-asr-service|canary-asr|5006|optional|canary-asr|2|1
 parakeet-asr-service|parakeet-asr|5005|optional|parakeet-asr|3|2.5
 chatterbox-tts-service|chatterbox-tts|5007|optional|chatterbox-tts|4|3
+magpie-tts-service|magpie-tts|5008|optional|magpie-tts|4.2|2.5
 piper-training-service|piper-training|8080|optional|training|4|2
 whisper-cpp|whisper-cpp|8080|optional|whisper-cpp|0|0.6
 CATALOGUE

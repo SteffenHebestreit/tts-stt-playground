@@ -44,7 +44,7 @@ def _load(path: Path, name: str):
 rc = _load(REPO_ROOT / "scripts" / "truenas" / "render_catalog.py", "truenas_render_catalog_for_catalog_tests")
 
 OPTIONAL_ON = {"enable_canary": "true", "enable_parakeet": "true", "enable_chatterbox": "true",
-               "enable_training": "true", "enable_whisper_cpp": "true"}
+               "enable_magpie": "true", "enable_training": "true", "enable_whisper_cpp": "true"}
 
 needs_docker = pytest.mark.skipif(DOCKER is None, reason="docker CLI not found: `docker compose config` cannot run")
 
@@ -254,7 +254,8 @@ def test_optional_services_appear_only_when_asked_for():
     assert set(render()["services"]) == {
         "piper-voices-seed", "frontend-service", "piper-tts-service", "stt-service", "qwen3-asr-service", "qwen3-tts-service"}
     for flag, service in [("enable_canary", "canary-asr-service"), ("enable_parakeet", "parakeet-asr-service"),
-                          ("enable_chatterbox", "chatterbox-tts-service"), ("enable_training", "piper-training-service"),
+                          ("enable_chatterbox", "chatterbox-tts-service"), ("enable_magpie", "magpie-tts-service"),
+                          ("enable_training", "piper-training-service"),
                           ("enable_whisper_cpp", "whisper-cpp")]:
         assert service in render(**{flag: "true"})["services"], flag
 
@@ -263,7 +264,7 @@ def test_the_ui_flags_follow_the_services_that_run():
     env = env_mapping(render(**OPTIONAL_ON)["services"]["frontend-service"])
     assert {k: env[k] for k in env if k.startswith("ENABLE_")} == {
         "ENABLE_PARAKEET_ASR": "true", "ENABLE_CANARY_ASR": "true", "ENABLE_CHATTERBOX_TTS": "true",
-        "ENABLE_WHISPER_CPP": "true"}
+        "ENABLE_MAGPIE_TTS": "true", "ENABLE_WHISPER_CPP": "true"}
     off = env_mapping(render()["services"]["frontend-service"])
     assert {off[k] for k in off if k.startswith("ENABLE_")} == {"false"}, "a flag without its service is a red indicator"
 
@@ -277,14 +278,16 @@ def test_cpu_mode_starts_no_gpu_service_and_reserves_no_device():
     assert (env["USE_CUDA"], env["FORCE_ACCELERATION"]) == ("false", "cpu")
     assert not [k for k in env if k.startswith("NVIDIA_")]
     frontend = env_mapping(document["services"]["frontend-service"])
-    assert frontend["ENABLE_CANARY_ASR"] == frontend["ENABLE_PARAKEET_ASR"] == frontend["ENABLE_CHATTERBOX_TTS"] == "false"
+    assert (frontend["ENABLE_CANARY_ASR"] == frontend["ENABLE_PARAKEET_ASR"] == frontend["ENABLE_CHATTERBOX_TTS"]
+            == frontend["ENABLE_MAGPIE_TTS"] == "false")
 
 
 def test_gpu_mode_gives_every_gpu_service_the_selected_device():
     services = render(**OPTIONAL_ON, gpu_device_id="GPU-1234")["services"]
     gpu_services = {n for n, s in services.items() if "deploy" in s}
     assert gpu_services == {"stt-service", "qwen3-asr-service", "qwen3-tts-service", "canary-asr-service",
-                            "parakeet-asr-service", "chatterbox-tts-service", "piper-training-service"}
+                            "parakeet-asr-service", "chatterbox-tts-service", "magpie-tts-service",
+                            "piper-training-service"}
     for name in gpu_services:
         device = services[name]["deploy"]["resources"]["reservations"]["devices"][0]
         assert device == {"driver": "nvidia", "device_ids": ["GPU-1234"], "capabilities": ["gpu"]}, name
@@ -357,7 +360,7 @@ def differences(scenario: dict, compose_env: dict[str, str], dropped_services: s
 
 
 UI_FLAGS_ON = {"ENABLE_CANARY_ASR": "true", "ENABLE_PARAKEET_ASR": "true", "ENABLE_CHATTERBOX_TTS": "true",
-               "ENABLE_WHISPER_CPP": "true"}
+               "ENABLE_MAGPIE_TTS": "true", "ENABLE_WHISPER_CPP": "true"}
 
 
 def test_at_the_default_answers_the_template_is_the_default_compose_stack():

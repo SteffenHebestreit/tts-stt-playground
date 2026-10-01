@@ -36,6 +36,7 @@ names German.
 | Whisper `small` / `large-v3-turbo` | Multilingual checkpoints (no `.en` suffix). German WER at `small` is **(unverified)** |
 | `piper` `de_DE-thorsten-medium` | A German voice by construction; 18 German Piper voices exist under [csukuangfj](https://huggingface.co/api/models?author=csukuangfj&search=vits-piper-de_DE) |
 | Chatterbox Multilingual | German named in its language list ([model card](https://huggingface.co/ResembleAI/chatterbox)). The v3 checkpoint exists only on GitHub master: PyPI `chatterbox-tts` 0.1.7 has no `t3_model` argument, so the image installs a pinned commit (`CHATTERBOX_REF`) with `--no-deps`, because the package hard-pins `torch==2.6.0`, which has no Blackwell kernels, on top of the cu128 torch the Dockerfile installs first. `CHATTERBOX_T3_MODEL=v3` selects it and falls back to the library default with a warning if the installed package cannot. The first build from this Dockerfile is the real test of the pin **(unverified: no image was built where this was written)** |
+| Magpie-TTS Multilingual | German named among its languages ([model card](https://huggingface.co/nvidia/magpie_tts_multilingual_357m), 0.80 % CER for German on v2607). Measured here: a German sentence with a date, a price and a time, synthesized on an RTX 4080 and transcribed by Parakeet, came back word for word. NeMo 3.0.x routes only `de`, `en`, `es`, `fr`, `ja` and `zh` to a tokenizer; NVIDIA Open Model License |
 | `parakeet-tdt-0.6b-v3` | German WER **5.04 % FLEURS / 4.84 % CoVoST**, CC-BY-4.0 ([card](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)) |
 | `canary-180m-flash` | German WER **4.81 % MLS**, CC-BY-4.0 ([card](https://huggingface.co/nvidia/canary-180m-flash)) |
 | `Qwen3-TTS-12Hz-0.6B-Base` | Declares `de` in its HF language metadata |
@@ -199,7 +200,7 @@ mismatch instead of guessing shapes.
 ### What cannot run on ARM64 at all
 
 `stt-service`, `qwen3-asr`, `qwen3-tts`, `parakeet-asr`, `canary-asr`, `chatterbox-tts`,
-`piper-training`. All are built on `nvidia/cuda:*` bases, and NeMo/Qwen/Chatterbox require CUDA.
+`magpie-tts`, `piper-training`. All are built on `nvidia/cuda:*` bases, and NeMo/Qwen/Chatterbox/Magpie require CUDA.
 **Do not add them to the arm64 CI matrix** — they would either fail to build or produce an image
 that cannot start, which is worse because it looks supported.
 

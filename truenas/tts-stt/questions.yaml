@@ -161,6 +161,17 @@ questions:
       default: false
       show_if: [["use_gpu", "=", true]]
 
+  - variable: enable_magpie
+    label: Magpie-TTS (NVIDIA, 5 built-in voices, about 4 GB VRAM)
+    description: >-
+      German, English, Spanish, French, Japanese and Chinese; reads digits, dates and times
+      correctly. No voice cloning and no streaming. NVIDIA Open Model License.
+    group: Optional services
+    schema:
+      type: boolean
+      default: false
+      show_if: [["use_gpu", "=", true]]
+
   - variable: enable_training
     label: Voice training
     description: Run it on demand. An idle container still holds a CUDA context (about 0.5 GB).

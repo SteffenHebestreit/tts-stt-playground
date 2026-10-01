@@ -33,7 +33,7 @@ docker compose -f docker-compose.yml -f docker-compose.truenas.yml --profile all
 
 The build takes 20 to 40 minutes. Without `--build`, `up` pulls the pinned release from GHCR
 instead. `--profile all` is the default set; add `--profile training`, `--profile canary-asr`,
-`--profile parakeet-asr`, `--profile chatterbox-tts` or `--profile whisper-cpp` for the opt-in
+`--profile parakeet-asr`, `--profile chatterbox-tts`, `--profile magpie-tts` or `--profile whisper-cpp` for the opt-in
 services, and set the matching `ENABLE_*` flag so the UI shows them
 ([profiles and modes](./truenas-service-profiles.md)).
 
@@ -58,10 +58,10 @@ APP_DATA_DIR=/mnt/tank/apps/tts-stt
 
 Each path can be overridden on its own (`MODELS_DIR`, `OUTPUT_DIR`, `CACHE_DIR`,
 `TRAINING_DATA_DIR`, `TRAINING_CHECKPOINTS_DIR`, `TRAINING_MODELS_DIR`, `TRAINING_CONFIGS_DIR`).
-The large Hugging Face downloads (Qwen3, Parakeet, Canary, Chatterbox) and the whisper.cpp models
+The large Hugging Face downloads (Qwen3, Parakeet, Canary, Chatterbox, Magpie) and the whisper.cpp models
 default to **named Docker volumes** in the Docker root. To keep them on your pool set
 `QWEN3_TTS_CACHE_DIR`, `QWEN3_ASR_CACHE_DIR`, `PARAKEET_ASR_CACHE_DIR`, `CANARY_ASR_CACHE_DIR`,
-`CHATTERBOX_TTS_CACHE_DIR`, `QWEN3_TTS_VOICES_DIR` and `WHISPER_CPP_MODELS_DIR`. (The Custom App
+`CHATTERBOX_TTS_CACHE_DIR`, `MAGPIE_TTS_CACHE_DIR`, `QWEN3_TTS_VOICES_DIR` and `WHISPER_CPP_MODELS_DIR`. (The Custom App
 file uses one shared `cache/` directory for all of them instead.)
 
 ## GPU driver

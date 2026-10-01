@@ -444,6 +444,15 @@ def chatterbox_tts_app():
     })
 
 
+@pytest.fixture(scope="module")
+def magpie_tts_app():
+    """Deployment whose default TTS is NVIDIA Magpie — `speaker`, five built-in voices, no speed."""
+    return _load_app({
+        "DEFAULT_TTS_PROVIDER": "magpie",
+        "ENABLE_MAGPIE_TTS": "true",
+    })
+
+
 def test_speech_reaches_qwen3_in_its_own_field_names(qwen3_tts_app, monkeypatch):
     client = _client(qwen3_tts_app, monkeypatch)
     _StubClient.last_post = {}
@@ -482,6 +491,29 @@ def test_speech_reaches_chatterbox_with_its_language_field(chatterbox_tts_app, m
         "chatterbox takes text+language only; forwarding piper's speed/voice/"
         "output_format relies on Pydantic silently discarding them"
     )
+
+
+def test_speech_reaches_magpie_with_its_speaker_field(magpie_tts_app, monkeypatch):
+    client = _client(magpie_tts_app, monkeypatch)
+    _StubClient.last_post = {}
+    r = client.post("/v1/audio/speech", json={
+        "model": "tts-1", "input": "Guten Tag", "voice": "Leo", "language": "de",
+        "response_format": "wav"})
+    assert r.status_code == 200
+    sent = _StubClient.last_post["json"]
+    assert sent == {"text": "Guten Tag", "language": "de", "speaker": "Leo"}, (
+        "magpie reads text, language and speaker; piper's voice/speed/output_format would be "
+        "dropped by Pydantic in silence and the default speaker would answer"
+    )
+
+
+def test_openai_placeholder_voice_does_not_become_a_magpie_speaker(magpie_tts_app, monkeypatch):
+    """'alloy' is OpenAI's name for nothing we have; Magpie would refuse it as an unknown speaker."""
+    client = _client(magpie_tts_app, monkeypatch)
+    _StubClient.last_post = {}
+    client.post("/v1/audio/speech", json={
+        "model": "tts-1", "input": "hi", "voice": "alloy", "response_format": "wav"})
+    assert _StubClient.last_post["json"] == {"text": "hi", "language": "auto", "speaker": "auto"}
 
 
 def test_speech_body_matches_the_api_tts_body_for_the_same_request(qwen3_tts_app, monkeypatch):

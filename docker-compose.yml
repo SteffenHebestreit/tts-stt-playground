@@ -669,6 +669,86 @@ services:
     networks:
       - tts-stt-network
 
+  # Magpie-TTS service (NVIDIA NeMo, NVIDIA Open Model License: multilingual TTS, 5 built-in voices)
+  # Opt-in: heavy NeMo image, so it is not part of the `all` profile. Enable it in the
+  # browser UI with ENABLE_MAGPIE_TTS=true on the frontend. NVIDIA GPUs only.
+  magpie-tts-service:
+    profiles: [magpie-tts]
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-magpie-tts:${IMAGE_TAG:-latest}
+    pull_policy: ${PULL_POLICY:-missing}
+    build:
+      context: ./magpie-tts-service
+      dockerfile: Dockerfile
+      # NeMo 3.0.x on torch 2.11 (cu128): the only line the Magpie model loads on here
+      # (NeMo 2.x has no MagpieTTSModel). Same pins as the NeMo ASR images.
+      args:
+        - NEMO_TOOLKIT_SPEC=${NEMO_TOOLKIT_SPEC:->=3.0.0,<3.1}
+        - TORCH_VERSION=${NEMO_TORCH_VERSION:-2.11.0}
+        - TORCHAUDIO_VERSION=${NEMO_TORCHAUDIO_VERSION:-2.11.0}
+    ports:
+      - "${BACKEND_BIND_ADDR:-127.0.0.1}:${MAGPIE_TTS_PORT:-5008}:5008"
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+      # A Hugging Face id, an NGC name, or the path of a .nemo file on a mounted volume.
+      MAGPIE_MODEL: ${MAGPIE_MODEL:-nvidia/magpie_tts_multilingual_357m}
+      # What "auto" means. NeMo 3.0.x speaks de, en, es, fr, ja and zh; any other
+      # language is refused (NeMo would read it with English rules).
+      MAGPIE_DEFAULT_LANGUAGE: ${MAGPIE_DEFAULT_LANGUAGE:-de}
+      # Aria, Jason, John, Leo or Sofia (or an index 0-4).
+      MAGPIE_DEFAULT_SPEAKER: ${MAGPIE_DEFAULT_SPEAKER:-Sofia}
+      # More languages to warm at load, comma-separated (e.g. en,fr). The first request in a
+      # language builds its text normalizer: 12 s de, 18 s en, 37 s fr, 48 s es, measured.
+      MAGPIE_WARM_LANGUAGES: ${MAGPIE_WARM_LANGUAGES:-}
+      # Text normalization. Off, the model's tokenizer silently drops every digit
+      # ("12,50 Euro um 14:30 Uhr" would be read as "Euro um Uhr").
+      MAGPIE_APPLY_TN: ${MAGPIE_APPLY_TN:-true}
+      # Classifier-free guidance: better speech for roughly twice the compute.
+      MAGPIE_USE_CFG: ${MAGPIE_USE_CFG:-true}
+      # Long text is generated in groups of whole sentences of at most this many
+      # characters, joined with MAGPIE_GROUP_GAP_MS of silence.
+      MAGPIE_MAX_GROUP_CHARS: ${MAGPIE_MAX_GROUP_CHARS:-200}
+      MAGPIE_GROUP_GAP_MS: ${MAGPIE_GROUP_GAP_MS:-150}
+      MAX_TEXT_CHARS: ${MAGPIE_MAX_TEXT_CHARS:-5000}
+      # Unload the ~3 GB model after this many idle seconds so it can share a 12 GB
+      # card with the STT/ASR stack. >0 seconds | 0 = unload immediately | -1 = never.
+      TTS_MODEL_TTL: ${TTS_MODEL_TTL:-300}
+      # Global fallback the code reads when the specific TTL is unset.
+      MODEL_TTL: ${MODEL_TTL:-300}
+      # One shared model on one GPU: bound concurrent generation rather than letting
+      # the default thread pool multiply peak VRAM. (The model itself cannot run two
+      # generations at once: values above 1 only queue.)
+      TTS_MAX_CONCURRENCY: ${TTS_MAX_CONCURRENCY:-1}
+      # Requests that may wait for a generation slot. Empty = 4 x TTS_MAX_CONCURRENCY;
+      # 0 = nobody waits. A request beyond that, or one that waited TTS_QUEUE_TIMEOUT_S
+      # seconds without getting its turn, is answered 503 + Retry-After instead of hanging.
+      TTS_MAX_QUEUE: ${TTS_MAX_QUEUE:-}
+      TTS_QUEUE_TIMEOUT_S: ${TTS_QUEUE_TIMEOUT_S:-60}
+      # expandable_segments avoids the fragmentation that per-request empty_cache()
+      # calls used to (badly) paper over.
+      PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-}
+      ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
+    volumes:
+      - "${MAGPIE_TTS_CACHE_DIR:-magpie-tts-cache}:/root/.cache"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              count: 1
+    restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5008/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 180s
+      retries: 3
+    networks:
+      - tts-stt-network
+
   # Qwen3-TTS service (voice cloning + TTS, replaces XTTS)
   qwen3-tts-service:
     profiles: [qwen3-tts, all]
@@ -818,6 +898,8 @@ services:
       ENABLE_CANARY_ASR: ${ENABLE_CANARY_ASR:-false}
       CHATTERBOX_TTS_SERVICE_URL: ${CHATTERBOX_TTS_SERVICE_URL:-http://chatterbox-tts-service:5007}
       ENABLE_CHATTERBOX_TTS: ${ENABLE_CHATTERBOX_TTS:-false}
+      MAGPIE_TTS_SERVICE_URL: ${MAGPIE_TTS_SERVICE_URL:-http://magpie-tts-service:5008}
+      ENABLE_MAGPIE_TTS: ${ENABLE_MAGPIE_TTS:-false}
       WHISPER_CPP_SERVICE_URL: ${WHISPER_CPP_SERVICE_URL:-http://whisper-cpp:8080}
       ENABLE_WHISPER_CPP: ${ENABLE_WHISPER_CPP:-false}
       # Browser access control. Empty = same-origin only: no CORS headers, and a
@@ -847,7 +929,7 @@ services:
       API_KEY: ${API_KEY:-}
       # Largest request body (MB) for uploads (training audio, voice samples,
       # STT files) and the longest text (characters) for TTS. Keep MAX_TTS_CHARS
-      # <= the smallest backend limit in use (chatterbox and qwen3-tts: 5000).
+      # <= the smallest backend limit in use (chatterbox, magpie-tts and qwen3-tts: 5000).
       MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-512}
       MAX_TTS_CHARS: ${MAX_TTS_CHARS:-5000}
       # Per worker process: uploads forwarded at the same time (the next one
@@ -914,6 +996,8 @@ volumes:
   canary-asr-cache:
     driver: local
   chatterbox-tts-cache:
+    driver: local
+  magpie-tts-cache:
     driver: local
   qwen3-tts-cache:
     driver: local

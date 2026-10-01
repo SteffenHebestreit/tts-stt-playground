@@ -207,7 +207,7 @@ services:
           # Cleared here, not in the anchor — see the note above `services:`.
           devices: !reset []
 
-  # NOTE: canary-asr-service and chatterbox-tts-service have NO Dockerfile.rocm,
+  # NOTE: canary-asr-service, chatterbox-tts-service and magpie-tts-service have NO Dockerfile.rocm,
   # so they are deliberately absent here rather than silently building a CUDA
   # image. canary is NeMo (same caveat as above); run them on CPU, or use the
   # Vulkan whisper-cpp path for AMD speech-to-text.

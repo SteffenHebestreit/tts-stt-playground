@@ -86,7 +86,7 @@ authentication and TLS in front of a port that untrusted people can reach.
 multi-file training upload) get **413**, as do JSON bodies over 1 MiB; `/v1/audio/transcriptions`
 takes at most 25 MB per file. Text fields for TTS and voice design are capped at `MAX_TTS_CHARS`
 (default **5000**, 422 beyond it): keep it at or below the smallest text limit of the TTS backends
-in use, since Qwen3-TTS and Chatterbox accept 5000 and a larger value only turns the early `422`
+in use, since Qwen3-TTS, Chatterbox and Magpie accept 5000 and a larger value only turns the early `422`
 into a `413` from the backend; a Piper-only deployment (backend limit 20000) can raise it. Each
 backend also enforces its own limit; see [Limits per service](#limits-per-service).
 
@@ -216,7 +216,7 @@ naming `wav` as the alternative rather than silently returning a WAV labelled as
 
 **On `pcm`:** raw 16-bit little-endian mono at **24 kHz**, which is what OpenAI documents and what
 stock clients hard-code. Qwen3-TTS and Chatterbox already produce 24 kHz, so only the WAV header is
-dropped (and stereo mixed down); Piper voices (22050 or 16000 Hz) are resampled with `ffmpeg`, and
+dropped (and stereo mixed down); Piper voices and Magpie (22050 or 16000 Hz) are resampled with `ffmpeg`, and
 without it the endpoint answers **501** naming `wav`, as it does for `mp3`. `X-Sample-Rate` is
 always `24000`. `wav` keeps the backend's own rate, which its header states.
 
@@ -279,7 +279,7 @@ Quote the id to the operator (`docker compose logs frontend-service | grep 3f9a1
 answer in the 4xx range that is one short line of prose (a validation message such as `text is 5001
 characters; the limit is 5000`) still passes through, because the UI shows it; one that contains a
 traceback, a filesystem path or a URL is treated like a 5xx. The backends themselves answer an
-unexpected failure with a generic message and a request id too; the Piper, Qwen3-TTS and Chatterbox
+unexpected failure with a generic message and a request id too; the Piper, Qwen3-TTS, Chatterbox and Magpie
 services also put it in an `X-Request-ID` response header, and the exception text is in their log
 under the same id.
 
@@ -314,7 +314,8 @@ everything as German), and Qwen3-TTS answers 400.
 **TTS defaults to German.** A request that names no language (or `auto`, in any capitalisation) is
 spoken in `PIPER_DEFAULT_LANGUAGE` (`de`) after Piper has guessed German versus English from the
 text (`PIPER_AUTO_DETECT`); Qwen3-TTS uses `QWEN3_DEFAULT_LANGUAGE` (`German`), Chatterbox
-`CHATTERBOX_DEFAULT_LANGUAGE` (`de`).
+`CHATTERBOX_DEFAULT_LANGUAGE` (`de`), Magpie `MAGPIE_DEFAULT_LANGUAGE` (`de`; a language it cannot
+speak is a `400` that lists the ones it can, never English with a `200`).
 
 **A TTS voice that cannot serve the requested language is reported.** If you ask for German on a
 deployment with no German voice, Piper substitutes another one. That is signalled rather than
@@ -413,7 +414,7 @@ whether a retry is worthwhile. A client that disconnects mid-request no longer l
 behind that would answer 409 forever.
 
 Supported where the provider lists the `model_unload` capability — currently `whisper`,
-`qwen3-asr`, `qwen3` (TTS), `chatterbox`, `parakeet` and `canary`. Asking any other provider
+`qwen3-asr`, `qwen3` (TTS), `chatterbox`, `magpie`, `parakeet` and `canary`. Asking any other provider
 returns 400. The two that cannot: `piper` is CPU-only ONNX with no VRAM to reclaim, and
 `whisper-cpp` is the upstream whisper-server binary with no Python layer to add a route to.
 
@@ -441,9 +442,10 @@ gives each its own host variable:
 | piper-tts, uploaded voices | 20 voices, 2048 MB in total | a new voice has 30 s to load and answer a test request | `PIPER_MAX_CUSTOM_VOICES` (0 = no upload), `PIPER_MAX_CUSTOM_MB`, `PIPER_ONNX_VALIDATE_TIMEOUT_S` |
 | qwen3-tts | 20 MB reference audio | 5000 characters; 60 s reference clip | `QWEN3_TTS_MAX_UPLOAD_MB`, `QWEN3_TTS_MAX_TEXT_CHARS`, `QWEN3_TTS_REF_MAX_SECONDS` |
 | chatterbox | 20 MB reference audio | 5000 characters | `CHATTERBOX_MAX_UPLOAD_MB`, `CHATTERBOX_MAX_TEXT_CHARS` |
+| magpie-tts | takes no uploads | 5000 characters | `MAGPIE_MAX_TEXT_CHARS` |
 | piper-training | 500 MB per `/train` request | 1000 characters per segment | `TRAINING_MAX_UPLOAD_MB`, `TRAINING_MAX_TEXT_CHARS` |
 
-The gateway's `MAX_TTS_CHARS` now defaults to the 5000 of Qwen3-TTS and Chatterbox, so a text that
+The gateway's `MAX_TTS_CHARS` now defaults to the 5000 of Qwen3-TTS, Chatterbox and Magpie, so a text that
 is too long for them is refused early and clearly (`422`) instead of after a round trip; with
 Piper alone (20000) it can be raised, and if it is raised past a backend's own limit the backend's
 `413` is relayed with its message. Chatterbox used to cut such audio off at about 40 s without
@@ -462,7 +464,7 @@ them up until every client times out:
 |---|---|---|---|---|
 | gateway (per worker process) | 4 uploads, 4 `ffmpeg` conversions | nobody | not at all | `MAX_CONCURRENT_UPLOADS`, `MAX_CONCURRENT_FFMPEG` |
 | qwen3-asr, parakeet, canary | 1 | 4 x the concurrency (`0` = nobody waits) | 60 s | `ASR_MAX_CONCURRENCY`, `ASR_MAX_QUEUE`, `ASR_QUEUE_TIMEOUT_S` |
-| qwen3-tts, chatterbox | 1 | 4 x the concurrency (`0` = nobody waits) | 60 s | `TTS_MAX_CONCURRENCY`, `TTS_MAX_QUEUE`, `TTS_QUEUE_TIMEOUT_S` |
+| qwen3-tts, chatterbox, magpie | 1 | 4 x the concurrency (`0` = nobody waits) | 60 s | `TTS_MAX_CONCURRENCY`, `TTS_MAX_QUEUE`, `TTS_QUEUE_TIMEOUT_S` |
 | piper-tts | half the CPU cores | any number, for `PIPER_TIMEOUT_S` | 60 s | `PIPER_MAX_CONCURRENCY`, `PIPER_TIMEOUT_S` |
 
 For the ASR and TTS services at most `MAX_CONCURRENCY + MAX_QUEUE` requests are admitted; the next one

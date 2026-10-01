@@ -34,7 +34,8 @@ DOCKER = shutil.which("docker")
 DATA = "/mnt/tank/apps/tts-stt"
 PLACEHOLDER = "${APP_DATA_DIR:?set dataset path}"
 
-OPTIONAL_PROFILES = ["canary-asr", "parakeet-asr", "chatterbox-tts", "training", "whisper-cpp", "update-watch"]
+OPTIONAL_PROFILES = ["canary-asr", "parakeet-asr", "chatterbox-tts", "magpie-tts", "training", "whisper-cpp",
+                     "update-watch"]
 
 needs_docker = pytest.mark.skipif(DOCKER is None, reason="docker CLI not found: `docker compose config` cannot run")
 
@@ -159,7 +160,7 @@ def test_the_default_stack_and_what_a_profile_adds():
                             "qwen3-asr-service", "qwen3-tts-service"}
     everything = resolved("--env-file", str(ENV_EXAMPLE), *all_profiles(), "-f", str(COMPOSE_APP))["services"]
     assert set(everything) - set(default) == {"canary-asr-service", "parakeet-asr-service", "chatterbox-tts-service",
-                                              "piper-training-service", "whisper-cpp", "diun"}
+                                              "magpie-tts-service", "piper-training-service", "whisper-cpp", "diun"}
 
 
 @needs_docker
@@ -294,7 +295,7 @@ def test_every_persistent_path_is_a_bind_mount_under_the_one_dataset_and_nothing
 def test_one_model_cache_is_shared_by_every_service_that_downloads_models():
     cache_users = {n for n, s in services().items() if any(v.endswith(":/root/.cache") for v in s.get("volumes", []))}
     assert cache_users == {"stt-service", "qwen3-asr-service", "qwen3-tts-service", "canary-asr-service",
-                           "parakeet-asr-service", "chatterbox-tts-service"}
+                           "parakeet-asr-service", "chatterbox-tts-service", "magpie-tts-service"}
     sources = {volume_source(v) for n in cache_users for v in services()[n]["volumes"] if v.endswith(":/root/.cache")}
     assert sources == {f"{DATA}/cache"}, "a model would download once per service"
 
@@ -340,7 +341,7 @@ def test_services_that_download_models_wait_long_enough_before_they_can_be_unhea
     """First start pulls gigabytes; a start_period shorter than that shows a red app for a healthy install."""
     for name in ("stt-service", "qwen3-asr-service", "qwen3-tts-service", "whisper-cpp"):
         assert seconds(healthchecks()[name]["start_period"]) >= 600, name
-    for name in ("canary-asr-service", "parakeet-asr-service", "chatterbox-tts-service"):
+    for name in ("canary-asr-service", "parakeet-asr-service", "chatterbox-tts-service", "magpie-tts-service"):
         assert seconds(healthchecks()[name]["start_period"]) >= 900, name
     assert seconds(healthchecks()["frontend-service"]["start_period"]) >= 30
 
