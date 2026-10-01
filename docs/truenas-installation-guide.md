@@ -340,7 +340,7 @@ start downloads), not measurements on your hardware. `preflight.sh` uses this ta
 | `canary-asr-service` | 2 GB | 1 GB | Estimate: 182M parameters at 4 bytes |
 | `parakeet-asr-service` | 3 GB | 2.5 GB | Estimate: 0.6B parameters at 4 bytes |
 | `chatterbox-tts-service` | 4 GB | 3 GB | Streaming German TTS |
-| `magpie-tts-service` | 4.2 GB | 2.5 GB | NVIDIA TTS, five built-in voices. Measured on an RTX 4080: 4.2 GB of the card with the model loaded, 2.5 GB downloaded |
+| `magpie-tts-service` | 4.2 GB | 2.5 GB | NVIDIA TTS, five built-in voices. Measured on an RTX 4080: 4.2 GB of the card with the model loaded, 2.5 GB downloaded, and about 7 GB of host RAM |
 | `piper-training-service` | 4 GB | 2 GB | On demand only. Download column is a data and checkpoint reserve |
 | `whisper-cpp` | 0 GB | 0.6 GB | CPU only; estimate for the q5_0 model |
 

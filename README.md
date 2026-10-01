@@ -283,8 +283,8 @@ Use smaller models (`WHISPER_MODEL_SIZE=small`, `WHISPER_MODEL=small`) to improv
 
 ### Text-to-Speech — Magpie (NVIDIA, optional)
 - NVIDIA's Magpie-TTS Multilingual (`magpie_tts_multilingual_357m`) through NeMo 3: five built-in voices (Aria, Jason, John, Leo, Sofia) in German, English, Spanish, French, Japanese and Chinese. No voice cloning and no streaming. NVIDIA Open Model License, a custom license: read it before relying on it
-- Digits, dates and times are read correctly (text normalization is on; without it the model silently drops every number). A language it cannot speak is a 400, never English with a 200
-- About 4.2 GB of VRAM and a first-start download of about 2.5 GB. The first request in a language other than German waits 18 to 48 s while its text normalizer is built (`MAGPIE_WARM_LANGUAGES` builds it during the first model load instead). Normalizers stay in host RAM across idle unloads (a few hundred MB per language, no VRAM), so a reload after `TTS_MODEL_TTL` repeats neither that wait nor the warm-up; `/ready` answers 503 `loading` during the first load only
+- Digits, dates and times are spoken (text normalization is on; without it the model silently drops every number), though German numbers written with thousands dots ("1.200") are read digit by digit; see the Magpie README. A language it cannot speak is a 400, never English with a 200
+- About 4.2 GB of VRAM, about 7 GB of host RAM and a first-start download of about 2.5 GB. The first request in a language other than German waits 18 to 48 s while its text normalizer is built (`MAGPIE_WARM_LANGUAGES` builds it during the first model load instead). Normalizers stay in host RAM across idle unloads (a few hundred MB per language, no VRAM), so a reload after `TTS_MODEL_TTL` repeats neither that wait nor the warm-up; `/ready` answers 503 `loading` during the first load only
 - Opt-in: profile `magpie-tts` plus `ENABLE_MAGPIE_TTS` on the frontend. Details: [magpie-tts-service/README.md](magpie-tts-service/README.md)
 
 ### Model memory

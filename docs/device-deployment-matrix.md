@@ -74,8 +74,10 @@ one-argument rollback to 2.7.x (`NEMO_TOOLKIT_SPEC='>=2.7.3,<3'`, or the prebuil
 imports), and its own `MAGPIE_NEMO_TOOLKIT_SPEC` keeps that rollback away from it.
 PyTorch publishes cu128 wheels for 2.7 through 2.11 only, which is what caps torch there for a
 Blackwell card; a newer torch needs a CUDA 13 wheel and a newer driver. The ROCm parakeet image stays
-on NeMo 2.x and torch 2.5.1. No NeMo 3 run on a GPU has happened yet **(unverified)**; the
-smoke test is in `parakeet-asr-service/README.md`.
+on NeMo 2.x and torch 2.5.1. Magpie-TTS has run on NeMo 3.0.0 and torch 2.11 on an RTX 4080
+(sm_89; see `magpie-tts-service/README.md`). The Parakeet and Canary GPU smoke test in
+`parakeet-asr-service/README.md` is still open, and no NeMo 3 image has run on a Blackwell card
+**(unverified)**.
 
 **ggml is the only runtime covering all four.** If you want exactly one STT engine,
 `whisper-cpp` is the answer and it already exists in this repo. The cost is that it caps the SBC

@@ -10,7 +10,7 @@ shows it when `ENABLE_MAGPIE_TTS=true` is set on the frontend.
 | Languages | `de`, `en`, `es`, `fr`, `ja`, `zh` with NeMo 3.0.x (see below). |
 | Output | WAV, mono, 22.05 kHz. No streaming: audio arrives when the whole text is done. |
 | License | [NVIDIA Open Model License](https://huggingface.co/nvidia/magpie_tts_multilingual_357m), a custom license, not MIT or Apache. Read it before shipping. |
-| Cost | About **4.2 GB of GPU memory** while loaded (measured at the card on an RTX 4080: 1.75 GB of tensors plus the CUDA context and allocator cache); about 0.6 s of compute per second of audio. First start downloads **~2.5 GB**: the model, its audio codec and two helper models (`google/byt5-small`, `microsoft/wavlm-base-plus`). |
+| Cost | About **4.2 GB of GPU memory** while loaded (measured at the card on an RTX 4080: 1.75 GB of tensors plus the CUDA context and allocator cache) and **about 7 GB of host RAM** (the process held 7.0 to 7.5 GB with the German, Chinese and Japanese text normalizers built, steady over eight reloads); about 0.6 s of compute per second of audio. First start downloads **~2.5 GB**: the model, its audio codec and two helper models (`google/byt5-small`, `microsoft/wavlm-base-plus`). |
 
 ## Endpoints
 
@@ -44,6 +44,18 @@ generating; a request still waiting for its turn leaves the queue at once.
   by the warm-up or by a request, stays in host RAM across idle unloads until the container stops (a few
   hundred MB per language, no VRAM), so a reload after `TTS_MODEL_TTL` (300 s by default, 120 s in
   `deploy/profiles/truenas-5060ti.env`) repeats neither the warm-up nor a normalizer build.
+* **German numbers are read the way NeMo's normalizer writes them out, which is not always how a reader
+  would.** A number with thousands dots is read digit by digit: "1.200 Euro" became "eins punkt zwei null
+  null Euro", and "1.234.567 Einwohner" likewise, while "1200 Euro" became "ein tausend zwei hundert Euro".
+  "12,50 Euro" became "zwölf komma fünf null Euro". A date at the very end of a sentence ("am 12.03.2024.")
+  was read digit by digit, the same date followed by "um 14:30 Uhr" as "zwölfter märz zwei tausend vier und
+  zwanzig". Times ("14:30 Uhr", "14.30 Uhr") and other dates ("am 5.11.1990 geboren") came out right. Where
+  it matters, write such numbers without the dots, or in words.
+* **A reload costs only the load.** NeMo's audio codec also builds a speaker encoder that only training uses,
+  and downloaded its checkpoint from huggingface.co on every load: about 600 MiB moved and about 22 s of
+  every 33 to 37 s reload, and no load at all without internet access. The service skips that download, so
+  a reload after an idle unload now takes about 11 s on an RTX 4080 and receives 0.1 MB (and needs no
+  warm-up and no normalizer build, see above).
 * **An unknown language is not an error in NeMo, it is English.** `do_tts` falls back to the English
   tokenizer for any language it has no route for, so Dutch would be read with English rules and answered 200.
   The service lists only the languages whose tokenizer NeMo really routes to and refuses the rest. The
@@ -54,20 +66,27 @@ generating; a request still waiting for its turn leaves the queue at once.
   trailing token at the points where it ended a chunk by force. Groups of whole sentences (at most
   `MAGPIE_MAX_GROUP_CHARS`, 200 by default) transcribed back word for word.
   Chinese and Japanese are grouped too, in groups of at most a third of that (66 characters by default,
-  14 to 16 s of speech at the measured 4.2 to 4.6 characters per second). A sentence ends after 。！？…
+  12 to 16 s of speech at the 4.2 to 5.4 characters per second measured, depending on the speaker;
+  Japanese ran at about 6). A sentence ends after 。！？…
   or `!` `?` (closing marks such as 」 stay with it), at a `.` only before a space or the end of the
   text (so `3.5` stays whole), and at a line break. A longer sentence is cut after its last clause mark
-  (，、；： or `,;:`, but not inside `14:30` or `1,000`) that leaves at least a third of the limit before
-  the cut, else at a space, and only else hard at the limit. NeMo 3.0.0 splits these languages itself
+  (，、；： or `,;:`, but not one inside a number such as `14:30`, `14：30`, `1,000` or `１，０００`) that
+  leaves at least a third of the limit before the cut, else at a space, else before a number (so a
+  timetable is cut between two times), and only else hard at the limit. NeMo 3.0.0 splits these languages itself
   only above 100 characters (Chinese) or 80 words (Japanese), and only at 。？！…, so a long sentence
   joined only by commas used to be one chunk, cut off by the decoder at about 23 s while the request
   still answered 200.
 * **A group that NeMo cuts off is generated again.** NeMo stops decoding a call at 500 frames, 23.2 s
-  of audio. A group that reaches that limit (number-dense text, which normalization makes much longer,
-  can) is cut again, at sentence ends where it can, into pieces of at most half its length (usually
-  two or three), which are generated instead, with a warning in the log; if it cannot be cut, or a
-  piece reaches the limit too, that audio is kept as it is, again with a warning, rather than failing
-  the request.
+  of audio, but the model seldom gets that far: it ends a text that needs more room itself, at about
+  21.7 s (decoder step 234 of 250), with the end of the text missing and nothing in the answer to say
+  so. Number-dense text does that, because normalization makes it several times longer: one 7-digit
+  number takes about 4.7 s. So audio of 20.9 s or more (within 10% of the limit) counts as cut off;
+  complete generations were measured up to 21.1 s, so a false alarm costs one more generation. Such a
+  group is cut again into pieces sized by how long they take to speak (a digit counts as ten
+  characters; at most about 15 s each): at sentence ends, after commas and before *und*, *and*, *et*
+  where it can, never between a number and the word next to it. The pieces are generated instead,
+  with a warning in the log. A piece that comes back as long, or a group that cannot be cut, is kept
+  as it is, again with a warning, rather than failing the request.
 
 ## Settings
 
@@ -133,3 +152,9 @@ OpenJTalk dictionary is built in (about 107 MB, in pyopenjtalk's package directo
 request downloads nothing and works on a host without internet access. Building the image therefore
 needs access to github.com (the dictionary is a release asset of `r9y9/open_jtalk`) as well as to PyPI
 and download.pytorch.org.
+
+The image keeps no pip cache. Images built before that left about 75 MB of wheels in `/root/.cache/pip`,
+and Docker copied them into the `magpie-tts-cache` volume (mounted at `/root/.cache`) when it created the
+volume; a newer image does not take them out of an existing volume. To free that space:
+`docker exec <magpie container> rm -rf /root/.cache/pip`, or on TrueNAS delete `pip` in the directory
+`MAGPIE_TTS_CACHE_DIR` points at.

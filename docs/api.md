@@ -504,12 +504,16 @@ is refused the same way. The `*_MAX_QUEUE` variables are empty by default, which
 concurrency (4 with the default of 1). A synthesis that itself runs longer than `PIPER_TIMEOUT_S` is
 killed and answered `504`.
 
-A caller that hangs up while `/api/tts` or `/v1/audio/speech` waits for a backend's answer does not
-leave the work running: the gateway cancels its backend call, which closes its connection to the
-backend, and logs that the caller hung up. Piper then kills its synthesis process, and Magpie stops
-after the group of sentences it is generating (a request still waiting for its turn leaves the queue
-at once); the gateway's own read timeout closes the connection the same way. Once a streamed answer
-has started (Chatterbox on `/api/tts`), Starlette's own disconnect handling applies instead.
+A caller that hangs up while `/api/tts` or `/v1/audio/speech` waits for a backend's answer makes the
+gateway cancel its backend call, which closes its connection to the backend, and log that the caller
+hung up; the gateway's own read timeout closes the connection the same way. Whether the work then
+stops depends on the backend. Piper kills its synthesis process, and Magpie stops after the group of
+sentences it is generating (a request still waiting for its turn leaves the queue at once). Qwen3-TTS,
+and Chatterbox's non-streaming `/tts` (which `/v1/audio/speech` always uses), do not watch the
+connection: they finish the generation for nobody and keep their generation slot until then, and a
+request already waiting in their queue still runs when its turn comes, so a client's retry queues
+behind the abandoned work. A streamed answer (Chatterbox on `/api/tts`) falls under Starlette's own
+disconnect handling instead: Chatterbox stops after the sentence it is generating.
 
 ---
 
