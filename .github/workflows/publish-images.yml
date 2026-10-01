@@ -106,7 +106,7 @@ jobs:
       image_prefix: ${{ steps.plan.outputs.image_prefix }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Inputs reach the script as environment variables, not as text spliced
       # into the shell command, so a hostile tag or input cannot inject code.
@@ -143,7 +143,7 @@ jobs:
       matrix: ${{ fromJSON(needs.plan.outputs.build) }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Free up disk space (large GPU images)
         run: |
@@ -152,10 +152,10 @@ jobs:
           df -h
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -166,7 +166,7 @@ jobs:
       # except for the -nemo2 rollback images; `cache-to` is empty for those too.
       - name: Build and push by digest
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.context }}/Dockerfile
@@ -189,7 +189,7 @@ jobs:
           touch "/tmp/digests/${DIGEST#sha256:}"
 
       - name: Upload digest
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: /tmp/digests/*
@@ -215,7 +215,7 @@ jobs:
       # One sub-directory per architecture artifact (no merge-multiple), so the
       # next step can tell which architecture is missing.
       - name: Download digests
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: digests-${{ matrix.key }}_*
           path: /tmp/digests
@@ -240,10 +240,10 @@ jobs:
           echo "digests present for: ${archs[*]}"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -254,7 +254,7 @@ jobs:
       # `suffix` is empty except for the -nemo2 rollback images.
       - name: Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ needs.plan.outputs.image_prefix }}${{ matrix.name }}
           flavor: |
