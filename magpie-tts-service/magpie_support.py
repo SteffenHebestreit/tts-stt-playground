@@ -41,8 +41,21 @@ DOCUMENTED_LANGUAGES = ("de", "en", "es", "fr", "ja", "zh")
 # at 。？！…, so a long sentence joined by commas went through as one chunk and was cut
 # off at the decoder's 500 frames (~23 s). They are grouped like every other language,
 # by text_splitting.split_cjk, at a third of the ceiling: 66 characters at the default
-# 200, 14-16 s of speech at the 4.2-4.6 characters per second measured.
+# 200, 12-16 s of speech at the 4.2-5.4 characters per second measured (it depends on
+# the speaker; Japanese ran at about 6).
 SPACELESS_LANGUAGES = frozenset({"ja", "zh"})
+
+# How long text takes to speak, for cutting a group whose generation was cut off: its
+# length, with every digit counted as this many characters. Normalization writes
+# numbers out, and "1234567" becomes "eine million zwei hundert vier und dreißig
+# tausend fünf hundert sieben und sechzig" (83 characters, 4.7 s): 10 is the measured
+# worst case, whole numbers read as cardinals. (German numbers with a dot in them,
+# "1.234.567" or "12.000", are read digit by digit, about 6 characters per digit.)
+DIGIT_WEIGHT = 10
+# The most a piece of a cut-off German, English, Spanish or French group may weigh by
+# that measure: 15-16 s of speech at the ~16-17 characters per second measured for prose
+# and for numbers written out, inside the 20.9 s at which a generation counts as cut off.
+RESPLIT_WEIGHT = 250
 
 # What no HTTP header value may contain (h11 refuses the response, which then never
 # reaches the caller).
@@ -234,7 +247,7 @@ def group_text(text: str, language: str, max_chars: int) -> list[str]:
     """Whole-sentence groups, each short enough for one single-chunk generation; never empty for non-blank text.
 
     Chinese and Japanese groups get a third of *max_chars*: 66 characters at the default
-    200, 14-16 s of speech, and below NeMo's own thresholds for them (100 characters, 80
+    200, 12-16 s of speech, and below NeMo's own thresholds for them (100 characters, 80
     words), so NeMo never chunks a group again.
     """
     text = text.strip()
@@ -245,20 +258,30 @@ def group_text(text: str, language: str, max_chars: int) -> list[str]:
     return text_splitting.split_for_synthesis(text, max_chars) or [text]
 
 
-def halve_group(text: str, language: str) -> list[str]:
-    """*text* cut again at its best boundaries into pieces of at most half its length; a single piece means it cannot be cut.
+def spoken_weight(text: str) -> int:
+    """*text*'s length with every digit counted as ``DIGIT_WEIGHT`` characters: roughly how long it takes to speak."""
+    return len(text) + (DIGIT_WEIGHT - 1) * sum(c.isdecimal() for c in text)
 
-    That is usually two or three pieces, not always two: a piece ends at a sentence (or
-    clause) boundary the splitter picks, and those seldom fall at the middle.
 
-    For a group whose generation filled the decoder's frame limit. Usually that is text
-    full of numbers, which normalization writes out: 62 characters of 7-digit numbers
-    took 233 of the 250 decoder steps (measured).
+def split_cut_off_group(text: str, language: str) -> list[str]:
+    """*text*, a group whose generation was cut off, cut again into pieces that can be spoken in full; ``[text]`` if it cannot be cut.
+
+    The usual cause is text full of numbers, which normalization makes several times
+    longer: the 151 characters "Es gab 1.234.567 Autos, 2.345.678 Busse, ..." needed
+    about 31 s, and the real model ended its generation at 21.7 s. Halving such a group
+    by characters left halves that were still too long (one 7-digit number alone takes
+    4.7 s), so German, English, Spanish and French are cut by ``spoken_weight`` instead:
+    into pieces of at most half the group's weight and never more than ``RESPLIT_WEIGHT``,
+    at sentence ends and clause commas where possible, and never leaving a word or two
+    on their own at the end (``text_splitting.split_by_weight``). Chinese and Japanese
+    groups are short already (a third of the ceiling) and are halved at their clause
+    marks, never inside a number.
     """
     text = text.strip()
     if language in SPACELESS_LANGUAGES:
         return text_splitting.split_cjk(text, max(10, len(text) // 2)) or [text]
-    return text_splitting.split_for_synthesis(text, max(20, len(text) // 2)) or [text]
+    budget = min(RESPLIT_WEIGHT, spoken_weight(text) // 2)
+    return text_splitting.split_by_weight(text, budget, spoken_weight) or [text]
 
 
 def join_audio(parts: Sequence[np.ndarray], sample_rate: int, gap_ms: int) -> np.ndarray:

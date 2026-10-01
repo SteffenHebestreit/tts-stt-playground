@@ -254,6 +254,7 @@ def test_a_number_is_not_cut_at_its_separator():
     assert splitter.split_cjk(text, 15) == ["价格是1,000元，", "然后是2,000元，", "最后是3,000元的东西"]
 
 
+
 @pytest.mark.parametrize("language", ["zh", "ja"])
 @pytest.mark.parametrize("text", [
     pytest.param("。" * 5000, id="5000-stops"),
@@ -268,7 +269,7 @@ def test_grouping_chinese_and_japanese_is_linear(text, language):
     assert all(len(g) <= CJK_CEILING for g in groups) and "".join(groups) == text
 
 
-# --- a group that filled the decoder's frame limit --------------------------------------
+# --- a group whose generation was cut off ----------------------------------------------
 
 @pytest.mark.parametrize("language, text, halves", [
     ("de", "Das ist der erste Satz. Das ist der zweite Satz.", ["Das ist der erste Satz.", "Das ist der zweite Satz."]),
@@ -276,13 +277,91 @@ def test_grouping_chinese_and_japanese_is_linear(text, language):
     ("zh", "这是第一句话，这是第二句话。这是第三句话，这是第四句话。", ["这是第一句话，这是第二句话。", "这是第三句话，这是第四句话。"]),
     ("ja", "字" * 30, ["字" * 15, "字" * 15]),
 ])
-def test_a_group_is_halved_at_its_best_boundaries(language, text, halves):
-    assert support.halve_group(text, language) == halves
+def test_a_group_of_prose_is_halved_at_its_best_boundaries(language, text, halves):
+    assert support.split_cut_off_group(text, language) == halves
 
 
 @pytest.mark.parametrize("language, text", [("de", "Hallo Welt."), ("zh", "你好。")])
-def test_a_short_group_cannot_be_halved(language, text):
-    assert support.halve_group(text, language) == [text]
+def test_a_short_group_cannot_be_cut(language, text):
+    assert support.split_cut_off_group(text, language) == [text]
+
+
+def test_a_digit_weighs_like_ten_characters():
+    """Normalization writes "1234567" out as 83 characters, spoken in about 4.7 s."""
+    assert support.spoken_weight("Hallo Welt.") == 11
+    assert support.spoken_weight("1234567") == 70
+    assert support.spoken_weight("Am 3. Mai") == 9 + 9
+
+
+# Measured on the real model: 6 of 7 runs of this group ended at 21.7 s with the last
+# number or two missing; halving it by characters cut "8.912.345 | Schiffe." and
+# "und im Jahr | 2020", and spoke "Schiffe." on its own.
+GERMAN_CAPPED = ("Die Stadt hatte im Jahr 1990 genau 1.234.567 Einwohner, im Jahr 2000 schon 2.345.678 Einwohner, "
+                 "im Jahr 2010 dann 3.456.789 Einwohner und im Jahr 2020 schließlich 4.567.891 Einwohner.")
+GERMAN_CAPPED3 = ("Es gab 1.234.567 Autos, 2.345.678 Busse, 3.456.789 Räder, 4.567.891 Boote, 5.678.912 Züge, "
+                  "6.789.123 Flugzeuge, 7.891.234 Roller und 8.912.345 Schiffe.")
+
+
+def test_a_cut_off_number_list_is_cut_at_its_commas_and_keeps_its_last_noun():
+    assert support.split_cut_off_group(GERMAN_CAPPED3, "de") == [
+        "Es gab 1.234.567 Autos, 2.345.678 Busse, 3.456.789 Räder,",
+        "4.567.891 Boote, 5.678.912 Züge, 6.789.123 Flugzeuge,",
+        "7.891.234 Roller und 8.912.345 Schiffe.",
+    ]
+
+
+def test_a_cut_off_sentence_is_cut_before_its_und_rather_than_inside_a_phrase():
+    assert support.split_cut_off_group(GERMAN_CAPPED, "de") == [
+        "Die Stadt hatte im Jahr 1990 genau 1.234.567 Einwohner,",
+        "im Jahr 2000 schon 2.345.678 Einwohner,",
+        "im Jahr 2010 dann 3.456.789 Einwohner",
+        "und im Jahr 2020 schließlich 4.567.891 Einwohner.",
+    ]
+
+
+@pytest.mark.parametrize("text", [
+    pytest.param(GERMAN_CAPPED, id="years-and-numbers"),
+    pytest.param(GERMAN_CAPPED3, id="numbers-and-nouns"),
+    pytest.param("Die Messwerte waren " + ", ".join(str(1234567 + 1111111 * i) for i in range(17)) + ".", id="17-numbers"),
+    pytest.param("Die Kontonummern lauten " + ", ".join(str(1234567890 + 1111111111 * i) for i in range(7)) + " und 1023456789.",
+                 id="10-digit-numbers"),
+    pytest.param("Die Termine sind am " + ", ".join(f"{d:02d}.{m:02d}.2024" for d, m in zip(range(3, 30, 3), range(1, 12))) + ".",
+                 id="dates"),
+    pytest.param("The totals were 1,234,567, 2,345,678, 3,456,789, 4,567,891, 5,678,912, 6,789,123 and 7,891,234 units.",
+                 id="english"),
+])
+def test_every_piece_of_a_cut_off_group_can_be_spoken_in_full(text):
+    pieces = support.split_cut_off_group(text, "de")
+
+    assert len(pieces) > 1
+    assert " ".join(pieces) == text, "text was lost or changed"
+    budget = min(support.RESPLIT_WEIGHT, support.spoken_weight(text) // 2)
+    assert max(support.spoken_weight(p) for p in pieces) <= budget, [support.spoken_weight(p) for p in pieces]
+
+
+def test_a_few_words_a_cut_left_at_the_end_join_the_piece_before_them():
+    """A piece of a word or two is spoken as an utterance of its own, after a pause."""
+    text = "eins zwei drei vier fuenf sechs sieben acht neun zehn elf"
+
+    assert splitter.split_by_weight(text, 50, len) == [text]
+    assert splitter.split_by_weight(text, 30, len) == ["eins zwei drei vier fuenf", "sechs sieben acht neun zehn elf"]
+
+
+def test_a_cut_between_words_does_not_part_a_number_from_its_neighbours():
+    """Only "8.912.345" (weight 72) and "Besucher" may not part: the cut moves before the number."""
+    pieces = splitter.split_by_weight("Heute kamen 8.912.345 Besucher in die Stadt", 85, support.spoken_weight)
+
+    assert pieces == ["Heute kamen", "8.912.345 Besucher in die Stadt"]
+
+
+def test_a_word_too_heavy_for_any_piece_is_cut_into_equal_parts():
+    pieces = splitter.split_by_weight("Nummer 123456789012345678901234567890 Ende", 120, support.spoken_weight)
+
+    assert pieces == ["Nummer 1234567890", "1234567890", "1234567890 Ende"]
+
+
+def test_nothing_to_cut_gives_nothing():
+    assert splitter.split_by_weight("  \n ", 10, len) == []
 
 
 # --- the splitter is chatterbox's, and stays linear ---------------------------------------
@@ -327,6 +406,21 @@ def test_the_sentence_rules_are_chatterboxs_and_not_a_fork_of_them():
         f"{diverged} differ between magpie-tts-service/text_splitting.py and chatterbox-tts-service/app.py: "
         "make the same change in both."
     )
+
+
+@pytest.mark.parametrize("text", [
+    pytest.param("1" * 5000, id="digits"),
+    pytest.param("1, " * 1666, id="numbers-and-commas"),
+    pytest.param("und " * 1250, id="conjunctions"),
+    pytest.param("a " * 2500, id="words"),
+    pytest.param("12. " * 1250, id="ordinals"),
+])
+@pytest.mark.parametrize("budget", [10, 250, 100000])
+def test_cutting_by_weight_is_linear_on_hostile_input(text, budget):
+    started = time.perf_counter()
+    pieces = splitter.split_by_weight(text, budget, support.spoken_weight)
+    assert time.perf_counter() - started < 3.0
+    assert "".join(pieces).replace(" ", "") == text.replace(" ", "")
 
 
 @pytest.mark.parametrize("language", ["de", "zh"])

@@ -1,6 +1,6 @@
 """Sentence-aware text splitting for the Magpie TTS service (pure Python, no torch or NeMo).
 
-Two splitters:
+Three splitters:
 
 * ``split_for_synthesis`` (German, English, Spanish, French) uses chatterbox-tts-service's
   sentence rules: German ordinals and abbreviations, closing quotes, and a length ceiling
@@ -11,6 +11,9 @@ Two splitters:
   tests/test_chatterbox_chunking.py runs every one of its cases against both copies.
 * ``split_cjk`` (Chinese, Japanese: no spaces between words) cuts at the scripts' own
   sentence marks, and an over-long sentence after a clause mark.
+* ``split_by_weight`` cuts a group whose generation was cut off into pieces by how long
+  they take to speak rather than by length, at sentence ends, clause commas and before
+  a conjunction, without parting a number from its neighbours.
 
 Why Magpie splits at all: ``MagpieTTSModel.do_tts`` decodes at most 500 frames (about
 23 s of audio) per chunk of text and, above a per-language threshold (45 English words,
@@ -179,6 +182,109 @@ def split_for_synthesis(text: str, max_chars: int) -> list[str]:
     max_chars = max(20, int(max_chars))
     floor = min(60, max_chars // 2)
     return _split_sentences(text, first_chunk_chars=floor, min_chars=floor, max_chars=max_chars)
+
+
+# --- Cutting by how long a text takes to speak ------------------------------------------
+
+# A clause may also begin before one of these words; a cut there keeps "und im Jahr 2020"
+# together instead of leaving "und im Jahr" at the end of one piece.
+_COORDINATORS = frozenset({"und", "oder", "aber", "sowie", "and", "or", "but", "y", "pero", "et", "ou", "mais"})
+# A last piece shorter than this, without a digit, is a few words a cut left behind: it
+# joins the piece before it rather than being spoken on its own after a pause.
+_TAIL_CHARS = 20
+
+
+def _clauses(sentence: str) -> list:
+    """*sentence*'s words grouped into clauses: a clause ends after a word with a trailing comma, or before a coordinating conjunction."""
+    clauses: list = []
+    for word in sentence.split():
+        if clauses and not (clauses[-1][-1].endswith(",") or word.lower() in _COORDINATORS):
+            clauses[-1].append(word)
+        else:
+            clauses.append([word])
+    return clauses
+
+
+def _has_digit(word: str) -> bool:
+    return any(c.isdecimal() for c in word)
+
+
+def _latest_cut(start: int, end: int, allowed) -> int:
+    """The latest k in (start, end] with ``allowed(k)``, or 0 when there is none."""
+    for k in range(end, start, -1):
+        if allowed(k):
+            return k
+    return 0
+
+
+def _cut_words(words: list, budget: int, weight) -> list:
+    """*words* (a clause heavier than *budget*) in runs of at most *budget*, each ending as late as fits.
+
+    A run ends next to a word with a digit only when it cannot end elsewhere, and after
+    one only when it cannot end before it: "8.912.345 Schiffe" and "im Jahr 2020" stay
+    together. A single word heavier than *budget* (a long number, a URL) is cut into
+    equal parts.
+    """
+    runs: list = []
+    start = 0
+    while start < len(words):
+        used, end = -1, start
+        while end < len(words) and used + 1 + weight(words[end]) <= budget:
+            used += 1 + weight(words[end])
+            end += 1
+        if end == len(words):
+            runs.append(" ".join(words[start:]))
+            break
+        if end == start:  # the next word alone is too heavy
+            word = words[start]
+            parts = -(-weight(word) // budget)
+            size = -(-len(word) // parts)
+            runs.extend(word[i:i + size] for i in range(0, len(word), size))
+            start += 1
+            continue
+        cut = end
+        if weight(words[end]) <= budget:  # (a word too heavy alone is cut up next anyway)
+            cut = (_latest_cut(start, end, lambda k: not _has_digit(words[k - 1]) and not _has_digit(words[k]))
+                   or _latest_cut(start, end, lambda k: not _has_digit(words[k - 1]))
+                   or end)
+        runs.append(" ".join(words[start:cut]))
+        start = cut
+    return runs
+
+
+def split_by_weight(text: str, budget: int, weight) -> list[str]:
+    """Pieces of *text*, each weighing at most *budget* by ``weight(piece)``, cut where a reader would pause.
+
+    *weight* measures a piece of text, is at least its length and adds up (two pieces
+    joined by a space weigh both plus one); the Magpie service counts a digit as several
+    characters, because normalization writes numbers out. The text is taken apart into
+    clauses (at sentence ends by the rules above, after a comma, before "und", "and",
+    "et", ...), a clause heavier than *budget* into runs of words (``_cut_words``), and
+    the parts are packed into pieces in order, each as full as *budget* allows. A last
+    piece of a few words without a digit then joins the one before it, even past
+    *budget*. Whitespace between pieces becomes one space; nothing else changes.
+    """
+    budget = max(1, int(budget))
+    parts: list = []
+    for line in re.split(r"\n+", text.strip()):
+        for sentence in _sentences(line):
+            for words in _clauses(sentence):
+                clause = " ".join(words)
+                parts.extend(_cut_words(words, budget, weight) if weight(clause) > budget else [clause])
+
+    pieces: list = []  # each a list of parts, joined at the end
+    used = 0
+    for part in parts:
+        part_weight = weight(part)
+        if pieces and used + 1 + part_weight <= budget:
+            pieces[-1].append(part)
+            used += 1 + part_weight
+        else:
+            pieces.append([part])
+            used = part_weight
+    if len(pieces) > 1 and sum(map(len, pieces[-1])) < _TAIL_CHARS and not any(map(_has_digit, pieces[-1])):
+        pieces[-2].extend(pieces.pop())
+    return [" ".join(piece) for piece in pieces]
 
 
 # --- Text without spaces between words (Chinese, Japanese) -----------------------------

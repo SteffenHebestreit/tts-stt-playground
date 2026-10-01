@@ -26,7 +26,9 @@ real model:
 * the decoder stops after ``inference_parameters.max_decoder_steps`` frames of
   ``codec_model_samples_per_frame`` samples and returns what it has, with no error
   (``install_nemo(decoder_cap=...)``; without it the fake has no limit and no such
-  attributes);
+  attributes). The real model seldom gets that far: it ends speech that needs more room
+  itself, a little before the limit (decoder step 234 of 250), and ``early_end`` makes
+  the fake do the same;
 * the real ``LANGUAGE_TOKENIZER_MAP`` lists tokenizers by name, and the checkpoint holds
   Italian, Vietnamese and Hindi tokenizers under names that map does not list. The fake
   map reproduces that gap, so ``it``, ``vi`` and ``hi`` are not routable even though a
@@ -309,9 +311,12 @@ class FakeMagpie:
                     f"got min={index}, max={index}"
                 )
             spoken = self._normalized(transcript, language) if apply_TN else _without_digits(transcript)
-            samples = len(spoken.strip()) * SAMPLES_PER_CHAR
-            if self.package.decoder_cap is not None:
-                samples = min(samples, self.package.decoder_cap * SAMPLES_PER_CHAR)
+            frames = len(spoken.strip())
+            cap = self.package.decoder_cap
+            if cap is not None and frames > cap:
+                # Too long to finish: the real model ends it itself, early_end frames short of the limit.
+                frames = cap - self.package.early_end
+            samples = frames * SAMPLES_PER_CHAR
             audio = np.full((1, samples), 0.1 * (index + 1), dtype=np.float32)
             return FakeDeviceTensor(audio), FakeDeviceTensor(np.array([samples], dtype=np.int64))
         finally:
@@ -324,7 +329,7 @@ class FakeNemo:
 
     def __init__(self, speakers: int, tokenizers, load_error: Optional[Exception], generate_error: Optional[Exception],
                  generate_error_calls: Optional[int], decoder_cap: Optional[int] = None,
-                 failing_normalizers=(), normalizer_cache: bool = True):
+                 failing_normalizers=(), normalizer_cache: bool = True, early_end: int = 0):
         self.speakers = speakers
         self.tokenizers = tokenizers
         self.load_error = load_error
@@ -332,6 +337,7 @@ class FakeNemo:
         # None: every do_tts call raises generate_error; N: only the first N calls do.
         self.generate_error_calls = generate_error_calls
         self.decoder_cap = decoder_cap
+        self.early_end = early_end
         self.failing_normalizers = set(failing_normalizers)
         self.normalizer_cache = normalizer_cache
         self.loads = 0
@@ -358,16 +364,18 @@ class FakeNemo:
 def install_nemo(monkeypatch, *, speakers: int = 5, tokenizers=CHECKPOINT_TOKENIZERS,
                  load_error: Optional[Exception] = None, generate_error: Optional[Exception] = None,
                  generate_error_calls: Optional[int] = None, decoder_cap: Optional[int] = None,
-                 failing_normalizers=(), normalizer_cache: bool = True) -> FakeNemo:
+                 early_end: int = 0, failing_normalizers=(), normalizer_cache: bool = True) -> FakeNemo:
     """Register a fake ``nemo.collections.tts`` (removed again by monkeypatch).
 
     ``decoder_cap``: the decoder's frame limit (NeMo's max_decoder_steps), counted in
-    characters' worth of fake audio; longer speech comes back cut to it.
+    characters' worth of fake audio; longer speech comes back cut to it, or, with
+    ``early_end``, that many frames shorter (the real model ends such speech itself at
+    decoder step 234 of 250: 32 of 500 frames before the limit).
     ``failing_normalizers``: languages whose first text-normalizer build fails.
     ``normalizer_cache=False``: a model without NeMo 3.0's ``_text_normalizers``.
     """
     package = FakeNemo(speakers, tokenizers, load_error, generate_error, generate_error_calls,
-                       decoder_cap, failing_normalizers, normalizer_cache)
+                       decoder_cap, failing_normalizers, normalizer_cache, early_end)
 
     class MagpieTTSModel:
         @classmethod

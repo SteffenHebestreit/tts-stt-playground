@@ -32,6 +32,10 @@ LONG_COMMA_SENTENCE = "，".join([
     "因此政府和企业以及社会各界都应当共同努力", "积极探索切实可行的解决方案",
 ]) + "。"
 
+# 181 characters of 17 numbers: the reviewer's case. On the real model one 7-digit number
+# takes about 4.7 s, so halving this by characters left halves that were still too long.
+NUMBER_LIST = "Die Messwerte waren " + ", ".join(str(1234567 + 1111111 * i) for i in range(17)) + "."
+
 
 def _tts(client, text=TEXT, **body):
     return client.post("/tts", json={"text": text, "language": "de", **body})
@@ -339,8 +343,69 @@ def test_a_group_that_fills_the_decoders_limit_is_generated_again_in_halves(
     assert "generating it again as 2 pieces" in caplog.text
 
 
-def test_a_half_that_still_fills_the_limit_is_kept_with_a_warning_not_a_500(monkeypatch, caplog):
-    """A generation that never stops cannot be fixed by cutting the text further."""
+def test_a_group_the_model_ends_just_short_of_the_limit_is_generated_again(monkeypatch, caplog):
+    """The real model seldom reaches the limit: it ends speech that needs more room itself, at decoder step 234 of 250.
+
+    6 of 7 runs of one number-dense sentence came back with 21.7 s of the 23.2 s, its end
+    missing, as a 200 without a warning, because only audio that filled the limit counted.
+    """
+    first, second = "Das ist der erste Satz.", "Das ist der zweite Satz."
+    package = install_nemo(monkeypatch, decoder_cap=40, early_end=3)  # 37 of 40 frames: 92.5%
+    client = TestClient(load_app(MAGPIE_GROUP_GAP_MS="100").app)
+
+    with caplog.at_level("WARNING"):
+        response = _tts(client, f"{first} {second}")
+
+    assert response.status_code == 200
+    assert [c["text"] for c in _real(package)] == [f"{first} {second}", first, second]
+    assert response.headers["X-Chunk-Count"] == "2"
+    assert decode_audio(response.content).size == (len(first) + len(second)) * SAMPLES_PER_CHAR + int(SAMPLE_RATE * 0.1)
+    assert "its end is probably missing; generating it again as 2 pieces" in caplog.text
+
+
+@pytest.mark.parametrize("frames, again", [(89, False), (90, True)], ids=["89%", "90%"])
+def test_audio_counts_as_cut_off_from_90_percent_of_the_decoders_limit(monkeypatch, caplog, frames, again):
+    """Complete generations were measured up to 91% of the limit (step 227), cut-off ones from 93.6% (step 234)."""
+    text = "Wort " * 17 + ("Wort" if frames == 89 else "Worte")
+    assert len(text) == frames
+    package = install_nemo(monkeypatch, decoder_cap=100)
+    client = TestClient(load_app().app)
+
+    with caplog.at_level("WARNING"):
+        response = _tts(client, text)
+
+    assert response.status_code == 200
+    calls = [c["text"] for c in _real(package)]
+    assert (len(calls) > 1) is again, calls
+    assert ("generating it again" in caplog.text) is again
+
+
+def test_a_number_dense_group_is_cut_into_pieces_that_are_spoken_in_full(monkeypatch, caplog):
+    """Halving 181 characters of numbers gave halves that were cut off as well; their ends were silently missing.
+
+    The pieces are sized by how long they take to speak (a digit weighs like ten
+    characters) and cut at the commas, so every one of them fits.
+    """
+    package = install_nemo(monkeypatch, decoder_cap=67, early_end=4)
+    client = TestClient(load_app(MAGPIE_GROUP_GAP_MS="100").app)
+
+    with caplog.at_level("WARNING"):
+        response = _tts(client, NUMBER_LIST)
+
+    assert response.status_code == 200
+    first, *pieces = [c["text"] for c in _real(package)]
+    assert first == NUMBER_LIST and len(pieces) > 2
+    assert " ".join(pieces) == NUMBER_LIST, "a piece of the text was never generated"
+    assert all(piece.endswith((",", ".")) for piece in pieces), f"cut between a number and its comma: {pieces}"
+    assert "its end may be missing" not in caplog.text
+    assert response.headers["X-Chunk-Count"] == str(len(pieces))
+    audio = decode_audio(response.content)
+    gaps = int(SAMPLE_RATE * 0.1) * (len(pieces) - 1)
+    assert audio.size == sum(len(piece) for piece in pieces) * SAMPLES_PER_CHAR + gaps, "the cut-off attempt is in the answer"
+
+
+def test_a_piece_that_still_fills_the_limit_is_kept_with_a_warning_not_a_500(monkeypatch, caplog):
+    """Pieces are not cut again: a generation that never stops would otherwise multiply without bound."""
     first, second = "Das ist der erste Satz.", "Das ist der zweite Satz."
     package = install_nemo(monkeypatch, decoder_cap=10)
     client = TestClient(load_app(MAGPIE_GROUP_GAP_MS="100").app)
@@ -363,11 +428,11 @@ def test_a_group_too_short_to_halve_is_kept_with_a_warning(monkeypatch, caplog):
 
     assert response.status_code == 200 and response.headers["X-Chunk-Count"] == "1"
     assert [c["text"] for c in _real(package)] == [TEXT]
-    assert "Group 1 of 1 (11 characters) filled the decoder's limit of 50 samples" in caplog.text
+    assert "Group 1 of 1 (11 characters) came back with" in caplog.text and "its end may be missing" in caplog.text
 
 
-def test_audio_below_the_decoders_limit_is_not_generated_again(monkeypatch, caplog):
-    package = install_nemo(monkeypatch, decoder_cap=len(TEXT) + 1)
+def test_audio_well_below_the_decoders_limit_is_not_generated_again(monkeypatch, caplog):
+    package = install_nemo(monkeypatch, decoder_cap=2 * len(TEXT))
     client = TestClient(load_app().app)
 
     with caplog.at_level("WARNING"):
