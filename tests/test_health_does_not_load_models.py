@@ -32,7 +32,10 @@ SERVICES = [
 ]
 
 # Calls that either load weights or take a reference that blocks unloading.
-FORBIDDEN = {"get_model", "load_model", "_acquire_model", "acquire", "acquire_async", "acquire_ref"}
+# `acquire_lease` and `lease` are ModelSlot's lease API, the only one Magpie and
+# Chatterbox use. Exact names only: a substring match would flag release().
+FORBIDDEN = {"get_model", "load_model", "_acquire_model", "acquire", "acquire_async", "acquire_ref",
+             "acquire_lease", "lease"}
 
 
 def _health_functions(tree: ast.AST, path: str = "/health"):
@@ -60,6 +63,28 @@ def _called_names(node: ast.AST):
             yield func.attr
 
 
+def _forbidden_uses(node: ast.AST) -> list:
+    """The FORBIDDEN names *node* calls, or reads as an attribute: a bound method handed
+    to a thread (`asyncio.to_thread(_model_slot.lease)`) is never called by the handler."""
+    names = set(_called_names(node))
+    names.update(sub.attr for sub in ast.walk(node) if isinstance(sub, ast.Attribute))
+    return sorted(FORBIDDEN.intersection(names))
+
+
+@pytest.mark.parametrize("body", [
+    "lease = await _model_slot.acquire_lease()\n    await lease.release_async()",
+    "async with await _model_slot.acquire_lease():\n        pass",
+    "_model_slot.lease().release()",
+    "await asyncio.to_thread(_model_slot.lease)",
+])
+def test_the_guard_catches_a_health_handler_that_takes_a_lease(body):
+    """Magpie and Chatterbox pin their model only through ModelSlot.acquire_lease() and
+    lease(); a guard that knew only acquire/acquire_async/acquire_ref let them through."""
+    tree = ast.parse(f'@app.get("/health")\nasync def health():\n    {body}\n    return {{}}\n')
+    [(_, node)] = _health_functions(tree)
+    assert _forbidden_uses(node), f"the guard missed: {body!r}"
+
+
 @pytest.mark.parametrize("service", SERVICES)
 def test_health_handler_does_not_load_a_model(service):
     app_py = REPO / service / "app.py"
@@ -71,7 +96,7 @@ def test_health_handler_does_not_load_a_model(service):
     assert handlers, f"{service}: no /health handler found — did the route move?"
 
     for name, node in handlers:
-        offenders = sorted(FORBIDDEN.intersection(_called_names(node)))
+        offenders = _forbidden_uses(node)
         assert not offenders, (
             f"{service}: /health handler '{name}' calls {offenders}. "
             "The gateway polls /health on a timer, so this would pin every model "
@@ -96,14 +121,19 @@ def test_health_handler_exists_and_is_cheap(service):
         )
 
 
-def test_stt_ready_handler_does_not_load_a_model():
-    """/ready is polled on a timer exactly like /health, so it has the same rule:
-    a readiness probe that loaded the model would keep it resident for as long as
-    anything polls it. (The behavioural twin of this is in test_stt_http_endpoints.py;
+@pytest.mark.parametrize("service", SERVICES)
+def test_ready_handler_does_not_load_a_model(service):
+    """/ready may be polled on a timer like /health, so it has the same rule: a
+    readiness probe that loaded the model would keep it resident for as long as
+    anything polls it, and every service's /ready says it only reads state. (The
+    behavioural twins are test_stt_http_endpoints.py and test_magpie_service.py;
     this catches the call being written.)"""
-    tree = ast.parse((REPO / "stt-service" / "app.py").read_text(encoding="utf-8"))
+    app_py = REPO / service / "app.py"
+    if not app_py.exists():
+        pytest.skip(f"{service} has no app.py")
+    tree = ast.parse(app_py.read_text(encoding="utf-8"))
     handlers = list(_health_functions(tree, "/ready"))
-    assert handlers, "stt-service: no /ready handler found — did the route move?"
+    assert handlers, f"{service}: no /ready handler found — did the route move?"
     for name, node in handlers:
-        offenders = sorted(FORBIDDEN.intersection(_called_names(node)))
-        assert not offenders, f"stt-service: /ready handler '{name}' calls {offenders}."
+        offenders = _forbidden_uses(node)
+        assert not offenders, f"{service}: /ready handler '{name}' uses {offenders}."
