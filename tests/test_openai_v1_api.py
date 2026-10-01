@@ -606,7 +606,8 @@ def test_a_busy_backend_is_a_503_the_client_can_wait_out(monkeypatch):
     assert r.headers["retry-after"] == "5"
     error = r.json()["error"]
     assert (error["type"], error["code"]) == ("server_error", "server_busy")
-    assert error["message"] == f"Speech backend is busy: {MAGPIE_BUSY}"
+    # The sentence says "busy" itself: "Speech backend is busy: The service is busy: ..." said it twice.
+    assert error["message"] == f"Speech backend: {MAGPIE_BUSY}"
 
 
 def test_a_busy_status_with_a_traceback_is_still_a_generic_502(monkeypatch):

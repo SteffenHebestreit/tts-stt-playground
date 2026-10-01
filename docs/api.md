@@ -188,9 +188,13 @@ than silently downgraded, and an unknown value is 400 `invalid_value`.
 **Which provider answered.** The response carries `X-Provider: <id>`. If the *default* provider
 could not be reached at all (connection refused or timed out) and exactly one other STT provider is
 healthy, the request is retried there once and the response also carries
-`X-Provider-Fallback: <default>-><used>` (and a warning is logged). A backend that answers with an
-error, or times out while working, is **not** retried: that would run the job twice. `/api/stt`
-never falls back; it does what you asked.
+`X-Provider-Fallback: <default>-><used>` (and a warning is logged), an error response too. When the
+stand-in refuses the request (a language it cannot do, audio longer than its own cap), the answer is
+**502** `server_error` naming it ("Transcription fallback 'canary' (the default 'whisper' is
+unreachable) rejected the request: ..."), not the caller's 400/413: the default it stood in for was
+never asked and may well accept the request once it is back, and the SDKs retry a 502. A backend that
+answers with an error, or times out while working, is **not** retried: that would run the job twice.
+`/api/stt` never falls back; it does what you asked.
 
 ---
 

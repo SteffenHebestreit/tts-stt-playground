@@ -388,14 +388,16 @@ def backend_error(what: str, exc: Any) -> JSONResponse:
     to something a client may see. A busy backend's 503 (its queue is full, the
     request waited its time for a turn, the GPU is out of memory) comes with a
     Retry-After; that stays a 503 `server_busy` with the header, which OpenAI
-    clients wait out and retry, like the gateway's own ffmpeg refusal.
+    clients wait out and retry, like the gateway's own ffmpeg refusal. Its sentence
+    says what is wrong itself ("The service is busy: ...", "GPU out of memory ..."),
+    so it is only prefixed with the backend it came from.
     """
     status = _CALLER_FAULT_STATUS.get(getattr(exc, "status_code", None))
     if status is not None:
         return openai_error(status, f"{what} backend rejected the request: {backend_detail(exc)}")
     retry_after = _retry_after(exc) if getattr(exc, "status_code", None) == 503 else None
     if retry_after is not None:
-        busy = openai_error(503, f"{what} backend is busy: {backend_detail(exc)}", code="server_busy")
+        busy = openai_error(503, f"{what} backend: {backend_detail(exc)}", code="server_busy")
         busy.headers["Retry-After"] = retry_after
         return busy
     return openai_error(502, f"{what} backend failed: {backend_detail(exc)}")
@@ -407,7 +409,11 @@ def backend_error(what: str, exc: Any) -> JSONResponse:
 class ClientDisconnected(HTTPException):
     """The caller closed the connection before the backend answered (499, nginx's code for it).
 
-    Nobody reads the answer; the status is for the access log.
+    The answer never goes out and nothing logs its status: uvicorn drops whatever is
+    sent after a disconnect, before its access-log line (and the gateway runs with
+    --no-access-log). The hang-up is recorded by the INFO line in `unless_client_gone`.
+    A class of its own so that a handler turning a backend's HTTPException into a 502
+    can let it through.
     """
 
 
@@ -729,7 +735,19 @@ def build_router(
             try:
                 upstream = await transcribe_with(alternative, get_provider(alternative, kind="stt"))
             except HTTPException as fallback_exc:
-                return backend_error("Transcription", fallback_exc)
+                if getattr(fallback_exc, "status_code", None) in _CALLER_FAULT_STATUS:
+                    # The stand-in's own limits (a language it cannot do, a shorter audio
+                    # cap), not a verdict on the request: the default was never asked and
+                    # may well take it once it is back. A 502, which the SDKs retry, as
+                    # when there is no stand-in at all.
+                    failed = openai_error(502, (
+                        f"Transcription fallback '{alternative}' (the default '{provider_id}' "
+                        f"is unreachable) rejected the request: {backend_detail(fallback_exc)}"))
+                else:
+                    failed = backend_error("Transcription", fallback_exc)
+                failed.headers["X-Provider"] = alternative
+                failed.headers["X-Provider-Fallback"] = f"{provider_id}->{alternative}"
+                return failed
         except HTTPException as exc:
             return backend_error("Transcription", exc)
 

@@ -15,6 +15,7 @@ default STT provider is `whisper`, which does not run there, so
 import logging
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from frontend_loader import install_stub, load_frontend_app, wav_bytes
@@ -261,6 +262,55 @@ def test_the_fallback_target_failing_too_is_reported(monkeypatch):
     r = _transcribe(client)
     assert r.status_code == 502
     _envelope_ok(r.json())
+    assert r.headers["x-provider-fallback"] == "whisper->qwen3-asr"
+
+
+def _stand_in_answering(status, detail, headers=None):
+    """The default (whisper) cannot be reached; qwen3-asr, the one healthy stand-in, answers `status`."""
+    def handler(method, url, kwargs):
+        host = httpx.URL(url).host
+        if host != "qwen3-asr-service":
+            raise httpx.ConnectError("connection refused", request=httpx.Request(method, url))
+        if method == "GET":
+            return {"status": "healthy"}
+        return httpx.Response(status, json={"detail": detail}, headers=headers or {})
+    return handler
+
+
+@pytest.mark.parametrize("status", [400, 413, 422])
+def test_a_stand_ins_refusal_is_a_502_that_names_it_not_the_callers_error(monkeypatch, status):
+    """The stand-in's limits (a language it cannot do, a shorter audio cap) are not a verdict on the request.
+
+    The default it stood in for was never asked and may well take it once it is back, so
+    the answer is the 502 the SDKs retry, as with no stand-in at all, not a 400/413 they
+    give up on; and it says which provider refused, and that it was a stand-in.
+    """
+    detail = "Language 'it' is not supported by this model. Supported: de, en, es, fr."
+    _, stub, client = _client(monkeypatch, handler=_stand_in_answering(status, detail))
+
+    r = _transcribe(client, language="it")
+
+    assert r.status_code == 502
+    error = _envelope_ok(r.json())
+    assert (error["type"], error["code"]) == ("server_error", None)
+    assert error["message"] == (
+        f"Transcription fallback 'qwen3-asr' (the default 'whisper' is unreachable) rejected the request: {detail}")
+    assert r.headers["x-provider"] == "qwen3-asr"
+    assert r.headers["x-provider-fallback"] == "whisper->qwen3-asr"
+    assert _posted_hosts(stub) == ["stt-service", "qwen3-asr-service"]
+
+
+def test_a_busy_stand_in_is_a_503_the_client_can_wait_out_and_says_it_stood_in(monkeypatch):
+    busy = "The service is busy: 5 requests are already in progress or waiting. Retry shortly."
+    _, _, client = _client(monkeypatch, handler=_stand_in_answering(503, busy, {"Retry-After": "5"}))
+
+    r = _transcribe(client)
+
+    assert r.status_code == 503 and r.headers["retry-after"] == "5"
+    error = _envelope_ok(r.json())
+    assert (error["type"], error["code"]) == ("server_error", "server_busy")
+    assert r.headers["x-provider"] == "qwen3-asr"
+    assert r.headers["x-provider-fallback"] == "whisper->qwen3-asr"
 
 
 def test_explicit_provider_selection_stays_strict(monkeypatch):
