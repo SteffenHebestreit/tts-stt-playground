@@ -272,11 +272,14 @@ def test_the_nemo_install_holds_torch_and_torchaudio_with_a_constraint_file(dock
     assert "rm" not in shlex.split(command), \
         "this test runs the NeMo install RUN on the test host with only pip3 and python3 stubbed; put a cleanup in a RUN of its own"
     constraints = tmp_path / "torch-constraints.txt"
+    # The path goes into the RUN text unquoted, so in POSIX form: sh would eat the
+    # backslashes of a Windows path (C:/... is fine there). On Linux it is str(constraints).
+    shell_path = constraints.as_posix()
     (tmp_path / "requirements.txt").write_text((dockerfile.parent / "requirements.txt").read_text(encoding="utf-8"))
     torch, audio = _arg_default(dockerfile, "TORCH_VERSION"), _arg_default(dockerfile, "TORCHAUDIO_VERSION")
 
     done = _shell(
-        command.replace("/tmp/torch-constraints.txt", str(constraints)), tmp_path,
+        command.replace("/tmp/torch-constraints.txt", shell_path), tmp_path,
         env={"TORCH_VERSION": torch, "TORCHAUDIO_VERSION": audio, "NEMO_TOOLKIT_SPEC": ">=3.0.0,<3.1",
              "RECORD": str(tmp_path / "pip-argv")},
         stubs={"pip3": 'for a in "$@"; do echo "$a"; done > "$RECORD"', "python3": "exit 0"},
@@ -285,7 +288,7 @@ def test_the_nemo_install_holds_torch_and_torchaudio_with_a_constraint_file(dock
     assert done.returncode == 0, done.stderr
     argv = (tmp_path / "pip-argv").read_text().split("\n")
     nemo = f"nemo_toolkit[{NEMO_EXTRA[dockerfile.parent.name]}]>=3.0.0,<3.1"
-    assert argv[argv.index("-c") + 1] == str(constraints)
+    assert argv[argv.index("-c") + 1] == shell_path
     assert constraints.read_text().split() == [f"torch=={torch}", f"torchaudio=={audio}"]
     assert nemo in argv, "the NeMo spec is unchanged"
     assert argv.index("-c") < argv.index(nemo), "-c must apply to the whole install"
