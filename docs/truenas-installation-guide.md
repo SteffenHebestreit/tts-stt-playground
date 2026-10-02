@@ -174,13 +174,13 @@ the next request on, in every gateway worker, with no restart, and is kept in th
 | API access & keys | Open on the network or a key required; what the YAML's `API_KEY` may do (admin or client); named API keys, created and revoked one by one |
 | Engines | Which optional engines are offered (Canary, Parakeet, Chatterbox, Magpie, whisper.cpp, voice training), each with whether its container answers; the default text-to-speech and speech-to-text engine |
 | Limits | `MAX_UPLOAD_MB`, `MAX_TTS_CHARS`, `MAX_CONCURRENT_UPLOADS`, `MAX_CONCURRENT_FFMPEG` |
-| History & recovery | The last 20 versions with Restore, Discard (back to the YAML), and a recovery code for a lost admin key |
+| History & recovery | The last 20 versions with Restore, **Back to the app YAML** (drops every value saved here), and **Print a recovery code** for a lost admin key |
 
 **Who may change them.** Every change needs an admin key.
 
 - `API_KEY` set in the YAML: enter it when the page asks. It is an admin key unless you make it a
   client key on the page (which needs an admin key made there first).
-- No `API_KEY`: the page shows the values read-only. Ask it for a **one-time code**, read the code
+- No `API_KEY`: the page shows the values read-only. Press **Print a one-time code**, read the code
   in the gateway's log (**Apps -> Installed -> tts-stt -> Workloads -> frontend-service -> View
   Logs**, or `docker logs ix-tts-stt-frontend-service-1`), and enter it with a name for your key.
   The browser creates the key and shows it once: store it in a password manager. The same step can
@@ -206,7 +206,7 @@ switches of the page itself: `ENABLE_SETTINGS_UI` (`false` makes the page read-o
 values ignored; API keys made there stay in force) and `SETTINGS_LOCKED_KEYS` (settings that always
 come from the YAML, comma separated, for example `TRUSTED_HOSTS,MAX_UPLOAD_MB`). Where the YAML and
 the page both set something, the page wins ([section 3](#3-what-truenas-does-with-this-app)); every
-field shows where its value comes from and has **Reset to YAML**.
+field shows where its value comes from and has **Reset to app YAML**.
 
 **An install pasted before the page existed** has no `settings/` mount. The page then shows the
 values read-only, says why, and shows the two lines to add under `frontend-service:` ->
@@ -486,10 +486,10 @@ panel, not against feel):
 | The UI asks for an API key, or a script gets `401` | `API_KEY` is set, or **Settings -> API access & keys** requires a key. There is no exemption for the web UI | Type the key into the prompt (once per browser tab); scripts send `Authorization: Bearer <key>`. Keys made in the page work everywhere the YAML key does |
 | The Settings page is read-only: "Settings cannot be saved here" | The YAML was pasted before the page existed and has no `settings/` mount | Add the two lines the page shows under `frontend-service:` -> `volumes:` (or paste the current file with your edits), Save |
 | The Settings page shows the values but saves nothing; "Nobody can change these settings yet" | No admin key exists: no `API_KEY` in the YAML and none made in the page | Ask the page for a one-time code and read it in the log: **Workloads -> frontend-service -> View Logs**, or `docker logs ix-tts-stt-frontend-service-1` |
-| Lost the admin key; Settings answers `401` to everything | The key made in the page is gone from your browser and password manager | Same as above: a one-time code from the log creates a new admin key (revoke the old one afterwards). Or delete `settings/keys.json`: every key made in the page is gone, and API access follows the YAML again (open without `API_KEY`) |
+| Lost the admin key; Settings answers `401` to everything | The key made in the page is gone from your browser and password manager | **Print a recovery code** under the page's key prompt: a one-time code from the log, as above, creates a new admin key (revoke the old one afterwards). Or delete `settings/keys.json`: every key made in the page is gone, and API access follows the YAML again (open without `API_KEY`) |
 | Settings answers `would_lock_out` | The change would refuse the address you are saving from (a host name or proxy you reach it by) | Keep that name, or make the change from `http://<truenas-ip>:3000/settings` |
-| A saved value broke something (host name, engine, limit) | The page saved it and it wins over the YAML | **Settings -> History**: Restore an earlier version, or Discard (back to the YAML). Without the page: delete `settings/gateway.json` (the YAML applies from the next request), create an empty `settings/SAFE-MODE`, or set `ENABLE_SETTINGS_UI:-false` |
-| A value you changed in the YAML does nothing | The Settings page saved that setting, and a saved value wins | The field says where its value comes from: press **Reset to YAML**, or list the setting in `SETTINGS_LOCKED_KEYS` |
+| A saved value broke something (host name, engine, limit) | The page saved it and it wins over the YAML | **Settings -> History & recovery**: Restore an earlier version, or **Back to the app YAML**. Without the page: delete `settings/gateway.json` (the YAML applies from the next request), create an empty `settings/SAFE-MODE`, or set `ENABLE_SETTINGS_UI:-false` |
+| A value you changed in the YAML does nothing | The Settings page saved that setting, and a saved value wins | The field says where its value comes from: press **Reset to app YAML**, or list the setting in `SETTINGS_LOCKED_KEYS` |
 | A banner says a saved value was ignored | A hand edit of `settings/gateway.json` with a value the page would refuse; the rest of the file still applies | Save the field again in the page, or fix or delete that line |
 | `503` with `Retry-After` | A limit was reached, not a fault: too many uploads or `ffmpeg` conversions at once, or a full or timed-out queue at a model service | Retry after the delay. Limits: `MAX_CONCURRENT_UPLOADS`, `MAX_CONCURRENT_FFMPEG`, `ASR_MAX_QUEUE`, `TTS_MAX_QUEUE`, `ASR_QUEUE_TIMEOUT_S`, `TTS_QUEUE_TIMEOUT_S` |
 | Live transcription lags | Decode time exceeds the update interval | Read `decode NNN ms`: under 500 ms is fine; near 1000 ms use a smaller model; over 1500 ms you are probably on CPU or the GPU is contended. Audio is skipped rather than queued, so lag stays bounded |

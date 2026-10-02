@@ -616,8 +616,8 @@ keeps the key in `sessionStorage`; scripts send `Authorization: Bearer <key>`. T
 **The Settings page saves nothing, or the admin key is lost**
 Without `API_KEY` and before the first claim nobody may change settings: ask the page for a one-time code and
 read it in `docker compose logs frontend-service` (the same recovers a lost admin key). A saved value that broke
-something: Restore or Discard under History, or delete `settings/gateway.json` (`.env` applies from the next
-request). `ENABLE_SETTINGS_UI=false` makes the gateway ignore what the page saved.
+something: Restore, or Back to the app YAML, under History & recovery, or delete `settings/gateway.json` (`.env`
+applies from the next request). `ENABLE_SETTINGS_UI=false` makes the gateway ignore what the page saved.
 
 **503 with `Retry-After`**
 The service is at its limit rather than broken: too many uploads or `ffmpeg` conversions at the gateway
