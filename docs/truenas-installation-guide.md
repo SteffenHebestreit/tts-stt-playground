@@ -4,6 +4,7 @@ The one guide for running TTS-STT on TrueNAS SCALE. The other TrueNAS pages in t
 short and point back here.
 
 - **Install** in about 5 minutes: [section 2](#2-install-in-5-minutes)
+- **Change settings** in the web UI, no YAML: [Settings in the web UI](#settings-in-the-web-ui)
 - **Update** in about 2 minutes: [section 4](#4-update-in-2-minutes)
 - **Roll back**: [section 5](#5-roll-back)
 - **VRAM planning**: [section 6](#6-vram-and-disk-planning)
@@ -63,6 +64,8 @@ example `/mnt/tank/apps/tts-stt`. Everything persistent goes there:
   output/                  generated audio, pruned after 24 h
   cache/                   ONE model cache for all services: a model downloads once
   qwen3-voices/            saved voice-clone profiles
+  settings/                what the web UI's Settings page saves (host names, engines, API keys)
+  backend-settings/        backend settings saved in the web UI (kept for later releases)
   piper-training-service/  datasets and checkpoints (training only)
   whisper-cpp-models/      whisper.cpp models (whisper-cpp only)
 ```
@@ -119,14 +122,16 @@ curl -fsSL https://raw.githubusercontent.com/SteffenHebestreit/tts-stt-playgroun
 cat /mnt/tank/apps/tts-stt/app.yml
 ```
 
-The other settings sit in the same file as `${NAME:-default}`; you change the default in place:
+Most settings are changed later in the web UI ([Settings in the web UI](#settings-in-the-web-ui)).
+The ones that need a container to be recreated sit in the same file as `${NAME:-default}`; you
+change the default in place:
 
 | Setting | Text to search for | Meaning |
 |---|---|---|
 | `IMAGE_TAG` | `IMAGE_TAG:-0.2.0` | The release to run. Change it to [update or roll back](#4-update-in-2-minutes). |
 | `PULL_POLICY` | `PULL_POLICY:-missing` | `missing` pulls only absent images (pinned release). `always` pulls on every Start/Save. |
 | `GPU_DEVICE_ID` | `GPU_DEVICE_ID:-0` | Index or `GPU-...` UUID from `nvidia-smi -L`. |
-| `FRONTEND_PORT` | `FRONTEND_PORT:-3000` | Web UI port. Also change `port:` under `x-portals`. |
+| `FRONTEND_PORT` | `FRONTEND_PORT:-3000` | Web UI port. Also change both `port:` lines under `x-portals`. |
 
 There is **no separate GPU step**: the file itself asks Docker for the GPU
 (`deploy.resources.reservations.devices`) on every GPU service.
@@ -155,23 +160,82 @@ Live Transcription, start, allow the microphone, speak: words appear within abou
 microphone needs a secure context: `http://` works on `localhost` only, so from another machine
 use [HTTPS](#8-reverse-proxy-and-https).
 
+### Settings in the web UI
+
+Most settings are changed in the app itself, not in the YAML: the gear next to **API
+Documentation** in the web UI, or `http://<truenas-ip>:3000/settings` (an app installed from this
+file also gets a **Settings** button next to **Web UI** in the Apps screen). A change applies from
+the next request on, in every gateway worker, with no restart, and is kept in the dataset's
+`settings/` folder, so it survives Edit, Update, Stop/Start and a re-paste of a newer YAML.
+
+| Part of the page | What it changes |
+|---|---|
+| Access | The host names the UI may be reached by (`TRUSTED_HOSTS`), the public URL behind a proxy that rewrites `Host` (`TRUSTED_ORIGINS`), whether to believe `X-Forwarded-Host` (`TRUST_PROXY_HEADERS`), other web pages that may call the API (`ALLOWED_ORIGINS`) |
+| API access & keys | Open on the network or a key required; what the YAML's `API_KEY` may do (admin or client); named API keys, created and revoked one by one |
+| Engines | Which optional engines are offered (Canary, Parakeet, Chatterbox, Magpie, whisper.cpp, voice training), each with whether its container answers; the default text-to-speech and speech-to-text engine |
+| Limits | `MAX_UPLOAD_MB`, `MAX_TTS_CHARS`, `MAX_CONCURRENT_UPLOADS`, `MAX_CONCURRENT_FFMPEG` |
+| History & recovery | The last 20 versions with Restore, Discard (back to the YAML), and a recovery code for a lost admin key |
+
+**Who may change them.** Every change needs an admin key.
+
+- `API_KEY` set in the YAML: enter it when the page asks. It is an admin key unless you make it a
+  client key on the page (which needs an admin key made there first).
+- No `API_KEY`: the page shows the values read-only. Ask it for a **one-time code**, read the code
+  in the gateway's log (**Apps -> Installed -> tts-stt -> Workloads -> frontend-service -> View
+  Logs**, or `docker logs ix-tts-stt-frontend-service-1`), and enter it with a name for your key.
+  The browser creates the key and shows it once: store it in a password manager. The same step can
+  switch the API to "a key is required". A code is valid for 30 minutes, works once and appears
+  nowhere but the log.
+- Keys made on the page are stored only as SHA-256 digests. Give scripts and Home Assistant their
+  own **client** keys: those use the API but cannot change settings.
+
+**Example: a new host name.** `http://speach.k2o:3000` answers `403 host_not_allowed`. Open
+`http://<truenas-ip>:3000/settings` (an IP address is always accepted), add `speach.k2o` under
+**Access**, Save. The next request by that name works; nothing restarts.
+
+**Safety nets.** A change that would refuse the address you are saving from is refused
+(`would_lock_out`) and says why. A new proxy URL or a change of `X-Forwarded-Host` is confirmed by
+the page through the new rules, and undone after 60 seconds if that confirmation never arrives.
+Every save is a version: Restore brings an earlier one back. A hand edit of `settings/gateway.json`
+with an invalid value is ignored and shown in a banner.
+
+**What stays in the YAML:** the release (`IMAGE_TAG`, `PULL_POLICY`), the GPU, the port, the
+dataset, which optional containers are installed (the `profiles:` lines), `API_KEY`, the switches
+that would open the gateway completely (`ALLOWED_HOSTS:-*`, `ALLOWED_ORIGINS:-*`), and the two
+switches of the page itself: `ENABLE_SETTINGS_UI` (`false` makes the page read-only and its saved
+values ignored; API keys made there stay in force) and `SETTINGS_LOCKED_KEYS` (settings that always
+come from the YAML, comma separated, for example `TRUSTED_HOSTS,MAX_UPLOAD_MB`). Where the YAML and
+the page both set something, the page wins ([section 3](#3-what-truenas-does-with-this-app)); every
+field shows where its value comes from and has **Reset to YAML**.
+
+**An install pasted before the page existed** has no `settings/` mount. The page then shows the
+values read-only, says why, and shows the two lines to add under `frontend-service:` ->
+`volumes:`. Pasting the current file with your edits carried over adds them, together with the
+`backend-settings` line of every backend and the three lines `ENABLE_SETTINGS_UI`,
+`SETTINGS_LOCKED_KEYS` and `ENABLE_TRAINING`. Snapshot the dataset first.
+
 ### Optional services
 
-Two edits per service, both required (a flag without its service is a permanently red
-indicator; a service without its flag runs but never shows in the UI):
+Two steps per service:
 
-1. Delete the service's `profiles:` line in the YAML.
-2. Set its flag on `frontend-service` to true, for example `ENABLE_CANARY_ASR:-false` to
+1. **Install it:** delete the service's `profiles:` line in the YAML (**Apps -> Installed -> tts-stt
+   -> Edit**) and Save. The image is pulled and the container starts.
+2. **Offer it:** **Settings -> Engines**, tick its **Offer** box, Save. The row says whether the
+   container answers, or that it is not installed, with the line to delete. Or set its flag on
+   `frontend-service` in the YAML instead, for example `ENABLE_CANARY_ASR:-false` to
    `ENABLE_CANARY_ASR:-true`.
 
-| Service | Delete the `profiles` line of | Flag |
+An engine offered without its container is a permanently red indicator; a container that is not
+offered runs but never shows in the UI.
+
+| Service | Delete the `profiles` line of | Offer it in Settings, or the flag |
 |---|---|---|
 | Canary (fast German STT) | `canary-asr-service` | `ENABLE_CANARY_ASR` |
 | Parakeet (25 languages) | `parakeet-asr-service` | `ENABLE_PARAKEET_ASR` |
 | Chatterbox (streaming TTS) | `chatterbox-tts-service` | `ENABLE_CHATTERBOX_TTS` |
 | Magpie (NVIDIA TTS, 5 voices) | `magpie-tts-service` | `ENABLE_MAGPIE_TTS` |
 | whisper.cpp (CPU STT) | `whisper-cpp` | `ENABLE_WHISPER_CPP` |
-| Voice training | `piper-training-service` | none |
+| Voice training | `piper-training-service` | `ENABLE_TRAINING` (off in this file, which hides the Voice Training tab) |
 
 Check the VRAM first: `./preflight.sh --data-dir /mnt/tank/apps/tts-stt --with canary-asr`.
 
@@ -179,15 +243,17 @@ Check the VRAM first: `./preflight.sh --data-dir /mnt/tank/apps/tts-stt --with c
 app shows **Deploying** until that finishes. Every other service answers `/health` at once and
 downloads in the background.
 
-**No GPU?** Delete `stt-service`, `qwen3-asr-service` and `qwen3-tts-service`, enable
-`whisper-cpp` as above, and set `DEFAULT_STT_PROVIDER:-whisper` to `whisper-cpp`.
+**No GPU?** Delete `stt-service`, `qwen3-asr-service` and `qwen3-tts-service`, install and offer
+`whisper-cpp` as above, and make it the default speech-to-text engine in **Settings -> Engines**
+(or set `DEFAULT_STT_PROVIDER:-whisper` to `whisper-cpp` in the YAML).
 
 ### Other ways to install
 
-- **Settings file** (recommended if you will edit settings often). TrueNAS keeps only the parsed
-  YAML, so comments and your edit history are gone after Save, and a change of release means
-  editing the tag on every `image:` line. With a settings file the pasted YAML is fixed and the release
-  is one line:
+- **Settings file** (`include:` with `env_file:`). Not needed on TrueNAS: most settings live in the
+  web UI's Settings page now, and what is left in the YAML changes rarely. It stays for people who
+  run the stack with `docker compose` from a shell. TrueNAS keeps only the parsed YAML, so comments
+  and your edit history are gone after Save, and a change of release means editing the tag on every
+  `image:` line. With a settings file the pasted YAML is fixed and the release is one line:
 
   ```bash
   cd /mnt/tank/apps/tts-stt && mkdir -p app && cd app
@@ -229,6 +295,22 @@ how updates behave:
 - Every container runs as **root** (no image sets `USER`). Root can write anywhere in the
   dataset: no `chown` or ACL entry is needed. If you also share the dataset over SMB, set the
   share's ACL for your users on the folders you want to edit.
+- **What the Settings page saves survives all of the above.** It lives in the dataset's
+  `settings/` folder, a bind mount of `frontend-service` only, and Install, Edit/Save, Update and
+  Stop/Start only recreate containers. A re-paste of a newer YAML, a delete and reinstall on the
+  same dataset, and a ZFS snapshot rollback (data and settings together) keep it too. The gateway
+  refuses to save unless `settings/` really is a mount, so a save cannot land inside a container and
+  vanish with it. The folder holds `gateway.json` (only the values changed in the page),
+  `keys.json` (API keys as SHA-256 digests, never the keys), `history/` (the last 20 versions) and
+  `audit.jsonl` (who changed what, also written to the gateway's log). `backend-settings/` is
+  mounted into every Python backend read-only and stays empty until a release uses it.
+- **Which value wins**, setting by setting, from highest to lowest: a name in
+  `SETTINGS_LOCKED_KEYS` (the YAML value, and the field is read-only); a valid value saved in the
+  page; the YAML's `${NAME:-default}`; the built-in default. A setting never touched in the page
+  keeps following the YAML and the defaults of new releases. `ENABLE_SETTINGS_UI:-false` in the
+  YAML, or a file named `SAFE-MODE` in `settings/`, makes the gateway ignore what the page saved;
+  API keys made in the page stay in force in every case, so recovery never opens the API. The
+  gateway's log names the settings that come from the page when it starts.
 
 ---
 
@@ -259,8 +341,9 @@ Prefer a push notification? Enable the optional `diun` service ([section 10](#10
 5. **Save.** TrueNAS recreates the containers; images that are missing are pulled first.
 6. **Check:** `curl -s http://localhost:3000/api/health` and open the UI.
 
-Your models, voices and output stay in the dataset; nothing is downloaded again. Once you are sure
-of the new version, free the old images: `docker image prune -a --filter "until=720h"` removes
+Your models, voices, output and what the Settings page saved stay in the dataset; nothing is
+downloaded again. Once you are sure of the new version, free the old images:
+`docker image prune -a --filter "until=720h"` removes
 unused images older than 30 days (keep the previous release's images until then, they make a
 rollback instant).
 
@@ -297,6 +380,11 @@ already stored; the release notes call that out, and the snapshot in step 2 cove
    Save. Its images are still on the host if you did not prune them, so this takes seconds. If
    they are gone, run `./pull-images.sh --tag <previous-release>` first.
 2. Check `curl -s http://localhost:3000/api/health`.
+
+**Back to a release from before the Settings page:** it ignores `settings/` and
+`backend-settings/` and runs on the YAML values alone, until you update again (then the saved
+values apply once more). **Keep `API_KEY` in the YAML** if the API must need a key: a key made in
+the page, and "a key is required" switched on there, mean nothing to an older image.
 
 **A NeMo service misbehaves after an update (canary, parakeet):** the images are built on NeMo
 3.x. Every release also publishes both services built against NeMo 2.x as `<release>-nemo2`
@@ -393,9 +481,16 @@ panel, not against feel):
 | A service fails after you enabled another | Out of VRAM | `nvidia-smi` while it runs; smaller Whisper or `0.6B` Qwen3-TTS, shorter `MODEL_TTL`, or drop a service |
 | No Piper voices | The models directory is empty and the seed job did not run | `docker logs ix-tts-stt-piper-voices-seed-1`; voices are files `*.onnx` + `*.onnx.json` in `models/default` |
 | Microphone button does nothing | Browsers grant the microphone only in a secure context | Use `https://` (or `http://localhost`); check the proxy forwards the WebSocket upgrade |
-| `403 Host '...' is not allowed` (`host_not_allowed`) on every request, the page does not even load | The web UI is reached by a name the gateway does not accept without setup: a real domain (a reverse proxy) or a Tailscale MagicDNS name. IP addresses, `localhost`, `*.local`, `*.lan`, `*.internal`, `*.home.arpa` and plain names such as `truenas` are always accepted | Set `TRUSTED_HOSTS:-voice.example.com` (comma separated, `*.tail1234.ts.net` for a whole domain) on `frontend-service`, or open the UI by the NAS's IP address. `ALLOWED_HOSTS:-*` switches the check off; avoid it |
-| 403 on every button behind a reverse proxy (the page loads) | The proxy changes the `Host` header, so the browser's `Origin` no longer matches it | Set `TRUSTED_ORIGINS` to the proxy's public URL (it also trusts that host name) |
-| The UI asks for an API key, or a script gets `401` | `API_KEY` is set. There is no exemption for the web UI | Type the key into the prompt (once per browser tab); scripts send `Authorization: Bearer <key>` |
+| `403 Host '...' is not allowed` (`host_not_allowed`) on every request, the page does not even load | The web UI is reached by a name the gateway does not accept without setup: a real domain (a reverse proxy) or a Tailscale MagicDNS name. IP addresses, `localhost`, `*.local`, `*.lan`, `*.internal`, `*.home.arpa` and plain names such as `truenas` are always accepted | Open `http://<truenas-ip>:3000/settings` (by IP address) and add the name under **Access**; it works on the next request. Or set `TRUSTED_HOSTS:-voice.example.com` (comma separated, `*.tail1234.ts.net` for a whole domain) on `frontend-service`. `ALLOWED_HOSTS:-*` switches the check off; avoid it |
+| 403 on every button behind a reverse proxy (the page loads) | The proxy changes the `Host` header, so the browser's `Origin` no longer matches it | Add the proxy's public URL under **Settings -> Access** (or `TRUSTED_ORIGINS`); it also trusts that host name |
+| The UI asks for an API key, or a script gets `401` | `API_KEY` is set, or **Settings -> API access & keys** requires a key. There is no exemption for the web UI | Type the key into the prompt (once per browser tab); scripts send `Authorization: Bearer <key>`. Keys made in the page work everywhere the YAML key does |
+| The Settings page is read-only: "Settings cannot be saved here" | The YAML was pasted before the page existed and has no `settings/` mount | Add the two lines the page shows under `frontend-service:` -> `volumes:` (or paste the current file with your edits), Save |
+| The Settings page shows the values but saves nothing; "Nobody can change these settings yet" | No admin key exists: no `API_KEY` in the YAML and none made in the page | Ask the page for a one-time code and read it in the log: **Workloads -> frontend-service -> View Logs**, or `docker logs ix-tts-stt-frontend-service-1` |
+| Lost the admin key; Settings answers `401` to everything | The key made in the page is gone from your browser and password manager | Same as above: a one-time code from the log creates a new admin key (revoke the old one afterwards). Or delete `settings/keys.json`: every key made in the page is gone, and API access follows the YAML again (open without `API_KEY`) |
+| Settings answers `would_lock_out` | The change would refuse the address you are saving from (a host name or proxy you reach it by) | Keep that name, or make the change from `http://<truenas-ip>:3000/settings` |
+| A saved value broke something (host name, engine, limit) | The page saved it and it wins over the YAML | **Settings -> History**: Restore an earlier version, or Discard (back to the YAML). Without the page: delete `settings/gateway.json` (the YAML applies from the next request), create an empty `settings/SAFE-MODE`, or set `ENABLE_SETTINGS_UI:-false` |
+| A value you changed in the YAML does nothing | The Settings page saved that setting, and a saved value wins | The field says where its value comes from: press **Reset to YAML**, or list the setting in `SETTINGS_LOCKED_KEYS` |
+| A banner says a saved value was ignored | A hand edit of `settings/gateway.json` with a value the page would refuse; the rest of the file still applies | Save the field again in the page, or fix or delete that line |
 | `503` with `Retry-After` | A limit was reached, not a fault: too many uploads or `ffmpeg` conversions at once, or a full or timed-out queue at a model service | Retry after the delay. Limits: `MAX_CONCURRENT_UPLOADS`, `MAX_CONCURRENT_FFMPEG`, `ASR_MAX_QUEUE`, `TTS_MAX_QUEUE`, `ASR_QUEUE_TIMEOUT_S`, `TTS_QUEUE_TIMEOUT_S` |
 | Live transcription lags | Decode time exceeds the update interval | Read `decode NNN ms`: under 500 ms is fine; near 1000 ms use a smaller model; over 1500 ms you are probably on CPU or the GPU is contended. Audio is skipped rather than queued, so lag stays bounded |
 | Permission problems on the dataset | ACL denies root, or the folder is read-only | Containers run as root; check the dataset's ACL type and that no restrictive ACL blocks root. `preflight.sh` reports a dataset it cannot write |
@@ -437,18 +532,22 @@ server {
 `ALLOWED_ORIGINS` stays empty: the UI and the API are the same origin, also over
 `http://<ip>:3000`. The gateway refuses a `Host` header that is not an IP address, `localhost`,
 `*.local`, `*.lan`, `*.internal`, `*.home.arpa` or a plain name (it is the guard against DNS
-rebinding), so the proxy's public name has to be listed: set `TRUSTED_HOSTS:-voice.example.com` on
+rebinding), so the proxy's public name has to be listed: add it under **Settings -> Access** (open
+the page by the NAS's IP address to do that), or set `TRUSTED_HOSTS:-voice.example.com` on
 `frontend-service` (comma separated; `*.example.com` covers a whole domain; symptom without it:
 `403 host_not_allowed` on every request). With `proxy_set_header Host $host` that is all. A proxy
-that does not pass the original `Host` needs `TRUSTED_ORIGINS:-https://voice.example.com` as well
-(symptom without it: 403 on every button; the host name of a trusted origin counts as trusted, so
-this one setting also satisfies the Host check). If the proxy sets `X-Forwarded-Host` instead, set
-`TRUST_PROXY_HEADERS:-true` (only when the proxy overwrites what the client sent) and list that name
-in `TRUSTED_HOSTS`.
+that does not pass the original `Host` needs its public URL as well, `https://voice.example.com`
+under **Settings -> Access** or in `TRUSTED_ORIGINS:-` (symptom without it: 403 on every button; the
+host name of a trusted origin counts as trusted, so this one setting also satisfies the Host check).
+If the proxy sets `X-Forwarded-Host` instead, turn on believing it (`TRUST_PROXY_HEADERS`, only when
+the proxy overwrites what the client sent) and list that name as a host name. The page applies a
+new proxy URL and the `X-Forwarded-Host` switch for 60 seconds and keeps them only once it has
+reached the gateway through the new rules, so a wrong value undoes itself.
 
-To lock a script-facing API, set `API_KEY`: a Bearer token for `/v1/*`, mutating `/api/*` and the
+To lock a script-facing API, set `API_KEY`, or switch **Settings -> API access & keys** to "a key
+is required" and create named keys there: a Bearer token for `/v1/*`, mutating `/api/*` and the
 live-transcription socket. There is **no exemption for the web UI**: it asks for the key once per
-browser tab and keeps it in `sessionStorage`. The key is a shared secret, not user authentication,
+browser tab and keeps it in `sessionStorage`. A key is a shared secret, not user authentication,
 and it crosses the network in clear over plain `http://`: use it behind the HTTPS proxy.
 
 ---
@@ -487,6 +586,10 @@ Not verified, in the order to check them after your first install:
 9. That an exited `piper-voices-seed` counts as normal for the app state. The middleware source
    counts an exited container with a normal exit code as fine while another one runs; the list
    of normal exit codes was not in the copy that was read.
+10. The Settings page on the NAS: the **Settings** button of a new install (read from the source,
+    like the Web UI button), a host name added in the page working on the next request, the saved
+    values surviving Edit/Save, Update and Stop/Start, and the one-time code showing up under
+    **Workloads -> View Logs**.
 
 ---
 
@@ -533,7 +636,8 @@ updates on its own, which is why it is not used here.
   gets `403`.
 - **Host names are validated.** A request must address an IP address, `localhost`, `*.local`,
   `*.lan`, `*.internal`, `*.home.arpa` or a plain name; a real domain or a Tailscale name has to be
-  listed in `TRUSTED_HOSTS`, or every request answers `403 host_not_allowed` (see Troubleshooting).
+  listed in `TRUSTED_HOSTS` or under Settings -> Access, or every request answers
+  `403 host_not_allowed` (see Troubleshooting).
 - **`API_KEY` has no UI exemption any more.** With a key set, the web UI prompts for it once per
   browser tab; `/ws/stt` needs it too.
 - **`MAX_TTS_CHARS` defaults to 5000** (it was 20000): what Qwen3-TTS, Chatterbox and Magpie accept. A

@@ -299,7 +299,9 @@ else
       warn "$DATA_DIR is on '${fstype:-unknown}', not ZFS: there will be no dataset snapshots to roll back to."
     fi
 
-    subdirs=(models output cache qwen3-voices)
+    # settings: what the web UI's Settings page saves (frontend-service, read-write);
+    # backend-settings: the backends' settings folder (frontend read-write, backends read-only).
+    subdirs=(models output cache qwen3-voices settings backend-settings)
     selected_has piper-training-service && subdirs+=(piper-training-service/data piper-training-service/checkpoints piper-training-service/models piper-training-service/configs)
     selected_has whisper-cpp && subdirs+=(whisper-cpp-models)
     missing=()

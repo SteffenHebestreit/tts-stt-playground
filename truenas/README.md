@@ -13,9 +13,23 @@ backend call, live microphone transcription included.
 | Route | Effort | Status |
 |---|---|---|
 | **A. Install via YAML**: paste [`docker-compose.truenas-app.yml`](../docker-compose.truenas-app.yml), replace one path | 5 minutes | **Supported.** The recommended route |
-| **A2. Settings file**: the same compose file plus a `settings.env` on the dataset, wrapped by [`custom-app-include.yml`](./custom-app-include.yml) | 10 minutes, then updates are one line | Standard Compose (`include` with `env_file`); not yet run on a TrueNAS |
+| **A2. Settings file**: the same compose file plus a `settings.env` on the dataset, wrapped by [`custom-app-include.yml`](./custom-app-include.yml) | 10 minutes, then updates are one line | **Not needed on TrueNAS**: most settings live in the web UI's Settings page (below). Kept for running the file with `docker compose` from a shell; standard Compose (`include` with `env_file`), not yet run on a TrueNAS |
 | **B. Custom catalog**: a form instead of YAML, [`tts-stt/`](./tts-stt/) | - | **Scaffold, not loadable as it stands** (see below) |
 | **C. Build from source** on the NAS | 30+ minutes | Supported: [`docs/truenas-deployment.md`](../docs/truenas-deployment.md) |
+
+## Settings in the web UI
+
+TrueNAS gives a YAML app no settings form, so the app has its own: the gear in the web UI, or
+`http://<truenas-ip>:3000/settings` (a new install also gets a **Settings** button in the Apps
+screen). Host names, the reverse-proxy URL, API access and named API keys, which optional engines
+are offered, the default engines and the gateway limits change there at once, without a restart.
+They are stored in the dataset (`settings/`, mounted into the gateway only), so Edit, Update,
+Stop/Start and a re-paste keep them; a value saved there wins over the YAML, setting by setting.
+What needs a container to be recreated stays in the YAML: the release, the GPU, the port, the
+dataset and the `profiles:` lines that install optional services. Changes need an admin key: the
+YAML's `API_KEY`, or, on an install without one, a key created with a one-time code that only the
+gateway's log shows. Details and recovery: the guide's
+[Settings in the web UI](../docs/truenas-installation-guide.md#settings-in-the-web-ui).
 
 ## Setup and updates
 

@@ -53,11 +53,14 @@ APP_DATA_DIR=/mnt/tank/apps/tts-stt
   models/                              Piper voices + exported custom voices
   output/                              generated audio
   .cache/                              Whisper / Python cache
+  settings/                            what the web UI's Settings page saves
+  backend-settings/                    backend settings saved there (later releases)
   piper-training-service/{data,checkpoints,models,configs}/
 ```
 
-Each path can be overridden on its own (`MODELS_DIR`, `OUTPUT_DIR`, `CACHE_DIR`,
-`TRAINING_DATA_DIR`, `TRAINING_CHECKPOINTS_DIR`, `TRAINING_MODELS_DIR`, `TRAINING_CONFIGS_DIR`).
+Each path can be overridden on its own (`MODELS_DIR`, `OUTPUT_DIR`, `CACHE_DIR`, `SETTINGS_DIR`,
+`BACKEND_SETTINGS_DIR`, `TRAINING_DATA_DIR`, `TRAINING_CHECKPOINTS_DIR`, `TRAINING_MODELS_DIR`,
+`TRAINING_CONFIGS_DIR`).
 The large Hugging Face downloads (Qwen3, Parakeet, Canary, Chatterbox, Magpie) and the whisper.cpp models
 default to **named Docker volumes** in the Docker root. To keep them on your pool set
 `QWEN3_TTS_CACHE_DIR`, `QWEN3_ASR_CACHE_DIR`, `PARAKEET_ASR_CACHE_DIR`, `CANARY_ASR_CACHE_DIR`,

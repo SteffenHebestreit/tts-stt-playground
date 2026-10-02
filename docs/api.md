@@ -12,7 +12,8 @@ reachable from the machine itself for `curl` and benchmarks, but not from the ne
 [Network exposure](#network-exposure-and-access-control).
 
 The machine-readable specs are served by the gateway too: `/static/openapi/gateway.json` (the
-gateway's own `/v1` and `/api` routes, i.e. this page), and the backends' `stt.json`, `pipertts.json`
+gateway's own `/v1` and `/api` routes, i.e. this page, without the internal
+[Settings API](#settings-api-internal)), and the backends' `stt.json`, `pipertts.json`
 and `training.json`. They are generated from the
 running apps (`scripts/sync_openapi.py`) and checked against them in CI, so they cannot describe
 routes that do not exist.
@@ -58,20 +59,27 @@ configuration: any IP address (`192.168.1.20`, `[::1]`, a Tailscale `100.x`), `l
 `*.local`, `*.localdomain`, `*.lan`, `*.internal`, `*.home.arpa` and single-label names (`truenas`,
 `frontend-service`). Any other name, such as a real domain in front of a reverse proxy or a
 Tailscale MagicDNS name, goes into **`TRUSTED_HOSTS`** (comma separated, `*.` for a whole domain:
-`TRUSTED_HOSTS=tts.example.com,*.tail1234.ts.net`; the hostnames of `TRUSTED_ORIGINS` count too).
-`ALLOWED_HOSTS=*` switches the check off and reads nothing else. With
-`TRUST_PROXY_HEADERS=true` the name in `X-Forwarded-Host` is the one validated.
+`TRUSTED_HOSTS=tts.example.com,*.tail1234.ts.net`; the hostnames of `TRUSTED_ORIGINS` count too),
+or under Access in the [Settings page](#settings-api-internal), where it applies from the next
+request. `ALLOWED_HOSTS=*` switches the check off and reads nothing else. With
+`TRUST_PROXY_HEADERS=true` the name in `X-Forwarded-Host` is the one validated. A browser that
+navigates to a refused name gets a short HTML page saying to open the UI by its IP address and add
+the name under Settings -> Access; API callers get the JSON `detail`.
 
-**API key.** Optional. With `API_KEY` set, `/v1/*` needs `Authorization: Bearer <key>` and so does
-every state-changing `/api/*` call and the `/ws/stt` upgrade. **There is no exemption for the
-bundled UI**: `Origin`, `Host` and `Sec-Fetch-Site` are exactly what a rebinding page controls, so
-none of them proves who is calling. The UI asks for the key once (a browser prompt) on the first
-`401`, keeps it in `sessionStorage` (this tab only) and sends it on every later request; a refused
-key is dropped and asked for again. Reads (`GET /api/...`), CORS preflights, `/health`, `/providers`
-and the pages stay open; a wrong or missing key is **401** with `WWW-Authenticate: Bearer` (in the
-OpenAI envelope on `/v1`, code `invalid_api_key`). The check is constant-time. `POST /api/auth/check`
-answers `204` when the caller may use the state-changing API and `401` otherwise; the UI calls it
-before opening the live-transcription socket.
+**API key.** Optional. With `API_KEY` set, or with "a key is required" switched on in the Settings
+page, `/v1/*` needs `Authorization: Bearer <key>` and so does every state-changing `/api/*` call and
+the `/ws/stt` upgrade. Besides `API_KEY`, the Settings page can create named keys (up to 32, each
+revocable on its own, stored only as a SHA-256 digest); every one of them is accepted wherever
+`API_KEY` is. A key's role decides only whether it may also change settings (admin) or not
+(client). **There is no exemption for the bundled UI**: `Origin`, `Host` and `Sec-Fetch-Site` are
+exactly what a rebinding page controls, so none of them proves who is calling. The UI asks for the
+key once (a browser prompt) on the first `401`, keeps it in `sessionStorage` (this tab only) and
+sends it on every later request; a refused key is dropped and asked for again. Reads
+(`GET /api/...`), CORS preflights, `/health`, `/providers` and the pages stay open; a wrong or
+missing key is **401** with `WWW-Authenticate: Bearer` (in the OpenAI envelope on `/v1`, code
+`invalid_api_key`). The check compares SHA-256 digests in constant time, against every key.
+`POST /api/auth/check` answers `204` when the caller may use the state-changing API and `401`
+otherwise; the UI calls it before opening the live-transcription socket.
 
 Browsers cannot set headers on a WebSocket handshake, so `/ws/stt` takes the key as a subprotocol
 next to the real one: `new WebSocket(url, ["tts-stt.v1", "bearer." + base64url(key)])` (base64url,
@@ -88,7 +96,9 @@ takes at most 25 MB per file. Text fields for TTS and voice design are capped at
 (default **5000**, 422 beyond it): keep it at or below the smallest text limit of the TTS backends
 in use, since Qwen3-TTS, Chatterbox and Magpie accept 5000 and a larger value only turns the early `422`
 into a `413` from the backend; a Piper-only deployment (backend limit 20000) can raise it. Each
-backend also enforces its own limit; see [Limits per service](#limits-per-service).
+backend also enforces its own limit; see [Limits per service](#limits-per-service). The Settings page
+changes `MAX_UPLOAD_MB`, `MAX_TTS_CHARS`, `MAX_CONCURRENT_UPLOADS` and `MAX_CONCURRENT_FFMPEG` live;
+the `422` for a long text keeps its exact shape (`string_too_long`, with the limit in force).
 
 **Busy answers (503 + `Retry-After`).** Nothing queues without bound. Per gateway worker process,
 `MAX_CONCURRENT_UPLOADS` (default 4) uploads are forwarded at once, and the next one is refused
@@ -318,8 +328,8 @@ under the same id.
 
 | Status | When |
 |---|---|
-| **401** | `API_KEY` is set and the request did not send it (`WWW-Authenticate: Bearer`) |
-| **403** | a foreign `Origin` on a state-changing request (`cross_origin_blocked`), or a `Host` the gateway does not accept (`host_not_allowed`, fix with `TRUSTED_HOSTS`); on a backend port, a foreign `Origin` |
+| **401** | a key is required (`API_KEY` is set, or the Settings page requires one) and the request did not send a valid one (`WWW-Authenticate: Bearer`) |
+| **403** | a foreign `Origin` on a state-changing request (`cross_origin_blocked`), or a `Host` the gateway does not accept (`host_not_allowed`, fix with `TRUSTED_HOSTS` or under Settings -> Access); on a backend port, a foreign `Origin` |
 | **409** | Piper: an upload named like a built-in voice, or past `PIPER_MAX_CUSTOM_VOICES`; every model service: `/unload` while a request is in flight |
 | **413** | a body, text or upload over a limit (see [Limits per service](#limits-per-service)), including a custom-voice total past `PIPER_MAX_CUSTOM_MB`, a recording longer than `PIPER_ANALYZE_MAX_SECONDS` and a reference clip longer than `QWEN3_TTS_REF_MAX_SECONDS` |
 | **503** | no room: too many uploads or conversions at the gateway, a full or timed-out queue at a model backend, a second Piper voice upload while one is running; always with `Retry-After` when the service itself answers, and the gateway relays it with the service's sentence |
@@ -514,6 +524,70 @@ connection: they finish the generation for nobody and keep their generation slot
 request already waiting in their queue still runs when its turn comes, so a client's retry queues
 behind the abandoned work. A streamed answer (Chatterbox on `/api/tts`) falls under Starlette's own
 disconnect handling instead: Chatterbox stops after the sentence it is generating.
+
+---
+
+## Settings API (internal)
+
+The Settings page (`/settings`, the gear in the web UI) talks to the gateway through
+`/api/settings*`. These routes belong to the page, not to the public contract: they are left out of
+the OpenAPI document and may change with the page. They are listed for operators and for scripting
+a deployment.
+
+**What it changes, and where it is kept.** The access settings (`TRUSTED_HOSTS`,
+`TRUSTED_ORIGINS`, `TRUST_PROXY_HEADERS`, explicit `ALLOWED_ORIGINS`), API access and named keys,
+which optional engines are offered (`ENABLE_*`, `ENABLE_TRAINING` included), the two
+`DEFAULT_*_PROVIDER` and the four limits above. A saved value applies from the next request in
+every gateway worker, with no restart, and is kept in `/app/settings`, which must be a bind mount
+(`SETTINGS_DIR` in compose, `settings/` in the TrueNAS dataset): `gateway.json` holds only the values
+changed in the page, `keys.json` the keys as SHA-256 digests. Per setting the order is: a name in
+`SETTINGS_LOCKED_KEYS` (the environment wins) > a valid saved value > the environment > the built-in
+default. `ENABLE_SETTINGS_UI=false`, or a file `SAFE-MODE` in the folder, makes the gateway ignore the
+saved values; keys made in the page stay in force in every mode. Settings that need a container to
+be recreated (ports, GPUs, images, `ALLOWED_HOSTS=*`, `ALLOWED_ORIGINS=*`, `API_KEY` itself) are not
+in the page.
+
+**Who may call it.** Every change needs an admin credential: `API_KEY` (an admin unless the page
+made it a client) or an admin key made in the page. A deployment without either is *unclaimed*: its
+`GET`s answer read-only, and the only write is the claim, which takes a one-time code that
+`POST /api/settings/claim-code` prints to the gateway's log and nowhere else (valid 30 minutes, five
+tries, single use). The same claim replaces a lost admin key.
+
+**Request rules**, stricter than the rest of `/api`:
+
+- The `Host` check always applies, even with `ALLOWED_HOSTS=*`.
+- Once claimed, every request needs an admin key as `Authorization: Bearer <key>`, reads included:
+  no key or a wrong one is `401` with `WWW-Authenticate: Bearer`, a client key `403
+  admin_key_required`. Ten wrong keys or codes from one address within 10 minutes are answered `429`
+  with `Retry-After` (per gateway worker). Unclaimed, a write other than the claim is `403
+  not_claimed`.
+- A changing request must come from the server's own origin or a `TRUSTED_ORIGINS` entry
+  (`ALLOWED_ORIGINS` does not count, `null` neither: `403 cross_origin_blocked`); `Sec-Fetch-Site`,
+  when sent, must be `same-origin` (`403 cross_site_blocked`); the body must be `application/json`
+  (`415`), at most 64 KiB (`413`) and without duplicate names (`400 duplicate_key`).
+- `OPTIONS` is `403`. Every answer carries `Cache-Control: no-store` and never an `Access-Control-*`
+  header, whatever `ALLOWED_ORIGINS` says.
+- Errors are `{"detail": "...", "code": "..."}` plus, where it applies, `errors` per field (`400
+  invalid_input`), `warnings` (`409 needs_confirmation`) or the current `revision` (`409
+  revision_conflict`). Nothing secret is ever echoed.
+
+| Method and path | Body | Answer |
+|---|---|---|
+| `GET /api/settings` | - | Every setting: the value in force, where it comes from (`default`, `yaml`, `saved`, `locked`), the YAML value, bounds and help; `revision` and `keys_revision`; the keys (name, role, hint, never the key or its digest); banners; the last 20 versions |
+| `PUT /api/settings` | `{base_revision, set: {KEY: value}, reset: [KEY], acknowledge: ["KEY:warning_id"], dry_run}` | `200 {revision, changed, written, confirm, warnings, ...}`. `409 would_lock_out` when the change would refuse the request's own `Host`, `X-Forwarded-Host` or `Origin`; `409 needs_confirmation` with the warnings to acknowledge (a `dry_run` lists them with `200`); `409 revision_conflict`; `403 locked_by_deployment` for a locked setting or an engine `PROVIDER_REGISTRY_JSON` defines; `409 settings_not_mounted` without the bind mount |
+| `POST /api/settings/confirm` | `{revision}` | Keeps a change of `TRUSTED_ORIGINS` or `TRUST_PROXY_HEADERS`. Such a change is live at once and undone after 60 seconds unless confirmed; the page confirms through the new rules by itself |
+| `POST /api/settings/restore` | `{history_id, base_revision}` | Brings an earlier version back; the same checks as `PUT` |
+| `POST /api/settings/discard` | `{base_revision}` | Back to the environment's values; the discarded version stays in the history |
+| `GET /api/settings/engines` | - | Each optional engine as `running`, `not_reachable` or `not_installed`, with how to install it (probed within 4 s, cached 30 s) |
+| `PUT /api/settings/access` | `{base_revision: keys_revision, require_key, deployment_key_role}` | Open or a key required; `API_KEY` as `admin` or `client`. `require_key: false` is refused while `API_KEY` is set, and `API_KEY` cannot make itself a client |
+| `POST /api/settings/keys` | `{name, role, key}` | `201 {id, name, role, hint, created_at}`. The caller makes the key: `tts_` and 43 base64url characters (32 random bytes); the gateway keeps its SHA-256 only |
+| `DELETE /api/settings/keys/{id}` | - | Revokes the key; `409 last_admin_credential` for the last admin credential |
+| `POST /api/settings/claim-code` | `{}` | `202`; the code is in the gateway's log (`docker compose logs frontend-service`; TrueNAS: Workloads -> frontend-service -> View Logs) |
+| `POST /api/settings/claim` | `{code, name, key, require_key}` | `201`: an admin key made with the one-time code; `403 invalid_code` for a wrong one |
+
+Every save, key change, claim and automatic undo, and refusals such as a wrong key or a change that
+would lock its caller out, are recorded in `audit.jsonl` next to the settings and in the gateway's
+log (logger `tts_stt.settings.audit`), without a key, a code or a digest.
 
 ---
 

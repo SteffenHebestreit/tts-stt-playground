@@ -7,11 +7,13 @@ Browser-facing UI and API hub for the TTS-STT platform. Built with FastAPI, Jinj
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/` | Main web application |
+| GET | `/settings` | The Settings page (see below) |
+| GET, PUT, POST, DELETE | `/api/settings`, `/api/settings/*` | The Settings page's own API: values, confirm, restore, discard, engines, access, keys, claim-code, claim. Internal, not in the OpenAPI document; reference in [docs/api.md](../docs/api.md#settings-api-internal) |
 | GET | `/api-docs` | Static API documentation page |
 | GET | `/health` | Service health plus configured backend URLs |
 | GET | `/providers` | Provider registry with capabilities and contract metadata |
 | GET | `/api/health` | Health of every backend, probed concurrently and cached for `HEALTH_CACHE_TTL` seconds (default 2). A backend that reports a `default_language` has it forwarded |
-| POST | `/api/auth/check` | `204` when the caller may use the state-changing API, `401` when `API_KEY` is set and was not sent. The UI calls it before opening the live-transcription socket |
+| POST | `/api/auth/check` | `204` when the caller may use the state-changing API, `401` when a key is required (`API_KEY`, or the Settings page) and no valid one was sent. The UI calls it before opening the live-transcription socket |
 | GET | `/api/providers/{provider_id}/voices` | Normalized voice or speaker catalog for a TTS provider, plus the backend's `default_language` (what "auto" resolves to) when it reports one |
 | GET | `/api/providers/{provider_id}/custom-voices` | Managed custom voice catalog for providers that support custom model deletion |
 | GET | `/api/providers/{provider_id}/models` | Normalized model catalog for providers that support model switching |
@@ -37,7 +39,7 @@ Browser-facing UI and API hub for the TTS-STT platform. Built with FastAPI, Jinj
 | GET | `/api/training/download/{job_id}` | Download exported model through the frontend adapter |
 | DELETE | `/api/training/model/{job_id}` | Delete a trained model through the frontend adapter |
 | DELETE | `/api/training/job/{job_id}` | Cancel a job through the frontend adapter |
-| WS | `/ws/stt?provider=whisper` | Live-transcription relay to the STT service (same-origin or `ALLOWED_ORIGINS` only; needs the `API_KEY` when one is set, see Security) |
+| WS | `/ws/stt?provider=whisper` | Live-transcription relay to the STT service (same-origin or `ALLOWED_ORIGINS` only; needs a key when one is required, see Security) |
 | POST | `/v1/audio/transcriptions` | OpenAI-compatible transcription (`json`, `text`, `verbose_json`, `srt`, `vtt`); max 25 MB |
 | POST | `/v1/audio/speech` | OpenAI-compatible speech (`mp3` default, `wav`, `pcm`) |
 | GET | `/v1/models`, `/v1/models/{id}` | OpenAI-compatible model list |
@@ -93,6 +95,10 @@ Every `/v1` failure - including the ones FastAPI raises itself (missing form fie
 | `MAGPIE_TTS_SERVICE_URL` | `http://magpie-tts-service:5008` | Internal Magpie URL |
 | `ENABLE_WHISPER_CPP` | `false` | Include whisper.cpp in the provider registry, STT selector, and health polling |
 | `ENABLE_PARAKEET_ASR`, `ENABLE_CANARY_ASR`, `ENABLE_CHATTERBOX_TTS`, `ENABLE_MAGPIE_TTS` | `false` | The same for Parakeet, Canary, Chatterbox and Magpie |
+| `ENABLE_TRAINING` | `true` | The training provider: the Voice Training tab, its status dot and `/api/training/*` (404 when off). Only `1`, `true`, `yes` or `on` count as on; unset or empty means on. The TrueNAS file sets `false` |
+| `ENABLE_SETTINGS_UI` | `true` | `false` makes the Settings page read-only and the gateway ignore what it saved; keys made in the page stay in force |
+| `SETTINGS_LOCKED_KEYS` | *(empty)* | Settings that always come from the environment (comma or space separated, any case), e.g. `TRUSTED_HOSTS,MAX_UPLOAD_MB`; the page shows them read-only. `require_key` and `deployment_key_role` can be locked too |
+| `TTS_STT_SETTINGS_DIR` | *(unset)* | The Settings page's folder outside a container (tests, a local `uvicorn`). Unset, it is `/app/settings`, which must be a read-write mount point (`/proc/self/mountinfo`) or nothing can be saved |
 | `DEFAULT_TTS_PROVIDER` | `piper` | Default TTS provider ID: preselected by the UI and used by `/v1/audio/speech` |
 | `DEFAULT_STT_PROVIDER` | `whisper` | Default STT provider ID: preselected by the UI and used by `/v1/audio/transcriptions` (falls back to the one healthy alternative if unreachable, see above) |
 | `TRAINING_PROVIDER` | `piper-training` | Provider ID used for training workflows |
@@ -103,7 +109,7 @@ Every `/v1` failure - including the ones FastAPI raises itself (missing form fie
 | `TRUSTED_HOSTS` | *(empty)* | Hostnames (besides the ones accepted automatically, see Security) that may address this service: `tts.example.com`, `*.tail1234.ts.net`. Ports, schemes and case are ignored. The hostname of every `TRUSTED_ORIGINS` entry counts too |
 | `ALLOWED_HOSTS` | *(empty)* | `*` switches the Host check off. Nothing else is read from it: hostnames go in `TRUSTED_HOSTS` |
 | `TRUST_PROXY_HEADERS` | `false` | Believe `X-Forwarded-Host` (instead of `Host`) as the name the browser used, for the Host and Origin checks. Only enable behind a proxy that overwrites it |
-| `API_KEY` | *(empty)* | Optional shared secret, see Security below |
+| `API_KEY` | *(empty)* | Optional shared secret, see Security below. Also an admin key of the Settings page unless the page makes it a client key |
 | `MAX_UPLOAD_MB` | `512` | Largest request body for uploads (training audio, voice samples, STT files) - about 48 minutes of 44.1 kHz mono 16-bit WAV. Larger requests get `413`. Everything is held in memory while being forwarded, so this is also the worst-case memory cost of one request |
 | `MAX_CONCURRENT_UPLOADS` | `4` | Uploads one worker process forwards at the same time; the next one gets `503` + `Retry-After: 5` before its body is read. Worst-case upload memory is `FRONTEND_WORKERS x MAX_CONCURRENT_UPLOADS x MAX_UPLOAD_MB` (2 x 4 x 512 MB = 4 GB by default), so lower `MAX_UPLOAD_MB` first on a small machine. JSON calls (capped at 1 MiB) do not count |
 | `MAX_CONCURRENT_FFMPEG` | `4` | `ffmpeg` processes one worker runs at the same time for `/v1/audio/speech` (`mp3`, resampled `pcm`); the next request gets `503` + `Retry-After: 2` |
@@ -111,6 +117,8 @@ Every `/v1` failure - including the ones FastAPI raises itself (missing form fie
 | `HEALTH_CACHE_TTL` | `2` | Seconds `/api/health` results are reused; `0` disables the cache |
 | `PROVIDER_HEALTH_TIMEOUT` | `6` | Per-provider timeout for a health probe, in seconds |
 | `FRONTEND_WORKERS` | `2` | uvicorn worker processes (the container's `entrypoint.sh` reads it; a value that is not a positive integer falls back to 2). Use `1` on memory-constrained boards |
+
+The Settings page changes `TRUSTED_HOSTS`, `TRUSTED_ORIGINS`, `TRUST_PROXY_HEADERS`, explicit `ALLOWED_ORIGINS`, the `ENABLE_*` engine flags (with `ENABLE_TRAINING`), both `DEFAULT_*_PROVIDER`, `MAX_UPLOAD_MB`, `MAX_TTS_CHARS`, `MAX_CONCURRENT_UPLOADS` and `MAX_CONCURRENT_FFMPEG` at runtime: a saved value wins over the variable, setting by setting, from the next request on in every worker. The table gives the environment's side.
 
 There are no browser-visible backend URLs to configure: the browser only talks to this service (`/api/*`, `/v1/*`, and the `/ws/stt` relay), and the gateway proxies every backend call over the internal `*_SERVICE_URL` addresses above. The former `BROWSER_*_URL` variables are no longer read anywhere.
 
@@ -127,14 +135,19 @@ The gateway is the only service a browser talks to, and it can delete trained mo
   - **The UI** learns it needs a key from the first `401` carrying that challenge, asks for it once with a browser prompt, keeps it in `sessionStorage` (this tab only, never `localStorage`) and sends it on every later gateway request. A key that is refused is dropped and asked for again. With no `API_KEY` nothing is prompted and nothing extra is sent.
   - **WebSocket**: browsers cannot set headers on a WebSocket handshake, so the key travels as a subprotocol next to the real one: `new WebSocket(url, ["tts-stt.v1", "bearer." + base64url(key)])` (base64url without padding, UTF-8). The gateway echoes back only `tts-stt.v1`, never the credential. Scripts may send `Authorization: Bearer <key>` on the upgrade request instead. A socket without a valid key is accepted and immediately closed with code `1008` and reason `A valid API key is required`, so a page can tell that from a dead server.
   - This keeps other web pages and scripts that lack the key out. It is a shared secret, not user authentication: everyone who has the key can do everything, the key is typed into a `prompt()` (not masked), and over plain `http://` it crosses the network unencrypted. If the port is reachable by people you do not trust, put real authentication and TLS in front of it.
+  - **Keys made in the Settings page** work everywhere `API_KEY` does, and the page can require a key without `API_KEY` at all. Each has a name and a role (admin: API and settings; client: API only), can be revoked on its own, and is stored only as a SHA-256 digest. Every presented key is compared as a digest, in constant time, against every known key.
+- **The Settings page** (`/settings`, `/api/settings*`) has stricter rules than the rest: the Host check applies even with `ALLOWED_HOSTS=*`; once an admin credential exists every request needs an admin key, reads included, and ten wrong keys from one address in 10 minutes get `429`; a changing request must be same-origin or from a `TRUSTED_ORIGINS` entry (never just `ALLOWED_ORIGINS`), JSON, at most 64 KiB, without duplicate names; `OPTIONS` is refused and no answer carries CORS headers. A change that would refuse the request's own Host or Origin is refused (`409 would_lock_out`), and a change of `TRUSTED_ORIGINS` or `TRUST_PROXY_HEADERS` is undone after 60 seconds unless the page confirms it through the new rules. A server without any admin credential is claimed with a one-time code that only this container's log shows. What the page saves is in `/app/settings`, which must be a bind mount: the image creates no such folder, and the gateway refuses to save unless `/proc/self/mountinfo` lists it as a read-write mount.
 - **Backend errors do not leak.** A backend's error body and connection errors contain file paths, tracebacks and internal URLs. Clients get a status-appropriate sentence plus a request id (`... Request id: 3f9a1c2b7d4e.`) and the detail is logged under that id. A `4xx` that is one short line of prose (a validation message such as `text is 5001 characters; the limit is 5000`) still passes through, because the UI shows it; one that contains a traceback, a filesystem path or a URL is treated like a `5xx`. A `503` with a numeric `Retry-After` and such a one-line sentence (a busy queue, out of GPU memory) passes through too, with its `Retry-After`. `/health` and `/providers` show the provider URLs on purpose.
 - **Memory and process bounds.** Uploads are held in RAM while forwarded, so at most `MAX_CONCURRENT_UPLOADS` per worker are in flight (`503` + `Retry-After` beyond that, before the body is read), on top of the `MAX_UPLOAD_MB` size cap; `MAX_CONCURRENT_FFMPEG` bounds the encoder processes.
-- Responses carry `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin` and `X-Frame-Options: SAMEORIGIN`. There is deliberately no `Content-Security-Policy`: the page still uses inline event handlers.
+- Responses carry `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin` and `X-Frame-Options: SAMEORIGIN`. There is deliberately no `Content-Security-Policy` on the main page: it still uses inline event handlers. The Settings page is the exception: `default-src 'self'` with no inline script or style, `frame-ancestors 'none'` and `X-Frame-Options: DENY`.
+- A browser that navigates to a host name the gateway refuses gets a short HTML page (no script, nothing to click) saying to open the UI by its IP address and add the name under Settings -> Access (or to `TRUSTED_HOSTS`, where the page cannot change it); API callers keep the JSON `403 host_not_allowed`.
 - The provider registry is embedded in the page with the `tojson` filter, so a `</script>` inside `PROVIDER_REGISTRY_JSON` cannot break out of it.
 
 ## Container
 
 The image is `python:3.12-slim` and starts through `entrypoint.sh`, which `exec`s uvicorn so `docker stop` reaches it. Worker count comes from `FRONTEND_WORKERS`.
+
+The Settings page needs two bind mounts, which every compose file in this repository has: `/app/settings` (read-write, `SETTINGS_DIR`, the TrueNAS dataset's `settings/`) and `/app/backend-settings` (read-write here, read-only in the backends, kept for later releases). Without the first the page is read-only and shows the lines to add. Both workers of the container share the folder through a lock file in the container's `/tmp`.
 
 `whisper-cpp` remains optional even when its backend container is running. To surface it in the browser UI, set `ENABLE_WHISPER_CPP=true` for `frontend-service` and start the `whisper-cpp` compose profile.
 
