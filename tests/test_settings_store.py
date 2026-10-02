@@ -1142,6 +1142,23 @@ def test_a_keys_json_read_that_may_pass_fails_closed_only_until_it_can_be_read(m
     assert not keys.fail_closed and keys.find(home).name == "Home" and len(keys.keys) == 2
 
 
+def test_a_failed_read_of_an_unchanged_keys_file_is_tried_again_too(make_store, monkeypatch):
+    """A write reads keys.json again under the lock, changed or not. When that read fails for a
+    reason that may pass, the worker fails closed meanwhile; it must then read the unchanged file
+    again, not stay closed (an open API asking everyone for a key) until the next write."""
+    monkeypatch.setattr(store_module, "READ_RETRY_S", 0.0, raising=False)
+    store = make_store()
+    home = new_key()
+    store.add_key(name="Home", role="admin", key=home, actor=ACTOR)
+    _failing_once(monkeypatch, store, "keys.json")
+    with pytest.raises(store_module.Unreadable):
+        store.update_preferences({"MAX_TTS_CHARS": 3000}, base_revision=0, actor=ACTOR)
+    assert store.state.keys.fail_closed                       # meanwhile
+    assert store.refresh() is True, "the unchanged file was not read again"
+    keys = store.state.keys
+    assert not keys.fail_closed and keys.find(home).name == "Home"
+
+
 def test_a_save_on_a_worker_that_missed_a_read_is_a_conflict_not_a_revert(make_store, folder, monkeypatch):
     """The write reads the file again under the lock: the stale worker's revision is refused, and the
     other worker's change (here: a host name removed) is never written back over."""

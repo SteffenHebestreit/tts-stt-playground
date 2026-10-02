@@ -201,6 +201,10 @@ DEPLOYMENT_KEY_ID = "yaml:API_KEY"
 # in force until the file changes (its owner, mode or ctime included). Any other error (out of
 # file descriptors or memory, an I/O error) may pass, and the file is read again later.
 _PERSISTENT_READ_ERRORS = frozenset({errno.EACCES, errno.EPERM})
+# The signature remembered for a file whose last read failed for a reason that may pass. No stat
+# result equals it, so the file is read again (after READ_RETRY_S) even when it has not changed:
+# a failed re-read under the write lock must not leave keys.json failed closed until the next write.
+_UNSETTLED = object()
 
 MOUNT_MOUNTED = "mounted"
 MOUNT_OVERRIDE = "override"
@@ -953,7 +957,8 @@ class SettingsStore:
         self._mount_entry: Optional[MountEntry] = None
         self._state: Optional[SettingsState] = None
         # The stat signature of each file as last read with a definite result. A read that failed
-        # for a reason that may pass leaves it alone, so the file is read again (after READ_RETRY_S).
+        # for a reason that may pass sets it to _UNSETTLED, so the file is read again (after
+        # READ_RETRY_S), changed or not.
         self._signatures: dict[str, Any] = {}
         self._read_failures: dict[str, str] = {}      # file -> why its last read failed and may pass
         self._read_retry_at: dict[str, float] = {}    # file -> time.monotonic() of the next attempt
@@ -1158,6 +1163,7 @@ class SettingsStore:
         reason = _reason(exc)
         if self._read_failures.get(name) != reason:
             logger.warning("settings: %s could not be read (%s); it is read again on a later request", name, reason)
+        self._signatures[name] = _UNSETTLED
         self._read_failures[name] = reason
         self._read_retry_at[name] = time.monotonic() + READ_RETRY_S
 
