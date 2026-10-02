@@ -37,13 +37,17 @@ from urllib.parse import urlsplit
 import asyncio
 import base64
 import binascii
+import collections
 import copy
+import dataclasses
 import hashlib
 import hmac
+import html
 import httpx
 import ipaddress
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -406,6 +410,77 @@ def _host_allowed(host_header: Optional[str], policy: Optional["_AccessPolicy"] 
     )
 
 
+# --- the refusal of a host name ---------------------------------------------------
+#
+# What a person who opened the UI under a new name needs to read: the IP address
+# always passes the check (above), and from there the name can be added in the
+# Settings page. API clients keep the JSON refusal; a browser navigation gets the
+# same text as a small HTML page. That page has no script and no "trust this name"
+# button: under DNS rebinding the refused name is the attacker's choice, and one
+# click must never be enough to trust it.
+
+
+def _settings_can_trust_hosts() -> bool:
+    """Can the Settings page add a host name (rather than only the app YAML)?"""
+    return ENABLE_SETTINGS_UI and "TRUSTED_HOSTS" not in SETTINGS_LOCKED_KEYS
+
+
+def _host_refusal_message(host: Optional[str]) -> str:
+    shown = f"Host {(host or '')[:100]!r} is not allowed. If this is the name you use to reach this service, "
+    if _settings_can_trust_hosts():
+        return shown + ("open it by its IP address and add the name under Settings -> Access (TRUSTED_HOSTS), "
+                        "or add it to TRUSTED_HOSTS in the app YAML.")
+    return shown + "add its hostname to TRUSTED_HOSTS in the app YAML."
+
+
+def _is_navigation(method: str, path: str, headers: Headers) -> bool:
+    """Is this a browser loading a page (rather than a script calling the API)?
+
+    Sec-Fetch-Mode says so where browsers send it (secure contexts only); over plain
+    http on a LAN they do not, and the Accept header of a navigation names text/html
+    while fetch() asks for */*.
+    """
+    if method not in ("GET", "HEAD") or is_v1_path(path) or path == "/api" or path.startswith("/api/"):
+        return False
+    mode = headers.get("sec-fetch-mode")
+    if mode is not None:
+        return mode.strip().lower() == "navigate"
+    return "text/html" in headers.get("accept", "").lower()
+
+
+# Nothing on the refusal page may load or run anything.
+_REFUSAL_PAGE_CSP = "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+
+
+def _host_refusal_page(host: Optional[str]) -> HTMLResponse:
+    """The host refusal for a browser: the name, escaped, and how to get it accepted."""
+    raw = (host or "")[:100]
+    match = _HOST_PATTERN.match(raw.strip())
+    port = match.group("port") if match and match.group("port") else "3000"
+    shown, address = html.escape(raw, quote=True), html.escape(f"http://<IP address>:{port}/settings", quote=True)
+    if _settings_can_trust_hosts():
+        steps = (
+            "<ol>\n"
+            f"<li>Open this server by its IP address instead, for example <code>{address}</code>. "
+            "IP addresses always work.</li>\n"
+            "<li>In Settings, under Access, add the name to <em>Host names of this server</em> and save.</li>\n"
+            "</ol>\n"
+            "<p>Or add the name to <code>TRUSTED_HOSTS</code> in the app YAML.</p>\n")
+    else:
+        steps = "<p>Add the name to <code>TRUSTED_HOSTS</code> in the app YAML.</p>\n"
+    body = (
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+        "<title>Host name not allowed</title>\n</head>\n<body>\n"
+        "<h1>This host name is not allowed</h1>\n"
+        f"<p>This server was opened as <strong>{shown}</strong>, a name it does not know as its own, so it "
+        "refuses the request. This protects it against DNS rebinding.</p>\n"
+        "<p>If this is the name you use for this server:</p>\n"
+        f"{steps}</body>\n</html>\n")
+    return HTMLResponse(body, status_code=403, headers={
+        "Content-Security-Policy": _REFUSAL_PAGE_CSP, "Cache-Control": "no-store"})
+
+
 # --- the access policy and the keys ----------------------------------------------
 #
 # Everything the guard decides on, built from the effective settings and replaced
@@ -549,12 +624,7 @@ def _guard_verdict(method: str, path: str, headers: Headers) -> Optional[tuple[i
     policy = _policy
     host = _request_host(headers, policy)
     if not _host_allowed(host, policy):
-        return (
-            403,
-            f"Host {(host or '')[:100]!r} is not allowed. If this is the name you use to reach "
-            "this service, add its hostname to TRUSTED_HOSTS.",
-            "host_not_allowed",
-        )
+        return 403, _host_refusal_message(host), "host_not_allowed"
 
     if method not in _SAFE_METHODS:
         origin = headers.get("origin")
@@ -613,14 +683,33 @@ def _websocket_subprotocol(websocket: WebSocket) -> Optional[str]:
 
 
 def _refusal(path: str, status: int, message: str, code: str) -> JSONResponse:
-    """A refusal in the shape the caller expects: OpenAI envelope on /v1, `detail` elsewhere."""
+    """A refusal in the shape the caller expects: OpenAI envelope on /v1, `detail` elsewhere.
+
+    The Settings API's refusals also carry the `code`, which its page switches on.
+    """
     if is_v1_path(path):
         response = openai_error(status, message, code=code)
+    elif _is_settings_path(path):
+        response = JSONResponse(status_code=status, content={"detail": message, "code": code})
     else:
         response = JSONResponse(status_code=status, content={"detail": message})
     if status == 401:
         response.headers["WWW-Authenticate"] = "Bearer"
     return response
+
+
+def _guard_response(scope) -> Optional[Response]:
+    """The refusal for a request the guard stops, or None to let it through."""
+    method, path = scope["method"], scope["path"]
+    headers = Headers(scope=scope)
+    if _is_settings_path(path):
+        return _settings_guard(method, path, headers, _client_address(scope))
+    verdict = _guard_verdict(method, path, headers)
+    if verdict is None:
+        return None
+    if verdict[2] == "host_not_allowed" and _is_navigation(method, path, headers):
+        return _host_refusal_page(_request_host(headers))
+    return _refusal(path, *verdict)
 
 
 class _RequestGuardMiddleware:
@@ -631,9 +720,9 @@ class _RequestGuardMiddleware:
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
-            verdict = _guard_verdict(scope["method"], scope["path"], Headers(scope=scope))
-            if verdict is not None:
-                await _refusal(scope["path"], *verdict)(scope, receive, send)
+            refusal = _guard_response(scope)
+            if refusal is not None:
+                await refusal(scope, receive, send)
                 return
         await self.app(scope, receive, send)
 
@@ -674,6 +763,10 @@ class _BodyTooLarge(Exception):
 
 
 def _body_limit_for(path: str, content_type: str) -> int:
+    if _is_settings_path(path):
+        # Small JSON documents only; never a setting of its own, so no saved
+        # value can lock the Settings page out of its own API.
+        return SETTINGS_BODY_LIMIT
     if path == "/v1/audio/transcriptions":
         # The route enforces the exact 25 MB on the file and answers in the
         # OpenAI shape; this is only the backstop for the framing around it.
@@ -703,7 +796,8 @@ class _BodyLimitMiddleware:
 
     @staticmethod
     async def _reject(scope, receive, send, limit: int):
-        message = f"Request body too large. Maximum is {limit / (1024 * 1024):g} MB."
+        size = f"{limit // 1024} KiB" if limit < 1024 * 1024 else f"{limit / (1024 * 1024):g} MB"
+        message = f"Request body too large. Maximum is {size}."
         response = _refusal(scope["path"], 413, message, "request_too_large")
         # The unread remainder of the body is still on the wire.
         response.headers["Connection"] = "close"
@@ -804,9 +898,190 @@ class _UploadSlotMiddleware:
             _upload_slots.release()
 
 
+# --- the Settings page and its API: their own request rules ---------------------------
+#
+# /settings (the page) and /api/settings* (its API) decide who may use this server
+# and how, so they get stricter rules than every other path:
+#   - The Host check always applies, even with ALLOWED_HOSTS='*'.
+#   - Once the server is claimed (an admin credential exists: the app YAML key in
+#     role admin, or an admin key made in the page), every API request needs an
+#     admin key, GET included: none or a wrong one is 401, a client key 403.
+#     Unclaimed, the API can be read (the page shows the values read-only), and the
+#     only write is the claim with a one-time code from the container log.
+#   - 10 wrong keys or codes from one address within 10 minutes give 429, per worker.
+#   - A changing request must come from this UI: an Origin, when sent, is this
+#     server or a TRUSTED_ORIGINS entry (ALLOWED_ORIGINS does not count, `null` is
+#     refused), Sec-Fetch-Site, when sent, is same-origin, and the body is JSON
+#     (415 otherwise) of at most 64 KiB without a duplicate key.
+#   - No CORS at all: a preflight gets 403, and no Access-Control-* header leaves.
+#   - Nothing is cached (Cache-Control: no-store).
+
+SETTINGS_BODY_LIMIT = 64 * 1024
+SETTINGS_AUTH_FAILURES = 10
+SETTINGS_AUTH_WINDOW_S = 600.0
+# Reached without a key: the claim takes the one-time code instead, and anyone may
+# ask for a code, because it only ever reaches the container log.
+_SETTINGS_OPEN_POSTS = frozenset({"/api/settings/claim-code", "/api/settings/claim"})
+
+
 def _is_settings_path(path: str) -> bool:
     """The Settings page and its API, which never get CORS headers."""
     return path in ("/settings", "/api/settings") or path.startswith(("/settings/", "/api/settings/"))
+
+
+def _is_settings_api_path(path: str) -> bool:
+    return path == "/api/settings" or path.startswith("/api/settings/")
+
+
+def _client_address(scope) -> str:
+    client = scope.get("client")
+    return str(client[0]) if client else ""
+
+
+class _FailureLimiter:
+    """Wrong keys and codes per client address on the Settings API, in this worker.
+
+    `limit` failures within `window` seconds refuse the address until the oldest of
+    them is `window` old. A request with a working admin key clears its record.
+    """
+
+    def __init__(self, limit: int, window: float, *, clock=time.monotonic, max_clients: int = 4096):
+        self.limit, self.window, self.clock, self.max_clients = limit, window, clock, max_clients
+        self._failures: dict[str, collections.deque] = {}
+
+    def _recent(self, client: str, now: float) -> Optional[collections.deque]:
+        times = self._failures.get(client)
+        if times is None:
+            return None
+        while times and now - times[0] >= self.window:
+            times.popleft()
+        if not times:
+            del self._failures[client]
+            return None
+        return times
+
+    def retry_after(self, client: str) -> Optional[int]:
+        """Seconds until the address may try again, or None when it is not blocked."""
+        now = self.clock()
+        times = self._recent(client, now)
+        if times is None or len(times) < self.limit:
+            return None
+        return max(1, math.ceil(times[0] + self.window - now))
+
+    def failed(self, client: str) -> bool:
+        """Count a failure; True when it is the one that blocks the address."""
+        now = self.clock()
+        times = self._recent(client, now)
+        if times is None:
+            if len(self._failures) >= self.max_clients:
+                oldest = min(self._failures, key=lambda address: self._failures[address][-1])
+                del self._failures[oldest]
+            times = self._failures[client] = collections.deque(maxlen=self.limit)
+        before = len(times)
+        times.append(now)
+        return before < self.limit <= len(times)
+
+    def succeeded(self, client: str) -> None:
+        self._failures.pop(client, None)
+
+
+_settings_limiter = _FailureLimiter(SETTINGS_AUTH_FAILURES, SETTINGS_AUTH_WINDOW_S)
+
+
+def _settings_error(status: int, message: str, code: str, *, headers: Optional[Mapping[str, str]] = None,
+                    **extra: Any) -> JSONResponse:
+    """A Settings API answer that is not a success: a message, a stable code and any details."""
+    response = JSONResponse(status_code=status, content={"detail": message, "code": code, **extra},
+                            headers=dict(headers or {}))
+    if status == 401:
+        response.headers["WWW-Authenticate"] = "Bearer"
+    return response
+
+
+def _presented_key(headers: Headers) -> bool:
+    scheme, _, token = headers.get("authorization", "").partition(" ")
+    return scheme.lower() == "bearer" and bool(token.strip())
+
+
+def _audit_refusal(result: str, method: str, path: str, headers: Headers, client: str,
+                   credential: Optional["_Credential"] = None) -> None:
+    """An audit line for a refused Settings request (never raises)."""
+    actor = settings_store.Actor(ip=client, host=headers.get("host", ""),
+                                 credential=credential.name if credential else "")
+    _settings_store.audit("refused", actor=actor, result=result, method=method, path=path[:200])
+
+
+def _settings_guard(method: str, path: str, headers: Headers, client: str) -> Optional[Response]:
+    """The rules above for one request to /settings or /api/settings*; None lets it through."""
+    policy = _policy
+    if policy.allow_any_host:
+        policy = dataclasses.replace(policy, allow_any_host=False)
+    host = _request_host(headers, policy)
+    if not _host_allowed(host, policy):
+        if _is_navigation(method, path, headers):
+            return _host_refusal_page(host)
+        return _refusal(path, 403, _host_refusal_message(host), "host_not_allowed")
+    if method == "OPTIONS":
+        return _settings_error(403, "The Settings page answers no cross-origin requests.", "cors_refused")
+    if not _is_settings_api_path(path):
+        return None                     # the page itself: an empty shell that asks the API
+    retry_after = _settings_limiter.retry_after(client)
+    if retry_after is not None:
+        return _settings_error(429, "Too many wrong keys or codes from this address; try again later.",
+                               "too_many_attempts", headers={"Retry-After": str(retry_after)})
+    safe = method in _SAFE_METHODS
+    if not safe:
+        origin = headers.get("origin")
+        if origin is not None and not _is_same_origin(origin, headers, policy):
+            _audit_refusal("403 cross_origin_blocked", method, path, headers, client)
+            return _settings_error(403, "Settings can only be changed from this server's own page.",
+                                   "cross_origin_blocked")
+        site = headers.get("sec-fetch-site")
+        if site is not None and site.strip().lower() != "same-origin":
+            _audit_refusal("403 cross_site_blocked", method, path, headers, client)
+            return _settings_error(403, "Settings can only be changed from this server's own page.",
+                                   "cross_site_blocked")
+    if not (method == "POST" and path in _SETTINGS_OPEN_POSTS):
+        if _settings_claimed():
+            credential = _bearer_credential(headers)
+            if credential is None:
+                if _presented_key(headers):
+                    blocked = _settings_limiter.failed(client)
+                    _audit_refusal("401 invalid_api_key" + (", address blocked" if blocked else ""),
+                                   method, path, headers, client)
+                return _settings_error(401, "An admin key is required (Authorization: Bearer <key>).",
+                                       "invalid_api_key")
+            if credential.role != settings_schema.ROLE_ADMIN:
+                _audit_refusal("403 admin_key_required", method, path, headers, client, credential)
+                return _settings_error(403, "This key may use the API but not the Settings; an admin key "
+                                            "is required.", "admin_key_required")
+            _settings_limiter.succeeded(client)
+        elif not safe:
+            _audit_refusal("403 not_claimed", method, path, headers, client)
+            return _settings_error(403, "Nobody may change settings yet: this server has no admin key. Print a "
+                                        "one-time code to the container log and claim the server with it.",
+                                   "not_claimed")
+    if method in ("POST", "PUT", "PATCH"):
+        content_type = headers.get("content-type", "").split(";")[0].strip().lower()
+        if content_type != "application/json":
+            return _settings_error(415, "The Settings API takes application/json.", "unsupported_media_type")
+    return None
+
+
+def _settings_send(send):
+    """`send` for a Settings response: never cached, and never with a CORS header.
+
+    Works on the raw header list, whatever case a layer further in used for a name.
+    """
+
+    async def send_settings(message):
+        if message["type"] == "http.response.start":
+            kept = [(name, value) for name, value in message.get("headers", [])
+                    if not name.lower().startswith(b"access-control-") and name.lower() != b"cache-control"]
+            message["headers"] = [*kept, (b"cache-control", b"no-store")]
+        await send(message)
+
+    return send_settings
 
 
 class _SettingsMiddleware:
@@ -822,7 +1097,8 @@ class _SettingsMiddleware:
     CORS is a starlette CORSMiddleware around the rest of the stack, rebuilt when
     the allowed origins change; with none (the default) the request passes through
     untouched, exactly as when no CORSMiddleware was installed. The Settings page
-    and its API never get CORS headers.
+    and its API never get CORS headers, and none of their answers may be cached
+    (`_settings_send`); their other rules are `_settings_guard`'s.
     """
 
     def __init__(self, app):
@@ -846,7 +1122,10 @@ class _SettingsMiddleware:
     async def __call__(self, scope, receive, send):
         if scope["type"] in ("http", "websocket"):
             _settings_tick()
-        if scope["type"] == "http" and not _is_settings_path(scope["path"]):
+        if scope["type"] == "http":
+            if _is_settings_path(scope["path"]):
+                await self.app(scope, receive, _settings_send(send))
+                return
             cors = self._cors_handler(_policy)
             if cors is not None:
                 await cors(scope, receive, send)
@@ -3663,17 +3942,25 @@ async def frontend_training_cancel_job(job_id: str = _job_id_param()):
 # (_SettingsMiddleware), so a change saved by any worker, or by hand, is in force
 # from the next request on, in every worker, without a restart.
 
-_settings_store = settings_store.SettingsStore.from_environment()
+# The store's wall clock (commit-confirm deadlines, one-time codes); injectable so
+# tests can move time instead of sleeping.
+_settings_clock = time.time
+_settings_store = settings_store.SettingsStore.from_environment(clock=lambda: _settings_clock())
 # What `_apply` last put in force: the store state it was given and its effective values.
 _applied_state: Optional[settings_store.SettingsState] = None
 _applied_values: Mapping[str, Any] = MappingProxyType({})
+
+
+def _overrides_in_force(values: Mapping[str, Any]) -> dict[str, Any]:
+    """The saved values of gateway.json that win over the app YAML: all but the locked keys."""
+    return {key: value for key, value in values.items() if key not in SETTINGS_LOCKED_KEYS}
 
 
 def _file_values_in_force(state: settings_store.SettingsState) -> dict[str, Any]:
     """The saved gateway.json values that apply now: none while the file is to be ignored."""
     if not ENABLE_SETTINGS_UI or state.safe_mode:
         return {}
-    return {key: value for key, value in state.preferences.values.items() if key not in SETTINGS_LOCKED_KEYS}
+    return _overrides_in_force(state.preferences.values)
 
 
 def _access_in_force(keys: settings_store.KeysState) -> tuple[bool, str]:
@@ -3791,9 +4078,833 @@ def _log_settings_at_start(state: settings_store.SettingsState) -> None:
         logger.info("settings: the Settings page cannot save here (%s)", state.mount.detail)
 
 
-# One read at start, and everything put in force before the first request.
+# One read at start, an unconfirmed change whose time is up undone (as on every
+# request), and everything put in force before the first request.
+_settings_store.expire_pending()
 _apply(_settings_store.state, initial=True)
 _log_settings_at_start(_settings_store.state)
+
+
+# --- the Settings API ------------------------------------------------------------------
+#
+# Internal: not in the OpenAPI document, and only for the page at /settings. Every
+# route here is behind `_settings_guard` (an admin key once the server is claimed,
+# JSON of at most 64 KiB, this UI's own origin). Writes go through settings_store: a
+# lock the workers share, a check of the revision the change is based on, atomic
+# files, history and audit. The answering worker puts a write in force before it
+# answers; the others do on their next request.
+#
+#   GET    /settings                 the page (an empty shell; settings.js asks the API)
+#   GET    /api/settings             everything the page shows
+#   PUT    /api/settings             {base_revision, set, reset, acknowledge, dry_run}
+#   POST   /api/settings/confirm     {revision}: keep a TRUSTED_ORIGINS / TRUST_PROXY_HEADERS change
+#   POST   /api/settings/restore     {history_id, base_revision, acknowledge, dry_run}
+#   POST   /api/settings/discard     {base_revision, dry_run}: back to the app YAML
+#   GET    /api/settings/engines     which optional engines run, answer or are not installed
+#   PUT    /api/settings/access      {base_revision, require_key, deployment_key_role}
+#   POST   /api/settings/keys        {name, role, key} -> 201
+#   DELETE /api/settings/keys/{id}
+#   POST   /api/settings/claim-code  {} -> 202; the code goes to the container log only
+#   POST   /api/settings/claim       {code, name, key, require_key} -> 201
+
+_SETTINGS_PAGE_CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+                      "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+# The one place a one-time code is written: the container log. Not the audit logger,
+# whose lines also go to audit.jsonl.
+_claim_logger = logging.getLogger("tts_stt.settings.claim")
+_LOCKED_MESSAGE = "Locked by SETTINGS_LOCKED_KEYS in the app YAML."
+_REGISTRY_JSON_MESSAGE = "Defined by PROVIDER_REGISTRY_JSON in the app YAML; it cannot be switched here."
+_API_KEY_FORCES_MESSAGE = "The app YAML sets API_KEY, so a key is always required."
+# The lines that mount the settings folder, for the page to show while it is missing.
+_SETTINGS_MOUNT_LINES = {
+    "truenas": ['- "${APP_DATA_DIR:?set dataset path}/settings:/app/settings"',
+                '- "${APP_DATA_DIR:?set dataset path}/backend-settings:/app/backend-settings"'],
+    "compose": ["- ${SETTINGS_DIR:-${APP_DATA_DIR:-.}/settings}:/app/settings",
+                "- ${BACKEND_SETTINGS_DIR:-${APP_DATA_DIR:-.}/backend-settings}:/app/backend-settings"],
+}
+_STORE_ERROR_STATUS = {
+    "settings_not_mounted": 409, "settings_write_failed": 500, "settings_busy": 503,
+    "revision_conflict": 409, "invalid_input": 400, "history_not_found": 404, "key_not_found": 404,
+    "key_limit_reached": 409, "last_admin_credential": 409, "no_key_configured": 409,
+    "keys_file_damaged": 409, "invalid_code": 403, "rate_limited": 429,
+}
+
+
+class _SettingsRefused(Exception):
+    """Raised by a store `check` to stop a write; `response` is the answer."""
+
+    def __init__(self, response: JSONResponse, code: str):
+        super().__init__(code)
+        self.response, self.code = response, code
+
+
+def _settings_claimed() -> bool:
+    """Is there an admin credential: an admin key made in the page, or the app YAML key as admin?"""
+    state = _applied_state
+    if state is not None and any(record.role == settings_schema.ROLE_ADMIN for record in state.keys.keys):
+        return True
+    return bool(API_KEY) and _applied_values.get("deployment_key_role") == settings_schema.ROLE_ADMIN
+
+
+def _settings_actor(request: Request, credential: Optional[_Credential], name: Optional[str] = None) -> settings_store.Actor:
+    """Who asks, for the audit trail and the history: address, Host and the credential's name."""
+    return settings_store.Actor(
+        ip=_client_address(request.scope), host=request.headers.get("host", ""),
+        credential=name if name is not None else (credential.name if credential else ""))
+
+
+def _store_refusal(exc: settings_store.SettingsStoreError) -> JSONResponse:
+    extra: dict[str, Any] = {}
+    headers: dict[str, str] = {}
+    if isinstance(exc, settings_store.InvalidInput):
+        extra["errors"] = exc.errors
+    if isinstance(exc, settings_store.RevisionConflict):
+        extra["revision"] = exc.current_revision
+    if isinstance(exc, settings_store.RateLimited):
+        headers["Retry-After"] = str(exc.retry_after)
+    if isinstance(exc, settings_store.LockTimeout):
+        headers["Retry-After"] = "1"
+    return _settings_error(_STORE_ERROR_STATUS.get(exc.code, 400), exc.message, exc.code, headers=headers, **extra)
+
+
+def _apply_saved() -> None:
+    """Put a write in force in this worker before answering it (never raises: the write is
+    done, and the next request's `_settings_tick` tries again)."""
+    try:
+        _apply(_settings_store.state)
+    except Exception:
+        logger.exception("settings: could not apply the saved settings; the ones in force stay")
+
+
+def _refused_write(refused: _SettingsRefused, request: Request, actor: settings_store.Actor) -> JSONResponse:
+    if refused.code == "would_lock_out":
+        _settings_store.audit("refused", actor=actor, result="409 would_lock_out", method=request.method,
+                              path=request.url.path)
+    return refused.response
+
+
+def _preferences_locked_out(state: settings_store.SettingsState) -> Optional[JSONResponse]:
+    """Why gateway.json cannot be changed now (as the answer), or None."""
+    if not ENABLE_SETTINGS_UI:
+        return _settings_error(403, "ENABLE_SETTINGS_UI=false in the app YAML: the Settings page is read-only.",
+                               "settings_disabled")
+    if state.safe_mode:
+        return _settings_error(403, "The settings folder holds a SAFE-MODE file: saved values are ignored and "
+                                    "cannot be changed until it is deleted.", "settings_disabled")
+    if not state.mount.writable:
+        return _store_refusal(settings_store.NotWritable())
+    return None
+
+
+def _keys_locked_out(state: settings_store.SettingsState) -> Optional[JSONResponse]:
+    """Why keys.json cannot be changed now (as the answer), or None. SAFE-MODE does not stop it."""
+    if not ENABLE_SETTINGS_UI:
+        return _settings_error(403, "ENABLE_SETTINGS_UI=false in the app YAML: the Settings page is read-only.",
+                               "settings_disabled")
+    if not state.mount.writable:
+        return _store_refusal(settings_store.NotWritable())
+    return None
+
+
+_FIELD_CHECKS: dict[str, tuple[Any, str]] = {
+    "base_revision": (lambda v: isinstance(v, int) and not isinstance(v, bool) and v >= 0,
+                      "Expected the revision the change is based on."),
+    "revision": (lambda v: isinstance(v, int) and not isinstance(v, bool) and v >= 0, "Expected a revision."),
+    "set": (lambda v: isinstance(v, dict), "Expected an object of settings."),
+    "reset": (lambda v: isinstance(v, list) and all(isinstance(i, str) for i in v), "Expected a list of settings."),
+    "acknowledge": (lambda v: isinstance(v, list) and all(isinstance(i, str) for i in v),
+                    "Expected a list of warnings."),
+    "dry_run": (lambda v: isinstance(v, bool), "Expected true or false."),
+    "require_key": (lambda v: isinstance(v, bool), "Expected true or false."),
+    "deployment_key_role": (lambda v: isinstance(v, str), "Expected admin or client."),
+    "history_id": (lambda v: isinstance(v, str), "Expected the id of a saved version."),
+    # checked by the store, with messages that never repeat a key or a code
+    "name": (lambda v: True, ""), "role": (lambda v: True, ""), "key": (lambda v: True, ""),
+    "code": (lambda v: True, ""),
+}
+
+
+async def _settings_body(request: Request, *, required: tuple[str, ...] = (),
+                         optional: tuple[str, ...] = ()) -> Any:
+    """The request's JSON object with its fields checked, or the refusal (a JSONResponse)."""
+    raw = await request.body()
+    try:
+        body = settings_schema.parse_json_strict(raw) if raw.strip() else {}
+    except settings_schema.DuplicateKeyError:
+        return _settings_error(400, "A name appears twice in the request.", "duplicate_key")
+    except ValueError:
+        return _settings_error(400, "The request is not valid JSON.", "invalid_json")
+    if not isinstance(body, dict):
+        return _settings_error(400, "The request has to be a JSON object.", "invalid_json")
+    errors: dict[str, str] = {}
+    for name, value in body.items():
+        if name not in required and name not in optional:
+            errors[name[:64]] = "Unknown field."
+            continue
+        check, message = _FIELD_CHECKS[name]
+        if not check(value):
+            errors[name] = message
+    for name in required:
+        if name not in body:
+            errors[name] = "Required."
+    if errors:
+        return _settings_error(400, "The request is not valid.", "invalid_input", errors=errors)
+    return body
+
+
+def _override_engine_kinds() -> dict[str, str]:
+    """{provider id: kind} of PROVIDER_REGISTRY_JSON's entries, which are offered whatever a flag says."""
+    providers = _REGISTRY_OVERRIDE.get("providers") if isinstance(_REGISTRY_OVERRIDE, dict) else None
+    if not isinstance(providers, dict):
+        return {}
+    return {provider: entry["kind"] for provider, entry in providers.items()
+            if isinstance(entry, dict) and isinstance(entry.get("kind"), str)}
+
+
+def _registry_toggle_errors(keys) -> dict[str, str]:
+    overridden = _registry_override_providers()
+    return {key: _REGISTRY_JSON_MESSAGE for key in keys
+            if key in settings_schema.ENGINE_FLAGS and settings_schema.ENGINE_FLAGS[key][0] in overridden}
+
+
+def _candidate_values(overrides: Mapping[str, Any]) -> dict[str, Any]:
+    """The values in force if `overrides` were what gateway.json holds (keys.json as it is)."""
+    values = dict(_ENV_VALUES)
+    values.update(_overrides_in_force(overrides))
+    values["require_key"], values["deployment_key_role"] = _access_in_force(_settings_store.state.keys)
+    return values
+
+
+def _lockout_reason(candidate: _AccessPolicy, headers: Headers) -> Optional[str]:
+    """Why `candidate` would refuse the request that asks for it, or None.
+
+    The request's own Host, X-Forwarded-Host (believed only under the candidate's
+    TRUST_PROXY_HEADERS) and Origin are judged by the Settings rules of the candidate.
+    """
+    candidate = dataclasses.replace(candidate, allow_any_host=False)
+    host = _request_host(headers, candidate)
+
+    def name(value: Optional[str]) -> str:
+        return repr(_parse_host_header(value or "") or (value or "")[:100])
+
+    match = _HOST_PATTERN.match((headers.get("host") or "").strip())
+    port = match.group("port") if match and match.group("port") else "3000"
+    elsewhere = f"make the change from the server's IP address (http://<IP address>:{port}/settings)"
+    if not _host_allowed(host, candidate):
+        return f"You are connected as {name(host)}; this change would refuse that name. Keep it, or {elsewhere}."
+    origin = headers.get("origin")
+    if origin is not None and not _is_same_origin(origin, headers, candidate):
+        now = _request_host(headers)
+        if now != host:
+            return (f"This page reaches the server as {name(now)} (X-Forwarded-Host); after this change the server "
+                    f"would see {name(host)} and refuse the page's changes. Keep it, or {elsewhere}.")
+        return (f"This page runs at {origin[:100]!r}; after this change the server would refuse its changes. "
+                f"Keep it, or {elsewhere}.")
+    return None
+
+
+def _write_check(headers: Headers, *, engines: bool = True):
+    """The store's `check` for a gateway.json write: runs under the lock with the exact new values."""
+
+    def check(values: Mapping[str, Any], changed: tuple[str, ...]) -> None:
+        candidate = _candidate_values(values)
+        if engines and any(key in _ENGINE_KEYS for key in changed):
+            offered = settings_schema.offered_engines(candidate, _override_engine_kinds())
+            errors = settings_schema.check_engine_defaults(candidate, offered)
+            if errors:
+                raise _SettingsRefused(_settings_error(400, "Some values are not valid.", "invalid_input",
+                                                       errors=errors), "invalid_input")
+        if any(key in settings_schema.GUARD_KEYS for key in changed):
+            reason = _lockout_reason(_build_access_policy(candidate), headers)
+            if reason:
+                raise _SettingsRefused(_settings_error(409, reason, "would_lock_out"), "would_lock_out")
+
+    return check
+
+
+def _confirm_view(pending: Optional[settings_store.Pending]) -> Optional[dict]:
+    if pending is None:
+        return None
+    return {"revision": pending.revision, "deadline": pending.deadline,
+            "seconds_left": max(0, math.ceil(pending.deadline - _settings_clock())),
+            "keys": sorted(pending.previous)}
+
+
+def _write_answer(result: settings_store.WriteResult, before: Mapping[str, Any], warnings=(),
+                  notes: Optional[Mapping[str, Any]] = None) -> dict:
+    """What a gateway.json write (or its dry run) answers."""
+    after = _candidate_values(result.values)
+    started = result.pending is not None and result.pending.revision == result.revision
+    return {
+        "revision": result.revision,
+        "changed": list(result.changed),
+        "dry_run": result.dry_run,
+        "written": result.written,
+        # the engines on offer changed: the main page shows them after a reload
+        "reload_main_ui": any(not settings_schema.same_value(after[key], before.get(key)) for key in _ENGINE_KEYS),
+        # a TRUSTED_ORIGINS / TRUST_PROXY_HEADERS change: POST /api/settings/confirm {revision} in time
+        "confirm": {**_confirm_view(result.pending), "window": settings_store.CONFIRM_WINDOW_S} if started else None,
+        "warnings": [warning.as_dict() for warning in warnings],
+        "notes": {key: list(texts) for key, texts in (notes or {}).items()},
+        "dropped": dict(result.dropped),
+    }
+
+
+def _jsonable(value: Any) -> Any:
+    return list(value) if isinstance(value, tuple) else value
+
+
+def _frontend_workers() -> int:
+    """FRONTEND_WORKERS as entrypoint.sh reads it, for the page's worst-case memory hint."""
+    raw = os.getenv("FRONTEND_WORKERS", "").strip()
+    return int(raw) if raw.isdigit() and int(raw) > 0 else 2
+
+
+def _setting_view(item: dict, state: settings_store.SettingsState, in_force: Mapping[str, Any],
+                  overridden: frozenset) -> dict:
+    """One field of the page: its value in force, where that comes from, and what else is known."""
+    key = item["key"]
+    preferences, keys = state.preferences, state.keys
+    locked = key in SETTINGS_LOCKED_KEYS
+    read_only = _LOCKED_MESSAGE if locked else None
+    if key in settings_schema.PREFERENCE_KEYS:
+        saved = key in preferences.values
+        source = "locked" if locked else "saved" if key in in_force else "yaml" if key in _ENV_SET else "default"
+        if read_only is None and key in settings_schema.ENGINE_FLAGS and settings_schema.ENGINE_FLAGS[key][0] in overridden:
+            read_only = _REGISTRY_JSON_MESSAGE
+        extra = {"yaml_value": _jsonable(_ENV_VALUES[key]), "yaml_set": key in _ENV_SET, "saved": saved,
+                 "saved_value": _jsonable(preferences.values[key]) if saved else None,
+                 "ignored": saved and key not in in_force, "dropped": preferences.dropped.get(key)}
+    else:
+        stored = keys.revision > 0 and not keys.fail_closed
+        if locked:
+            source = "locked"
+        elif keys.fail_closed:
+            source, read_only = "fail_closed", keys.problem
+        elif key == "require_key" and API_KEY:
+            source, read_only = "yaml", _API_KEY_FORCES_MESSAGE
+        else:
+            source = "saved" if stored else "default"
+        yaml_value = bool(API_KEY) if key == "require_key" else settings_schema.ROLE_ADMIN
+        saved_value = (keys.require_key if key == "require_key" else keys.deployment_key_role) if stored else None
+        extra = {"yaml_value": yaml_value, "yaml_set": key == "require_key" and bool(API_KEY), "saved": stored,
+                 "saved_value": saved_value, "ignored": False, "dropped": None}
+    return {**item, "value": _jsonable(_applied_values[key]), "source": source, "locked": locked,
+            "read_only": read_only, **extra}
+
+
+def _settings_banners(state: settings_store.SettingsState, claimed: bool) -> list[dict]:
+    banners: list[dict] = []
+
+    def add(banner_id: str, level: str, text: str) -> None:
+        banners.append({"id": banner_id, "level": level, "text": text})
+
+    if not state.mount.writable:
+        add("not_mounted", "error", f"Settings cannot be saved here: {state.mount.detail} Add the settings folder "
+                                    "to frontend-service's volumes in the app YAML (lines below) and redeploy.")
+    if not ENABLE_SETTINGS_UI:
+        add("disabled", "warning", "ENABLE_SETTINGS_UI=false in the app YAML: this page is read-only and saved "
+                                   "values are ignored. API keys made here stay in force.")
+    elif state.safe_mode:
+        add("safe_mode", "warning", "The settings folder holds a SAFE-MODE file: saved values are ignored and the "
+                                    "app YAML applies. Delete the file to use them again. API keys stay in force.")
+    if state.keys.fail_closed:
+        add("keys_damaged", "error", state.keys.problem or "keys.json is damaged.")
+    for problem in state.preferences.problems:
+        add("problem", "warning", problem)
+    if not claimed:
+        add("unclaimed", "warning", "Nobody can change these settings yet: this server has no admin key. Print a "
+                                    "one-time code to the container log and claim the server with it.")
+    if not _applied_values.get("require_key"):
+        add("open_api", "warning", "No API key: anyone on your network can use the API.")
+    pending = state.preferences.pending
+    if pending is not None:
+        add("pending", "warning", f"The change of {', '.join(sorted(pending.previous))} is undone at "
+                                  f"{datetime.fromtimestamp(pending.deadline, timezone.utc):%H:%M:%S} UTC "
+                                  "unless it is confirmed.")
+    if _file_values_in_force(state):
+        add("stored", "info", "Stored on this server, applied at once.")
+    elif ENABLE_SETTINGS_UI and not state.safe_mode:
+        add("yaml", "info", "Not saved yet: showing the app YAML.")
+    return banners
+
+
+def _settings_view(state: settings_store.SettingsState, credential: Optional[_Credential]) -> dict:
+    """GET /api/settings: every field, the keys without their secrets, banners and history."""
+    preferences, keys = state.preferences, state.keys
+    in_force = _file_values_in_force(state)
+    overridden = _registry_override_providers()
+    claimed = _settings_claimed()
+    admin = credential is not None and credential.role == settings_schema.ROLE_ADMIN
+    keys_open = ENABLE_SETTINGS_UI and state.mount.writable
+    return {
+        "revision": preferences.revision,
+        "keys_revision": keys.revision,
+        "claimed": claimed,
+        "credential": None if credential is None else {
+            "name": credential.name, "role": credential.role, "id": credential.key_id,
+            "deployment_key": credential.key_id is None},
+        "can_write": admin and keys_open and not state.safe_mode,
+        "can_manage_keys": admin and keys_open and not keys.fail_closed,
+        "can_claim": keys_open,
+        "enabled": ENABLE_SETTINGS_UI,
+        "safe_mode": state.safe_mode,
+        "mount": {"state": state.mount.state, "writable": state.mount.writable, "detail": state.mount.detail,
+                  "lines": _SETTINGS_MOUNT_LINES},
+        "source": preferences.source,
+        "saved_at": preferences.saved_at,
+        "saved_by": dict(preferences.saved_by) if preferences.saved_by else None,
+        "pending": _confirm_view(preferences.pending),
+        "groups": [{"id": group, "label": label} for group, label in settings_schema.GROUPS],
+        "settings": [_setting_view(item, state, in_force, overridden) for item in settings_schema.describe()],
+        "access": {"require_key": _applied_values["require_key"],
+                   "deployment_key_role": _applied_values["deployment_key_role"],
+                   "deployment_key_present": bool(API_KEY), "fail_closed": keys.fail_closed},
+        "keys": [record.public() for record in keys.keys],
+        "max_keys": settings_store.MAX_KEYS,
+        "engines": {
+            "offered": {provider: entry.get("kind") for provider, entry in PROVIDER_REGISTRY["providers"].items()},
+            "registry_json": sorted(overridden),
+            "builtin": dict(settings_schema.BUILTIN_ENGINES),
+        },
+        "deployment": {
+            "api_key_set": bool(API_KEY), "allow_any_host": ALLOW_ANY_HOST,
+            "allowed_origins_wildcard": "*" in _ENV_ALLOWED_ORIGINS, "allow_credentials": ALLOW_CREDENTIALS,
+            "settings_ui_enabled": ENABLE_SETTINGS_UI, "locked_keys": sorted(SETTINGS_LOCKED_KEYS),
+            "workers": _frontend_workers(),
+        },
+        "banners": _settings_banners(state, claimed),
+        "problems": list(preferences.problems) + ([keys.problem] if keys.problem else []),
+        "history": [entry.as_dict() for entry in _settings_store.history()],
+    }
+
+
+# --- which optional engines are installed and answering -------------------------------
+#
+# Probed only for the Settings page (never on a request of the main UI or the API):
+# a name that does not resolve can take seconds to fail on Docker Desktop. All at
+# once, within a 4 s budget, cached for 30 s per worker. A Compose service that is
+# not installed has no DNS name, which tells "not installed" from "not answering".
+
+_ENGINE_PROBE_TTL_S = 30.0
+_ENGINE_PROBE_BUDGET_S = 4.0
+# Injectable so tests can move time instead of sleeping.
+_engine_probe_clock = time.monotonic
+_engine_probe_cache: dict = {"at": None, "value": None, "inflight": None}
+# The profile that installs each engine's container, and what installing it downloads.
+_ENGINE_PROFILES = {
+    "canary": ("canary-asr", "about 5 GB"),
+    "parakeet": ("parakeet-asr", "about 5 GB"),
+    "chatterbox": ("chatterbox-tts", "about 5 GB"),
+    "magpie": ("magpie-tts", "about 5 GB"),
+    "whisper-cpp": ("whisper-cpp", "a small image and a model of about 0.6 GB"),
+    "piper-training": ("training", None),
+}
+
+
+def _engine_targets() -> dict[str, tuple[str, str]]:
+    """{provider id: (base URL, health path)} of the engines the Settings page offers or hides."""
+    targets = {
+        "canary": (CANARY_ASR_SERVICE_URL, "/health"),
+        "parakeet": (PARAKEET_ASR_SERVICE_URL, "/health"),
+        "chatterbox": (CHATTERBOX_TTS_SERVICE_URL, "/health"),
+        "magpie": (MAGPIE_TTS_SERVICE_URL, "/health"),
+        "whisper-cpp": (WHISPER_CPP_SERVICE_URL, "/"),
+        "piper-training": (VOICE_TRAINING_URL, "/health"),
+    }
+    providers = _REGISTRY_OVERRIDE.get("providers") if isinstance(_REGISTRY_OVERRIDE, dict) else None
+    for provider, entry in (providers if isinstance(providers, dict) else {}).items():
+        # An operator's entry (PROVIDER_REGISTRY_JSON) is probed where it says it is.
+        if provider in targets and isinstance(entry, dict) and isinstance(entry.get("internal_url"), str):
+            health = entry.get("health_endpoint")
+            targets[provider] = (entry["internal_url"], health if isinstance(health, str) else "/health")
+    return targets
+
+
+async def _resolves(host: str) -> bool:
+    """Does the name resolve? The service name of a container that is not installed does not."""
+    try:
+        await asyncio.get_running_loop().getaddrinfo(host, None)
+    except (OSError, UnicodeError):
+        return False
+    return True
+
+
+# Injectable: tests answer from a table instead of asking DNS.
+_engine_resolver = _resolves
+
+
+async def _probe_engine(url: str, path: str) -> str:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _ENGINE_PROBE_BUDGET_S
+    try:
+        host = urlsplit(url).hostname
+    except ValueError:
+        host = None
+    if not host:
+        return settings_schema.ENGINE_NOT_REACHABLE
+    try:
+        resolved = await asyncio.wait_for(_engine_resolver(host), _ENGINE_PROBE_BUDGET_S)
+    except asyncio.TimeoutError:
+        # Docker's DNS answers for its own containers at once; only an absent name takes this long.
+        return settings_schema.ENGINE_NOT_INSTALLED
+    except Exception:
+        return settings_schema.ENGINE_NOT_REACHABLE
+    if not resolved:
+        return settings_schema.ENGINE_NOT_INSTALLED
+    remaining = max(0.1, deadline - loop.time())
+    try:
+        response = await asyncio.wait_for(
+            _get_http_client().get(f"{url}{path}", timeout=_timeout(remaining)), remaining)
+    except Exception:
+        return settings_schema.ENGINE_NOT_REACHABLE
+    return settings_schema.ENGINE_RUNNING if response.status_code < 500 else settings_schema.ENGINE_NOT_REACHABLE
+
+
+async def _probe_engines() -> dict:
+    targets = _engine_targets()
+    states = await asyncio.gather(*(_probe_engine(url, path) for url, path in targets.values()))
+    return {"states": dict(zip(targets, states, strict=True)),
+            "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+
+
+async def _engine_states() -> dict:
+    """{"states": {provider id: state}, "checked_at"}: one probe round per TTL, shared by concurrent callers."""
+    cache = _engine_probe_cache
+    now = _engine_probe_clock()
+    if (cache["value"] is not None and cache["at"] is not None
+            and 0 <= now - cache["at"] < _ENGINE_PROBE_TTL_S):
+        return cache["value"]
+    loop = asyncio.get_running_loop()
+    task = cache["inflight"]
+    # A task from another event loop (tests, worker restarts) cannot be awaited here.
+    if task is None or task.done() or task.get_loop() is not loop:
+        task = loop.create_task(_probe_engines())
+        cache["inflight"] = task
+
+        def _store(finished: "asyncio.Task") -> None:
+            if cache["inflight"] is finished:
+                cache["inflight"] = None
+            if not finished.cancelled() and finished.exception() is None:
+                cache["value"], cache["at"] = finished.result(), _engine_probe_clock()
+
+        task.add_done_callback(_store)
+    return await asyncio.shield(task)
+
+
+async def _engine_status_for(changes: Mapping[str, Any]) -> Optional[dict[str, str]]:
+    """The engines' states when a change offers an optional engine (its warning depends on them)."""
+    if not any(changes.get(key) is True and _applied_values.get(key) is not True
+               for key in settings_schema.OPTIONAL_ENGINE_FLAGS):
+        return None
+    return (await _engine_states())["states"]
+
+
+def _install_hint(profile: Optional[str], download: Optional[str]) -> Optional[dict]:
+    if profile is None:
+        return None
+    size = f" ({download} download)" if download else ""
+    return {"profile": profile,
+            "truenas": f'Apps -> tts-stt -> Edit -> delete the line profiles: ["{profile}"] -> Save{size}',
+            "compose": f"docker compose --profile {profile} up -d"}
+
+
+# --- the routes ---------------------------------------------------------------------------
+
+
+@app.get("/settings", response_class=HTMLResponse, include_in_schema=False)
+async def settings_page(request: Request):
+    """The Settings page: an empty shell; settings.js asks /api/settings for everything."""
+    response = templates.TemplateResponse(request, "settings.html", {"app_version": APP_VERSION})
+    response.headers["Content-Security-Policy"] = _SETTINGS_PAGE_CSP
+    # The global middleware only sets SAMEORIGIN where a route has not set its own.
+    response.headers["X-Frame-Options"] = "DENY"
+    return response
+
+
+@app.get("/api/settings", include_in_schema=False)
+async def settings_read(request: Request):
+    """Everything the page shows; read-only for anyone while the server is unclaimed."""
+    return _settings_view(_settings_store.state, _bearer_credential(request.headers))
+
+
+@app.put("/api/settings", include_in_schema=False)
+async def settings_update(request: Request):
+    """Save values and reset others to the app YAML: {base_revision, set, reset, acknowledge, dry_run}."""
+    refusal = _preferences_locked_out(_settings_store.state)
+    if refusal is not None:
+        return refusal
+    body = await _settings_body(request, required=("base_revision",),
+                                optional=("set", "reset", "acknowledge", "dry_run"))
+    if isinstance(body, Response):
+        return body
+    changes, reset, dry_run = body.get("set", {}), body.get("reset", []), body.get("dry_run", False)
+    # What the app YAML fixes: SETTINGS_LOCKED_KEYS, and the engines PROVIDER_REGISTRY_JSON defines.
+    locked = {**_registry_toggle_errors((*changes, *reset)),
+              **{key: _LOCKED_MESSAGE for key in (*changes, *reset) if key in SETTINGS_LOCKED_KEYS}}
+    if locked:
+        return _settings_error(403, "Some settings are fixed by the app YAML.", "locked_by_deployment",
+                               errors=locked)
+    validation = settings_schema.validate_changes(
+        changes, current=_applied_values, engine_status=await _engine_status_for(changes))
+    errors = dict(validation.errors)
+    for key in reset:
+        if key not in settings_schema.PREFERENCE_KEYS:
+            errors[key[:64]] = "This setting is not changed here." if key in settings_schema.BY_KEY else "Unknown setting."
+        elif key in changes:
+            errors[key] = "Set and reset at the same time."
+    if errors:
+        return _settings_error(400, "Some values are not valid.", "invalid_input", errors=errors)
+    unconfirmed = settings_schema.unacknowledged(validation.warnings, body.get("acknowledge"))
+    if unconfirmed and not dry_run:
+        return _settings_error(409, "Some changes need to be confirmed first.", "needs_confirmation",
+                               warnings=[warning.as_dict() for warning in unconfirmed])
+    actor = _settings_actor(request, _bearer_credential(request.headers))
+    before = _applied_values
+    try:
+        result = _settings_store.update_preferences(
+            validation.values, reset, base_revision=body["base_revision"], actor=actor,
+            check=_write_check(request.headers), dry_run=dry_run)
+    except _SettingsRefused as refused:
+        return _refused_write(refused, request, actor)
+    except settings_store.SettingsStoreError as exc:
+        return _store_refusal(exc)
+    if result.written:
+        _apply_saved()
+    return _write_answer(result, before, validation.warnings, validation.notes)
+
+
+@app.post("/api/settings/confirm", include_in_schema=False)
+async def settings_confirm(request: Request):
+    """Keep a TRUSTED_ORIGINS / TRUST_PROXY_HEADERS change; the page sends it through the new rules."""
+    state = _settings_store.state
+    refusal = _preferences_locked_out(state)
+    if refusal is not None:
+        return refusal
+    body = await _settings_body(request, required=("revision",))
+    if isinstance(body, Response):
+        return body
+    pending = state.preferences.pending
+    if pending is None or pending.revision != body["revision"]:
+        return _settings_error(409, "No change of this revision waits for a confirmation; it may have been undone.",
+                               "nothing_to_confirm")
+    try:
+        confirmed = _settings_store.confirm(
+            body["revision"], actor=_settings_actor(request, _bearer_credential(request.headers)))
+    except settings_store.SettingsStoreError as exc:
+        return _store_refusal(exc)
+    _apply_saved()
+    if not confirmed:
+        return _settings_error(409, "Too late: the change was undone.", "confirm_expired")
+    return {"confirmed": True, "revision": body["revision"]}
+
+
+@app.post("/api/settings/restore", include_in_schema=False)
+async def settings_restore(request: Request):
+    """Make a saved version current again: {history_id, base_revision, acknowledge, dry_run}."""
+    refusal = _preferences_locked_out(_settings_store.state)
+    if refusal is not None:
+        return refusal
+    body = await _settings_body(request, required=("history_id", "base_revision"),
+                                optional=("acknowledge", "dry_run"))
+    if isinstance(body, Response):
+        return body
+    actor = _settings_actor(request, _bearer_credential(request.headers))
+    before = _applied_values
+    check = _write_check(request.headers)
+    try:
+        preview = _settings_store.restore(body["history_id"], base_revision=body["base_revision"], actor=actor,
+                                          check=check, dry_run=True)
+    except _SettingsRefused as refused:
+        return _refused_write(refused, request, actor)
+    except settings_store.SettingsStoreError as exc:
+        return _store_refusal(exc)
+    restored = {key: preview.values[key] for key in preview.changed
+                if key in preview.values and key not in SETTINGS_LOCKED_KEYS}
+    validation = settings_schema.validate_changes(
+        restored, current=_applied_values, engine_status=await _engine_status_for(restored))
+    if body.get("dry_run", False):
+        return _write_answer(preview, before, validation.warnings, validation.notes)
+    unconfirmed = settings_schema.unacknowledged(validation.warnings, body.get("acknowledge"))
+    if unconfirmed:
+        return _settings_error(409, "Some changes need to be confirmed first.", "needs_confirmation",
+                               warnings=[warning.as_dict() for warning in unconfirmed])
+    try:
+        result = _settings_store.restore(body["history_id"], base_revision=body["base_revision"], actor=actor,
+                                         check=check)
+    except _SettingsRefused as refused:
+        return _refused_write(refused, request, actor)
+    except settings_store.SettingsStoreError as exc:
+        return _store_refusal(exc)
+    if result.written:
+        _apply_saved()
+    return _write_answer(result, before, validation.warnings, validation.notes)
+
+
+@app.post("/api/settings/discard", include_in_schema=False)
+async def settings_discard(request: Request):
+    """Drop every saved value, so the app YAML applies; the discarded version stays in the history."""
+    refusal = _preferences_locked_out(_settings_store.state)
+    if refusal is not None:
+        return refusal
+    body = await _settings_body(request, required=("base_revision",), optional=("dry_run",))
+    if isinstance(body, Response):
+        return body
+    actor = _settings_actor(request, _bearer_credential(request.headers))
+    before = _applied_values
+    try:
+        # Back to the app YAML is always allowed, even where its engine defaults disagree.
+        result = _settings_store.discard(base_revision=body["base_revision"], actor=actor,
+                                         check=_write_check(request.headers, engines=False),
+                                         dry_run=body.get("dry_run", False))
+    except _SettingsRefused as refused:
+        return _refused_write(refused, request, actor)
+    except settings_store.SettingsStoreError as exc:
+        return _store_refusal(exc)
+    if result.written:
+        _apply_saved()
+    return _write_answer(result, before)
+
+
+@app.get("/api/settings/engines", include_in_schema=False)
+async def settings_engines():
+    """Per engine the page can offer: running, not_reachable or not_installed, and how to install it."""
+    probe = await _engine_states()
+    overridden = _registry_override_providers()
+    engines = []
+    for key, (provider, kind) in settings_schema.ENGINE_FLAGS.items():
+        engines.append({
+            "provider": provider, "key": key, "kind": kind, "label": settings_schema.BY_KEY[key].label,
+            "state": probe["states"].get(provider, settings_schema.ENGINE_NOT_REACHABLE),
+            "offered": provider in PROVIDER_REGISTRY["providers"],
+            "registry_json": provider in overridden,
+            "install": _install_hint(*_ENGINE_PROFILES.get(provider, (None, None))),
+        })
+    return {"engines": engines, "checked_at": probe["checked_at"], "max_age": int(_ENGINE_PROBE_TTL_S)}
+
+
+@app.put("/api/settings/access", include_in_schema=False)
+async def settings_access(request: Request):
+    """Open or key-required API, and what the app YAML key may do: {base_revision, require_key, deployment_key_role}."""
+    refusal = _keys_locked_out(_settings_store.state)
+    if refusal is not None:
+        return refusal
+    body = await _settings_body(request, required=("base_revision",),
+                                optional=("require_key", "deployment_key_role"))
+    if isinstance(body, Response):
+        return body
+    errors = {key: _LOCKED_MESSAGE for key in settings_schema.ACCESS_KEYS
+              if key in body and key in SETTINGS_LOCKED_KEYS}
+    if API_KEY and body.get("require_key") is False and "require_key" not in errors:
+        errors["require_key"] = _API_KEY_FORCES_MESSAGE
+    if errors:
+        return _settings_error(403, "Some settings are fixed by the app YAML.", "locked_by_deployment",
+                               errors=errors)
+    credential = _bearer_credential(request.headers)
+    actor = _settings_actor(request, credential)
+    if body.get("deployment_key_role") == settings_schema.ROLE_CLIENT and credential is not None \
+            and credential.key_id is None:
+        _settings_store.audit("refused", actor=actor, result="403 deployment_key_not_allowed",
+                              method=request.method, path=request.url.path)
+        return _settings_error(403, "The app YAML key cannot make itself a client: do it with an admin key "
+                                    "created on this page.", "deployment_key_not_allowed")
+    try:
+        keys = _settings_store.set_access(
+            base_revision=body["base_revision"], actor=actor, deployment_key_present=bool(API_KEY),
+            require_key=body.get("require_key"), deployment_key_role=body.get("deployment_key_role"))
+    except settings_store.SettingsStoreError as exc:
+        return _store_refusal(exc)
+    _apply_saved()
+    return {"keys_revision": keys.revision,
+            "access": {"require_key": _applied_values["require_key"],
+                       "deployment_key_role": _applied_values["deployment_key_role"]}}
+
+
+@app.post("/api/settings/keys", include_in_schema=False, status_code=201)
+async def settings_key_create(request: Request):
+    """Store a key the page generated, as its SHA-256 and a hint: {name, role, key} -> 201 {id, hint, ...}."""
+    refusal = _keys_locked_out(_settings_store.state)
+    if refusal is not None:
+        return refusal
+    body = await _settings_body(request, required=("name", "role", "key"))
+    if isinstance(body, Response):
+        return body
+    try:
+        record = _settings_store.add_key(name=body["name"], role=body["role"], key=body["key"],
+                                         actor=_settings_actor(request, _bearer_credential(request.headers)))
+    except settings_store.SettingsStoreError as exc:
+        return _store_refusal(exc)
+    _apply_saved()
+    return JSONResponse(status_code=201, content={**record.public(),
+                                                  "keys_revision": _settings_store.state.keys.revision})
+
+
+@app.delete("/api/settings/keys/{key_id}", include_in_schema=False)
+async def settings_key_revoke(request: Request, key_id: str = PathParam(..., pattern=r"^[A-Za-z0-9_-]{1,32}$")):
+    """Revoke a key made in the page; the last admin credential cannot go (409)."""
+    refusal = _keys_locked_out(_settings_store.state)
+    if refusal is not None:
+        return refusal
+    try:
+        record = _settings_store.revoke_key(key_id, actor=_settings_actor(request, _bearer_credential(request.headers)),
+                                            deployment_key_present=bool(API_KEY))
+    except settings_store.SettingsStoreError as exc:
+        return _store_refusal(exc)
+    _apply_saved()
+    return {"revoked": record.public(), "keys_revision": _settings_store.state.keys.revision}
+
+
+@app.post("/api/settings/claim-code", include_in_schema=False, status_code=202)
+async def settings_claim_code(request: Request):
+    """Print a one-time code to this container's log, the only place it ever appears."""
+    if not ENABLE_SETTINGS_UI:
+        return _settings_error(403, "ENABLE_SETTINGS_UI=false in the app YAML: the Settings page is read-only.",
+                               "settings_disabled")
+    body = await _settings_body(request)
+    if isinstance(body, Response):
+        return body
+    actor = _settings_actor(request, None)
+    try:
+        code = _settings_store.issue_code(actor=actor)
+    except settings_store.SettingsStoreError as exc:
+        return _store_refusal(exc)
+    minutes = settings_store.CODE_TTL_S // 60
+    _claim_logger.warning(
+        "Settings: one-time code %s (asked for from %s). It is valid for %d minutes and works once: enter it "
+        "on the Settings page to create an admin key.", code, actor.ip or "an unknown address", minutes)
+    return JSONResponse(status_code=202, content={
+        "detail": (f"A one-time code was printed to the log of frontend-service, valid for {minutes} minutes "
+                   "(TrueNAS: Apps -> tts-stt -> Workloads -> frontend-service -> View Logs; elsewhere: "
+                   "docker logs <frontend container>)."),
+        "expires_in": settings_store.CODE_TTL_S})
+
+
+@app.post("/api/settings/claim", include_in_schema=False, status_code=201)
+async def settings_claim(request: Request):
+    """Create an admin key with a one-time code: {code, name, key, require_key} -> 201. Also recovers a lost one."""
+    if not ENABLE_SETTINGS_UI:
+        return _settings_error(403, "ENABLE_SETTINGS_UI=false in the app YAML: the Settings page is read-only.",
+                               "settings_disabled")
+    body = await _settings_body(request, required=("code", "name", "key"), optional=("require_key",))
+    if isinstance(body, Response):
+        return body
+    require_key = body.get("require_key")
+    if "require_key" in SETTINGS_LOCKED_KEYS or (API_KEY and require_key is False):
+        require_key = None          # the app YAML decides; the claim itself still goes ahead
+    client = _client_address(request.scope)
+    try:
+        record = _settings_store.claim(code=body["code"], name=body["name"], key=body["key"],
+                                       require_key=require_key,
+                                       actor=_settings_actor(request, None, name="one-time code"))
+    except settings_store.InvalidCode as exc:
+        _settings_limiter.failed(client)
+        return _store_refusal(exc)
+    except settings_store.SettingsStoreError as exc:
+        return _store_refusal(exc)
+    _settings_limiter.succeeded(client)
+    _apply_saved()
+    return JSONResponse(status_code=201, content={**record.public(),
+                                                  "keys_revision": _settings_store.state.keys.revision})
 
 
 # --- OpenAI-compatible /v1 surface ------------------------------------------

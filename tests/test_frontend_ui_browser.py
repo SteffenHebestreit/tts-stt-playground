@@ -985,8 +985,14 @@ def test_a_page_on_a_rebound_hostname_gets_nothing_from_the_gateway(browser, mon
         rebound = page.goto(f"http://evil.example:{port}/", wait_until="load")
         assert rebound.status == 403
         assert "host_not_allowed" in page.content() or "not allowed" in page.content()
+        # A browser gets the refusal as a page that can run and fetch nothing.
+        assert rebound.headers["content-security-policy"].startswith("default-src 'none'")
 
-        # the attack itself: script on the rebound page calling the destructive API
+        # The attack itself: a script in a document of the rebound origin calling the destructive
+        # API. In a real attack that is the attacker's own page, served before the name was
+        # re-pointed; the refusal page runs nothing, so the JSON refusal of an API path (a
+        # document of that origin without a policy) stands in for it here.
+        assert page.goto(f"http://evil.example:{port}/api/health", wait_until="load").status == 403
         outcome = page.evaluate("""async () => {
             const response = await fetch('/api/training/model/job-1', { method: 'DELETE' });
             return response.status;

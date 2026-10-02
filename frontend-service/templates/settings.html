@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en" data-app-version="{{ app_version }}">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Settings - TTS-STT Platform</title>
+    <!-- Root-relative on purpose: the page's CSP allows 'self' only, and an absolute
+         URL built from the request could name another scheme behind a proxy. -->
+    <link rel="stylesheet" href="/static/css/style.css?v={{ app_version }}">
+</head>
+<body>
+    <main class="container" id="settings-root">
+        <h1>Settings</h1>
+        <p id="settings-status" role="status" aria-live="polite">Loading the settings...</p>
+        <noscript><p>The Settings page needs JavaScript.</p></noscript>
+        <p><a href="/">Back to the app</a></p>
+    </main>
+    <script defer src="/static/js/settings.js?v={{ app_version }}"></script>
+</body>
+</html>
