@@ -2558,3 +2558,87 @@ def test_every_server_banner_is_shown_and_the_pending_one_offers_to_keep_the_cha
     assert out["confirmed"] == [{"revision": view["revision"]}]
     assert out["live"] == "polite"
     assert out["timers"] == 1, "one reload after the deadline shows whether the change stayed"
+
+
+def _damaged_keys_answer(tmp_path) -> dict:
+    """What a gateway with API_KEY answers its own YAML key while keys.json is damaged."""
+    folder = tmp_path / "damaged-keys"
+    folder.mkdir()
+    module = load_frontend_app({"TTS_STT_SETTINGS_DIR": str(folder), "API_KEY": YAML_KEY})
+    (folder / "keys.json").write_text("{damaged", encoding="utf-8")
+    response = TestClient(module.app).get("/api/settings", headers={
+        "Host": NAS, "Origin": f"http://{NAS}", "Authorization": f"Bearer {YAML_KEY}"})
+    return _answer(response)
+
+
+def test_a_damaged_key_file_opens_the_repair_card_and_keeps_the_tabs_key(tmp_path, gateway_answers):
+    """keys.json damaged: no key can pass, so the page offers the repair (a claim with a one-time
+    code), not the key prompt, and keeps the tab's key, which the API may still take."""
+    damaged = _damaged_keys_answer(tmp_path)
+    assert damaged["status"] == 403 and damaged["body"]["code"] == "keys_damaged" and damaged["body"]["can_claim"]
+    answers = {**gateway_answers, "damaged": damaged}
+    out = run_settings_js(tmp_path, f"""
+        harness.storage.set('tts-stt.api-key', {json.dumps(YAML_KEY)});
+        harness.on('GET', '/api/settings', fixtures.answers.damaged);
+        await harness.boot();
+        const card = {{
+            shown: harness.visible('claim-card'), title: harness.text('claim-title'), intro: harness.text('claim-intro'),
+            keyPanel: harness.visible('key-panel'), main: harness.visible('settings-main'),
+            cancel: harness.visible('claim-cancel'), require: harness.visible('claim-require-row'),
+            stored: harness.storage.get('tts-stt.api-key'), status: harness.text('settings-status'),
+        }};
+        harness.on('POST', '/api/settings/claim-code', fixtures.answers.claim_code);
+        await harness.click('[data-action="print-code"]');
+        await harness.type('claim-code', 'ABCDE-FGHJK-MNPQR-STVWX');
+        await harness.check('claim-stored');
+        harness.on('POST', '/api/settings/claim', fixtures.answers.claim);
+        harness.on('GET', '/api/settings', {{ status: 200, body: fixtures.answers.view_claimed.body }});
+        await harness.click('claim-button');
+        return {{ card, status: harness.text('settings-status'), cardAfter: harness.visible('claim-card'),
+                  main: harness.visible('settings-main'), tabKey: harness.storage.get('tts-stt.api-key') }};
+    """, answers, start=None)
+    card = out["card"]
+    assert (card["shown"], card["keyPanel"], card["main"], card["cancel"], card["require"]) == (True, False, False, False, False)
+    assert card["title"] == "Repair the API keys" and "keys.json" in card["intro"] and "damaged" in card["intro"]
+    assert card["stored"] == YAML_KEY, "a 403 is no Bearer challenge: the tab's key is kept"
+    assert card["status"] == ""
+    assert "written again" in out["status"] and "make any that are missing again" in out["status"]
+    assert (out["cardAfter"], out["main"]) == (False, True)
+    assert PAGE_KEY.fullmatch(out["tabKey"]), "the new admin key is used in this tab"
+
+
+def test_a_damaged_key_file_that_the_page_cannot_repair_says_what_to_do(tmp_path, gateway_answers):
+    damaged = _damaged_keys_answer(tmp_path)
+    answers = {**gateway_answers, "damaged": {**damaged, "body": {**damaged["body"], "can_claim": False}}}
+    out = run_settings_js(tmp_path, """
+        harness.on('GET', '/api/settings', fixtures.answers.damaged);
+        await harness.boot();
+        return { card: harness.visible('claim-card'), keyPanel: harness.visible('key-panel'),
+                 status: harness.text('settings-status'),
+                 alert: Boolean(harness.el('settings-status').querySelector('[role="alert"]')) };
+    """, answers, start=None)
+    assert (out["card"], out["keyPanel"], out["alert"]) == (False, False, True)
+    assert "repair or delete settings/keys.json" in out["status"]
+
+
+def test_the_history_names_the_yaml_key_by_its_id_and_never_by_a_name_alone(tmp_path, gateway_answers):
+    """A page key named "deployment key" (made before such names were refused) is still a page key."""
+    saved_by = gateway_answers["view_saved"]["body"]["history"][0]["saved_by"]
+    assert saved_by["credential_id"] == "yaml:API_KEY", "the gateway records the YAML key by its id"
+    view = json.loads(json.dumps(gateway_answers["view_saved"]["body"]))
+    base = view["history"][0]
+    where = {"ip": "192.168.1.20", "host": NAS}
+    view["history"] = [
+        {**base, "id": "20261002T091203Z-r3", "revision": 3,
+         "saved_by": {**where, "credential": "deployment key", "credential_id": "0a1b2c3d"}},
+        {**base, "id": "20261002T091202Z-r2", "revision": 2,
+         "saved_by": {**where, "credential": "deployment key", "credential_id": "yaml:API_KEY"}},
+        {**base, "id": "20261002T091201Z-r1", "revision": 1, "saved_by": {**where, "credential": "deployment key"}},
+    ]
+    answers = {**gateway_answers, "custom": {"status": 200, "body": view}}
+    out = run_settings_js(tmp_path, OPEN_AS_ADMIN + """
+        return harness.el('history-list').children.map((item) => item.querySelector('.setting-note').textContent);
+    """, answers, start="custom")
+    assert out[0].endswith('By "deployment key" (192.168.1.20, 192.168.1.20:3000).')
+    assert "By the app YAML key (" in out[1]
+    assert "By the app YAML key (" in out[2], "a version saved before ids were recorded"

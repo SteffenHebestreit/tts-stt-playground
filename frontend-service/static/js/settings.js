@@ -44,10 +44,35 @@ const EVENT_LABELS = {
     'auto-revert': 'Undone: not confirmed in time',
 };
 const ROLE_LABELS = { admin: 'admin: use the API and change settings', client: 'client: use the API only' };
+// What an empty list field shows. Examples only, marked as such: a placeholder that reads like
+// a name (a real host name, say) is taken for a value that is set.
 const PLACEHOLDERS = {
-    TRUSTED_HOSTS: 'speach.k2o\ntts.example.com',
-    TRUSTED_ORIGINS: 'https://tts.example.com',
-    ALLOWED_ORIGINS: 'https://dashboard.example.com',
+    TRUSTED_HOSTS: 'e.g. tts.example.com (one name per line)',
+    TRUSTED_ORIGINS: 'e.g. https://tts.example.com',
+    ALLOWED_ORIGINS: 'e.g. https://dashboard.example.com',
+};
+// How the history and the audit trail name the app YAML's API_KEY (settings_store.DEPLOYMENT_KEY_ID):
+// by this id, not by the name, which a page key could otherwise share.
+const DEPLOYMENT_KEY_ID = 'yaml:API_KEY';
+// The claim card: claim (no admin key yet), recovery (a lost admin key) or repair (keys.json damaged).
+const CLAIM_TEXTS = {
+    claim: {
+        title: 'Claim this server',
+        intro: 'Nobody can change settings yet: this server has no admin key. A one-time code from the container log '
+            + 'proves that you run it and creates your admin key.',
+    },
+    recovery: {
+        title: 'Recover admin access',
+        intro: 'A one-time code from the container log creates a new admin key. The other keys stay as they are; '
+            + 'revoke the lost one afterwards.',
+    },
+    repair: {
+        title: 'Repair the API keys',
+        intro: 'keys.json in the settings folder is damaged or cannot be read: no key made here works, for these '
+            + 'settings or for the API (only an API_KEY in the app YAML does). A one-time code from the container '
+            + 'log creates a new admin key and writes the file again; a damaged one is kept as keys.json.damaged. '
+            + 'Keys made here that are gone with it have to be made again.',
+    },
 };
 const CONFLICT_TEXT = 'The settings were changed in the meantime, maybe in another tab. The page shows them now; '
     + 'your unsaved changes are kept where they still differ. Review them again.';
@@ -919,12 +944,19 @@ function renderKeys() {
     if (create) create.disabled = !view.can_manage_keys || view.keys.length >= view.max_keys;
 }
 
+/** Who saved a version: the app YAML key by its id; a page key by its name. */
+function savedByWhom(by) {
+    if (by.credential_id === DEPLOYMENT_KEY_ID) return 'the app YAML key';
+    // A version saved before credentials were recorded by id names the YAML key only by name.
+    if (!by.credential_id && by.credential === 'deployment key') return 'the app YAML key';
+    return by.credential ? `"${by.credential}"` : 'someone';
+}
+
 function describeEntry(entry) {
     const changed = entry.changed && entry.changed.length ? entry.changed.join(', ') : 'nothing';
     const by = entry.saved_by || {};
-    const who = by.credential ? (by.credential === 'deployment key' ? 'the app YAML key' : `"${by.credential}"`) : 'someone';
     const where = [by.ip, by.host].filter(Boolean).join(', ');
-    return `Changed: ${changed}. By ${who}${where ? ` (${where})` : ''}.`;
+    return `Changed: ${changed}. By ${savedByWhom(by)}${where ? ` (${where})` : ''}.`;
 }
 
 function renderHistory() {
@@ -1004,6 +1036,17 @@ async function loadView(candidate) {
             ? 'This key was not accepted. Enter an admin key of this server.'
             : 'This server has an admin key. Enter it to see and change the settings.');
         setStatus(null, '');
+    } else if (result.data.code === 'keys_damaged') {
+        // No key can pass until keys.json is written again: the repair card, not the key prompt
+        // (and the key in this tab is kept: it may be the app YAML key the API still takes).
+        setShown('key-panel', false);
+        if (result.data.can_claim) {
+            setStatus(null, '');
+            openClaim('repair');
+        } else {
+            setStatus('error', `${errorText(result)} This page cannot write the settings folder here: repair or `
+                + "delete settings/keys.json in the app's dataset, then load this page again.");
+        }
     } else if (result.data.code === 'admin_key_required') {
         showKeyPanel('The key in this tab may use the API but not change settings. Enter an admin key.');
         setStatus(null, '');
@@ -1088,18 +1131,15 @@ function openClaim(mode) {
         return;
     }
     S.claim = { mode, key: generateKey() };
-    const recovery = mode === 'recovery';
-    setText('claim-title', recovery ? 'Recover admin access' : 'Claim this server');
-    setText('claim-intro', recovery
-        ? 'A one-time code from the container log creates a new admin key. The other keys stay as they are; '
-            + 'revoke the lost one afterwards.'
-        : 'Nobody can change settings yet: this server has no admin key. A one-time code from the container log '
-            + 'proves that you run it and creates your admin key.');
+    const recovery = mode !== 'claim';
+    const texts = CLAIM_TEXTS[mode] || CLAIM_TEXTS.claim;
+    setText('claim-title', texts.title);
+    setText('claim-intro', texts.intro);
     const view = S.view;
     const requireLocked = !view || view.access.deployment_key_present
         || (view.deployment.locked_keys || []).includes('require_key') || view.access.require_key;
     setShown('claim-require-row', !recovery && !requireLocked);
-    setShown('claim-cancel', recovery || Boolean(view && view.claimed));
+    setShown('claim-cancel', mode === 'recovery' || Boolean(view && view.claimed));
     const code = byId('claim-code');
     if (code) code.value = '';
     const key = byId('claim-key');
@@ -1175,9 +1215,13 @@ async function submitClaim() {
     storeKey(S.claim.key);
     closeClaim();
     await loadView();
-    setStatus('success', mode === 'claim'
-        ? `This server is claimed. This tab now uses the new admin key "${name}".`
-        : `This tab now uses the new admin key "${name}". Revoke the lost key under API keys.`);
+    const done = {
+        claim: `This server is claimed. This tab now uses the new admin key "${name}".`,
+        recovery: `This tab now uses the new admin key "${name}". Revoke the lost key under API keys.`,
+        repair: `The API keys are written again. This tab now uses the new admin key "${name}". Check the keys `
+            + 'under API keys and make any that are missing again.',
+    };
+    setStatus('success', done[mode] || done.claim);
 }
 
 // --- dialogs --------------------------------------------------------------------------------

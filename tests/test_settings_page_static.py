@@ -249,3 +249,17 @@ def test_the_main_page_links_to_the_settings():
     index = INDEX_HTML.read_text(encoding="utf-8")
     link = re.search(r'<a href="/settings"[^>]*>(.*?)</a>', index, re.S)
     assert link and "Settings" in link.group(1)
+
+
+def test_an_empty_field_shows_an_example_that_reads_as_one(source, template):
+    """A placeholder that looks like a host name reads as a value that is set, in an empty field
+    that is exactly the list a reader is checking. And no real host name ships as an example."""
+    placeholders = re.search(r"const PLACEHOLDERS = \{(.*?)\};", source, re.S)
+    assert placeholders, "settings.js no longer names its placeholders PLACEHOLDERS"
+    examples = re.findall(r"^\s*([A-Z_]+): '([^']*)',$", placeholders.group(1), re.M)
+    assert {key for key, _ in examples} == {"TRUSTED_HOSTS", "TRUSTED_ORIGINS", "ALLOWED_ORIGINS"}
+    for key, text in examples:
+        assert text.startswith("e.g. ") and "example." in text, key
+    schema = (SERVICE_DIR / "settings_schema.py").read_text(encoding="utf-8")
+    for name, text in (("settings.js", source), ("settings.html", template), ("settings_schema.py", schema)):
+        assert "speach" not in text, f"{name} ships the owner's host name as an example"

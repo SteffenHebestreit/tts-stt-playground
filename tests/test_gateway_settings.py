@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno
 import hashlib
 import importlib
 import json
@@ -33,7 +34,7 @@ from fastapi.testclient import TestClient
 from starlette.datastructures import Headers
 from starlette.websockets import WebSocketDisconnect
 
-from frontend_loader import REPO, SERVICE_DIR, asgi_call, install_stub, load_frontend_app, wav_bytes
+from frontend_loader import REPO, SERVICE_DIR, asgi_call, asgi_client, install_stub, load_frontend_app, wav_bytes
 
 
 def _import(name: str):
@@ -1114,7 +1115,8 @@ def test_26_a_cors_header_from_further_in_is_stripped_from_a_settings_answer(mon
 # --- 28-36: who may change settings -------------------------------------------------------------------
 
 
-def test_28_unclaimed_the_settings_can_be_read_but_not_changed(monkeypatch, folder):
+def test_28_unclaimed_the_settings_can_be_read_but_not_changed(monkeypatch, folder, caplog):
+    caplog.set_level(logging.INFO, logger=store_module.AUDIT_LOGGER_NAME)
     _, _, client = api(monkeypatch, folder)
     view = view_of(client)
     assert (view["claimed"], view["can_write"], view["credential"], view["can_claim"]) == (False, False, None, True)
@@ -1128,7 +1130,11 @@ def test_28_unclaimed_the_settings_can_be_read_but_not_changed(monkeypatch, fold
     for method, path, body in writes:
         r = client.request(method, path, json=body, headers=page())
         assert r.status_code == 403 and r.json()["code"] == "not_claimed", path
-    assert sorted(path.name for path in folder.iterdir()) == ["audit.jsonl"]
+    # Anyone may send these as often as they like: noted in the container log, never in the folder.
+    assert list(folder.iterdir()) == []
+    noted = [json.loads(record.getMessage()) for record in caplog.records
+             if record.name == store_module.AUDIT_LOGGER_NAME]
+    assert [(line["result"], line["path"]) for line in noted] == [("403 not_claimed", "/api/settings")]
     assert client.get("/api/settings/engines", headers=page()).status_code == 200
 
 
@@ -1173,13 +1179,19 @@ def test_a_claim_can_require_a_key_and_recovers_a_damaged_keys_file(monkeypatch,
     assert client.get("/v1/models", headers=bearer(first)).status_code == 200
 
     hand_edit(folder / "keys.json", "{damaged")
-    view = view_of(client)                                   # fail closed: unclaimed, read-only, key required
-    assert view["claimed"] is False and view["access"]["fail_closed"] is True
-    assert "keys_damaged" in {banner["id"] for banner in view["banners"]}
+    # Fail closed: a key required for the API, and the Settings show nothing to anyone; only the
+    # claim (recovery) is open.
+    for headers in (page(), page(key=first), page(key="a-guess")):
+        r = client.get("/api/settings", headers=headers)
+        assert r.status_code == 403 and r.json() == {"detail": r.json()["detail"], "code": "keys_damaged",
+                                                     "can_claim": True}
+        assert "www-authenticate" not in r.headers, "a Bearer challenge would make the page forget its key"
     assert client.get("/v1/models", headers=bearer(first)).status_code == 401
     clock["t"] += 61                                         # one code per minute
     second = claim(client, caplog, name="Recovered")
-    assert view_of(client, second)["credential"]["name"] == "Recovered"
+    view = view_of(client, second)
+    assert view["credential"]["name"] == "Recovered" and view["claimed"] is True
+    assert view["access"]["fail_closed"] is False
     assert (folder / "keys.json.damaged").exists()
 
 
@@ -1209,15 +1221,16 @@ def test_a_write_is_in_force_in_the_answering_worker_before_it_answers(monkeypat
 
 
 def test_a_damaged_keys_file_with_a_yaml_key_is_recovered_by_a_claim(monkeypatch, folder, caplog):
-    _, _, client = api(monkeypatch, folder, {"API_KEY": YAML_KEY})
+    module, _, client = api(monkeypatch, folder, {"API_KEY": YAML_KEY})
     create_key(client, YAML_KEY, "Laptop", role="admin")
     hand_edit(folder / "keys.json", "[]")
-    view = view_of(client)                          # the YAML key is only a client now: unclaimed, readable
-    assert view["claimed"] is False and view["access"]["deployment_key_role"] == "client"
-    r = client.get("/api/settings", headers=page(key=YAML_KEY))
-    assert r.status_code == 200 and r.json()["credential"]["role"] == "client"
-    r = client.put("/api/settings", json={"base_revision": 0, "set": {"MAX_TTS_CHARS": 100}}, headers=page(key=YAML_KEY))
-    assert r.status_code == 403 and r.json()["code"] == "not_claimed"
+    # The YAML key is only a client now (the API still takes it); the Settings refuse it like anyone.
+    assert client.get("/v1/models", headers=bearer(YAML_KEY)).status_code == 200
+    for method, path, body in (("GET", "/api/settings", None), ("GET", "/api/settings/engines", None),
+                               ("PUT", "/api/settings", {"base_revision": 0, "set": {"MAX_TTS_CHARS": 100}})):
+        r = client.request(method, path, json=body, headers=page(key=YAML_KEY))
+        assert r.status_code == 403 and r.json()["code"] == "keys_damaged", path
+    assert module._settings_limiter._failures == {}
     recovered = claim(client, caplog, name="Recovered")
     assert view_of(client, recovered)["claimed"] is True
     assert client.get("/api/settings", headers=page(key=YAML_KEY)).json()["code"] == "admin_key_required"
@@ -1360,7 +1373,9 @@ def test_35_a_missing_or_wrong_key_gets_a_bearer_challenge(monkeypatch, folder):
     assert client.get("/settings").status_code == 200                # the empty page needs no key
 
 
-def test_36_ten_wrong_keys_or_codes_from_one_address_get_429(monkeypatch, folder):
+def test_36_ten_wrong_keys_or_codes_from_one_address_get_429(monkeypatch, folder, caplog):
+    """Only failures are throttled: an address behind a proxy or NAT is many people, and one of
+    them mistyping must not lock the others' right key, or their code request, out."""
     module, _, client = api(monkeypatch, folder, {"API_KEY": YAML_KEY})
     now = {"t": 1000.0}
     monkeypatch.setattr(module._settings_limiter, "clock", lambda: now["t"])
@@ -1368,11 +1383,17 @@ def test_36_ten_wrong_keys_or_codes_from_one_address_get_429(monkeypatch, folder
         assert client.get("/api/settings", headers=page()).status_code == 401
     for attempt in range(10):
         assert client.get("/api/settings", headers=page(key=f"guess-{attempt}")).status_code == 401
-    r = client.get("/api/settings", headers=page(key=YAML_KEY))          # even the right key, now
+    r = client.get("/api/settings", headers=page(key="guess-10"))         # the next wrong one
     assert r.status_code == 429 and r.json()["code"] == "too_many_attempts"
     assert 0 < int(r.headers["retry-after"]) <= 600
+    r = client.get("/api/settings", headers=page())                       # no key: still asked for one
+    assert r.status_code == 401 and r.headers["www-authenticate"] == "Bearer"
+    with caplog.at_level(logging.INFO):
+        assert client.post("/api/settings/claim-code", json={}, headers=page()).status_code == 202
     assert client.get("/v1/models", headers=bearer(YAML_KEY)).status_code == 200     # only the Settings API
     assert '"result":"401 invalid_api_key, address blocked"' in (folder / "audit.jsonl").read_text(encoding="utf-8")
+    r = client.get("/api/settings", headers=page(key=YAML_KEY))          # the right key, while blocked
+    assert r.status_code == 200, "the right key was refused for someone else's typos"
     now["t"] += 601
     assert client.get("/api/settings", headers=page(key=YAML_KEY)).status_code == 200
 
@@ -1733,3 +1754,393 @@ def test_restore_asks_for_the_acknowledgements_of_what_it_brings_back(monkeypatc
     gone = {"history_id": "20200101T000000Z-r99", "base_revision": r.json()["revision"]}
     r = client.post("/api/settings/restore", json=gone, headers=page(key=YAML_KEY))
     assert r.status_code == 404 and r.json()["code"] == "history_not_found"
+
+
+# =================================================================================================
+# Part 3: what the security review of the Settings API found, kept fixed
+# =================================================================================================
+
+
+def _key_id(client, admin, name) -> str:
+    return next(record["id"] for record in view_of(client, admin)["keys"] if record["name"] == name)
+
+
+async def _with_a_parked_request(module, method, path, body: dict, headers: dict, meanwhile):
+    """Send `method path`, hold its body after 8 bytes, run `meanwhile(client)`, then send the rest.
+
+    That is a client holding a request open between the guard's look at its key (the headers)
+    and the write (after the body). Returns (what `meanwhile` returned, the held request's answer).
+    """
+    gate = asyncio.Event()
+    data = json.dumps(body).encode()
+
+    async def slow_body():
+        yield data[:8]
+        await gate.wait()
+        yield data[8:]
+
+    async with asgi_client(module) as ac:
+        parked = asyncio.create_task(ac.request(method, path, content=slow_body(), headers={
+            **headers, "Content-Type": "application/json", "Content-Length": str(len(data))}))
+        await asyncio.sleep(0.2)
+        assert not parked.done(), "the request did not wait for the rest of its body"
+        result = await meanwhile(ac)
+        gate.set()
+        return result, await parked
+
+
+def test_a_key_revoked_while_its_request_is_on_its_way_writes_nothing(monkeypatch, folder, caplog):
+    """F1: the guard checks the key when the headers arrive; the write checks it again, under the
+    lock, so a key revoked meanwhile cannot finish a request it parked (here: plant an admin key)."""
+    module, _, client = api(monkeypatch, folder)
+    owner = claim(client, caplog, name="Owner")
+    stolen = create_key(client, owner, "Stolen", role="admin")
+    stolen_id = _key_id(client, owner, "Stolen")
+
+    async def revoke(ac):
+        revoked = await ac.delete(f"/api/settings/keys/{stolen_id}", headers=page(key=owner))
+        later = await ac.get("/api/settings", headers=page(key=stolen))
+        return revoked.status_code, later.status_code, (folder / "keys.json").read_bytes()
+
+    (revoked, later, keys_after), parked = asyncio.run(_with_a_parked_request(
+        module, "POST", "/api/settings/keys", {"name": "Backdoor", "role": "admin", "key": new_key()},
+        page(key=stolen), revoke))
+    assert (revoked, later) == (200, 401)
+    assert parked.status_code == 401 and parked.json()["code"] == "invalid_api_key"
+    assert parked.headers["www-authenticate"] == "Bearer" and parked.headers["cache-control"] == "no-store"
+    assert (folder / "keys.json").read_bytes() == keys_after, "the parked request planted a key"
+    assert [record["name"] for record in view_of(client, owner)["keys"]] == ["Owner"]
+    audit = [json.loads(line) for line in (folder / "audit.jsonl").read_text(encoding="utf-8").splitlines()]
+    late = [(line["credential"], line["credential_id"], line["result"]) for line in audit
+            if line["event"] == "refused" and "written" in line["result"]]
+    assert late == [("Stolen", stolen_id, "401 invalid_api_key, when it was to be written")]
+
+
+def test_a_key_revoked_in_the_other_worker_while_its_save_is_on_its_way_writes_nothing(monkeypatch, folder, caplog):
+    one, _, client_one = api(monkeypatch, folder)
+    two, _, client_two = api(monkeypatch, folder)
+    owner = claim(client_one, caplog, name="Owner")
+    stolen = create_key(client_one, owner, "Stolen", role="admin")
+    stolen_id = _key_id(client_one, owner, "Stolen")
+    revision = view_of(client_one, stolen)["revision"]
+
+    async def revoke_in_worker_two(_ac):
+        return client_two.delete(f"/api/settings/keys/{stolen_id}", headers=page(key=owner)).status_code
+
+    revoked, parked = asyncio.run(_with_a_parked_request(
+        one, "PUT", "/api/settings", {"base_revision": revision, "set": {"TRUSTED_HOSTS": ["evil.example.com"]}},
+        page(key=stolen), revoke_in_worker_two))
+    assert revoked == 200
+    assert parked.status_code == 401 and parked.json()["code"] == "invalid_api_key"
+    assert not (folder / "gateway.json").exists()
+    assert host_status(client_one, "evil.example.com") == 403
+
+
+def test_the_yaml_key_made_a_client_while_its_save_is_on_its_way_writes_nothing(monkeypatch, folder):
+    """Making the YAML key a client is the remedy for a YAML key on a device not fully trusted."""
+    module, _, client = api(monkeypatch, folder, {"API_KEY": YAML_KEY})
+    admin = create_key(client, YAML_KEY, "Owner", role="admin")
+    keys_revision = view_of(client, admin)["keys_revision"]
+
+    async def demote(ac):
+        r = await ac.put("/api/settings/access", headers=page(key=admin),
+                         json={"base_revision": keys_revision, "deployment_key_role": "client"})
+        return r.status_code
+
+    demoted, parked = asyncio.run(_with_a_parked_request(
+        module, "POST", "/api/settings/keys", {"name": "Backdoor", "role": "admin", "key": new_key()},
+        page(key=YAML_KEY), demote))
+    assert demoted == 200
+    assert parked.status_code == 403 and parked.json()["code"] == "admin_key_required"
+    assert "www-authenticate" not in parked.headers, "the YAML key still works for the API: no challenge"
+    assert [record["name"] for record in view_of(client, admin)["keys"]] == ["Owner"]
+    assert client.get("/v1/models", headers=bearer(YAML_KEY)).status_code == 200
+
+
+def test_a_revoked_key_cannot_open_the_api_with_a_request_it_parked(monkeypatch, folder, caplog):
+    module, _, client = api(monkeypatch, folder)
+    owner = claim(client, caplog, name="Owner", require_key=True)
+    stolen = create_key(client, owner, "Stolen", role="admin")
+    stolen_id = _key_id(client, owner, "Stolen")
+    keys_revision = view_of(client, owner)["keys_revision"]
+
+    async def revoke(ac):
+        return (await ac.delete(f"/api/settings/keys/{stolen_id}", headers=page(key=owner))).status_code
+
+    revoked, parked = asyncio.run(_with_a_parked_request(          # the revision the revocation makes
+        module, "PUT", "/api/settings/access", {"base_revision": keys_revision + 1, "require_key": False},
+        page(key=stolen), revoke))
+    assert revoked == 200
+    assert parked.status_code == 401
+    assert client.get("/v1/models").status_code == 401, "the API was opened"
+
+
+def test_a_settings_request_whose_body_does_not_arrive_in_time_gets_408(monkeypatch, folder):
+    module, _, _ = api(monkeypatch, folder, {"API_KEY": YAML_KEY})
+    monkeypatch.setattr(module, "SETTINGS_BODY_TIMEOUT_S", 0.3, raising=False)
+    data = json.dumps({"base_revision": 0, "set": {"MAX_TTS_CHARS": 100}}).encode()
+
+    async def scenario():
+        never = asyncio.Event()
+
+        async def stalled():
+            yield data[:8]
+            await never.wait()
+            yield data[8:]
+
+        async with asgi_client(module) as ac:
+            started = time.monotonic()
+            r = await asyncio.wait_for(ac.put("/api/settings", content=stalled(), headers={
+                **page(key=YAML_KEY), "Content-Type": "application/json", "Content-Length": str(len(data))}), 5)
+            return r, time.monotonic() - started
+
+    r, took = asyncio.run(scenario())
+    assert r.status_code == 408 and r.json()["code"] == "request_timeout" and took < 4
+    assert r.headers["connection"] == "close" and r.headers["cache-control"] == "no-store"
+    assert not (folder / "gateway.json").exists()
+
+
+def test_a_proxy_change_is_confirmed_from_an_address_with_too_many_wrong_keys(monkeypatch, folder):
+    """SEC-WEB-1: whoever shares the owner's address (a proxy, NAT, Docker Desktop) and sends wrong
+    keys must not keep the owner's right key out: the confirmation of a TRUST_PROXY_HEADERS change
+    would be refused, and the change undone against the owner's will."""
+    now = {"t": 1_790_000_000.0}
+    module, _, client = api(monkeypatch, folder, {"API_KEY": YAML_KEY, "TRUST_PROXY_HEADERS": "true"})
+    monkeypatch.setattr(module, "_settings_clock", lambda: now["t"])
+    r = put(client, YAML_KEY, {"TRUST_PROXY_HEADERS": False})
+    assert r.status_code == 200 and r.json()["confirm"]["keys"] == ["TRUST_PROXY_HEADERS"]
+    revision = r.json()["confirm"]["revision"]
+    for attempt in range(11):
+        client.get("/api/settings", headers=page(key=f"guess-{attempt}"))
+    assert client.get("/api/settings", headers=page(key="guess-11")).status_code == 429
+    r = client.post("/api/settings/confirm", json={"revision": revision}, headers=page(key=YAML_KEY))
+    assert r.status_code == 200 and r.json()["confirmed"] is True
+    now["t"] += 120
+    assert field(view_of(client, YAML_KEY), "TRUST_PROXY_HEADERS")["value"] is False
+    assert '"event":"auto-reverted"' not in (folder / "audit.jsonl").read_text(encoding="utf-8")
+
+
+def test_wrong_codes_from_another_address_do_not_cancel_the_owners_code(monkeypatch, folder, caplog):
+    """F2: a wrong code is not aimed at one code, so it costs no code anything; the address that
+    guesses is limited instead."""
+    module, _, client = api(monkeypatch, folder)
+    stranger = TestClient(module.app, client=("192.168.1.66", 50000))
+    with caplog.at_level(logging.INFO):
+        assert client.post("/api/settings/claim-code", json={}, headers=page()).status_code == 202
+    code = printed_code(caplog)
+    guesses = ["x", "AAAAA-AAAAA-AAAAA-AAAAA", "00000-00000-00000-00000", "-" * 20, "", "ZZZZZ ZZZZZ ZZZZZ ZZZZZ",
+               "1", "2", "3", "4"]
+    for guess in guesses:
+        r = stranger.post("/api/settings/claim", json={"code": guess, "name": "Intruder", "key": new_key()},
+                          headers=page())
+        assert r.status_code == 403 and r.json()["code"] == "invalid_code", guess
+    r = stranger.post("/api/settings/claim", json={"code": code, "name": "Intruder", "key": new_key()}, headers=page())
+    assert r.status_code == 429, "the address that guessed is limited, even with the right code"
+    key = new_key()
+    r = client.post("/api/settings/claim", json={"code": code, "name": "Owner", "key": key}, headers=page())
+    assert r.status_code == 201, r.text
+    assert view_of(client, key)["credential"]["name"] == "Owner"
+
+
+def test_refusals_anyone_can_cause_never_reach_the_audit_file(monkeypatch, folder, tmp_path, caplog):
+    """F3: a foreign page, or any host on the network, can send these without a key and as often as
+    it likes. They are noted in the container log, at most once a minute per address and kind, and
+    never written to audit.jsonl, whose saves, claims and key changes they would push out."""
+    caplog.set_level(logging.INFO, logger=store_module.AUDIT_LOGGER_NAME)
+    module, _, client = api(monkeypatch, folder)
+    owner = claim(client, caplog, name="Owner")
+    home_assistant = create_key(client, owner, "Home Assistant")
+    assert put(client, owner, {"MAX_TTS_CHARS": 4000}).status_code == 200
+    other = tmp_path / "unclaimed"
+    other.mkdir()
+    unclaimed_module, _, unclaimed = api(monkeypatch, other)
+    now = {"t": 5000.0}
+    for gateway_module in (module, unclaimed_module):
+        if hasattr(gateway_module, "_refusal_notes"):
+            monkeypatch.setattr(gateway_module._refusal_notes, "clock", lambda: now["t"])
+    audit_before = (folder / "audit.jsonl").read_bytes()
+    assert b'"event":"claim"' in audit_before and b'"event":"key-created"' in audit_before
+    taken = []
+    real_acquire = store_module.FileLock.acquire
+    monkeypatch.setattr(store_module.FileLock, "acquire", lambda lock: (taken.append(lock.path), real_acquire(lock))[1])
+    caplog.clear()
+
+    long_path = "/api/settings/" + "a" * 186
+    for _ in range(100):
+        r = client.put(long_path, json={}, headers={"Host": NAS, "Origin": "http://evil.example"})
+        assert r.status_code == 403 and r.json()["code"] == "cross_origin_blocked"
+        r = client.post("/api/settings/keys", content=b"x",
+                        headers={"Host": NAS, "Sec-Fetch-Site": "cross-site", "Content-Type": "text/plain"})
+        assert r.status_code == 403 and r.json()["code"] == "cross_site_blocked"
+        r = client.get("/api/settings", headers=page(key=home_assistant))
+        assert r.status_code == 403 and r.json()["code"] == "admin_key_required"
+        r = unclaimed.put("/api/settings", json={"base_revision": 0}, headers=page())
+        assert r.status_code == 403 and r.json()["code"] == "not_claimed"
+
+    assert (folder / "audit.jsonl").read_bytes() == audit_before
+    assert list(other.iterdir()) == []
+    assert taken == [], "a refusal anyone can cause took the settings lock"
+    assert module._settings_limiter._failures == {} and unclaimed_module._settings_limiter._failures == {}
+    noted = [json.loads(record.getMessage()) for record in caplog.records
+             if record.name == store_module.AUDIT_LOGGER_NAME]
+    assert sorted((line["result"], line.get("credential", "")) for line in noted) == [
+        ("403 admin_key_required", "Home Assistant"), ("403 cross_origin_blocked", ""),
+        ("403 cross_site_blocked", ""), ("403 not_claimed", "")]
+    assert next(line for line in noted if "cross_origin" in line["result"])["path"] == long_path
+
+    caplog.clear()
+    now["t"] += 61                                     # a minute later: one line, with the count
+    client.put(long_path, json={}, headers={"Host": NAS, "Origin": "http://evil.example"})
+    noted = [json.loads(record.getMessage()) for record in caplog.records
+             if record.name == store_module.AUDIT_LOGGER_NAME]
+    assert [(line["result"], line["left_out"]) for line in noted] == [("403 cross_origin_blocked", 99)]
+    assert view_of(client, owner)["claimed"] is True
+
+
+def test_the_refusal_notes_are_bounded():
+    module = load_frontend_app({})
+    notes = module._RefusalNotes(60.0, max_lines=3, max_keys=2, clock=lambda: 0.0)
+    assert [notes.due(("a", "x")), notes.due(("a", "x")), notes.due(("b", "x")), notes.due(("c", "x"))] == [
+        {}, None, {}, {}]
+    assert len(notes._seen) == 2 and ("a", "x") not in notes._seen        # the oldest address is forgotten
+    assert notes.due(("d", "x")) is None                                    # 3 lines in this minute already
+    notes.clock = lambda: 61.0
+    assert notes.due(("d", "x")) == {"left_out_in_all": 1}
+
+
+@pytest.mark.parametrize("damage", [
+    '{"schema": 2, "revision": 9, "require_key": false, "deployment_key_role": "admin", "keys": []}',
+    "{damaged", "[]"], ids=["newer-schema", "not-json", "not-an-object"])
+def test_a_damaged_keys_file_shows_no_settings_and_no_history(monkeypatch, folder, caplog, damage):
+    """F4: a keys.json that cannot be read means nobody knows who the admins are; it must not turn
+    a claimed server into an unclaimed one whose settings and history anyone may read."""
+    module, stub, client = api(monkeypatch, folder)
+    clock = {"t": time.time()}
+    monkeypatch.setattr(module, "_settings_clock", lambda: clock["t"])
+    owner = claim(client, caplog, name="Owner")
+    assert put(client, owner, {"TRUSTED_HOSTS": ["speach.k2o"]}).status_code == 200
+    hand_edit(folder / "keys.json", damage)
+    calls = len(stub.calls)
+    for path in ("/api/settings", "/api/settings/engines"):
+        for headers in (page(), page(key=owner), page(key="a-guess")):
+            r = client.get(path, headers=headers)
+            assert r.status_code == 403 and set(r.json()) == {"detail", "code", "can_claim"}, path
+            assert r.json()["code"] == "keys_damaged" and r.json()["can_claim"] is True
+            assert "speach" not in r.text and "Owner" not in r.text and "192.168" not in r.text
+    assert len(stub.calls) == calls, "the engines were probed for a caller without a key"
+    assert module._settings_limiter._failures == {}
+    clock["t"] += 61
+    with caplog.at_level(logging.INFO):
+        assert client.post("/api/settings/claim-code", json={}, headers=page()).status_code == 202
+
+
+def test_reserved_names_are_refused_and_a_save_says_whose_key_it_was(monkeypatch, folder):
+    """F5: a page key named like the YAML key could have its saves read as the YAML key's."""
+    _, _, client = api(monkeypatch, folder, {"API_KEY": YAML_KEY})
+    for name in ("deployment key", "Deployment Key", " one-time code ", "auto-revert"):
+        r = client.post("/api/settings/keys", json={"name": name, "role": "admin", "key": new_key()},
+                        headers=page(key=YAML_KEY))
+        assert r.status_code == 400 and list(r.json()["errors"]) == ["name"], name
+    laptop = create_key(client, YAML_KEY, "Laptop", role="admin")
+    laptop_id = _key_id(client, laptop, "Laptop")
+    assert put(client, YAML_KEY, {"MAX_TTS_CHARS": 4000}).status_code == 200
+    assert put(client, laptop, {"MAX_TTS_CHARS": 3000}).status_code == 200
+    history = view_of(client, laptop)["history"]
+    assert [entry["saved_by"]["credential_id"] for entry in history[:2]] == [laptop_id, "yaml:API_KEY"]
+    saves = [json.loads(line) for line in (folder / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+             if '"event":"save"' in line]
+    assert [(line["credential"], line["credential_id"]) for line in saves] == [
+        ("deployment key", "yaml:API_KEY"), ("Laptop", laptop_id)]
+
+
+def test_a_recovery_claim_is_told_apart_from_the_first_claim(monkeypatch, folder, tmp_path, caplog):
+    def claims(audit_file):
+        return [(line["event"], line["server_was_claimed"]) for line in map(json.loads, audit_file.read_text(
+            encoding="utf-8").splitlines()) if line["event"] in ("claim", "recovery")]
+
+    module, _, client = api(monkeypatch, folder)
+    clock = {"t": time.time()}
+    monkeypatch.setattr(module, "_settings_clock", lambda: clock["t"])
+    claim(client, caplog, name="Owner")
+    clock["t"] += 61
+    claim(client, caplog, name="Lost my key")
+    assert claims(folder / "audit.jsonl") == [("claim", False), ("recovery", True)]
+
+    keyed = tmp_path / "keyed"
+    keyed.mkdir()
+    _, _, client = api(monkeypatch, keyed, {"API_KEY": YAML_KEY})       # the YAML key is an admin
+    claim(client, caplog, name="Laptop")
+    assert claims(keyed / "audit.jsonl") == [("recovery", True)]
+
+
+def _failing_once(monkeypatch, store, name, error=errno.EMFILE):
+    """`store`'s next read of the file `name` fails with `error` (out of file descriptors), once."""
+    real = store._read_bytes
+    left = {"count": 1}
+
+    def read(path):
+        if os.path.basename(path) == name and left["count"]:
+            left["count"] -= 1
+            raise OSError(error, os.strerror(error))
+        return real(path)
+
+    monkeypatch.setattr(store, "_read_bytes", read)
+
+
+def test_a_read_that_failed_once_does_not_keep_page_keys_refused(monkeypatch, folder, writer):
+    """SEC-STORE-2: out of file descriptors just when a worker first reads a changed keys.json, it
+    fails closed for that moment only, and reads the file again on a later request."""
+    monkeypatch.setattr(store_module, "READ_RETRY_S", 0.0, raising=False)
+    key = add_key(writer, "Home Assistant")
+    require_a_key(writer)
+    module, _, client = gateway(monkeypatch, folder)
+    assert client.get("/v1/models", headers=bearer(key)).status_code == 200
+    add_key(writer, "Phone")
+    _failing_once(monkeypatch, module._settings_store, "keys.json")
+    assert client.get("/v1/models", headers=bearer(key)).status_code == 401      # closed while unread
+    assert client.get("/v1/models", headers=bearer(key)).status_code == 200      # read again: open again
+
+
+def test_a_canary_answer_that_arrives_after_a_rebuild_is_dropped(monkeypatch, folder):
+    """SEC-STORE-6: a settings change rebuilt the registry while canary's /status was awaited: the
+    answer belongs to an entry that is gone, and the rebuild's reset has to stand."""
+    languages = ["bg", "cs", "da", "de", "el", "en", "es", "et", "fi", "fr", "hr", "hu", "it", "lt", "lv",
+                 "mt", "nl", "pl", "pt", "ro", "ru", "sk", "sl", "sv", "uk"]
+    state = {"asked": 0}
+
+    async def slow_status():
+        state["asked"] += 1
+        await state["gate"].wait()
+        return {"supported_languages": languages, "default_language": "de", "current_model": "nvidia/canary-1b-v2"}
+
+    def handler(method, url, kwargs):
+        if url.endswith("/status") and "canary" in url:
+            return slow_status()
+        return backend(method, url, kwargs)
+
+    module, _, _ = api(monkeypatch, folder, {"API_KEY": YAML_KEY, "ENABLE_CANARY_ASR": "true"}, handler=handler)
+    old_entry = module.PROVIDER_REGISTRY["providers"]["canary"]
+    old_name = old_entry["display_name"]
+
+    async def scenario():
+        state["gate"] = asyncio.Event()
+        async with asgi_client(module) as ac:
+            page_load = asyncio.create_task(ac.get("/", headers={"Host": NAS}))
+            await asyncio.sleep(0.2)
+            view = await ac.get("/api/settings", headers=page(key=YAML_KEY))
+            r = await ac.put("/api/settings", json={"base_revision": view.json()["revision"],
+                                                     "set": {"DEFAULT_STT_PROVIDER": "qwen3-asr"}},
+                             headers=page(key=YAML_KEY))
+            assert r.status_code == 200, r.text
+            state["gate"].set()
+            await page_load
+            next_at = module._canary_languages["next_at"]
+            later = await ac.get("/providers", headers={"Host": NAS})
+            return next_at, later.json()["providers"]["canary"]
+
+    next_at, canary = asyncio.run(scenario())
+    assert next_at is None, "the late answer undid the rebuild's reset"
+    assert old_entry["display_name"] == old_name, "the answer was written into the replaced entry"
+    assert sorted(item["value"] for item in canary["settings"]["languages"]) == sorted(languages)
+    assert canary["display_name"] == "Canary (canary-1b-v2, 25 languages)"
+    assert state["asked"] == 2

@@ -175,7 +175,8 @@ SETTINGS: tuple[Setting, ...] = (
     Setting(
         key="TRUSTED_HOSTS", kind=KIND_HOSTS, group=GROUP_ACCESS,
         label="Host names of this server",
-        help=("The names you type in the browser to reach this server, one per line (speach.k2o). "
+        help=("The names you type in the browser to reach this server, one per line (for example "
+              "tts.example.com). "
               "*.example.com covers every name under example.com. IP addresses, localhost, "
               "single-label names and names under .local, .lan, .internal or .home.arpa always work "
               "and need no entry. The name you are saving from has to stay accepted."),

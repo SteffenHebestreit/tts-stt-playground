@@ -10,6 +10,7 @@ in the clear. Numbers in the test names refer to the store tests of the phase-1 
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import importlib
 import json
@@ -592,19 +593,45 @@ def test_12_codes_are_hashed_single_use_and_expire(make_store, folder, clock):
     assert store.redeem_code(second, actor=ACTOR) is False  # expired
 
 
-def test_12_wrong_guesses_burn_the_attempts(make_store, clock):
+def test_12_wrong_guesses_cancel_no_code(make_store, folder, clock):
+    """A wrong guess cannot be told apart by the code it was aimed at, so it costs no code anything:
+    a budget shared by every caller would let anyone on the network cancel the owner's code. The
+    gateway limits wrong codes per address instead."""
+    store, stranger = make_store(), make_store()
+    owner = Actor(ip="192.168.1.20", host="192.168.1.20:3000", credential="one-time code")
+    other = Actor(ip="192.168.1.66", host="192.168.1.20:3000", credential="one-time code")
+    code = store.issue_code(actor=owner)
+    clock.advance(61)
+    second = store.issue_code(actor=owner)
+    codes_before = (folder / "codes.json").read_bytes()
+    wrong = ["00000-00000-00000-00000", "AAAAA-AAAAA-AAAAA-AAAAA", "not even the right shape", "x", "", None, 123,
+             "-" * 20]
+    for guess in wrong * 3:
+        assert stranger.redeem_code(guess, actor=other) is False
+        with pytest.raises(store_module.InvalidCode):
+            stranger.claim(code=guess, name="Intruder", key=new_key(), actor=other)
+    assert (folder / "codes.json").read_bytes() == codes_before, "a wrong guess changed the codes"
+    audit = [json.loads(line) for line in (folder / "audit.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert sum(1 for line in audit if line["event"] == "code-refused" and line["ip"] == "192.168.1.66") == 48
+
+    record = store.claim(code=code, name="Owner", key=new_key(), actor=owner)
+    assert record.role == "admin"
+    with pytest.raises(store_module.InvalidCode):
+        store.claim(code=code, name="Again", key=new_key(), actor=owner)      # still single use
+    assert store.redeem_code(second, actor=owner) is True                    # the other one is untouched
+    assert "attempts_left" not in (folder / "codes.json").read_text(encoding="utf-8")
+
+
+def test_12_codes_written_by_the_earlier_layout_still_work(make_store, folder, clock):
+    """codes.json written before attempts were dropped carries "attempts_left"; it is ignored."""
     store = make_store()
     code = store.issue_code(actor=ACTOR)
-    for _ in range(4):
-        assert store.redeem_code("00000-00000-00000-00000", actor=ACTOR) is False
-    assert store.redeem_code("not even the right shape", actor=ACTOR) is False  # the 5th wrong attempt
-    assert store.redeem_code(code, actor=ACTOR) is False  # burned
-
-    clock.advance(61)
-    code = store.issue_code(actor=ACTOR)
-    for _ in range(4):
-        assert store.redeem_code("00000-00000-00000-00000", actor=ACTOR) is False
-    assert store.redeem_code(code, actor=ACTOR) is True  # one attempt was left
+    document = json.loads((folder / "codes.json").read_text(encoding="utf-8"))
+    for record in document["codes"]:
+        record["attempts_left"] = 1
+    write_json(folder / "codes.json", document)
+    assert store.redeem_code("00000-00000-00000-00000", actor=ACTOR) is False
+    assert store.redeem_code(code, actor=ACTOR) is True
 
 
 def test_12_codes_are_capped_and_rate_limited(make_store, clock):
@@ -1010,3 +1037,280 @@ def test_no_file_or_log_line_holds_a_plaintext_key_or_code(make_store, folder, c
     audit = (folder / "audit.jsonl").read_text(encoding="utf-8")
     for record in store.state.keys.keys:
         assert record.sha256 not in audit
+
+
+# --- a write asks again whether its credential may write -------------------------------------------
+
+def _revoked_meanwhile(key_id):
+    """An `authorize` that refuses once the page key `key_id` is gone from the keys just read."""
+    def authorize(keys):
+        if not any(record.id == key_id for record in keys.keys):
+            raise store_module.CredentialRefused("invalid_api_key", "revoked")
+    return authorize
+
+
+def test_every_write_asks_authorize_under_the_lock_with_the_keys_just_read(make_store, folder):
+    """The key that let a request in may be revoked by another worker while the request waits for its
+    body: every write judges it again, against keys.json as read under the lock, and writes nothing."""
+    owner_store, parked = make_store(), make_store()
+    owner = owner_store.add_key(name="Owner", role="admin", key=new_key(), actor=ACTOR)
+    stolen = owner_store.add_key(name="Stolen", role="admin", key=new_key(), actor=ACTOR)
+    owner_store.update_preferences({"MAX_TTS_CHARS": 4000}, base_revision=0, actor=ACTOR)
+    parked.refresh()
+    assert {record.id for record in parked.state.keys.keys} == {owner.id, stolen.id}
+    seen = []
+
+    def spying(keys):
+        seen.append(tuple(record.id for record in keys.keys))
+        _revoked_meanwhile(stolen.id)(keys)
+
+    owner_store.revoke_key(stolen.id, actor=ACTOR, deployment_key_present=False)       # in the other worker
+    before = {name: (folder / name).read_bytes() for name in ("gateway.json", "keys.json")}
+    history = parked.history()[0].id
+    attempts = [
+        lambda: parked.update_preferences({"MAX_TTS_CHARS": 1}, base_revision=1, actor=ACTOR, authorize=spying),
+        lambda: parked.update_preferences({"MAX_TTS_CHARS": 1}, base_revision=1, actor=ACTOR, dry_run=True,
+                                          authorize=spying),
+        lambda: parked.discard(base_revision=1, actor=ACTOR, authorize=spying),
+        lambda: parked.restore(history, base_revision=1, actor=ACTOR, authorize=spying),
+        lambda: parked.confirm(1, actor=ACTOR, authorize=spying),
+        lambda: parked.set_access(base_revision=3, actor=ACTOR, deployment_key_present=False, require_key=True,
+                                  authorize=spying),
+        lambda: parked.add_key(name="Backdoor", role="admin", key=new_key(), actor=ACTOR, authorize=spying),
+        lambda: parked.revoke_key(owner.id, actor=ACTOR, deployment_key_present=False, authorize=spying),
+    ]
+    for attempt in attempts:
+        with pytest.raises(store_module.CredentialRefused) as info:
+            attempt()
+        assert info.value.code == "invalid_api_key"
+    assert seen == [(owner.id,)] * len(attempts), "authorize did not see keys.json as it is now"
+    assert {name: (folder / name).read_bytes() for name in before} == before
+    # A credential that still may write goes through.
+    parked.add_key(name="Phone", role="client", key=new_key(), actor=ACTOR, authorize=_revoked_meanwhile(owner.id))
+    assert [record.name for record in make_store().state.keys.keys] == ["Owner", "Phone"]
+
+
+# --- a read that fails for a reason that may pass decides nothing --------------------------------------
+
+def _failing_once(monkeypatch, store, name, error=errno.EMFILE):
+    """`store`'s next read of the file `name` fails with `error` (out of file descriptors), once."""
+    real = store._read_bytes
+    left = {"count": 1}
+
+    def read(path):
+        if Path(path).name == name and left["count"]:
+            left["count"] -= 1
+            raise OSError(error, os.strerror(error))
+        return real(path)
+
+    monkeypatch.setattr(store, "_read_bytes", read)
+    return left
+
+
+def test_a_gateway_json_read_that_may_pass_keeps_what_is_in_force_and_is_tried_again(make_store, monkeypatch):
+    monkeypatch.setattr(store_module, "READ_RETRY_S", 0.0, raising=False)
+    writer, worker = make_store(), make_store()
+    writer.update_preferences({"TRUSTED_HOSTS": ["old.example.com"]}, base_revision=0, actor=ACTOR)
+    worker.refresh()
+    writer.update_preferences({}, reset=["TRUSTED_HOSTS"], base_revision=1, actor=ACTOR)   # a tightening
+    _failing_once(monkeypatch, worker, "gateway.json")
+    worker.refresh()
+    preferences = worker.state.preferences
+    assert preferences.revision == 1 and preferences.values["TRUSTED_HOSTS"] == ("old.example.com",)
+    assert not preferences.damaged, "a read that may pass is no verdict on the file"
+    reads = worker.reads
+    assert worker.refresh() is True, "the file was not read again"
+    assert worker.reads == reads + 1
+    assert worker.state.preferences.revision == 2 and "TRUSTED_HOSTS" not in worker.state.preferences.values
+    assert worker.refresh() is False and worker.reads == reads + 1        # read once it worked
+
+
+def test_a_keys_json_read_that_may_pass_fails_closed_only_until_it_can_be_read(make_store, monkeypatch):
+    monkeypatch.setattr(store_module, "READ_RETRY_S", 0.0, raising=False)
+    writer, worker = make_store(), make_store()
+    home = new_key()
+    writer.add_key(name="Home", role="admin", key=home, actor=ACTOR)
+    worker.refresh()
+    writer.add_key(name="Phone", role="client", key=new_key(), actor=ACTOR)
+    _failing_once(monkeypatch, worker, "keys.json")
+    worker.refresh()
+    keys = worker.state.keys
+    assert keys.fail_closed and keys.find(home) is None, "the change it could not read may be a revocation"
+    assert "could not be read" in keys.problem and "EMFILE" in keys.problem
+    assert worker.refresh() is True, "the file was not read again"
+    keys = worker.state.keys
+    assert not keys.fail_closed and keys.find(home).name == "Home" and len(keys.keys) == 2
+
+
+def test_a_save_on_a_worker_that_missed_a_read_is_a_conflict_not_a_revert(make_store, folder, monkeypatch):
+    """The write reads the file again under the lock: the stale worker's revision is refused, and the
+    other worker's change (here: a host name removed) is never written back over."""
+    monkeypatch.setattr(store_module, "READ_RETRY_S", 3600.0, raising=False)
+    writer, worker = make_store(), make_store()
+    writer.update_preferences({"TRUSTED_HOSTS": ["old.example.com"]}, base_revision=0, actor=ACTOR)
+    worker.refresh()
+    writer.update_preferences({}, reset=["TRUSTED_HOSTS"], base_revision=1, actor=ACTOR)
+    _failing_once(monkeypatch, worker, "gateway.json")
+    worker.refresh()
+    assert worker.state.preferences.revision == 1                  # what this worker shows meanwhile
+    with pytest.raises(store_module.RevisionConflict) as info:
+        worker.update_preferences({"MAX_TTS_CHARS": 4000}, base_revision=1, actor=ACTOR)
+    assert info.value.current_revision == 2
+    document = json.loads((folder / "gateway.json").read_text(encoding="utf-8"))
+    assert document["revision"] == 2 and "TRUSTED_HOSTS" not in document["values"]
+    assert not (folder / "gateway.json.damaged").exists()
+
+
+def test_a_write_whose_own_read_fails_is_refused_and_writes_nothing(make_store, folder, monkeypatch):
+    store = make_store()
+    store.update_preferences({"MAX_TTS_CHARS": 4000}, base_revision=0, actor=ACTOR)
+    before = (folder / "gateway.json").read_bytes()
+    _failing_once(monkeypatch, store, "gateway.json")
+    with pytest.raises(store_module.SettingsStoreError) as info:
+        store.update_preferences({"MAX_TTS_CHARS": 3000}, base_revision=1, actor=ACTOR)
+    assert isinstance(info.value, store_module.Unreadable) and info.value.code == "settings_unreadable"
+    assert (folder / "gateway.json").read_bytes() == before
+    assert store.update_preferences({"MAX_TTS_CHARS": 3000}, base_revision=1, actor=ACTOR).revision == 2
+
+
+def test_a_claim_on_a_worker_that_missed_a_read_keeps_every_key(make_store, folder, monkeypatch):
+    """Damage is decided by the read under the lock, never by what a worker cached: a healthy
+    keys.json one worker failed to read is not rewritten as if it were damaged."""
+    monkeypatch.setattr(store_module, "READ_RETRY_S", 3600.0, raising=False)
+    writer, worker = make_store(), make_store()
+    writer.add_key(name="Home", role="client", key=new_key(), actor=ACTOR)
+    worker.refresh()
+    writer.add_key(name="Laptop", role="admin", key=new_key(), actor=ACTOR)
+    writer.set_access(base_revision=2, actor=ACTOR, deployment_key_present=True, require_key=True)
+    _failing_once(monkeypatch, worker, "keys.json")
+    worker.refresh()
+    assert worker.state.keys.fail_closed                       # what this worker believes meanwhile
+    code = worker.issue_code(actor=ACTOR)
+    worker.claim(code=code, name="Recovered", key=new_key(), actor=ACTOR)
+    keys = make_store().state.keys
+    assert [record.name for record in keys.keys] == ["Home", "Laptop", "Recovered"]
+    assert keys.require_key and keys.deployment_key_role == "admin" and not keys.fail_closed
+    assert not (folder / "keys.json.damaged").exists()
+
+
+@POSIX_ONLY
+def test_a_keys_file_it_may_not_read_fails_closed_until_its_mode_is_repaired(make_store, folder, monkeypatch):
+    if os.geteuid() == 0:
+        pytest.skip("root reads the file whatever its mode")
+    writer, worker = make_store(), make_store()
+    key = new_key()
+    writer.add_key(name="Home", role="admin", key=key, actor=ACTOR)
+    path = folder / "keys.json"
+    path.chmod(0)
+    tried = []
+    real = worker._read_bytes
+    monkeypatch.setattr(worker, "_read_bytes", lambda name: (tried.append(Path(name).name), real(name))[1])
+    try:
+        keys = worker.state.keys
+        assert keys.fail_closed and "PermissionError" in keys.problem
+        assert worker.refresh() is False and tried.count("keys.json") == 1, "a verdict is kept until the file changes"
+    finally:
+        path.chmod(0o600)
+    assert worker.refresh() is True, "chmod is a change of the file (its mode and ctime)"
+    assert worker.state.keys.find(key).name == "Home"
+
+
+@POSIX_ONLY
+def test_a_recovery_keeps_a_keys_file_it_may_not_read_as_it_is(make_store, folder):
+    if os.geteuid() == 0:
+        pytest.skip("root reads the file whatever its mode")
+    make_store().add_key(name="Home", role="admin", key=new_key(), actor=ACTOR)
+    path = folder / "keys.json"
+    inode = path.stat().st_ino
+    path.chmod(0)
+    store = make_store()
+    assert store.state.keys.fail_closed
+    store.claim(code=store.issue_code(actor=ACTOR), name="Recovered", key=new_key(), actor=ACTOR)
+    kept = folder / "keys.json.damaged"
+    assert kept.stat().st_ino == inode and temp_files(folder) == []
+    kept.chmod(0o600)
+    assert json.loads(kept.read_text(encoding="utf-8"))["keys"][0]["name"] == "Home"
+    assert [record.name for record in store.state.keys.keys] == ["Recovered"]
+
+
+# --- names and ids of credentials --------------------------------------------------------------------
+
+def test_a_name_the_audit_trail_uses_is_refused_for_a_new_key_but_read_from_an_old_file(make_store, folder):
+    store = make_store()
+    code = store.issue_code(actor=ACTOR)
+    codes_before = (folder / "codes.json").read_bytes()
+    for name in ("deployment key", "Deployment Key", " DEPLOYMENT   KEY ", "one-time code", "AUTO-REVERT"):
+        with pytest.raises(store_module.InvalidInput) as info:
+            store.add_key(name=name, role="admin", key=new_key(), actor=ACTOR)
+        assert set(info.value.errors) == {"name"} and "reserved" in info.value.errors["name"], name
+        with pytest.raises(store_module.InvalidInput):
+            store.claim(code=code, name=name, key=new_key(), actor=ACTOR)
+    assert not (folder / "keys.json").exists()
+    assert (folder / "codes.json").read_bytes() == codes_before, "a refused name cost the code something"
+    assert store.claim(code=code, name="Deployment helper", key=new_key(), actor=ACTOR).role == "admin"
+
+    # A keys.json that already holds such a name (an earlier version let it be made) is read as it is.
+    write_json(folder / "keys.json", _valid_keys_document(keys=[
+        {"id": "9f2c1a7b", "name": "deployment key", "role": "admin", "sha256": "a" * 64, "hint": "tts_Ab3d",
+         "created_at": "2026-10-02T09:12:03Z"}]))
+    keys = make_store().state.keys
+    assert not keys.fail_closed and keys.keys[0].name == "deployment key"
+
+
+def test_who_saved_is_recorded_by_name_and_by_credential_id(make_store, folder):
+    store = make_store()
+    by_yaml = Actor(ip="192.168.1.20", host="truenas.k2o", credential=store_module.DEPLOYMENT_KEY,
+                    credential_id=store_module.DEPLOYMENT_KEY_ID)
+    store.update_preferences({"MAX_TTS_CHARS": 4000}, base_revision=0, actor=by_yaml)
+    document = json.loads((folder / "gateway.json").read_text(encoding="utf-8"))
+    assert document["saved_by"] == {"ip": "192.168.1.20", "host": "truenas.k2o", "credential": "deployment key",
+                                    "credential_id": "yaml:API_KEY"}
+    assert make_store().state.preferences.saved_by["credential_id"] == "yaml:API_KEY"
+    assert store.history()[0].saved_by["credential_id"] == "yaml:API_KEY"
+    assert json.loads((folder / "audit.jsonl").read_text(encoding="utf-8").splitlines()[-1])["credential_id"] == \
+        "yaml:API_KEY"
+    # The id of the key a line is about stays its own field next to the credential's.
+    record = store.add_key(name="Phone", role="client", key=new_key(),
+                           actor=Actor(credential="Laptop", credential_id="0a1b2c3d"))
+    line = json.loads((folder / "audit.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    assert (line["key_id"], line["credential_id"], line["credential"]) == (record.id, "0a1b2c3d", "Laptop")
+
+
+def test_a_claim_on_a_claimed_server_is_audited_as_a_recovery(make_store, folder, clock):
+    store = make_store()
+
+    def claim_line(name, **kwargs):
+        code = store.issue_code(actor=ACTOR)
+        clock.advance(61)
+        store.claim(code=code, name=name, key=new_key(), actor=ACTOR, **kwargs)
+        line = json.loads((folder / "audit.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+        return line["event"], line["server_was_claimed"], line["recovered"]
+
+    assert claim_line("Owner") == ("claim", False, False)
+    assert claim_line("Lost my key") == ("recovery", True, False)
+    (folder / "keys.json").write_text("garbage", encoding="utf-8")
+    assert claim_line("After the damage") == ("recovery", False, True)
+    # The gateway says what counts as claimed (the YAML key as admin, say), asked under the lock.
+    asked = []
+    assert claim_line("Asked", claimed=lambda keys: asked.append(keys) or True) == ("recovery", True, False)
+    assert len(asked) == 1 and [record.name for record in asked[0].keys] == ["After the damage"]
+
+
+def test_a_refusal_for_the_log_only_takes_no_lock_and_touches_no_file(make_store, folder, caplog, monkeypatch):
+    caplog.set_level(logging.INFO, logger=store_module.AUDIT_LOGGER_NAME)
+    store = make_store()
+    taken = []
+    real_acquire = store_module.FileLock.acquire
+
+    def acquire(lock):
+        taken.append(lock.path)
+        return real_acquire(lock)
+
+    monkeypatch.setattr(store_module.FileLock, "acquire", acquire)
+    store.audit("refused", actor=ACTOR, result="403 cross_origin_blocked", to_file=False, path="/api/settings")
+    assert taken == [] and list(folder.iterdir()) == []
+    lines = [json.loads(record.getMessage()) for record in caplog.records
+             if record.name == store_module.AUDIT_LOGGER_NAME]
+    assert [(line["event"], line["result"], line["path"]) for line in lines] == [
+        ("refused", "403 cross_origin_blocked", "/api/settings")]
+    assert "to_file" not in lines[0]

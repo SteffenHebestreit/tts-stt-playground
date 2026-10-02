@@ -550,21 +550,29 @@ in the page.
 **Who may call it.** Every change needs an admin credential: `API_KEY` (an admin unless the page
 made it a client) or an admin key made in the page. A deployment without either is *unclaimed*: its
 `GET`s answer read-only, and the only write is the claim, which takes a one-time code that
-`POST /api/settings/claim-code` prints to the gateway's log and nowhere else (valid 30 minutes, five
-tries, single use). The same claim replaces a lost admin key.
+`POST /api/settings/claim-code` prints to the gateway's log and nowhere else (valid 30 minutes, single
+use; a wrong code costs no code anything and counts toward the limit per address below). The same
+claim replaces a lost admin key, and the audit trail records it as a `recovery`. A `keys.json` that is
+damaged or cannot be read leaves no admin key: every request but the claim is `403 keys_damaged`,
+and a claim writes the file again (the damaged one is kept as `keys.json.damaged`).
 
 **Request rules**, stricter than the rest of `/api`:
 
 - The `Host` check always applies, even with `ALLOWED_HOSTS=*`.
 - Once claimed, every request needs an admin key as `Authorization: Bearer <key>`, reads included:
   no key or a wrong one is `401` with `WWW-Authenticate: Bearer`, a client key `403
-  admin_key_required`. Ten wrong keys or codes from one address within 10 minutes are answered `429`
-  with `Retry-After` (per gateway worker). Unclaimed, a write other than the claim is `403
+  admin_key_required`. Only failures are throttled: after ten wrong keys or codes from one address
+  within 10 minutes, that address's further wrong ones are answered `429` with `Retry-After` (per
+  gateway worker), while the right key, a request without a key and `claim-code` keep working (an
+  address behind a proxy or NAT is many people). Unclaimed, a write other than the claim is `403
   not_claimed`.
+- The key is checked again when a change is written: a key revoked, or `API_KEY` made a client,
+  while the request was still on its way changes nothing (`401`, or `403 admin_key_required`).
 - A changing request must come from the server's own origin or a `TRUSTED_ORIGINS` entry
   (`ALLOWED_ORIGINS` does not count, `null` neither: `403 cross_origin_blocked`); `Sec-Fetch-Site`,
   when sent, must be `same-origin` (`403 cross_site_blocked`); the body must be `application/json`
-  (`415`), at most 64 KiB (`413`) and without duplicate names (`400 duplicate_key`).
+  (`415`), at most 64 KiB (`413`) and without duplicate names (`400 duplicate_key`), and it has to
+  arrive within 10 seconds (`408 request_timeout`).
 - `OPTIONS` is `403`. Every answer carries `Cache-Control: no-store` and never an `Access-Control-*`
   header, whatever `ALLOWED_ORIGINS` says.
 - Errors are `{"detail": "...", "code": "..."}` plus, where it applies, `errors` per field (`400
@@ -580,14 +588,18 @@ tries, single use). The same claim replaces a lost admin key.
 | `POST /api/settings/discard` | `{base_revision}` | Back to the environment's values; the discarded version stays in the history |
 | `GET /api/settings/engines` | - | Each optional engine as `running`, `not_reachable` or `not_installed`, with how to install it (probed within 4 s, cached 30 s) |
 | `PUT /api/settings/access` | `{base_revision: keys_revision, require_key, deployment_key_role}` | Open or a key required; `API_KEY` as `admin` or `client`. `require_key: false` is refused while `API_KEY` is set, and `API_KEY` cannot make itself a client |
-| `POST /api/settings/keys` | `{name, role, key}` | `201 {id, name, role, hint, created_at}`. The caller makes the key: `tts_` and 43 base64url characters (32 random bytes); the gateway keeps its SHA-256 only |
+| `POST /api/settings/keys` | `{name, role, key}` | `201 {id, name, role, hint, created_at}`. The caller makes the key: `tts_` and 43 base64url characters (32 random bytes); the gateway keeps its SHA-256 only. The names the audit trail uses for other credentials (`deployment key`, `one-time code`, `auto-revert`) are refused |
 | `DELETE /api/settings/keys/{id}` | - | Revokes the key; `409 last_admin_credential` for the last admin credential |
 | `POST /api/settings/claim-code` | `{}` | `202`; the code is in the gateway's log (`docker compose logs frontend-service`; TrueNAS: Workloads -> frontend-service -> View Logs) |
 | `POST /api/settings/claim` | `{code, name, key, require_key}` | `201`: an admin key made with the one-time code; `403 invalid_code` for a wrong one |
 
-Every save, key change, claim and automatic undo, and refusals such as a wrong key or a change that
-would lock its caller out, are recorded in `audit.jsonl` next to the settings and in the gateway's
-log (logger `tts_stt.settings.audit`), without a key, a code or a digest.
+Every save, key change, claim or recovery and automatic undo, and refusals such as a wrong key or
+code or a change that would lock its caller out, are recorded in `audit.jsonl` next to the settings
+and in the gateway's log (logger `tts_stt.settings.audit`), without a key, a code or a digest, with
+the name of the key and its id (`yaml:API_KEY` for `API_KEY`). Refusals anyone can cause without an
+admin key (a foreign `Origin` or `Sec-Fetch-Site`, a change to an unclaimed server, a client key)
+go to the gateway's log only, at most once a minute per address and kind, so that they cannot push
+that record out of its files.
 
 ---
 

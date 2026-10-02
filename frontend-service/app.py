@@ -572,12 +572,16 @@ def _key_matches(candidate: str) -> Optional[_Credential]:
     return _keyring.match(candidate)
 
 
+def _bearer_token(headers: Headers) -> str:
+    """The key an `Authorization: Bearer <key>` header presents ("" for none)."""
+    scheme, _, token = headers.get("authorization", "").partition(" ")
+    return token.strip() if scheme.lower() == "bearer" else ""
+
+
 def _bearer_credential(headers: Headers) -> Optional[_Credential]:
     """The credential an `Authorization: Bearer <key>` header carries, or None."""
-    scheme, _, token = headers.get("authorization", "").partition(" ")
-    if scheme.lower() != "bearer":
-        return None
-    return _key_matches(token.strip())
+    token = _bearer_token(headers)
+    return _key_matches(token) if token else None
 
 
 def _bearer_key_ok(headers: Headers) -> bool:
@@ -703,7 +707,7 @@ def _guard_response(scope) -> Optional[Response]:
     method, path = scope["method"], scope["path"]
     headers = Headers(scope=scope)
     if _is_settings_path(path):
-        return _settings_guard(method, path, headers, _client_address(scope))
+        return _settings_guard(method, path, headers, _client_address(scope), scope)
     verdict = _guard_verdict(method, path, headers)
     if verdict is None:
         return None
@@ -908,20 +912,39 @@ class _UploadSlotMiddleware:
 #     admin key, GET included: none or a wrong one is 401, a client key 403.
 #     Unclaimed, the API can be read (the page shows the values read-only), and the
 #     only write is the claim with a one-time code from the container log.
-#   - 10 wrong keys or codes from one address within 10 minutes give 429, per worker.
+#     A damaged or unreadable keys.json counts as claimed with no admin key left:
+#     everything but the claim (recovery) is 403 keys_damaged.
+#   - Only failures are throttled: 10 wrong keys or codes from one address within 10
+#     minutes make that address's further wrong keys and codes 429, per worker. The
+#     right key, a request without a key and asking for a code are never refused for
+#     the address's record (several people can share one address behind a proxy).
 #   - A changing request must come from this UI: an Origin, when sent, is this
 #     server or a TRUSTED_ORIGINS entry (ALLOWED_ORIGINS does not count, `null` is
 #     refused), Sec-Fetch-Site, when sent, is same-origin, and the body is JSON
-#     (415 otherwise) of at most 64 KiB without a duplicate key.
+#     (415 otherwise) of at most 64 KiB without a duplicate key, all of it within
+#     10 s (408 otherwise).
+#   - The key a write was let in with is checked again when it is written, under the
+#     store's lock: a key revoked or made a client meanwhile writes nothing.
 #   - No CORS at all: a preflight gets 403, and no Access-Control-* header leaves.
 #   - Nothing is cached (Cache-Control: no-store).
+#   - Refusals that need no admin key (a foreign origin, a write to an unclaimed
+#     server, a client key) go to the container log only, at most once a minute per
+#     address and kind, never to audit.jsonl: anyone can cause them, and they must not
+#     push the record of saves, claims and key changes out of its files.
 
 SETTINGS_BODY_LIMIT = 64 * 1024
+SETTINGS_BODY_TIMEOUT_S = 10.0
 SETTINGS_AUTH_FAILURES = 10
 SETTINGS_AUTH_WINDOW_S = 600.0
 # Reached without a key: the claim takes the one-time code instead, and anyone may
 # ask for a code, because it only ever reaches the container log.
 _SETTINGS_OPEN_POSTS = frozenset({"/api/settings/claim-code", "/api/settings/claim"})
+# The scope entry _settings_guard leaves for the routes: the credential it let the request in
+# with, for the audit trail and the history (never the key itself).
+_SETTINGS_CREDENTIAL = "tts_stt.settings_credential"
+_KEYS_DAMAGED_MESSAGE = ("keys.json in the settings folder is damaged or cannot be read, so no key may see or "
+                         "change the settings. Print a recovery code to the container log and claim the server "
+                         "again; the damaged file is kept as keys.json.damaged.")
 
 
 def _is_settings_path(path: str) -> bool:
@@ -941,8 +964,11 @@ def _client_address(scope) -> str:
 class _FailureLimiter:
     """Wrong keys and codes per client address on the Settings API, in this worker.
 
-    `limit` failures within `window` seconds refuse the address until the oldest of
-    them is `window` old. A request with a working admin key clears its record.
+    `limit` failures within `window` seconds make the address's further wrong keys and
+    codes 429 until the oldest of them is `window` old. Only failures are throttled: a
+    working admin key, a request without a key and asking for a code are never refused
+    for the record (an address behind a proxy or NAT is many people), and a working
+    admin key clears it.
     """
 
     def __init__(self, limit: int, window: float, *, clock=time.monotonic, max_clients: int = 4096):
@@ -999,20 +1025,108 @@ def _settings_error(status: int, message: str, code: str, *, headers: Optional[M
 
 
 def _presented_key(headers: Headers) -> bool:
-    scheme, _, token = headers.get("authorization", "").partition(" ")
-    return scheme.lower() == "bearer" and bool(token.strip())
+    return bool(_bearer_token(headers))
+
+
+def _settings_throttled(client: str) -> Optional[JSONResponse]:
+    """The 429 for an address with too many wrong keys or codes, or None."""
+    retry_after = _settings_limiter.retry_after(client)
+    if retry_after is None:
+        return None
+    return _settings_error(429, "Too many wrong keys or codes from this address; try again later.",
+                           "too_many_attempts", headers={"Retry-After": str(retry_after)})
+
+
+class _RefusalNotes:
+    """When a refusal that needs no admin key gets a line in the container log.
+
+    Anyone can cause these as often as they like: a foreign page's request, a write to an
+    unclaimed server, a client key on the Settings API. They are therefore never written
+    to audit.jsonl (they would push the saves, claims and key changes out of its four
+    files) and take no lock; each (address, refusal) is logged at most once per `window`,
+    saying how many like it were left out since, and at most `max_lines` lines go out per
+    `window` in all. Bounded like _FailureLimiter: the oldest address is forgotten first.
+    """
+
+    def __init__(self, window: float = 60.0, *, max_lines: int = 120, max_keys: int = 4096,
+                 clock=time.monotonic):
+        self.window, self.max_lines, self.max_keys, self.clock = window, max_lines, max_keys, clock
+        self._seen: collections.OrderedDict = collections.OrderedDict()   # key -> [logged at, left out]
+        self._window_start: Optional[float] = None
+        self._lines = 0
+        self._dropped = 0
+
+    def due(self, key) -> Optional[dict]:
+        """None to stay quiet; else the fields the line carries about what was left out."""
+        now = self.clock()
+        if self._window_start is None or now - self._window_start >= self.window:
+            self._window_start, self._lines = now, 0
+        entry = self._seen.get(key)
+        if entry is not None and now - entry[0] < self.window:
+            entry[1] += 1
+            return None
+        if self._lines >= self.max_lines:
+            self._dropped += 1
+            return None
+        fields = {}
+        if entry is not None and entry[1]:
+            fields["left_out"] = entry[1]
+        if self._dropped:
+            fields["left_out_in_all"] = self._dropped
+            self._dropped = 0
+        if entry is None and len(self._seen) >= self.max_keys:
+            self._seen.popitem(last=False)
+        self._seen[key] = [now, 0]
+        self._seen.move_to_end(key)
+        self._lines += 1
+        return fields
+
+
+_refusal_notes = _RefusalNotes()
+
+
+def _credential_id(credential: Optional["_Credential"]) -> str:
+    """Which credential it was, as the audit trail and the history record it (never its name)."""
+    if credential is None:
+        return ""
+    return credential.key_id if credential.key_id is not None else settings_store.DEPLOYMENT_KEY_ID
+
+
+def _actor(client: str, host: str, credential: Optional["_Credential"], name: Optional[str] = None
+           ) -> settings_store.Actor:
+    """Who asks: address, Host, and the credential's name and id (or `name`, for a one-time code)."""
+    if name is not None:
+        return settings_store.Actor(ip=client, host=host, credential=name)
+    return settings_store.Actor(ip=client, host=host, credential=credential.name if credential else "",
+                                credential_id=_credential_id(credential))
 
 
 def _audit_refusal(result: str, method: str, path: str, headers: Headers, client: str,
                    credential: Optional["_Credential"] = None) -> None:
-    """An audit line for a refused Settings request (never raises)."""
-    actor = settings_store.Actor(ip=client, host=headers.get("host", ""),
-                                 credential=credential.name if credential else "")
-    _settings_store.audit("refused", actor=actor, result=result, method=method, path=path[:200])
+    """An audit line for a refused Settings request that only a bounded number of callers can
+    cause (a presented key that is wrong, which the limiter counts). Never raises."""
+    _settings_store.audit("refused", actor=_actor(client, headers.get("host", ""), credential), result=result,
+                          method=method, path=path[:200])
 
 
-def _settings_guard(method: str, path: str, headers: Headers, client: str) -> Optional[Response]:
-    """The rules above for one request to /settings or /api/settings*; None lets it through."""
+def _note_refusal(result: str, method: str, path: str, headers: Headers, client: str,
+                  credential: Optional["_Credential"] = None) -> None:
+    """A refusal anyone can cause without an admin key: the container log only, throttled
+    (_RefusalNotes). Never raises."""
+    fields = _refusal_notes.due((client, result))
+    if fields is None:
+        return
+    _settings_store.audit("refused", actor=_actor(client, headers.get("host", ""), credential), result=result,
+                          to_file=False, method=method, path=path[:200], **fields)
+
+
+def _settings_guard(method: str, path: str, headers: Headers, client: str,
+                    scope: Optional[dict] = None) -> Optional[Response]:
+    """The rules above for one request to /settings or /api/settings*; None lets it through.
+
+    A request let in with an admin key carries that credential in `scope`
+    (_SETTINGS_CREDENTIAL), so the route attributes its write to the key that passed here.
+    """
     policy = _policy
     if policy.allow_any_host:
         policy = dataclasses.replace(policy, allow_any_host=False)
@@ -1025,39 +1139,55 @@ def _settings_guard(method: str, path: str, headers: Headers, client: str) -> Op
         return _settings_error(403, "The Settings page answers no cross-origin requests.", "cors_refused")
     if not _is_settings_api_path(path):
         return None                     # the page itself: an empty shell that asks the API
-    retry_after = _settings_limiter.retry_after(client)
-    if retry_after is not None:
-        return _settings_error(429, "Too many wrong keys or codes from this address; try again later.",
-                               "too_many_attempts", headers={"Retry-After": str(retry_after)})
     safe = method in _SAFE_METHODS
     if not safe:
         origin = headers.get("origin")
         if origin is not None and not _is_same_origin(origin, headers, policy):
-            _audit_refusal("403 cross_origin_blocked", method, path, headers, client)
+            _note_refusal("403 cross_origin_blocked", method, path, headers, client)
             return _settings_error(403, "Settings can only be changed from this server's own page.",
                                    "cross_origin_blocked")
         site = headers.get("sec-fetch-site")
         if site is not None and site.strip().lower() != "same-origin":
-            _audit_refusal("403 cross_site_blocked", method, path, headers, client)
+            _note_refusal("403 cross_site_blocked", method, path, headers, client)
             return _settings_error(403, "Settings can only be changed from this server's own page.",
                                    "cross_site_blocked")
-    if not (method == "POST" and path in _SETTINGS_OPEN_POSTS):
+    if method == "POST" and path in _SETTINGS_OPEN_POSTS:
+        # A blocked address tries no more codes (every wrong one is counted and audited);
+        # asking for a code is never refused here: the store allows one a minute.
+        if path == "/api/settings/claim":
+            throttled = _settings_throttled(client)
+            if throttled is not None:
+                return throttled
+    else:
+        state = _applied_state
+        if state is not None and state.keys.fail_closed:
+            # keys.json is damaged: nobody knows who the admins are, and no key can pass, so
+            # nothing is shown; only the claim (recovery) stays open. 403, not a Bearer
+            # challenge: the key in a tab may still be the app YAML key, valid for the API.
+            _note_refusal("403 keys_damaged", method, path, headers, client)
+            return _settings_error(403, _KEYS_DAMAGED_MESSAGE, "keys_damaged",
+                                   can_claim=bool(ENABLE_SETTINGS_UI and state.mount.writable))
         if _settings_claimed():
             credential = _bearer_credential(headers)
             if credential is None:
                 if _presented_key(headers):
+                    throttled = _settings_throttled(client)
+                    if throttled is not None:
+                        return throttled
                     blocked = _settings_limiter.failed(client)
                     _audit_refusal("401 invalid_api_key" + (", address blocked" if blocked else ""),
                                    method, path, headers, client)
                 return _settings_error(401, "An admin key is required (Authorization: Bearer <key>).",
                                        "invalid_api_key")
             if credential.role != settings_schema.ROLE_ADMIN:
-                _audit_refusal("403 admin_key_required", method, path, headers, client, credential)
+                _note_refusal("403 admin_key_required", method, path, headers, client, credential)
                 return _settings_error(403, "This key may use the API but not the Settings; an admin key "
                                             "is required.", "admin_key_required")
             _settings_limiter.succeeded(client)
+            if scope is not None:
+                scope[_SETTINGS_CREDENTIAL] = credential
         elif not safe:
-            _audit_refusal("403 not_claimed", method, path, headers, client)
+            _note_refusal("403 not_claimed", method, path, headers, client)
             return _settings_error(403, "Nobody may change settings yet: this server has no admin key. Print a "
                                         "one-time code to the container log and claim the server with it.",
                                    "not_claimed")
@@ -2113,9 +2243,16 @@ _LANGUAGE_NAMES = {
 }
 _CANARY_LANGUAGE_REFRESH_S = 300.0    # how long a discovered list is trusted
 _CANARY_LANGUAGE_RETRY_S = 20.0       # how soon to ask again after a failed attempt
-_canary_languages = {"next_at": None}
+# `epoch` counts resets: an answer to a question asked before the last one is dropped.
+_canary_languages = {"next_at": None, "epoch": 0}
 # Injectable so tests can move time instead of sleeping.
 _language_clock = time.monotonic
+
+
+def _reset_canary_languages() -> None:
+    """Ask canary again on the next page load, and drop an answer that is still on its way."""
+    _canary_languages["next_at"] = None
+    _canary_languages["epoch"] += 1
 
 
 def _apply_canary_status(entry: dict, payload: Any) -> bool:
@@ -2164,12 +2301,17 @@ async def _refresh_canary_languages() -> None:
         return
     # Provisional, so concurrent page loads do not each probe a dead service.
     _canary_languages["next_at"] = now + _CANARY_LANGUAGE_RETRY_S
+    epoch = _canary_languages["epoch"]
     try:
         response = await _get_http_client().get(
             f"{entry['internal_url']}/status", timeout=_timeout(2.0))
         payload = response.json() if response.status_code == 200 else None
     except Exception as exc:
         logger.info("canary /status could not be read (%s); keeping the built-in language list", type(exc).__name__)
+        return
+    # A settings change rebuilt the registry while /status was awaited (_apply): `entry` is no
+    # longer shown, and the reset it made has to stand, so the next page load asks for the new one.
+    if _canary_languages["epoch"] != epoch or PROVIDER_REGISTRY["providers"].get("canary") is not entry:
         return
     if _apply_canary_status(entry, payload):
         _canary_languages["next_at"] = now + _CANARY_LANGUAGE_REFRESH_S
@@ -4021,7 +4163,7 @@ def _apply(state: settings_store.SettingsState, *, initial: bool = False) -> Non
         PROVIDER_REGISTRY.clear()
         PROVIDER_REGISTRY.update(registry)
         _registry_built_from = engines
-        _canary_languages["next_at"] = None
+        _reset_canary_languages()
         _reset_provider_health()
     if MAX_TTS_CHARS != previous_tts_chars:
         app.openapi_schema = None   # regenerated with the new maxLength when next asked for
@@ -4124,9 +4266,12 @@ _SETTINGS_MOUNT_LINES = {
 }
 _STORE_ERROR_STATUS = {
     "settings_not_mounted": 409, "settings_write_failed": 500, "settings_busy": 503,
-    "revision_conflict": 409, "invalid_input": 400, "history_not_found": 404, "key_not_found": 404,
-    "key_limit_reached": 409, "last_admin_credential": 409, "no_key_configured": 409,
+    "settings_unreadable": 503, "revision_conflict": 409, "invalid_input": 400, "history_not_found": 404,
+    "key_not_found": 404, "key_limit_reached": 409, "last_admin_credential": 409, "no_key_configured": 409,
     "keys_file_damaged": 409, "invalid_code": 403, "rate_limited": 429,
+    # settings_store.CredentialRefused: the key that let the request in was revoked (401) or
+    # made a client (403) before the change could be written.
+    "invalid_api_key": 401, "admin_key_required": 403,
 }
 
 
@@ -4138,19 +4283,46 @@ class _SettingsRefused(Exception):
         self.response, self.code = response, code
 
 
-def _settings_claimed() -> bool:
-    """Is there an admin credential: an admin key made in the page, or the app YAML key as admin?"""
-    state = _applied_state
-    if state is not None and any(record.role == settings_schema.ROLE_ADMIN for record in state.keys.keys):
+def _claimed_by(keys: settings_store.KeysState) -> bool:
+    """Do these keys hold an admin credential: an admin key made in the page, or the app YAML key as admin?"""
+    if any(record.role == settings_schema.ROLE_ADMIN for record in keys.keys):
         return True
-    return bool(API_KEY) and _applied_values.get("deployment_key_role") == settings_schema.ROLE_ADMIN
+    return bool(API_KEY) and _access_in_force(keys)[1] == settings_schema.ROLE_ADMIN
 
 
-def _settings_actor(request: Request, credential: Optional[_Credential], name: Optional[str] = None) -> settings_store.Actor:
-    """Who asks, for the audit trail and the history: address, Host and the credential's name."""
-    return settings_store.Actor(
-        ip=_client_address(request.scope), host=request.headers.get("host", ""),
-        credential=name if name is not None else (credential.name if credential else ""))
+def _settings_claimed() -> bool:
+    """Is there an admin credential in force in this worker?"""
+    state = _applied_state
+    return state is not None and _claimed_by(state.keys)
+
+
+def _settings_actor(request: Request, name: Optional[str] = None) -> settings_store.Actor:
+    """Who asks, for the audit trail and the history: address, Host, and the credential
+    _settings_guard let the request in with (or `name`, for a claim with a one-time code)."""
+    return _actor(_client_address(request.scope), request.headers.get("host", ""),
+                  request.scope.get(_SETTINGS_CREDENTIAL), name)
+
+
+def _write_authorizer(request: Request):
+    """The `authorize` of a Settings write: under the store's lock, against the keys read there,
+    is the key this request was let in with still an admin credential?
+
+    A key revoked, or the app YAML key made a client, since the request's headers arrived (by
+    this worker or another one, while its body was still on its way) writes nothing: 401 for a
+    key that is gone, 403 for one that is no longer an admin, as a new request would get.
+    """
+    token = _bearer_token(request.headers)
+
+    def authorize(keys: settings_store.KeysState) -> None:
+        credential = _build_key_ring(keys.keys, _access_in_force(keys)[1]).match(token) if token else None
+        if credential is None:
+            raise settings_store.CredentialRefused(
+                "invalid_api_key", "This key is no longer accepted (it was revoked); nothing was changed.")
+        if credential.role != settings_schema.ROLE_ADMIN:
+            raise settings_store.CredentialRefused(
+                "admin_key_required", "This key may no longer change settings; nothing was changed.")
+
+    return authorize
 
 
 def _store_refusal(exc: settings_store.SettingsStoreError) -> JSONResponse:
@@ -4162,9 +4334,20 @@ def _store_refusal(exc: settings_store.SettingsStoreError) -> JSONResponse:
         extra["revision"] = exc.current_revision
     if isinstance(exc, settings_store.RateLimited):
         headers["Retry-After"] = str(exc.retry_after)
-    if isinstance(exc, settings_store.LockTimeout):
+    if isinstance(exc, (settings_store.LockTimeout, settings_store.Unreadable)):
         headers["Retry-After"] = "1"
     return _settings_error(_STORE_ERROR_STATUS.get(exc.code, 400), exc.message, exc.code, headers=headers, **extra)
+
+
+def _write_refusal(exc: settings_store.SettingsStoreError, request: Request,
+                   actor: settings_store.Actor) -> JSONResponse:
+    """The answer to a write the store refused; a credential that lost its right meanwhile is audited
+    under the name it had when the request was let in."""
+    if isinstance(exc, settings_store.CredentialRefused):
+        _settings_store.audit("refused", actor=actor,
+                              result=f"{_STORE_ERROR_STATUS[exc.code]} {exc.code}, when it was to be written",
+                              method=request.method, path=request.url.path[:200])
+    return _store_refusal(exc)
 
 
 def _apply_saved() -> None:
@@ -4226,8 +4409,17 @@ _FIELD_CHECKS: dict[str, tuple[Any, str]] = {
 
 async def _settings_body(request: Request, *, required: tuple[str, ...] = (),
                          optional: tuple[str, ...] = ()) -> Any:
-    """The request's JSON object with its fields checked, or the refusal (a JSONResponse)."""
-    raw = await request.body()
+    """The request's JSON object with its fields checked, or the refusal (a JSONResponse).
+
+    The whole body has to arrive within SETTINGS_BODY_TIMEOUT_S (uvicorn has no such limit), so a
+    request cannot be held open for long between the guard's check of its key and its write.
+    """
+    try:
+        raw = await asyncio.wait_for(request.body(), SETTINGS_BODY_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        # The rest of the body may still be on the wire.
+        return _settings_error(408, "The request did not arrive in time.", "request_timeout",
+                               headers={"Connection": "close"})
     try:
         body = settings_schema.parse_json_strict(raw) if raw.strip() else {}
     except settings_schema.DuplicateKeyError:
@@ -4414,7 +4606,7 @@ def _settings_banners(state: settings_store.SettingsState, claimed: bool) -> lis
         add("keys_damaged", "error", state.keys.problem or "keys.json is damaged.")
     for problem in state.preferences.problems:
         add("problem", "warning", problem)
-    if not claimed:
+    if not claimed and not state.keys.fail_closed:
         add("unclaimed", "warning", "Nobody can change these settings yet: this server has no admin key. Print a "
                                     "one-time code to the container log and claim the server with it.")
     if not _applied_values.get("require_key"):
@@ -4661,16 +4853,16 @@ async def settings_update(request: Request):
     if unconfirmed and not dry_run:
         return _settings_error(409, "Some changes need to be confirmed first.", "needs_confirmation",
                                warnings=[warning.as_dict() for warning in unconfirmed])
-    actor = _settings_actor(request, _bearer_credential(request.headers))
+    actor = _settings_actor(request)
     before = _applied_values
     try:
         result = _settings_store.update_preferences(
             validation.values, reset, base_revision=body["base_revision"], actor=actor,
-            check=_write_check(request.headers), dry_run=dry_run)
+            check=_write_check(request.headers), dry_run=dry_run, authorize=_write_authorizer(request))
     except _SettingsRefused as refused:
         return _refused_write(refused, request, actor)
     except settings_store.SettingsStoreError as exc:
-        return _store_refusal(exc)
+        return _write_refusal(exc, request, actor)
     if result.written:
         _apply_saved()
     return _write_answer(result, before, validation.warnings, validation.notes)
@@ -4690,11 +4882,11 @@ async def settings_confirm(request: Request):
     if pending is None or pending.revision != body["revision"]:
         return _settings_error(409, "No change of this revision waits for a confirmation; it may have been undone.",
                                "nothing_to_confirm")
+    actor = _settings_actor(request)
     try:
-        confirmed = _settings_store.confirm(
-            body["revision"], actor=_settings_actor(request, _bearer_credential(request.headers)))
+        confirmed = _settings_store.confirm(body["revision"], actor=actor, authorize=_write_authorizer(request))
     except settings_store.SettingsStoreError as exc:
-        return _store_refusal(exc)
+        return _write_refusal(exc, request, actor)
     _apply_saved()
     if not confirmed:
         return _settings_error(409, "Too late: the change was undone.", "confirm_expired")
@@ -4711,16 +4903,17 @@ async def settings_restore(request: Request):
                                 optional=("acknowledge", "dry_run"))
     if isinstance(body, Response):
         return body
-    actor = _settings_actor(request, _bearer_credential(request.headers))
+    actor = _settings_actor(request)
     before = _applied_values
     check = _write_check(request.headers)
+    authorize = _write_authorizer(request)
     try:
         preview = _settings_store.restore(body["history_id"], base_revision=body["base_revision"], actor=actor,
-                                          check=check, dry_run=True)
+                                          check=check, dry_run=True, authorize=authorize)
     except _SettingsRefused as refused:
         return _refused_write(refused, request, actor)
     except settings_store.SettingsStoreError as exc:
-        return _store_refusal(exc)
+        return _write_refusal(exc, request, actor)
     restored = {key: preview.values[key] for key in preview.changed
                 if key in preview.values and key not in SETTINGS_LOCKED_KEYS}
     validation = settings_schema.validate_changes(
@@ -4733,11 +4926,11 @@ async def settings_restore(request: Request):
                                warnings=[warning.as_dict() for warning in unconfirmed])
     try:
         result = _settings_store.restore(body["history_id"], base_revision=body["base_revision"], actor=actor,
-                                         check=check)
+                                         check=check, authorize=authorize)
     except _SettingsRefused as refused:
         return _refused_write(refused, request, actor)
     except settings_store.SettingsStoreError as exc:
-        return _store_refusal(exc)
+        return _write_refusal(exc, request, actor)
     if result.written:
         _apply_saved()
     return _write_answer(result, before, validation.warnings, validation.notes)
@@ -4752,17 +4945,17 @@ async def settings_discard(request: Request):
     body = await _settings_body(request, required=("base_revision",), optional=("dry_run",))
     if isinstance(body, Response):
         return body
-    actor = _settings_actor(request, _bearer_credential(request.headers))
+    actor = _settings_actor(request)
     before = _applied_values
     try:
         # Back to the app YAML is always allowed, even where its engine defaults disagree.
         result = _settings_store.discard(base_revision=body["base_revision"], actor=actor,
                                          check=_write_check(request.headers, engines=False),
-                                         dry_run=body.get("dry_run", False))
+                                         dry_run=body.get("dry_run", False), authorize=_write_authorizer(request))
     except _SettingsRefused as refused:
         return _refused_write(refused, request, actor)
     except settings_store.SettingsStoreError as exc:
-        return _store_refusal(exc)
+        return _write_refusal(exc, request, actor)
     if result.written:
         _apply_saved()
     return _write_answer(result, before)
@@ -4802,8 +4995,9 @@ async def settings_access(request: Request):
     if errors:
         return _settings_error(403, "Some settings are fixed by the app YAML.", "locked_by_deployment",
                                errors=errors)
-    credential = _bearer_credential(request.headers)
-    actor = _settings_actor(request, credential)
+    # The credential _settings_guard let the request in with (an admin's).
+    credential = request.scope.get(_SETTINGS_CREDENTIAL)
+    actor = _settings_actor(request)
     if body.get("deployment_key_role") == settings_schema.ROLE_CLIENT and credential is not None \
             and credential.key_id is None:
         _settings_store.audit("refused", actor=actor, result="403 deployment_key_not_allowed",
@@ -4813,9 +5007,10 @@ async def settings_access(request: Request):
     try:
         keys = _settings_store.set_access(
             base_revision=body["base_revision"], actor=actor, deployment_key_present=bool(API_KEY),
-            require_key=body.get("require_key"), deployment_key_role=body.get("deployment_key_role"))
+            require_key=body.get("require_key"), deployment_key_role=body.get("deployment_key_role"),
+            authorize=_write_authorizer(request))
     except settings_store.SettingsStoreError as exc:
-        return _store_refusal(exc)
+        return _write_refusal(exc, request, actor)
     _apply_saved()
     return {"keys_revision": keys.revision,
             "access": {"require_key": _applied_values["require_key"],
@@ -4831,11 +5026,12 @@ async def settings_key_create(request: Request):
     body = await _settings_body(request, required=("name", "role", "key"))
     if isinstance(body, Response):
         return body
+    actor = _settings_actor(request)
     try:
-        record = _settings_store.add_key(name=body["name"], role=body["role"], key=body["key"],
-                                         actor=_settings_actor(request, _bearer_credential(request.headers)))
+        record = _settings_store.add_key(name=body["name"], role=body["role"], key=body["key"], actor=actor,
+                                         authorize=_write_authorizer(request))
     except settings_store.SettingsStoreError as exc:
-        return _store_refusal(exc)
+        return _write_refusal(exc, request, actor)
     _apply_saved()
     return JSONResponse(status_code=201, content={**record.public(),
                                                   "keys_revision": _settings_store.state.keys.revision})
@@ -4847,11 +5043,12 @@ async def settings_key_revoke(request: Request, key_id: str = PathParam(..., pat
     refusal = _keys_locked_out(_settings_store.state)
     if refusal is not None:
         return refusal
+    actor = _settings_actor(request)
     try:
-        record = _settings_store.revoke_key(key_id, actor=_settings_actor(request, _bearer_credential(request.headers)),
-                                            deployment_key_present=bool(API_KEY))
+        record = _settings_store.revoke_key(key_id, actor=actor, deployment_key_present=bool(API_KEY),
+                                            authorize=_write_authorizer(request))
     except settings_store.SettingsStoreError as exc:
-        return _store_refusal(exc)
+        return _write_refusal(exc, request, actor)
     _apply_saved()
     return {"revoked": record.public(), "keys_revision": _settings_store.state.keys.revision}
 
@@ -4865,7 +5062,7 @@ async def settings_claim_code(request: Request):
     body = await _settings_body(request)
     if isinstance(body, Response):
         return body
-    actor = _settings_actor(request, None)
+    actor = _settings_actor(request)
     try:
         code = _settings_store.issue_code(actor=actor)
     except settings_store.SettingsStoreError as exc:
@@ -4895,9 +5092,12 @@ async def settings_claim(request: Request):
         require_key = None          # the app YAML decides; the claim itself still goes ahead
     client = _client_address(request.scope)
     try:
+        # `claimed`: whether the server had an admin credential, judged under the lock, so the
+        # audit trail tells a recovery (an extra admin key for someone who reads the log) from
+        # the first claim.
         record = _settings_store.claim(code=body["code"], name=body["name"], key=body["key"],
-                                       require_key=require_key,
-                                       actor=_settings_actor(request, None, name="one-time code"))
+                                       require_key=require_key, claimed=_claimed_by,
+                                       actor=_settings_actor(request, name=settings_store.CLAIM_ACTOR))
     except settings_store.InvalidCode as exc:
         _settings_limiter.failed(client)
         return _store_refusal(exc)

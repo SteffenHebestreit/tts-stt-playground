@@ -11,9 +11,12 @@ module: it only ever writes into a folder that exists and is verified (below).
     codes.json                 one-time claim codes, as SHA-256 only
     history/<UTC>-r<rev>.json  the last 20 versions of gateway.json, each with the event, the
                                changed key names and who saved it (made on the first save, 0700)
-    audit.jsonl, .1 to .3      one JSON line per save, claim, key change, refusal and auto-revert,
-                               1 MiB per file; every line also goes to the logger
-                               "tts_stt.settings.audit" (the container log, which the app cannot edit)
+    audit.jsonl, .1 to .3      one JSON line per save, claim, key change, automatic undo, and per
+                               refusal of a presented key or code or of an admin's change, 1 MiB per
+                               file; every line also goes to the logger "tts_stt.settings.audit"
+                               (the container log, which the app cannot edit). Refusals anyone can
+                               cause without an admin key go to that logger only (audit(to_file=False)),
+                               so they can never push this record out of its four files.
     SAFE-MODE                  made by hand; the gateway then ignores gateway.json
     *.damaged                  the last damaged gateway.json / keys.json a write replaced
 
@@ -25,14 +28,21 @@ Guarantees
     skips that check; it must exist.
   - Every write holds an exclusive lock on /tmp/tts-stt-settings.lock (container-local and shared
     by the uvicorn workers; fcntl.flock, msvcrt on Windows, a thread lock where neither exists),
-    re-reads the file it changes, checks the revision the caller based the change on, writes a
-    temp file in the same folder (mode 0600), fsyncs it, os.replace()s it over the target and
-    fsyncs the folder (best effort).
+    re-reads gateway.json and keys.json whatever this process cached (a read that fails for a
+    reason that may pass refuses the write: Unreadable), asks the caller's `authorize` whether the
+    credential that let the request in still may write, checks the revision the caller based the
+    change on, writes a temp file in the same folder (mode 0600), fsyncs it, os.replace()s it over
+    the target and fsyncs the folder (best effort).
   - gateway.json is read leniently: an invalid value is dropped with a problem message, unknown
     keys are ignored, and a damaged file leaves the last good state of this process in force; a
     process that never had one takes the newest valid history version, else no overrides.
-  - keys.json fails closed: damaged or unreadable means a key is required, there are no page keys
-    and the app YAML key has the role client, until claim() rewrites it or it is deleted.
+  - keys.json fails closed: damaged, or unreadable for want of permission, means a key is required,
+    there are no page keys and the app YAML key has the role client, until claim() rewrites it or it
+    is deleted.
+  - A read that fails for a reason that may pass (out of file descriptors, an I/O error) decides
+    nothing and is not remembered: keys.json counts as unreadable (fail closed) and gateway.json
+    keeps what was in force until a read succeeds, tried again on the next refresh after
+    READ_RETRY_S. Only a read with a definite result (the content, or a verdict on it) is cached.
   - Keys and codes are stored as SHA-256 digests only, and no plaintext key or code is ever
     written to a file, the audit trail or a log line by this module.
 
@@ -51,8 +61,10 @@ tells whether gateway.json changed (the same for keys and mount).
   SettingsState(mount: MountStatus, safe_mode: bool, preferences: PreferencesState, keys: KeysState)
   MountStatus(state: "mounted" | "override" | "not_mounted" | "read_only" | "missing",
               writable: bool, directory: str, detail: str)
+  Actor(ip, host, credential, credential_id)  who asks; credential_id is a page key's id,
+              DEPLOYMENT_KEY_ID for the app YAML key, "" otherwise (never part of a name)
   PreferencesState(revision, values {KEY: normalized value}, pending: Pending | None,
-              saved_at, saved_by {ip, host, credential}, source: "absent" | "file" |
+              saved_at, saved_by {ip, host, credential[, credential_id]}, source: "absent" | "file" |
               "last_good" | "history" | "none", damaged: bool, problems: tuple[str],
               dropped {KEY: reason})
   Pending(revision, deadline (epoch s), previous {KEY: override before, None = followed the YAML})
@@ -64,32 +76,39 @@ tells whether gateway.json changed (the same for keys and mount).
   WriteResult(revision, changed: tuple[str], values, pending, dropped, dry_run, written)
       A write that created or moved a confirmation answers pending.revision == revision.
 
-Writes (all raise NotWritable when the folder is not writable, LockTimeout, WriteFailed on I/O)
-  update_preferences(set_values, reset=(), *, base_revision, actor, check=None, dry_run=False)
-  restore(history_id, *, base_revision, actor, check=None, dry_run=False)
-  discard(*, base_revision, actor, check=None, dry_run=False)
+Writes (all raise NotWritable when the folder is not writable, LockTimeout, Unreadable, WriteFailed
+on I/O). Those an admin credential asks for take `authorize`: called under the lock with the
+KeysState just read, it raises (CredentialRefused) when the key that let the request in has been
+revoked or made a client since, and nothing is written.
+  update_preferences(set_values, reset=(), *, base_revision, actor, check=None, dry_run=False, authorize=None)
+  restore(history_id, *, base_revision, actor, check=None, dry_run=False, authorize=None)
+  discard(*, base_revision, actor, check=None, dry_run=False, authorize=None)
       -> WriteResult; RevisionConflict, InvalidInput (values are re-checked with
       settings_schema.parse_value), HistoryNotFound. `check(values, changed)` runs under the lock
       with the exact override map about to be written and may raise to stop the write (the
       gateway's lockout self-check); it must not do I/O. A change to a commit_confirm key gets a
       Pending record (deadline now + 60 s), and later writes carry it over.
-  confirm(revision, *, actor=None) -> bool        clears the pending record of that revision
+  confirm(revision, *, actor=None, authorize=None) -> bool   clears the pending record of that revision
   expire_pending() -> bool                        never raises
   set_access(*, base_revision, actor, deployment_key_present, require_key=None,
-             deployment_key_role=None) -> KeysState
+             deployment_key_role=None, authorize=None) -> KeysState
       RevisionConflict, InvalidInput, LastAdminCredential, NoKeyConfigured, KeysFileDamaged
-  add_key(*, name, role, key, actor) -> KeyRecord
-      InvalidInput, KeyLimitReached (32), KeysFileDamaged
-  revoke_key(key_id, *, actor, deployment_key_present) -> KeyRecord
+  add_key(*, name, role, key, actor, authorize=None) -> KeyRecord
+      InvalidInput (also for a name the audit trail reserves), KeyLimitReached (32), KeysFileDamaged
+  revoke_key(key_id, *, actor, deployment_key_present, authorize=None) -> KeyRecord
       KeyNotFound, LastAdminCredential, KeysFileDamaged
   issue_code(*, purpose="claim", actor=None) -> str
       The only copy of the code: the caller prints it to the container log and nowhere else.
       RateLimited (one per minute, at most 3 active)
   redeem_code(code, *, purpose="claim", actor=None) -> bool
-  claim(*, code, name, key, require_key=None, actor) -> KeyRecord
+      A wrong code changes nothing: no attempt budget is shared between callers, so nobody can
+      use up the owner's code. Guessing is bounded by 100 bits, 30 minutes, at most 3 codes and the
+      gateway's per-address limit on wrong codes.
+  claim(*, code, name, key, require_key=None, actor, claimed=None) -> KeyRecord
       Creates an admin key with a one-time code (also on a damaged keys.json, which it rewrites).
-      InvalidInput, InvalidCode
-  audit(event, *, actor=None, result="ok", **fields) -> None     never raises
+      Audited as "claim", or as "recovery" when the server already had an admin credential
+      (`claimed(keys)`) or keys.json was damaged. InvalidInput, InvalidCode
+  audit(event, *, actor=None, result="ok", to_file=True, **fields) -> None     never raises
 
 Reads: refresh() -> bool, state, mount_status(), history(limit=20) -> list[HistoryEntry],
 reads (a counter of file reads, for tests). Module helpers: key_digest(key),
@@ -157,17 +176,31 @@ MAX_KEYS = 32
 MAX_FILE_BYTES = 1024 * 1024
 CONFIRM_WINDOW_S = 60.0
 LOCK_TIMEOUT_S = 10.0
+# How soon a refresh tries a file again whose read failed for a reason that may pass.
+READ_RETRY_S = 1.0
 
 CODE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"   # Crockford base32: 5 bits a character
 CODE_LENGTH = 20                                      # 100 bits
 CODE_TTL_S = 30 * 60
-CODE_ATTEMPTS = 5
 CODE_MAX_ACTIVE = 3
 CODE_MIN_INTERVAL_S = 60.0
 CODE_PURPOSES = ("claim",)
 
-# The credential name audit lines use for the app YAML's API_KEY.
+# The names audit lines and the history give the credentials that are not page keys: the app
+# YAML's API_KEY, a claim with a one-time code, and an unconfirmed change undone by its deadline.
+# A page key cannot be named like one of them (see _checked_key_fields).
 DEPLOYMENT_KEY = "deployment key"
+CLAIM_ACTOR = "one-time code"
+AUTO_REVERT_ACTOR = "auto-revert"
+RESERVED_CREDENTIAL_NAMES = frozenset({DEPLOYMENT_KEY, CLAIM_ACTOR, AUTO_REVERT_ACTOR})
+# Actor.credential_id of the app YAML's API_KEY. The colon keeps it apart from every page key id
+# (letters, digits, "_" and "-"), so the record says whose key it was, whatever the key's name.
+DEPLOYMENT_KEY_ID = "yaml:API_KEY"
+
+# A read that failed with one of these is a verdict on the file, as damaged content is: it stays
+# in force until the file changes (its owner, mode or ctime included). Any other error (out of
+# file descriptors or memory, an I/O error) may pass, and the file is read again later.
+_PERSISTENT_READ_ERRORS = frozenset({errno.EACCES, errno.EPERM})
 
 MOUNT_MOUNTED = "mounted"
 MOUNT_OVERRIDE = "override"
@@ -208,6 +241,28 @@ class WriteFailed(SettingsStoreError):
 class LockTimeout(SettingsStoreError):
     code = "settings_busy"
     default_message = "The settings are being changed by another request; try again."
+
+
+class Unreadable(SettingsStoreError):
+    """A file a write depends on could not be read just now, for a reason that may pass."""
+
+    code = "settings_unreadable"
+    default_message = "The settings files could not be read just now; try again."
+
+
+class CredentialRefused(SettingsStoreError):
+    """Raised by a write's `authorize`: the key that let the request in may not write any more.
+
+    `code` is the refusal the request would get if it came now: "invalid_api_key" for a key
+    that is gone (revoked), "admin_key_required" for one that is no longer an admin.
+    """
+
+    code = "invalid_api_key"
+    default_message = "This key is no longer accepted; nothing was changed."
+
+    def __init__(self, code: str = "invalid_api_key", message: Optional[str] = None):
+        super().__init__(message)
+        self.code = code
 
 
 class RevisionConflict(SettingsStoreError):
@@ -321,7 +376,20 @@ def _reason(exc: BaseException) -> str:
         return "a key appears twice"
     if isinstance(exc, ValueError):
         return "not valid JSON"
+    if isinstance(exc, OSError) and exc.errno in errno.errorcode:
+        return f"{type(exc).__name__} {errno.errorcode[exc.errno]}"
     return type(exc).__name__
+
+
+def _may_pass(exc: OSError) -> bool:
+    """Did a read fail for a reason that may pass (descriptors, memory, I/O), not a verdict?"""
+    return exc.errno not in _PERSISTENT_READ_ERRORS
+
+
+def _reserved_name(name: str) -> bool:
+    """Is `name` (case and inner spaces aside) one the audit trail uses for another credential?"""
+    folded = " ".join(name.split()).casefold()
+    return any(folded == reserved.casefold() for reserved in RESERVED_CREDENTIAL_NAMES)
 
 
 def _fsync_directory(directory: str) -> None:
@@ -530,15 +598,20 @@ class FileLock:
 
 @dataclass(frozen=True)
 class Actor:
-    """Who asks: the client address, the Host it used and the credential's display name."""
+    """Who asks: the client address, the Host it used, the credential's display name and which
+    credential it is (a page key's id, DEPLOYMENT_KEY_ID, or "" for none or a one-time code)."""
 
     ip: str = ""
     host: str = ""
     credential: str = ""
+    credential_id: str = ""
 
     def as_dict(self) -> dict:
-        return {"ip": _clip(self.ip, 64), "host": _clip(self.host, 200),
-                "credential": _clip(self.credential, 80)}
+        record = {"ip": _clip(self.ip, 64), "host": _clip(self.host, 200),
+                  "credential": _clip(self.credential, 80)}
+        if self.credential_id:
+            record["credential_id"] = _clip(self.credential_id, 40)
+        return record
 
 
 @dataclass(frozen=True)
@@ -695,7 +768,8 @@ def _clean_values(raw: Mapping) -> tuple[dict, dict]:
 def _clean_saved_by(raw: Any) -> Optional[Mapping[str, str]]:
     if not isinstance(raw, dict):
         return None
-    return MappingProxyType({field: _clip(raw.get(field), 200) for field in ("ip", "host", "credential")
+    return MappingProxyType({field: _clip(raw.get(field), 200)
+                             for field in ("ip", "host", "credential", "credential_id")
                              if isinstance(raw.get(field), str)})
 
 
@@ -878,7 +952,11 @@ class SettingsStore:
         self._mount_checked = False
         self._mount_entry: Optional[MountEntry] = None
         self._state: Optional[SettingsState] = None
+        # The stat signature of each file as last read with a definite result. A read that failed
+        # for a reason that may pass leaves it alone, so the file is read again (after READ_RETRY_S).
         self._signatures: dict[str, Any] = {}
+        self._read_failures: dict[str, str] = {}      # file -> why its last read failed and may pass
+        self._read_retry_at: dict[str, float] = {}    # file -> time.monotonic() of the next attempt
         self._last_good_preferences: Optional[PreferencesState] = None
         self._keys_revision_floor = 0
         self.reads = 0
@@ -905,13 +983,15 @@ class SettingsStore:
 
     @staticmethod
     def _signature(path: Path) -> Any:
+        """What tells a changed file: os.replace() gives a new inode, and the owner, mode and
+        ctime show a repair by chmod/chown/setfacl of a file that could not be read."""
         try:
             st = os.stat(path, follow_symlinks=False)
         except (FileNotFoundError, NotADirectoryError):
             return None
         except OSError as exc:
             return ("error", exc.errno)
-        return (st.st_ino, st.st_mtime_ns, st.st_size, stat.S_IFMT(st.st_mode))
+        return (st.st_ino, st.st_mtime_ns, st.st_size, st.st_mode, st.st_uid, st.st_gid, st.st_ctime_ns)
 
     def _read_bytes(self, path: Path) -> bytes:
         """A regular file's bytes, never through a symbolic link; raises _Damaged or OSError."""
@@ -971,11 +1051,30 @@ class SettingsStore:
         return self._signature(path)
 
     def _keep_damaged_copy(self, name: str) -> None:
-        """Before a write replaces a damaged file, keep it as <name>.damaged (best effort)."""
+        """Before a write replaces a damaged file, keep it as <name>.damaged (best effort).
+
+        A file this process may not read (its permissions) is kept as it is, under the new name,
+        through a second hard link: the write that follows replaces only the old name.
+        """
+        source, target = self._path(name), self._path(f"{name}.damaged")
         try:
-            data = self._read_bytes(self._path(name))
-            self._atomic_write(self._path(f"{name}.damaged"), data)
+            data = self._read_bytes(source)
+        except FileNotFoundError:
+            return
         except (OSError, _Damaged):
+            data = None
+        try:
+            if data is not None:
+                self._atomic_write(target, data)
+                return
+            temp = self._path(f".{name}.damaged.{secrets.token_hex(4)}.tmp")
+            os.link(source, temp, follow_symlinks=False)
+            try:
+                os.replace(temp, target)
+            except OSError:
+                os.unlink(temp)
+                raise
+        except (OSError, NotImplementedError):
             pass
 
     # --- the mount ---------------------------------------------------------------------------
@@ -1019,49 +1118,86 @@ class SettingsStore:
                 self.refresh()
             return self._state
 
-    def refresh(self) -> bool:
-        """Stat the files; re-read the ones that changed. True when the state object changed."""
+    def refresh(self, force: bool = False) -> bool:
+        """Stat the files; re-read the ones that changed. True when the state object changed.
+
+        `force` re-reads gateway.json and keys.json whatever was cached (the write section does,
+        under the lock); a state equal to the one in force is kept as the same object.
+        """
         with self._mutex:
             old = self._state
             mount = self.mount_status()
             if old is not None and mount == old.mount:
                 mount = old.mount
             safe_mode = os.path.lexists(self._path(SAFE_MODE_FILE))
-            preferences = self._refresh_preferences(old.preferences if old else None)
-            keys = self._refresh_keys(old.keys if old else None)
+            preferences = self._refresh_preferences(old.preferences if old else None, force)
+            keys = self._refresh_keys(old.keys if old else None, force)
             if (old is not None and mount is old.mount and safe_mode == old.safe_mode
                     and preferences is old.preferences and keys is old.keys):
                 return False
             self._state = SettingsState(mount=mount, safe_mode=safe_mode, preferences=preferences, keys=keys)
             return True
 
-    def _refresh_preferences(self, previous: Optional[PreferencesState]) -> PreferencesState:
+    def _unchanged(self, name: str, signature: Any, previous: Any, force: bool) -> bool:
+        """Can `previous` stand without a read: the same file, or a failed read not yet due again?"""
+        if previous is None or force:
+            return False
+        if signature == self._signatures.get(name):
+            return True
+        retry_at = self._read_retry_at.get(name)
+        return retry_at is not None and time.monotonic() < retry_at
+
+    def _read_settled(self, name: str, signature: Any) -> None:
+        """The read had a definite result (the content, or a verdict on it): remember the file."""
+        self._signatures[name] = signature
+        self._read_failures.pop(name, None)
+        self._read_retry_at.pop(name, None)
+
+    def _read_failed(self, name: str, exc: OSError) -> None:
+        """The read failed for a reason that may pass: remember nothing, and try again later."""
+        reason = _reason(exc)
+        if self._read_failures.get(name) != reason:
+            logger.warning("settings: %s could not be read (%s); it is read again on a later request", name, reason)
+        self._read_failures[name] = reason
+        self._read_retry_at[name] = time.monotonic() + READ_RETRY_S
+
+    def _refresh_preferences(self, previous: Optional[PreferencesState], force: bool = False) -> PreferencesState:
         path = self._path(PREFERENCES_FILE)
         signature = self._signature(path)
-        if previous is not None and signature == self._signatures.get(PREFERENCES_FILE):
+        if self._unchanged(PREFERENCES_FILE, signature, previous, force):
             return previous
-        self._signatures[PREFERENCES_FILE] = signature
-        if signature is None:
-            self._last_good_preferences = _ABSENT_PREFERENCES
-            return _ABSENT_PREFERENCES
         try:
+            if signature is None:
+                raise FileNotFoundError(errno.ENOENT, PREFERENCES_FILE)
             state = _preferences_from_document(schema.parse_json_strict(self._read_bytes(path)),
                                                source=SOURCE_FILE)
         except FileNotFoundError:
-            self._last_good_preferences = _ABSENT_PREFERENCES
-            return _ABSENT_PREFERENCES
-        except (OSError, ValueError, _Damaged) as exc:
-            return self._damaged_preferences(_reason(exc))
-        if state.problems:
-            logger.warning("settings: %s", "; ".join(state.problems))
-        self._last_good_preferences = state
-        return state
+            state, signature = _ABSENT_PREFERENCES, None
+            self._last_good_preferences = state
+        except OSError as exc:
+            if _may_pass(exc):
+                self._read_failed(PREFERENCES_FILE, exc)
+                # Whatever was in force stays until the file can be read (a process that has
+                # nothing yet starts from its fallbacks, as for a damaged file).
+                if previous is not None:
+                    return previous
+                return self._damaged_preferences(_reason(exc), unread=True)
+            state = self._damaged_preferences(_reason(exc))
+        except (ValueError, _Damaged) as exc:
+            state = self._damaged_preferences(_reason(exc))
+        else:
+            if state.problems:
+                logger.warning("settings: %s", "; ".join(state.problems))
+            self._last_good_preferences = state
+        self._read_settled(PREFERENCES_FILE, signature)
+        return previous if previous is not None and state == previous else state
 
-    def _damaged_preferences(self, reason: str) -> PreferencesState:
-        problem = f"gateway.json is damaged ({reason})"
+    def _damaged_preferences(self, reason: str, *, unread: bool = False) -> PreferencesState:
+        problem = f"gateway.json could not be read ({reason})" if unread else f"gateway.json is damaged ({reason})"
+        log = logger.warning if unread else logger.error
         good = self._last_good_preferences
         if good is not None:
-            logger.error("settings: %s; keeping what was in force before", problem)
+            log("settings: %s; keeping what was in force before", problem)
             if good.source == SOURCE_ABSENT:
                 kept = "the app YAML values stay in force."
             else:
@@ -1070,11 +1206,11 @@ class SettingsStore:
                            problems=(f"{problem}; {kept}",) + good.problems)
         fallback = self._newest_history_state()
         if fallback is not None:
-            logger.error("settings: %s; using history revision %d", problem, fallback.revision)
+            log("settings: %s; using history revision %d", problem, fallback.revision)
             return replace(fallback, source=SOURCE_HISTORY, damaged=True,
                            problems=(f"{problem}; the saved version {fallback.revision} from the history "
                                      "is in force.",) + fallback.problems)
-        logger.error("settings: %s; using the app YAML values", problem)
+        log("settings: %s; using the app YAML values", problem)
         return replace(_ABSENT_PREFERENCES, source=SOURCE_NONE, damaged=True,
                        problems=(f"{problem}; the app YAML values are in force.",))
 
@@ -1088,29 +1224,44 @@ class SettingsStore:
             return replace(state, pending=None)
         return None
 
-    def _refresh_keys(self, previous: Optional[KeysState]) -> KeysState:
+    def _refresh_keys(self, previous: Optional[KeysState], force: bool = False) -> KeysState:
         path = self._path(KEYS_FILE)
         signature = self._signature(path)
-        if previous is not None and signature == self._signatures.get(KEYS_FILE):
+        if self._unchanged(KEYS_FILE, signature, previous, force):
             return previous
-        self._signatures[KEYS_FILE] = signature
-        if signature is None:
-            return _DEFAULT_KEYS
         try:
+            if signature is None:
+                raise FileNotFoundError(errno.ENOENT, KEYS_FILE)
             state = _keys_from_document(schema.parse_json_strict(self._read_bytes(path)))
         except FileNotFoundError:
-            return _DEFAULT_KEYS
-        except (OSError, ValueError, _Damaged) as exc:
-            reason = _reason(exc)
-            logger.error("settings: keys.json is damaged (%s); a key is required and only the app "
-                         "YAML key is accepted until it is repaired", reason)
-            return KeysState(
-                revision=self._keys_revision_floor, require_key=True,
-                deployment_key_role=schema.ROLE_CLIENT, keys=(), fail_closed=True,
-                problem=(f"keys.json is damaged ({reason}): a key is required, and only the app YAML "
-                         "key is accepted, until a recovery code rewrites it or it is deleted."))
-        self._keys_revision_floor = max(self._keys_revision_floor, state.revision)
-        return state
+            state, signature = _DEFAULT_KEYS, None
+        except OSError as exc:
+            if _may_pass(exc):
+                # The change that could not be read may be a revocation: fail closed meanwhile.
+                self._read_failed(KEYS_FILE, exc)
+                state = self._closed_keys(
+                    f"keys.json could not be read ({_reason(exc)}): a key is required, and only the app YAML "
+                    "key is accepted, until it can be read again.")
+                return previous if previous is not None and state == previous else state
+            state = self._closed_keys(self._damaged_keys_problem(_reason(exc)))
+        except (ValueError, _Damaged) as exc:
+            state = self._closed_keys(self._damaged_keys_problem(_reason(exc)))
+        else:
+            self._keys_revision_floor = max(self._keys_revision_floor, state.revision)
+        self._read_settled(KEYS_FILE, signature)
+        return previous if previous is not None and state == previous else state
+
+    @staticmethod
+    def _damaged_keys_problem(reason: str) -> str:
+        logger.error("settings: keys.json is damaged (%s); a key is required and only the app "
+                     "YAML key is accepted until it is repaired", reason)
+        return (f"keys.json is damaged ({reason}): a key is required, and only the app YAML "
+                "key is accepted, until a recovery code rewrites it or it is deleted.")
+
+    def _closed_keys(self, problem: str) -> KeysState:
+        """The fail-closed state: a key required, no page keys, the app YAML key a client."""
+        return KeysState(revision=self._keys_revision_floor, require_key=True,
+                         deployment_key_role=schema.ROLE_CLIENT, keys=(), fail_closed=True, problem=problem)
 
     def _history_entries(self) -> list[tuple[int, str, str]]:
         """(revision, stamp, id) of every history file, newest first."""
@@ -1154,16 +1305,27 @@ class SettingsStore:
     # --- writing: common ------------------------------------------------------------------------
 
     @contextmanager
-    def _exclusive(self):
+    def _exclusive(self, authorize: Optional[Callable[[KeysState], None]] = None):
         """The write section: a writable folder, this process's mutex, the cross-process lock,
-        and a state that is fresh under that lock."""
+        and a state that is fresh under that lock.
+
+        Fresh means read from the files now, not taken from this process's cache: a worker that
+        missed a change (a read that failed) must not decide from what it had before. A read that
+        fails again refuses the write (Unreadable). `authorize(keys)` then judges the credential
+        the write was let in with against the keys just read, so a key revoked or made a client
+        by any worker since the request arrived writes nothing.
+        """
         status = self.mount_status()
         if not status.writable:
             raise NotWritable()
         with self._mutex:
             self._lock.acquire()
             try:
-                self.refresh()
+                self.refresh(force=True)
+                if self._read_failures:
+                    raise Unreadable()
+                if authorize is not None:
+                    authorize(self._state.keys)
                 yield
             finally:
                 self._lock.release()
@@ -1246,8 +1408,13 @@ class SettingsStore:
         except OSError as exc:
             logger.warning("settings: could not append to the audit log (%s)", type(exc).__name__)
 
-    def audit(self, event: str, *, actor: Optional[Actor] = None, result: str = "ok", **fields: Any) -> None:
+    def audit(self, event: str, *, actor: Optional[Actor] = None, result: str = "ok", to_file: bool = True,
+              **fields: Any) -> None:
         """One audit line: to the logger always, to audit.jsonl when the folder is writable.
+
+        `to_file=False` is for what anyone can cause as often as they like (a refusal that needs no
+        admin key): the line goes to the logger only, takes no lock and touches no file, so a flood
+        of them cannot rotate the saves, claims and key changes out of audit.jsonl.
 
         Fields named like a secret (key, code, sha256, token, ...) are left out, and anything
         shaped like a page key, a code or a digest is masked. Never raises.
@@ -1257,6 +1424,8 @@ class SettingsStore:
         except Exception:  # pragma: no cover - only an exotic field type gets here
             line = json.dumps({"event": _clip(event, 40), "result": _clip(result, 80)})
         audit_logger.info("%s", line)
+        if not to_file:
+            return
         try:
             if not self.mount_status().writable:
                 return
@@ -1305,7 +1474,7 @@ class SettingsStore:
                 values[key] = previous
         changed = _changed(current.values, values)
         revision = max(current.revision, self._max_history_revision()) + 1
-        actor = Actor(credential="auto-revert")
+        actor = Actor(credential=AUTO_REVERT_ACTOR)
         document = self._preferences_document(revision, _iso(now), actor.as_dict(), values, None)
         self._store_preferences(document, None, values, keep_damaged=current.damaged)
         self._write_history(document, "auto-revert", changed, now)
@@ -1316,10 +1485,11 @@ class SettingsStore:
     @_write_operation
     def _write_preferences(self, build: Callable[[PreferencesState], tuple[dict, dict]], *, base_revision: int,
                            actor: Actor, check: Optional[Callable], dry_run: bool, event: str,
-                           audit_fields: Optional[Mapping[str, Any]] = None) -> WriteResult:
+                           audit_fields: Optional[Mapping[str, Any]] = None,
+                           authorize: Optional[Callable[[KeysState], None]] = None) -> WriteResult:
         if not _is_int(base_revision):
             raise InvalidInput({"base_revision": "Expected the revision the change is based on."})
-        with self._exclusive():
+        with self._exclusive(authorize):
             if self._state.preferences.pending is not None:
                 # An overdue confirmation is undone first; the caller's revision is then stale.
                 self._expire_locked()
@@ -1352,7 +1522,8 @@ class SettingsStore:
 
     def update_preferences(self, set_values: Optional[Mapping[str, Any]] = None, reset: Iterable[str] = (), *,
                            base_revision: int, actor: Actor, check: Optional[Callable] = None,
-                           dry_run: bool = False) -> WriteResult:
+                           dry_run: bool = False,
+                           authorize: Optional[Callable[[KeysState], None]] = None) -> WriteResult:
         """Set some overrides and remove others ("Reset to YAML"); every value is re-checked."""
         if set_values is not None and not isinstance(set_values, Mapping):
             raise InvalidInput({"set": "Expected an object of settings."})
@@ -1389,10 +1560,10 @@ class SettingsStore:
             return values, {}
 
         return self._write_preferences(build, base_revision=base_revision, actor=actor, check=check,
-                                       dry_run=dry_run, event="save")
+                                       dry_run=dry_run, event="save", authorize=authorize)
 
     def restore(self, history_id: str, *, base_revision: int, actor: Actor, check: Optional[Callable] = None,
-                dry_run: bool = False) -> WriteResult:
+                dry_run: bool = False, authorize: Optional[Callable[[KeysState], None]] = None) -> WriteResult:
         """Make a saved version current again, as a new revision (values invalid today are dropped)."""
         if not isinstance(history_id, str) or not _HISTORY_ID.fullmatch(history_id):
             raise HistoryNotFound()
@@ -1406,18 +1577,20 @@ class SettingsStore:
             return dict(state.values), dict(state.dropped)
 
         return self._write_preferences(build, base_revision=base_revision, actor=actor, check=check,
-                                       dry_run=dry_run, event="restore", audit_fields={"history_id": history_id})
+                                       dry_run=dry_run, event="restore", audit_fields={"history_id": history_id},
+                                       authorize=authorize)
 
     def discard(self, *, base_revision: int, actor: Actor, check: Optional[Callable] = None,
-                dry_run: bool = False) -> WriteResult:
+                dry_run: bool = False, authorize: Optional[Callable[[KeysState], None]] = None) -> WriteResult:
         """Drop every override (the app YAML values apply); the discarded version stays in the history."""
         return self._write_preferences(lambda _current: ({}, {}), base_revision=base_revision, actor=actor,
-                                       check=check, dry_run=dry_run, event="discard")
+                                       check=check, dry_run=dry_run, event="discard", authorize=authorize)
 
     @_write_operation
-    def confirm(self, revision: int, *, actor: Optional[Actor] = None) -> bool:
+    def confirm(self, revision: int, *, actor: Optional[Actor] = None,
+                authorize: Optional[Callable[[KeysState], None]] = None) -> bool:
         """Clear the pending record created by `revision`; False when there is none or it is overdue."""
-        with self._exclusive():
+        with self._exclusive(authorize):
             current = self._state.preferences
             pending = current.pending
             if pending is None or not _is_int(revision) or revision != pending.revision:
@@ -1484,10 +1657,19 @@ class SettingsStore:
 
     @staticmethod
     def _checked_key_fields(name: Any, key: Any, role: Any = schema.ROLE_ADMIN) -> tuple[str, str]:
+        """The new key's name and role, or InvalidInput. Checked before anything is locked or
+        read, so a refused name costs no code.
+
+        A name the audit trail uses for another credential ("deployment key", "one-time code",
+        "auto-revert") is refused here, when a key is made, and never when keys.json is read: one
+        such name in an older file must not fail the whole file closed.
+        """
         errors = {}
         clean_name = clean_role = None
         try:
             clean_name = schema.validate_key_name(name)
+            if _reserved_name(clean_name):
+                errors["name"] = "This name is reserved for the audit trail; choose another."
         except schema.ValueInvalid as exc:
             errors["name"] = exc.message
         try:
@@ -1504,7 +1686,8 @@ class SettingsStore:
 
     @_write_operation
     def set_access(self, *, base_revision: int, actor: Actor, deployment_key_present: bool,
-                   require_key: Optional[bool] = None, deployment_key_role: Optional[str] = None) -> KeysState:
+                   require_key: Optional[bool] = None, deployment_key_role: Optional[str] = None,
+                   authorize: Optional[Callable[[KeysState], None]] = None) -> KeysState:
         """Open or key-required API, and the YAML key's role; refuses a change that leaves no admin."""
         errors = {}
         if require_key is not None and not isinstance(require_key, bool):
@@ -1518,7 +1701,7 @@ class SettingsStore:
             errors["base_revision"] = "Expected the revision the change is based on."
         if errors:
             raise InvalidInput(errors)
-        with self._exclusive():
+        with self._exclusive(authorize):
             current = self._usable_keys()
             if base_revision != current.revision:
                 raise RevisionConflict(current.revision)
@@ -1543,10 +1726,11 @@ class SettingsStore:
             return state
 
     @_write_operation
-    def add_key(self, *, name: str, role: str, key: str, actor: Actor) -> KeyRecord:
+    def add_key(self, *, name: str, role: str, key: str, actor: Actor,
+                authorize: Optional[Callable[[KeysState], None]] = None) -> KeyRecord:
         """Store a page key as its digest and hint; the plaintext is not kept anywhere."""
         clean_name, clean_role = self._checked_key_fields(name, key, role)
-        with self._exclusive():
+        with self._exclusive(authorize):
             current = self._usable_keys()
             if len(current.keys) >= MAX_KEYS:
                 raise KeyLimitReached()
@@ -1561,9 +1745,10 @@ class SettingsStore:
             return record
 
     @_write_operation
-    def revoke_key(self, key_id: str, *, actor: Actor, deployment_key_present: bool) -> KeyRecord:
+    def revoke_key(self, key_id: str, *, actor: Actor, deployment_key_present: bool,
+                   authorize: Optional[Callable[[KeysState], None]] = None) -> KeyRecord:
         """Remove a page key; the last admin credential cannot go."""
-        with self._exclusive():
+        with self._exclusive(authorize):
             current = self._usable_keys()
             record = next((r for r in current.keys if isinstance(key_id, str) and r.id == key_id), None)
             if record is None:
@@ -1580,7 +1765,11 @@ class SettingsStore:
     # --- one-time codes ----------------------------------------------------------------------
 
     def _load_codes(self) -> dict:
-        """{"last_issued_at", "codes"}: only well-formed codes that are still usable."""
+        """{"last_issued_at", "codes"}: only well-formed codes that are still usable.
+
+        An "attempts_left" written by an earlier version is ignored (codes have no attempt
+        budget any more); codes.json only ever holds codes of the last 30 minutes.
+        """
         empty = {"last_issued_at": None, "codes": []}
         try:
             document = schema.parse_json_strict(self._read_bytes(self._path(CODES_FILE)))
@@ -1598,14 +1787,13 @@ class SettingsStore:
             if not isinstance(record, dict):
                 continue
             digest, purpose = record.get("sha256"), record.get("purpose")
-            issued, expires, attempts = record.get("issued_at"), record.get("expires_at"), record.get("attempts_left")
+            issued, expires = record.get("issued_at"), record.get("expires_at")
             if (not isinstance(digest, str) or not _HEX64.fullmatch(digest) or purpose not in CODE_PURPOSES
-                    or not _is_number(issued) or not _is_number(expires) or not _is_int(attempts)):
+                    or not _is_number(issued) or not _is_number(expires)):
                 continue
-            if expires <= now or attempts <= 0:
+            if expires <= now:
                 continue
-            codes.append({"sha256": digest, "purpose": purpose, "issued_at": issued, "expires_at": expires,
-                          "attempts_left": min(attempts, CODE_ATTEMPTS)})
+            codes.append({"sha256": digest, "purpose": purpose, "issued_at": issued, "expires_at": expires})
         return {"last_issued_at": last if _is_number(last) else None, "codes": codes}
 
     def _save_codes(self, document: Mapping) -> None:
@@ -1623,17 +1811,13 @@ class SettingsStore:
         return found
 
     def _refuse_code(self, document: dict, purpose: str, actor: Optional[Actor]) -> None:
-        """A wrong code burns one attempt of every active code of that purpose."""
-        if document["codes"]:
-            kept = []
-            for record in document["codes"]:
-                if record["purpose"] == purpose:
-                    record = {**record, "attempts_left": record["attempts_left"] - 1}
-                    if record["attempts_left"] <= 0:
-                        continue
-                kept.append(record)
-            document["codes"] = kept
-            self._save_codes(document)
+        """A wrong code is recorded and changes nothing else.
+
+        It cannot be told which code a wrong guess was aimed at, so a budget per code would be
+        one budget for every caller: a few wrong guesses from anyone on the network would cancel
+        the code the owner is about to type. A 100-bit code needs no budget; the gateway limits
+        wrong codes per address instead (its Settings limiter).
+        """
         self._audit_locked("code-refused", actor, result="refused", purpose=purpose,
                            active_codes=len(document["codes"]))
 
@@ -1655,7 +1839,7 @@ class SettingsStore:
                                   f"{CODE_MAX_ACTIVE} codes are still valid; use one of them from the log.")
             canonical = "".join(secrets.choice(CODE_ALPHABET) for _ in range(CODE_LENGTH))
             document["codes"].append({"sha256": _code_digest(canonical), "purpose": purpose, "issued_at": now,
-                                      "expires_at": now + CODE_TTL_S, "attempts_left": CODE_ATTEMPTS})
+                                      "expires_at": now + CODE_TTL_S})
             document["last_issued_at"] = now
             self._save_codes(document)
             self._audit_locked("code-issued", actor, purpose=purpose, expires_at=_iso(now + CODE_TTL_S))
@@ -1663,7 +1847,7 @@ class SettingsStore:
 
     @_write_operation
     def redeem_code(self, code: Any, *, purpose: str = "claim", actor: Optional[Actor] = None) -> bool:
-        """Use a code up: True once for the right one; a wrong one burns attempts."""
+        """Use a code up: True once for the right one; a wrong one changes nothing (it is audited)."""
         with self._exclusive():
             document = self._load_codes()
             index = self._find_code(document, code, purpose)
@@ -1677,12 +1861,18 @@ class SettingsStore:
 
     @_write_operation
     def claim(self, *, code: Any, name: str, key: str, require_key: Optional[bool] = None,
-              actor: Actor) -> KeyRecord:
+              actor: Actor, claimed: Optional[Callable[[KeysState], bool]] = None) -> KeyRecord:
         """With a one-time code: create an admin page key (and optionally require keys).
 
         Also the recovery path: on a damaged keys.json it starts from an empty file in the
         fail-closed state (a key required, the YAML key a client) and keeps the damaged one as
         keys.json.damaged. The key limit does not apply here, so a full list cannot block recovery.
+        Whether keys.json is damaged is decided by the read just made under the lock, never by
+        what this process cached (a read that may pass refuses the claim instead: Unreadable).
+
+        `claimed(keys)` says whether the server had an admin credential before; the audit line
+        is "recovery" when it had (someone who can read the log made an extra admin key) or when
+        keys.json was damaged, and "claim" otherwise.
         """
         clean_name, _role = self._checked_key_fields(name, key)
         if require_key is not None and not isinstance(require_key, bool):
@@ -1696,6 +1886,7 @@ class SettingsStore:
                 raise InvalidCode()
             current = self._state.keys
             recovering = current.fail_closed
+            was_claimed = bool(claimed(current)) if claimed is not None else current.has_admin(False)
             existing = () if recovering else current.keys
             digest = key_digest(key)
             self._check_new_key(existing, clean_name, digest)
@@ -1710,6 +1901,7 @@ class SettingsStore:
             if recovering:
                 self._keep_damaged_copy(KEYS_FILE)
             self._store_keys(state)
-            self._audit_locked("claim", actor, key_id=record.id, name=record.name, role=record.role,
-                               hint=record.hint, require_key=state.require_key, recovered=recovering)
+            self._audit_locked("recovery" if recovering or was_claimed else "claim", actor, key_id=record.id,
+                               name=record.name, role=record.role, hint=record.hint, require_key=state.require_key,
+                               recovered=recovering, server_was_claimed=was_claimed)
             return record
