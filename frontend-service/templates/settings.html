@@ -5,16 +5,216 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Settings - TTS-STT Platform</title>
     <!-- Root-relative on purpose: the page's CSP allows 'self' only, and an absolute
-         URL built from the request could name another scheme behind a proxy. -->
+         URL built from the request could name another scheme behind a proxy.
+         No inline script, style or event handler anywhere: settings.js builds the
+         fields with createElement/textContent and wires controls by data-action. -->
     <link rel="stylesheet" href="/static/css/style.css?v={{ app_version }}">
 </head>
-<body>
-    <main class="container" id="settings-root">
-        <h1>Settings</h1>
-        <p id="settings-status" role="status" aria-live="polite">Loading the settings...</p>
-        <noscript><p>The Settings page needs JavaScript.</p></noscript>
-        <p><a href="/">Back to the app</a></p>
-    </main>
+<body class="settings-page">
+    <div class="container settings-container">
+        <header class="settings-header">
+            <div>
+                <h1>Settings</h1>
+                <p class="settings-subtitle">How this server is reached, who may use it, which engines it offers and its limits. Saved on the server and in force at once, without a restart.</p>
+            </div>
+            <a href="/" class="api-docs-link">Back to the app</a>
+        </header>
+
+        <noscript><p class="warning">The Settings page needs JavaScript.</p></noscript>
+
+        <div id="settings-banners" class="settings-banners" aria-live="polite"></div>
+        <div id="settings-status" class="settings-status" role="status" aria-live="polite">Loading the settings...</div>
+        <div id="settings-who" class="settings-who" hidden></div>
+
+        <!-- Shown when the server asks for an admin key (401) or the key in this tab is not one (403). -->
+        <section id="key-panel" class="settings-card" aria-labelledby="key-panel-title" hidden>
+            <h2 id="key-panel-title">Admin key needed</h2>
+            <p id="key-panel-text" class="card-intro"></p>
+            <label for="key-input">Admin key</label>
+            <div class="inline-row">
+                <input id="key-input" type="password" autocomplete="off" spellcheck="false" autocapitalize="none" data-enter="use-key">
+                <button type="button" class="btn-primary" data-action="use-key">Use this key</button>
+            </div>
+            <p class="setting-help">It is kept for this browser tab only, together with the main page's key, and sent as <code>Authorization: Bearer</code>.</p>
+            <p id="key-panel-error" class="setting-error" role="alert" hidden></p>
+            <p class="card-footnote">Lost your admin key? <button type="button" class="link-button" data-action="start-recovery">Print a recovery code</button></p>
+        </section>
+
+        <!-- Claim (no admin key exists yet) or recovery (a lost admin key): a one-time code from the container log. -->
+        <section id="claim-card" class="settings-card claim-card" aria-labelledby="claim-title" hidden>
+            <h2 id="claim-title">Claim this server</h2>
+            <p id="claim-intro" class="card-intro"></p>
+            <ol class="claim-steps">
+                <li>
+                    <p>Ask the server to print a one-time code to its own log. Only someone who can read the logs of the frontend-service container sees it.</p>
+                    <button type="button" class="btn-secondary" data-action="print-code">Print a one-time code</button>
+                    <p id="claim-code-status" class="setting-note" aria-live="polite"></p>
+                </li>
+                <li>
+                    <label for="claim-code">One-time code from the log</label>
+                    <input id="claim-code" autocomplete="off" spellcheck="false" autocapitalize="characters" placeholder="XXXXX-XXXXX-XXXXX-XXXXX" data-watch="claim">
+                    <label for="claim-name" class="label-spaced">Name of your admin key</label>
+                    <input id="claim-name" maxlength="64" autocomplete="off" value="Admin" data-watch="claim">
+                    <label class="check label-spaced" id="claim-require-row">
+                        <input type="checkbox" id="claim-require" data-watch="claim">
+                        <span>Also require a key for the API from now on. Clients that send no key (scripts, Home Assistant, OpenAI-style clients) then stop working until they get one.</span>
+                    </label>
+                </li>
+                <li>
+                    <p>This is your new admin key, generated in this browser. It is shown only now: store it, for example in your password manager.</p>
+                    <div class="inline-row">
+                        <input id="claim-key" class="key-value" readonly aria-label="Your new admin key" spellcheck="false">
+                        <button type="button" class="btn-secondary" data-action="copy-claim-key">Copy</button>
+                    </div>
+                    <p id="claim-copy-status" class="setting-note" aria-live="polite"></p>
+                    <label class="check">
+                        <input type="checkbox" id="claim-stored" data-watch="claim">
+                        <span>I have stored it</span>
+                    </label>
+                </li>
+            </ol>
+            <p id="claim-error" class="setting-error" role="alert" hidden></p>
+            <div class="button-row">
+                <button type="button" id="claim-button" class="btn-primary" data-action="claim" disabled>Create the admin key</button>
+                <button type="button" id="claim-cancel" class="btn-secondary" data-action="cancel-claim">Cancel</button>
+            </div>
+        </section>
+
+        <main id="settings-main" hidden>
+            <p id="readonly-note" class="settings-readonly" hidden></p>
+
+            <section id="card-access" class="settings-card" aria-labelledby="card-access-title">
+                <h2 id="card-access-title">Access</h2>
+                <p class="card-intro">The names and addresses this server answers to. Requests under any other name are refused, which protects the API against DNS rebinding.</p>
+                <div id="fields-access" class="settings-fields"></div>
+            </section>
+
+            <section id="card-api_access" class="settings-card" aria-labelledby="card-api_access-title">
+                <h2 id="card-api_access-title">API access &amp; keys</h2>
+                <p class="card-intro">Whether the API needs a key, and the keys that work. An admin key may also change these settings; a client key may only use the API.</p>
+                <div id="fields-api_access" class="settings-fields"></div>
+                <h3 id="keys-title">API keys</h3>
+                <p id="keys-count" class="setting-note"></p>
+                <ul id="keys-list" class="item-list" aria-labelledby="keys-title"></ul>
+                <div class="button-row">
+                    <button type="button" id="create-key-button" class="btn-secondary" data-action="create-key">Create a key</button>
+                </div>
+            </section>
+
+            <section id="card-engines" class="settings-card" aria-labelledby="card-engines-title">
+                <h2 id="card-engines-title">Engines</h2>
+                <p class="card-intro">Which optional engines the web UI and the API offer, and the default ones. Offering an engine does not install it: its container is installed once in the app YAML.</p>
+                <div class="inline-row engines-line">
+                    <p id="engines-line" class="setting-note" aria-live="polite"></p>
+                    <button type="button" class="btn-secondary btn-sm" data-action="recheck-engines">Check again</button>
+                </div>
+                <div id="fields-engines" class="settings-fields"></div>
+            </section>
+
+            <section id="card-limits" class="settings-card" aria-labelledby="card-limits-title">
+                <h2 id="card-limits-title">Limits</h2>
+                <p class="card-intro">What one request may ask of the gateway. Every value has a floor, so no limit can lock this page out.</p>
+                <div id="fields-limits" class="settings-fields"></div>
+            </section>
+
+            <section id="card-history" class="settings-card" aria-labelledby="card-history-title">
+                <h2 id="card-history-title">History &amp; recovery</h2>
+                <p class="card-intro">The last 20 saved versions. Restoring one saves it again as a new version.</p>
+                <ol id="history-list" class="item-list"></ol>
+                <div class="button-row">
+                    <button type="button" id="discard-button" class="btn-secondary" data-action="discard">Back to the app YAML</button>
+                </div>
+                <p class="setting-help">Back to the app YAML drops every value saved here; the YAML values apply again and the dropped version stays in the history.</p>
+                <p class="card-footnote">Lost your admin key? <button type="button" class="link-button" data-action="start-recovery">Print a recovery code</button></p>
+                <details class="recovery-details">
+                    <summary>Recovery without this page</summary>
+                    <ul>
+                        <li>Delete <code>settings/gateway.json</code> in the app's dataset: the app YAML values apply from the next request on.</li>
+                        <li>Create an empty file <code>settings/SAFE-MODE</code>: saved values are ignored until it is deleted. API keys stay in force.</li>
+                        <li>Set <code>ENABLE_SETTINGS_UI: false</code> in the app YAML: this page becomes read-only and saved values are ignored.</li>
+                        <li>Delete <code>settings/keys.json</code>: the keys made here are gone and the API follows the app YAML key again.</li>
+                    </ul>
+                </details>
+            </section>
+
+            <section id="card-yaml" class="settings-card" aria-labelledby="card-yaml-title">
+                <h2 id="card-yaml-title">Set in the app YAML, not here</h2>
+                <p class="card-intro">These need the container to be created again, or are controls a web page must not hold over itself. Change them in the app YAML (TrueNAS: Apps, tts-stt, Edit).</p>
+                <ul class="yaml-list">
+                    <li>Release and updates: <code>IMAGE_TAG</code>, <code>PULL_POLICY</code>, <code>IMAGE_REGISTRY</code>, <code>NEMO_IMAGE_SUFFIX</code>, <code>DIUN_*</code></li>
+                    <li>GPU: <code>GPU_DEVICE_ID</code></li>
+                    <li>Web UI port and bind address: <code>FRONTEND_PORT</code>, <code>FRONTEND_BIND_ADDR</code></li>
+                    <li>Data folder: <code>APP_DATA_DIR</code></li>
+                    <li>Which optional containers are installed: their <code>profiles:</code> lines</li>
+                    <li>The host check's off switch: <code>ALLOWED_HOSTS='*'</code></li>
+                    <li>Any web page may call the API: <code>ALLOWED_ORIGINS='*'</code>; cookies for it: <code>ALLOW_CREDENTIALS</code></li>
+                    <li>The deployment key: <code>API_KEY</code></li>
+                    <li>This page's own switches: <code>ENABLE_SETTINGS_UI</code>, <code>SETTINGS_LOCKED_KEYS</code></li>
+                </ul>
+                <h3>In force now</h3>
+                <dl id="yaml-facts" class="yaml-facts"></dl>
+            </section>
+        </main>
+
+        <div id="save-bar" class="save-bar" role="region" aria-label="Unsaved changes" hidden>
+            <span id="save-bar-count" aria-live="polite"></span>
+            <div class="button-row">
+                <button type="button" class="btn-secondary" data-action="undo-draft">Undo the changes</button>
+                <button type="button" id="review-button" class="btn-primary" data-action="review">Review and save</button>
+            </div>
+        </div>
+    </div>
+
+    <dialog id="review-dialog" class="settings-dialog" aria-labelledby="review-title">
+        <h2 id="review-title">Review the changes</h2>
+        <p id="review-intro" class="card-intro"></p>
+        <div id="review-rows" class="review-rows"></div>
+        <div id="review-notes"></div>
+        <div id="review-warnings"></div>
+        <p id="review-confirm" class="setting-note" hidden></p>
+        <p id="review-error" class="setting-error" role="alert" hidden></p>
+        <div class="button-row dialog-actions">
+            <button type="button" id="review-back" class="btn-secondary" data-action="review-cancel">Back</button>
+            <button type="button" id="review-save" class="btn-primary" data-action="review-save">Save</button>
+        </div>
+    </dialog>
+
+    <dialog id="key-dialog" class="settings-dialog" aria-labelledby="key-dialog-title">
+        <h2 id="key-dialog-title">Create an API key</h2>
+        <div id="key-dialog-form">
+            <label for="new-key-name">Name</label>
+            <input id="new-key-name" maxlength="64" autocomplete="off" data-watch="key-dialog">
+            <p class="setting-help">Who uses it, for example Home Assistant or Laptop.</p>
+            <fieldset class="setting-choice">
+                <legend>Role</legend>
+                <label class="check"><input type="radio" name="new-key-role" id="new-key-role-client" value="client" checked data-watch="key-dialog"><span>client: use the API only</span></label>
+                <label class="check"><input type="radio" name="new-key-role" id="new-key-role-admin" value="admin" data-watch="key-dialog"><span>admin: use the API and change these settings</span></label>
+            </fieldset>
+            <p class="label-spaced">The key, generated in this browser. It is shown only now; the server keeps only a fingerprint of it.</p>
+            <div class="inline-row">
+                <input id="new-key-value" class="key-value" readonly aria-label="The new key" spellcheck="false">
+                <button type="button" class="btn-secondary" data-action="copy-key">Copy</button>
+            </div>
+            <p id="new-key-copy-status" class="setting-note" aria-live="polite"></p>
+            <label class="check">
+                <input type="checkbox" id="new-key-stored" data-watch="key-dialog">
+                <span>I have stored it</span>
+            </label>
+            <p id="key-dialog-error" class="setting-error" role="alert" hidden></p>
+            <div class="button-row dialog-actions">
+                <button type="button" class="btn-secondary" data-action="key-dialog-close">Cancel</button>
+                <button type="button" id="key-dialog-save" class="btn-primary" data-action="key-dialog-save" disabled>Save the key</button>
+            </div>
+        </div>
+        <div id="key-dialog-done" hidden>
+            <p id="key-dialog-done-text" role="status"></p>
+            <div class="button-row dialog-actions">
+                <button type="button" id="use-new-key" class="btn-secondary" data-action="use-new-key">Use it in this tab</button>
+                <button type="button" class="btn-primary" data-action="key-dialog-close">Close</button>
+            </div>
+        </div>
+    </dialog>
+
     <script defer src="/static/js/settings.js?v={{ app_version }}"></script>
 </body>
 </html>

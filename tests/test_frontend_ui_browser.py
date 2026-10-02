@@ -7,6 +7,9 @@ transcription WebSocket is played by the test too, frame by frame, so a scenario
 such as "the server sends a shorter `confirmed`" or "the socket closes with 1011"
 can be produced exactly.
 
+The Settings page (/settings) is tested at the end against a real gateway with a
+real settings folder: nothing under /api/settings is mocked there.
+
 Skips when Playwright or its Chromium is not installed (CI only installs the
 test requirements; the browser is preinstalled in the dev image). Like the other
 frontend suites it honours `FRONTEND_SERVICE_DIR`, which is how these were run
@@ -16,8 +19,10 @@ against the previous UI code to show that they fail there.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
+import logging
 import os
 import re
 import threading
@@ -25,6 +30,7 @@ import time
 import wave
 from urllib.parse import urlparse
 
+import httpx
 import pytest
 
 playwright_sync = pytest.importorskip("playwright.sync_api", reason="playwright not installed")
@@ -1003,3 +1009,228 @@ def test_a_page_on_a_rebound_hostname_gets_nothing_from_the_gateway(browser, mon
         rebinding.close()
         server.should_exit = True
         thread.join(timeout=10)
+
+
+# --- voice training offered or not --------------------------------------------------------
+
+
+def test_without_training_the_main_page_has_no_training_tab_and_asks_nothing_of_it(browser):
+    """ENABLE_TRAINING=false (TrueNAS, the RK3588): no tab whose every call is a 404, no request
+    to the training API, and switching engines does not bring the tab back."""
+    module = load_frontend_app({"ENABLE_TRAINING": "false"})
+    server, thread, port = _serve(module)
+    try:
+        with _ui_session(browser, f"http://127.0.0.1:{port}") as ui:
+            ui.open()
+            assert ui.page.query_selector("#training-tab-button") is None
+            assert ui.page.query_selector("#training-tab") is None
+            assert ui.page.query_selector("#service-status-piper-training") is None
+            ui.use_qwen3()
+            ui.use_engine("piper")
+            assert ui.page.query_selector("#training-tab-button") is None
+            assert ui.api.calls_to("GET", "/api/training") == []
+            assert ui.errors() == [] and ui.api.unmocked == []
+
+            # the gear next to "API Documentation"
+            ui.page.click("a[href='/settings']")
+            ui.page.wait_for_url("**/settings")
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10)
+
+
+# --- the Settings page, against a real gateway and a real settings folder -----------------
+#
+# Nothing is mocked here: /api/settings* is the gateway's own, the folder is a temporary
+# TTS_STT_SETTINGS_DIR, and the page runs under the gateway's Content-Security-Policy.
+# Every test also collects CSP violations (from an init script, which the policy does not
+# apply to) and page errors, so inline code or style anywhere would fail it.
+
+CLAIM_CODE = re.compile(r"\b[0-9A-Z]{5}(?:-[0-9A-Z]{5}){3}\b")
+
+
+@pytest.fixture
+def settings_gateway(tmp_path, monkeypatch):
+    """start(env) -> (module, base URL, settings folder) of a gateway serving on a real socket."""
+    started = []
+
+    def start(env=None):
+        folder = tmp_path / "settings"
+        folder.mkdir(exist_ok=True)
+        module = load_frontend_app({"TTS_STT_SETTINGS_DIR": str(folder), **(env or {})})
+
+        async def nothing_installed(host):
+            return False                     # no optional engine's name resolves: no network
+
+        monkeypatch.setattr(module, "_engine_resolver", nothing_installed)
+        server, thread, port = _serve(module)
+        started.append((server, thread))
+        return module, f"http://127.0.0.1:{port}", folder
+
+    yield start
+    for server, thread in started:
+        server.should_exit = True
+        thread.join(timeout=10)
+
+
+class SettingsPage:
+    def __init__(self, browser, base, **context_options):
+        self.base = base
+        self.context = browser.new_context(**context_options)
+        self.page = self.context.new_page()
+        self.page.set_default_timeout(TIMEOUT_MS)
+        self.problems: list[str] = []
+        self.page.add_init_script("""
+            window.__violations = [];
+            document.addEventListener('securitypolicyviolation',
+                (event) => window.__violations.push(event.violatedDirective + ' ' + event.blockedURI));
+        """)
+        self.page.on("pageerror", lambda error: self.problems.append(f"pageerror: {error}"))
+        # A 401 before the key is entered is the page working as meant; anything else is not.
+        self.page.on("console", lambda message: self.problems.append(f"{message.type}: {message.text}")
+                     if message.type == "error" and "Failed to load resource" not in message.text else None)
+        self.page.route("**/favicon.ico", lambda route: route.fulfill(status=204))
+
+    def open(self, key=None):
+        if key:
+            self.page.add_init_script(f"sessionStorage.setItem('tts-stt.api-key', {json.dumps(key)})")
+        self.page.goto(self.base + "/settings", wait_until="load")
+
+    def status_says(self, text):
+        self.page.wait_for_function(
+            "(text) => document.querySelector('#settings-status').innerText.includes(text)", arg=text)
+
+    def tab_to(self, element_id, limit=60):
+        for _ in range(limit):
+            self.page.keyboard.press("Tab")
+            if self.page.evaluate("document.activeElement && document.activeElement.id") == element_id:
+                return
+        pytest.fail(f"#{element_id} cannot be reached with the Tab key")
+
+    def fits(self):
+        return self.page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+
+    def clean(self):
+        return self.page.evaluate("window.__violations") == [] and self.problems == []
+
+    def close(self):
+        self.context.close()
+
+
+def test_settings_page_adds_a_host_name_and_it_stays_after_a_reload(browser, settings_gateway):
+    """The owner's case: the page opened by IP address, the name the NAS is reached by added,
+    saved, reloaded. The name works from the next request on and is shown as set here."""
+    module, base, folder = settings_gateway({"API_KEY": KEY, "TRUSTED_HOSTS": "truenas.k2o"})
+    ui = SettingsPage(browser, base)
+    page = ui.page
+    try:
+        ui.open()
+        page.wait_for_selector("#key-panel:not([hidden])")
+        assert httpx.get(base + "/providers", headers={"Host": "speach.k2o"}).status_code == 403
+        page.fill("#key-input", KEY)
+        page.press("#key-input", "Enter")
+        page.wait_for_selector("#input-TRUSTED_HOSTS:not([disabled])")
+        assert page.input_value("#input-TRUSTED_HOSTS") == "truenas.k2o"
+        assert "App YAML" in page.inner_text("#setting-TRUSTED_HOSTS")
+
+        page.fill("#input-TRUSTED_HOSTS", "truenas.k2o\nspeach.k2o")
+        page.click("#review-button")
+        page.wait_for_selector("#review-dialog[open]")
+        assert "speach.k2o" in page.inner_text("#review-rows")
+        page.click("#review-save")
+        ui.status_says("Saved")
+        assert httpx.get(base + "/providers", headers={"Host": "speach.k2o"}).status_code == 200, \
+            "in force from the next request, without a restart"
+
+        page.reload(wait_until="load")
+        page.wait_for_selector("#input-TRUSTED_HOSTS:not([disabled])")
+        assert page.input_value("#input-TRUSTED_HOSTS") == "truenas.k2o\nspeach.k2o"
+        assert "Set here" in page.inner_text("#setting-TRUSTED_HOSTS")
+        assert json.loads((folder / "gateway.json").read_text(encoding="utf-8"))["values"]["TRUSTED_HOSTS"] == [
+            "truenas.k2o", "speach.k2o"]
+        assert page.evaluate("sessionStorage.getItem('tts-stt.api-key')") == KEY, "the main page's key slot"
+        assert ui.clean(), (page.evaluate("window.__violations"), ui.problems)
+    finally:
+        ui.close()
+
+
+class _LogLines(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.lines: list[str] = []
+
+    def emit(self, record):
+        self.lines.append(record.getMessage())
+
+
+def test_a_keyless_server_is_claimed_with_the_code_from_its_log(browser, settings_gateway):
+    module, base, folder = settings_gateway()
+    log = _LogLines()
+    claim_log = logging.getLogger("tts_stt.settings.claim")
+    claim_log.addHandler(log)
+    ui = SettingsPage(browser, base)
+    page = ui.page
+    try:
+        ui.open()
+        page.wait_for_selector("#claim-card:not([hidden])")
+        assert page.is_disabled("#input-TRUSTED_HOSTS"), "nothing can be changed before the claim"
+        page.click("[data-action=print-code]")
+        # A function, not an expression: the page's CSP has no 'unsafe-eval' for Playwright to poll with.
+        page.wait_for_function("() => document.querySelector('#claim-code-status').innerText.includes('log')")
+        code = CLAIM_CODE.findall(" ".join(log.lines))[-1]
+        assert code not in page.content(), "the code is in the container log, nowhere else"
+
+        page.fill("#claim-code", code)
+        assert page.is_disabled("#claim-button")
+        page.check("#claim-stored")
+        key = page.input_value("#claim-key")
+        page.click("#claim-button")
+        ui.status_says("claimed")
+        assert page.evaluate("sessionStorage.getItem('tts-stt.api-key')") == key
+        page.wait_for_selector("#input-TRUSTED_HOSTS:not([disabled])")
+        stored = (folder / "keys.json").read_text(encoding="utf-8")
+        assert key not in stored
+        assert [(record["name"], record["role"], record["sha256"]) for record in json.loads(stored)["keys"]] == [
+            ("Admin", "admin", hashlib.sha256(key.encode()).hexdigest())]
+        assert ui.clean(), (page.evaluate("window.__violations"), ui.problems)
+    finally:
+        claim_log.removeHandler(log)
+        ui.close()
+
+
+def test_the_settings_page_fits_a_phone_and_works_from_the_keyboard(browser, settings_gateway):
+    module, base, folder = settings_gateway({"API_KEY": KEY})
+    ui = SettingsPage(browser, base, viewport={"width": 360, "height": 740})
+    page = ui.page
+    try:
+        ui.open(KEY)
+        page.wait_for_selector("#input-MAX_TTS_CHARS:not([disabled])")
+        assert ui.fits(), "the page scrolls sideways at phone width"
+        assert page.evaluate("getComputedStyle(document.body).paddingLeft") == "16px"
+
+        page.focus("#input-MAX_TTS_CHARS")
+        page.keyboard.press("Control+A")
+        page.keyboard.type("6000")
+        ui.tab_to("review-button")
+        page.keyboard.press("Enter")
+        page.wait_for_selector("#review-dialog[open]")
+        assert ui.fits()
+        assert page.evaluate("document.activeElement.type") == "checkbox", "the warning to tick has the focus"
+        page.keyboard.press("Escape")
+        page.wait_for_selector("#review-dialog", state="hidden")
+        # the focus goes back where it was (after the dialog's close event, which comes a task later)
+        page.wait_for_function("() => document.activeElement && document.activeElement.id === 'review-button'")
+
+        page.keyboard.press("Enter")
+        page.wait_for_selector("#review-dialog[open]")
+        assert page.is_disabled("#review-save")
+        page.keyboard.press("Space")                  # tick: Qwen3-TTS, Chatterbox and Magpie refuse more
+        ui.tab_to("review-save", limit=5)
+        page.keyboard.press("Enter")
+        ui.status_says("Saved")
+        assert json.loads((folder / "gateway.json").read_text(encoding="utf-8"))["values"]["MAX_TTS_CHARS"] == 6000
+        assert module.MAX_TTS_CHARS == 6000, "in force in the gateway"
+        assert ui.fits()
+        assert ui.clean(), (page.evaluate("window.__violations"), ui.problems)
+    finally:
+        ui.close()
