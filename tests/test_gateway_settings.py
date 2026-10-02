@@ -1245,6 +1245,41 @@ def test_31_the_yaml_key_is_admin_until_a_page_key_makes_it_a_client(monkeypatch
     assert r.json()["errors"] == {"require_key": "The app YAML sets API_KEY, so a key is always required."}
 
 
+def test_api_access_is_set_here_only_where_keys_json_changes_it(monkeypatch, folder, caplog):
+    """keys.json holds both access fields once the first claim or key writes it; a field nobody
+    changed must keep its Default badge."""
+    _, _, client = api(monkeypatch, folder)
+
+    def sources(key=None) -> tuple:
+        view = view_of(client, key)
+        return field(view, "require_key")["source"], field(view, "deployment_key_role")["source"]
+
+    assert sources() == ("default", "default")
+    admin = claim(client, caplog)                                    # writes keys.json, changes neither field
+    create_key(client, admin, "Home Assistant")
+    assert (folder / "keys.json").exists() and sources(admin) == ("default", "default")
+    r = client.put("/api/settings/access", json={"base_revision": view_of(client, admin)["keys_revision"],
+                                                 "require_key": True}, headers=page(key=admin))
+    assert r.status_code == 200
+    assert sources(admin) == ("saved", "default")
+    require = field(view_of(client, admin), "require_key")
+    assert (require["value"], require["saved_value"], require["yaml_value"]) == (True, True, False)
+
+
+def test_the_yaml_keys_role_is_set_here_once_it_is_made_a_client(monkeypatch, folder):
+    _, _, client = api(monkeypatch, folder, {"API_KEY": YAML_KEY})
+    admin = create_key(client, YAML_KEY, "Laptop", role="admin")      # writes keys.json
+    role = field(view_of(client, admin), "deployment_key_role")
+    assert (role["source"], role["value"], role["saved"]) == ("default", "admin", True)
+    r = client.put("/api/settings/access", json={"base_revision": view_of(client, admin)["keys_revision"],
+                                                 "deployment_key_role": "client"}, headers=page(key=admin))
+    assert r.status_code == 200
+    view = view_of(client, admin)
+    role = field(view, "deployment_key_role")
+    assert (role["source"], role["value"]) == ("saved", "client")
+    assert field(view, "require_key")["source"] == "yaml"
+
+
 def test_32_requiring_a_key_closes_v1_the_changing_api_and_the_live_microphone(monkeypatch, folder, caplog):
     import websockets
 

@@ -4377,6 +4377,8 @@ def _setting_view(item: dict, state: settings_store.SettingsState, in_force: Map
                  "ignored": saved and key not in in_force, "dropped": preferences.dropped.get(key)}
     else:
         stored = keys.revision > 0 and not keys.fail_closed
+        yaml_value = bool(API_KEY) if key == "require_key" else settings_schema.ROLE_ADMIN
+        saved_value = (keys.require_key if key == "require_key" else keys.deployment_key_role) if stored else None
         if locked:
             source = "locked"
         elif keys.fail_closed:
@@ -4384,9 +4386,9 @@ def _setting_view(item: dict, state: settings_store.SettingsState, in_force: Map
         elif key == "require_key" and API_KEY:
             source, read_only = "yaml", _API_KEY_FORCES_MESSAGE
         else:
-            source = "saved" if stored else "default"
-        yaml_value = bool(API_KEY) if key == "require_key" else settings_schema.ROLE_ADMIN
-        saved_value = (keys.require_key if key == "require_key" else keys.deployment_key_role) if stored else None
+            # keys.json holds both fields as soon as anything is written to it (the first key, a claim),
+            # so a field counts as set here only where the stored value differs from what applies without it
+            source = "saved" if stored and saved_value != yaml_value else "default"
         extra = {"yaml_value": yaml_value, "yaml_set": key == "require_key" and bool(API_KEY), "saved": stored,
                  "saved_value": saved_value, "ignored": False, "dropped": None}
     return {**item, "value": _jsonable(_applied_values[key]), "source": source, "locked": locked,
