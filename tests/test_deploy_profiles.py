@@ -105,19 +105,32 @@ def started(profile: Path) -> set[str]:
 
 @lru_cache(maxsize=None)
 def _providers(flags: tuple[str, ...]) -> dict[str, dict]:
-    env = {flag: "true" for flag in flags}
+    """The gateway's providers with exactly `flags` on and every other ENABLE_* flag off.
+
+    Off explicitly, not unset: a flag that defaults to on (ENABLE_TRAINING) would otherwise hide
+    its provider among those that need no flag.
+    """
+    env = {flag: "true" if flag in flags else "false" for flag in _enable_flags()}
     return dict(load_frontend_app(env).PROVIDER_REGISTRY["providers"])
 
 
-def _enable_flags() -> list[str]:
-    return sorted(k for k in merged_services(["docker-compose.yml"])[FRONTEND]["env"]
-                  if k.startswith("ENABLE_"))
+@lru_cache(maxsize=None)
+def _enable_flags() -> tuple[str, ...]:
+    return tuple(sorted(k for k in merged_services(["docker-compose.yml"])[FRONTEND]["env"]
+                        if k.startswith("ENABLE_")))
+
+
+def flag_is_on(profile: Path, flag: str) -> bool:
+    """The flag as the gateway gets it: the preset's value, else the compose file's default."""
+    files, _ = launch_command(profile)
+    value = interpolate(str(merged_services(files)[FRONTEND]["env"].get(flag, "")), dotenv(profile))
+    return value.strip().lower() in ("1", "true", "yes", "on")
 
 
 @lru_cache(maxsize=None)
 def provider_service_and_flag() -> dict[str, tuple[str, str | None]]:
     """{provider id: (compose service that serves it, ENABLE_* flag that shows it or None)}."""
-    flags = tuple(_enable_flags())
+    flags = _enable_flags()
     everything = _providers(flags)
     base = _providers(())
     flag_of: dict[str, str] = {}
@@ -185,7 +198,7 @@ def test_the_default_providers_are_providers_the_preset_actually_starts(profile)
                 f"{key}={effective!r} is served by {service}, which "
                 f"`{' '.join(launch_command(profile)[1])}` does not start "
                 f"(set {key} explicitly for this device)")
-        if flag and env.get(flag, "false") != "true":
+        if flag and not flag_is_on(profile, flag):
             problems.append(f"{key}={effective!r} needs {flag}=true or the UI hides it")
     assert not problems, f"{profile.name}:\n  " + "\n  ".join(problems)
 
@@ -193,14 +206,15 @@ def test_the_default_providers_are_providers_the_preset_actually_starts(profile)
 @pytest.mark.parametrize("profile", PROFILES, ids=_ids(PROFILES))
 def test_optional_backends_are_started_and_shown_together(profile):
     """An ENABLE_* flag without its container is a permanently red indicator; a container
-    without its flag is invisible in the UI."""
-    env = dotenv(profile)
+    without its flag is invisible in the UI. A flag counts as the gateway gets it, compose's
+    default included: ENABLE_TRAINING is on unless a preset turns it off, so a preset that does
+    not start `--profile training` has to say ENABLE_TRAINING=false."""
     running = started(profile)
     problems = []
     for provider, (service, flag) in provider_service_and_flag().items():
         if not flag:
             continue
-        shown = env.get(flag, "false") == "true"
+        shown = flag_is_on(profile, flag)
         if shown and service not in running:
             problems.append(f"{flag}=true but {service} is not started ({provider})")
         if service in running and not shown:

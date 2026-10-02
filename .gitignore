@@ -50,6 +50,11 @@ piper-training-service/checkpoints/
 piper-training-service/models/
 piper-training-service/configs/
 
+# What the web UI's Settings page saves (SETTINGS_DIR, BACKEND_SETTINGS_DIR):
+# API key digests, the audit log and the saved values of a local stack.
+/settings/
+/backend-settings/
+
 # Environment
 .env
 .env.local

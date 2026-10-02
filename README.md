@@ -56,9 +56,16 @@ Open **http://localhost:3000** for the web interface. The first start downloads 
 background (several GB), so containers report healthy long before they can transcribe or speak; the UI
 shows each backend's state, and `GET /ready` on a backend says whether it can serve a request yet.
 
+The gear in the UI opens **Settings** (`/settings`): host names, the reverse-proxy URL, API access and named
+API keys, which engines are offered, the default engines and the gateway limits, applied at once without a
+restart and kept in `./settings` (`SETTINGS_DIR`). A saved value wins over `.env`, setting by setting. Saving
+needs an admin key: `API_KEY`, or on a stack without one a key created with a one-time code that only
+`docker compose logs frontend-service` shows.
+
 `whisper-cpp`, Parakeet, Canary, Chatterbox and Magpie are opt-in. Starting a profile alone is not enough for the
-service to appear in the frontend; set the matching `ENABLE_WHISPER_CPP`, `ENABLE_PARAKEET_ASR`,
-`ENABLE_CANARY_ASR`, `ENABLE_CHATTERBOX_TTS` or `ENABLE_MAGPIE_TTS=true` for the frontend service as well.
+service to appear in the frontend; offer it under Settings -> Engines, or set the matching `ENABLE_WHISPER_CPP`,
+`ENABLE_PARAKEET_ASR`, `ENABLE_CANARY_ASR`, `ENABLE_CHATTERBOX_TTS` or `ENABLE_MAGPIE_TTS=true` for the frontend
+service as well.
 
 Images are pulled from GHCR as `ghcr.io/steffenhebestreit/tts-stt-*:${IMAGE_TAG}` (`latest` by default, which
 follows the newest release or master build). Pin `IMAGE_TAG=X.Y.Z` where a deployment has to be reproducible,
@@ -440,6 +447,7 @@ the per-service limits; the ones most people touch:
 | `FORCE_ACCELERATION` | (empty: auto-detect) | Only `rocm` changes behaviour (faster-whisper on AMD); use `USE_CUDA=false` to force the CPU |
 | `WHISPER_CPP_PORT` | `5003` | Host port for whisper-cpp |
 | `ENABLE_WHISPER_CPP`, `ENABLE_PARAKEET_ASR`, `ENABLE_CANARY_ASR`, `ENABLE_CHATTERBOX_TTS`, `ENABLE_MAGPIE_TTS` | `false` | Expose the optional backend in the frontend provider registry and status checks |
+| `ENABLE_TRAINING` | `true` (`false` in the TrueNAS file) | The Voice Training tab, its status dot and `/api/training`; the service itself runs with `--profile training` |
 | `DEFAULT_STT_PROVIDER`, `DEFAULT_TTS_PROVIDER` | `whisper`, `piper` | Engine the UI preselects; the ARM64 and Strix Halo presets use `whisper-cpp` because `stt-service` does not run there |
 | `GGML_VULKAN_DEVICE` | `0` | Vulkan GPU device index |
 | `HIP_VISIBLE_DEVICES` | `0` | ROCm GPU device index |
@@ -450,8 +458,10 @@ the per-service limits; the ones most people touch:
 | `QWEN3_DEFAULT_LANGUAGE`, `PIPER_DEFAULT_LANGUAGE` | `German`, `de` | Language TTS uses when a request names none |
 | `QWEN3_ASR_MODEL` | `Qwen/Qwen3-ASR-1.7B` | Qwen3 ASR model ID |
 | `ALLOWED_ORIGINS` | (empty: same origin only) | Extra origins that may call the gateway from a browser; `*` opens it to any page. Behind a reverse proxy that rewrites `Host`, set `TRUSTED_ORIGINS` |
-| `TRUSTED_HOSTS` | (empty) | Host names the gateway may be reached by, besides IP addresses, `localhost`, `*.local`, `*.lan`, `*.internal` and single-label names such as `truenas`, which need nothing. A real domain (reverse proxy) or a Tailscale name must be listed (`voice.example.com,*.tail1234.ts.net`), else every request is `403 host_not_allowed` (DNS-rebinding guard). `ALLOWED_HOSTS=*` switches the check off |
-| `API_KEY` | (empty: open) | Optional shared secret required as `Authorization: Bearer` on `/v1/*`, on state-changing `/api/*` calls and on the `/ws/stt` upgrade. No exemption for the web UI: it asks for the key once per browser tab |
+| `TRUSTED_HOSTS` | (empty) | Host names the gateway may be reached by, besides IP addresses, `localhost`, `*.local`, `*.lan`, `*.internal` and single-label names such as `truenas`, which need nothing. A real domain (reverse proxy) or a Tailscale name must be listed (`voice.example.com,*.tail1234.ts.net`, or under Settings -> Access), else every request is `403 host_not_allowed` (DNS-rebinding guard). `ALLOWED_HOSTS=*` switches the check off |
+| `API_KEY` | (empty: open) | Optional shared secret required as `Authorization: Bearer` on `/v1/*`, on state-changing `/api/*` calls and on the `/ws/stt` upgrade. No exemption for the web UI: it asks for the key once per browser tab. It is also an admin key of the Settings page, which can require a key without it and create named, revocable keys |
+| `ENABLE_SETTINGS_UI`, `SETTINGS_LOCKED_KEYS` | `true`, (empty) | The Settings page's own switches, set only here: `false` makes the page read-only and its saved values ignored (keys made there stay in force); `SETTINGS_LOCKED_KEYS` names settings that always come from `.env`, e.g. `TRUSTED_HOSTS,MAX_UPLOAD_MB` |
+| `SETTINGS_DIR`, `BACKEND_SETTINGS_DIR` | `${APP_DATA_DIR}/settings`, `.../backend-settings` | Where the Settings page saves (frontend only) and the folder kept for backend settings saved there (every Python backend mounts it read-only). Bind mounts: the page refuses to save into a container |
 | `MAX_UPLOAD_MB`, `MAX_TTS_CHARS` | `512`, `5000` | Gateway limits (`5000` is what Qwen3-TTS, Chatterbox and Magpie accept; a Piper-only setup can raise it). Each backend has its own (`ASR_MAX_UPLOAD_MB`, `PIPER_MAX_UPLOAD_MB`, `CHATTERBOX_MAX_TEXT_CHARS`, ... see `.env.example`) |
 | `MAX_CONCURRENT_UPLOADS`, `MAX_CONCURRENT_FFMPEG` | `4`, `4` | Per gateway worker: uploads forwarded at once and `ffmpeg` conversions for `/v1/audio/speech`; the next request gets `503` + `Retry-After` |
 | `ASR_MAX_QUEUE`, `ASR_QUEUE_TIMEOUT_S` | (empty: 4 x `ASR_MAX_CONCURRENCY`), `60` | Requests that may wait for the one inference slot of Qwen3-ASR, Parakeet and Canary (`0` = nobody waits) and how long; beyond either the answer is `503` + `Retry-After`. `TTS_MAX_QUEUE` and `TTS_QUEUE_TIMEOUT_S` do the same for Qwen3-TTS, Chatterbox and Magpie |
@@ -497,6 +507,7 @@ tts-stt-playground/
 ├── tests/                       # pytest suite (unit, config-drift and, opt-in, live-stack tests)
 ├── docs/                        # API reference, provider contracts, device matrix, TrueNAS guide, research
 ├── truenas/                     # TrueNAS custom catalog scaffold
+├── settings/                    # What the web UI's Settings page saves (gitignored)
 └── models/                      # Shared model storage (gitignored)
 ```
 
@@ -590,16 +601,23 @@ backend; set `BACKEND_BIND_ADDR=0.0.0.0` only on a network you trust.
 **Every request answers `403 Host ... is not allowed` (`host_not_allowed`)**
 The gateway only answers to names that cannot be re-pointed by a third party: IP addresses, `localhost`,
 `*.local`, `*.lan`, `*.internal`, `*.home.arpa` and single-label names. A real domain in front of a reverse
-proxy, or a Tailscale MagicDNS name, has to be listed in `TRUSTED_HOSTS` (`TRUSTED_HOSTS=voice.example.com`).
+proxy, or a Tailscale MagicDNS name, has to be listed: open `http://<ip>:3000/settings` by IP address and add
+it under Access (it works on the next request), or set `TRUSTED_HOSTS=voice.example.com`.
 
 **Every button in the UI answers 403 behind a reverse proxy**
-The proxy rewrites the `Host` header, so the UI's requests look cross-origin. Add the public URL to
-`TRUSTED_ORIGINS` (and set `TRUST_PROXY_HEADERS=true` if the proxy overwrites `X-Forwarded-Host`).
-A proxy that passes `Host` through only needs its name in `TRUSTED_HOSTS`.
+The proxy rewrites the `Host` header, so the UI's requests look cross-origin. Add the public URL under
+Settings -> Access, or to `TRUSTED_ORIGINS` (and believe `X-Forwarded-Host`, `TRUST_PROXY_HEADERS=true`, only
+if the proxy overwrites it). A proxy that passes `Host` through only needs its name as a host name.
 
 **The UI asks for an API key, or answers 401**
-`API_KEY` is set on the gateway. The UI prompts once per browser tab and keeps the key in `sessionStorage`;
-scripts send `Authorization: Bearer <key>`. There is no exemption for the UI.
+`API_KEY` is set on the gateway, or the Settings page requires a key. The UI prompts once per browser tab and
+keeps the key in `sessionStorage`; scripts send `Authorization: Bearer <key>`. There is no exemption for the UI.
+
+**The Settings page saves nothing, or the admin key is lost**
+Without `API_KEY` and before the first claim nobody may change settings: ask the page for a one-time code and
+read it in `docker compose logs frontend-service` (the same recovers a lost admin key). A saved value that broke
+something: Restore, or Back to the app YAML, under History & recovery, or delete `settings/gateway.json` (`.env`
+applies from the next request). `ENABLE_SETTINGS_UI=false` makes the gateway ignore what the page saved.
 
 **503 with `Retry-After`**
 The service is at its limit rather than broken: too many uploads or `ffmpeg` conversions at the gateway
@@ -680,6 +698,12 @@ guide (install, update, roll back, VRAM planning, troubleshooting).
 The images (`ghcr.io/steffenhebestreit/tts-stt-*`) are about 25 GB and TrueNAS aborts an Apps job
 after 20 minutes: run `scripts/truenas/pull-images.sh` first on a slow link.
 
+Most settings are then changed in the web UI, not in the YAML: **Settings** (the gear, or
+`http://<truenas-ip>:3000/settings`) holds host names, API access and keys, which optional engines are
+offered, the default engines and the gateway limits. They apply at once and are kept in the dataset, so
+Edit, Update and Stop/Start keep them. The YAML keeps what needs a container to be recreated: the release,
+the GPU, the port and the `profiles:` lines that install optional services.
+
 ### Updates
 
 The compose file **pins a release** (`IMAGE_TAG`), so nothing changes until you change it.
@@ -692,7 +716,8 @@ instead, and an optional `diun` service sends notifications only. Details are in
 ### Other routes
 
 - **Settings file:** the same compose file with a `settings.env` on the dataset, so an update is
-  one changed line ([`truenas/custom-app-include.yml`](truenas/custom-app-include.yml)).
+  one changed line ([`truenas/custom-app-include.yml`](truenas/custom-app-include.yml)). Not needed on
+  TrueNAS now that most settings live in the web UI; it stays for running the file from a shell.
 - **Custom catalog** (a form instead of YAML): [`truenas/tts-stt/`](truenas/tts-stt/) is a
   scaffold that TrueNAS cannot load as it stands, see [`truenas/README.md`](truenas/README.md).
 - **Build from source** on the NAS with `docker-compose.truenas.yml`:
@@ -708,8 +733,8 @@ instead, and an optional `diun` service sends notifications only. Details are in
   `nvidia-smi` reports for your card; the per-service table is in the guide.
 - Remote browser access needs nothing beyond port 3000 (`ALLOWED_ORIGINS` stays empty) as long as you
   open it by IP address, `*.local` or a plain name such as `truenas`. A real domain or a reverse proxy
-  needs `TRUSTED_HOSTS` (and `TRUSTED_ORIGINS` if the proxy rewrites `Host`). The microphone from another
-  machine needs HTTPS.
+  needs its name under Settings -> Access or in `TRUSTED_HOSTS` (and the proxy's URL, `TRUSTED_ORIGINS`, if
+  it rewrites `Host`). The microphone from another machine needs HTTPS.
 
 ### Cleanup (optional)
 
@@ -727,7 +752,7 @@ the gateway and it works unchanged across every device:
 
 ```python
 from openai import OpenAI
-client = OpenAI(base_url="http://your-host:3000/v1", api_key="unused")  # your API_KEY if the gateway has one
+client = OpenAI(base_url="http://your-host:3000/v1", api_key="unused")  # a key if the gateway requires one
 client.audio.transcriptions.create(model="whisper-1", file=open("audio.wav", "rb")).text
 ```
 

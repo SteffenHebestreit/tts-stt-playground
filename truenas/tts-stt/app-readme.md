@@ -17,8 +17,12 @@ in the UI shows each backend's state.
 
 - All data lives in the dataset you chose under **Storage**.
 - Only the Web UI port is published. Backends stay on the internal network.
+- **Settings** in the web UI (the gear, or `/settings`) change host names, API keys, the engines
+  offered and the gateway limits at once, without editing the app. They are kept in the dataset
+  (`settings/`) and win over the answers in this form, setting by setting.
 - Open the UI by IP address, `*.local` or a plain name such as `truenas`. A real domain or a
-  reverse proxy needs its name under **Access** (`403 host_not_allowed` otherwise).
+  reverse proxy needs its name under **Access** or in the web UI under Settings -> Access
+  (`403 host_not_allowed` otherwise).
 - **Image release** defaults to a pinned version: nothing updates behind your back. To update,
   snapshot the dataset, change the release and save. See docs/truenas-installation-guide.md.
 - GPU images need an NVIDIA driver that supports CUDA 12.8 (R570 or newer; GeForce cards need

@@ -38,7 +38,11 @@ MANAGED_ENV = (
     "API_KEY", "MAX_UPLOAD_MB", "MAX_TTS_CHARS", "MAX_CONCURRENT_UPLOADS", "HEALTH_CACHE_TTL",
     "DEFAULT_STT_PROVIDER", "DEFAULT_TTS_PROVIDER", "PROVIDER_REGISTRY_JSON",
     "ENABLE_WHISPER_CPP", "ENABLE_PARAKEET_ASR", "ENABLE_CANARY_ASR",
-    "ENABLE_CHATTERBOX_TTS", "ENABLE_MAGPIE_TTS", "APP_VERSION",
+    "ENABLE_CHATTERBOX_TTS", "ENABLE_MAGPIE_TTS", "ENABLE_TRAINING", "APP_VERSION",
+    # The Settings page: its switches, and the folder it saves to. Without
+    # TTS_STT_SETTINGS_DIR the store looks at /app/settings, which is not mounted
+    # here, so nothing saved applies and nothing can be saved.
+    "ENABLE_SETTINGS_UI", "SETTINGS_LOCKED_KEYS", "TTS_STT_SETTINGS_DIR",
 )
 
 _counter = count()

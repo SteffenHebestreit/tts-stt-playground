@@ -102,6 +102,10 @@ services:
     volumes:
       - "./frontend-service/app.py:/app/app.py"
       - "./frontend-service/openai_router.py:/app/openai_router.py"
+      - "./frontend-service/settings_schema.py:/app/settings_schema.py"
+      - "./frontend-service/settings_store.py:/app/settings_store.py"
+      - "./frontend-service/public_suffix.py:/app/public_suffix.py"
+      - "./frontend-service/public_suffix_list.dat:/app/public_suffix_list.dat"
       - "./frontend-service/entrypoint.sh:/app/entrypoint.sh"
       - "./frontend-service/static:/app/static"
       - "./frontend-service/templates:/app/templates"

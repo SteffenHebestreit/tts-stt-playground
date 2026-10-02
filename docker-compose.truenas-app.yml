@@ -19,7 +19,9 @@ name: tts-stt
 #   docs/truenas-installation-guide.md
 #
 # -----------------------------------------------------------------------------
-# SETTINGS: every one is written ${NAME:-default}. No environment can be set in
+# Most settings: web UI -> Settings (gear icon, or http://<truenas-ip>:3000/settings).
+#
+# YAML SETTINGS: every one is written ${NAME:-default}. No environment can be set in
 # the Apps YAML editor, so you change the default in place. In the editor,
 # search-and-replace the exact text in the middle column (every occurrence).
 #
@@ -29,7 +31,7 @@ name: tts-stt
 #   PULL_POLICY    PULL_POLICY:-missing                     missing = pull only absent images (pinned tags)
 #                                                           always  = pull on every Start/Save (IMAGE_TAG=latest)
 #   GPU_DEVICE_ID  GPU_DEVICE_ID:-0                         Index from `nvidia-smi -L`, or the GPU-xxxx UUID
-#   FRONTEND_PORT  FRONTEND_PORT:-3000                      Web UI port. Also change `port:` under x-portals.
+#   FRONTEND_PORT  FRONTEND_PORT:-3000                      Web UI port. Also change both `port:` lines under x-portals.
 #
 # APP_DATA_DIR has no default on purpose: a forgotten path makes the editor
 # reject the YAML with "required variable APP_DATA_DIR is missing a value"
@@ -46,17 +48,18 @@ name: tts-stt
 #            magpie-tts-service, piper-training-service, whisper-cpp (CPU STT),
 #            diun (update notices)
 #
-# ENABLE AN OPTIONAL SERVICE (two edits, both required):
-#   1. Delete its `profiles:` line.
-#   2. Change its flag on frontend-service from false to true, e.g.
-#      ENABLE_CANARY_ASR:-false  ->  ENABLE_CANARY_ASR:-true
-#      (piper-training-service has no flag; diun needs neither flag nor profile removal
-#      beyond step 1.) A flag without its service is a permanently red indicator.
+# ENABLE AN OPTIONAL SERVICE:
+#   1. Delete its `profiles:` line (installs it) and Save.
+#   2. Offer it in Settings -> Engines (or set its flag here on frontend-service, e.g.
+#      ENABLE_CANARY_ASR:-false  ->  ENABLE_CANARY_ASR:-true; voice training is ENABLE_TRAINING).
+#      diun needs step 1 only. A flag without its service is a permanently red indicator:
+#      Settings -> Engines shows whether the service answers.
 #   Each one adds VRAM: see the VRAM table in the guide, or run preflight.sh --with <name>.
 #   From a shell instead: COMPOSE_PROFILES=canary-asr,training docker compose -f <this file> up -d
 #
 # NO GPU? Delete stt-service, qwen3-asr-service and qwen3-tts-service, enable
-#   whisper-cpp (above) and set DEFAULT_STT_PROVIDER:-whisper to whisper-cpp.
+#   whisper-cpp (above) and make it the default speech-to-text engine in Settings -> Engines
+#   (or set DEFAULT_STT_PROVIDER:-whisper to whisper-cpp here).
 #
 # ONLY PORT 3000 IS PUBLISHED. The browser talks to the frontend, which proxies
 # every backend call (including the live-microphone WebSocket) over the internal
@@ -84,9 +87,18 @@ x-portals:
     host: 0.0.0.0
     port: 3000
     path: /
+  - name: Settings
+    scheme: http
+    host: 0.0.0.0
+    port: 3000
+    path: /settings
 x-notes: |
   TTS-STT Studio. Web UI on port 3000 (see the Web UI button).
-  Data: everything lives in the dataset you set as APP_DATA_DIR (models, cache, voices, output).
+  Settings (the Settings button, or /settings): host names, engines, API keys and limits, applied at
+  once and kept in the dataset's settings/ folder. Locked out: open http://<NAS-IP>:3000/settings by
+  IP address; delete settings/gateway.json (back to this YAML) or create settings/SAFE-MODE. Lost the
+  admin key: ask for a one-time code on that page and read it in the frontend-service log.
+  Data: everything lives in the dataset you set as APP_DATA_DIR (models, cache, voices, output, settings).
   First start: models download in the background and the app can take a few minutes to serve
   requests from every backend; the web UI shows each backend's state.
   Update: snapshot the dataset, change the release in IMAGE_TAG (all services), Save.
@@ -141,12 +153,15 @@ services:
       CHATTERBOX_TTS_SERVICE_URL: http://chatterbox-tts-service:5007
       MAGPIE_TTS_SERVICE_URL: http://magpie-tts-service:5008
       WHISPER_CPP_SERVICE_URL: http://whisper-cpp:8080
-      # Show these backends in the UI. Set true only together with the service.
+      # Show these backends in the UI. Set true only together with the service
+      # (or offer them in Settings -> Engines, which says whether they answer).
       ENABLE_PARAKEET_ASR: ${ENABLE_PARAKEET_ASR:-false}
       ENABLE_CANARY_ASR: ${ENABLE_CANARY_ASR:-false}
       ENABLE_CHATTERBOX_TTS: ${ENABLE_CHATTERBOX_TTS:-false}
       ENABLE_MAGPIE_TTS: ${ENABLE_MAGPIE_TTS:-false}
       ENABLE_WHISPER_CPP: ${ENABLE_WHISPER_CPP:-false}
+      # The Voice Training tab; piper-training-service is off until its profiles line goes.
+      ENABLE_TRAINING: ${ENABLE_TRAINING:-false}
       # Empty = same-origin only, which is what the web UI needs, also over
       # http://<ip>:3000. List origins only for scripts in other web pages.
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
@@ -165,6 +180,10 @@ services:
       # Optional shared secret for /v1/*, mutating /api/* and /ws/stt; empty = open
       # (LAN). No exemption for the web UI: it asks for the key once.
       API_KEY: ${API_KEY:-}
+      # Settings page (web UI -> gear). false = page read-only and saved values ignored
+      # (keys created in the page stay in force). SETTINGS_LOCKED_KEYS pins keys to this file.
+      ENABLE_SETTINGS_UI: ${ENABLE_SETTINGS_UI:-true}
+      SETTINGS_LOCKED_KEYS: ${SETTINGS_LOCKED_KEYS:-}
       MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-512}
       MAX_TTS_CHARS: ${MAX_TTS_CHARS:-5000}
       # Per worker: uploads in flight and ffmpeg conversions; the next request gets 503.
@@ -180,6 +199,10 @@ services:
       UPSTREAM_MAX_CONNECTIONS: ${UPSTREAM_MAX_CONNECTIONS:-100}
       UPSTREAM_MAX_KEEPALIVE: ${UPSTREAM_MAX_KEEPALIVE:-20}
       UPSTREAM_KEEPALIVE_EXPIRY: ${UPSTREAM_KEEPALIVE_EXPIRY:-115}
+    volumes:
+      # What the Settings page saves. Keep these lines when you paste a newer file.
+      - "${APP_DATA_DIR:?set dataset path}/settings:/app/settings"
+      - "${APP_DATA_DIR:?set dataset path}/backend-settings:/app/backend-settings"
     labels: {diun.enable: "true", diun.watch_repo: "true", diun.sort_tags: semver, diun.max_tags: "3", diun.include_tags: '^\d+\.\d+\.\d+$$'}
     restart: unless-stopped
     stop_grace_period: 20s
@@ -233,6 +256,8 @@ services:
     volumes:
       - "${APP_DATA_DIR:?set dataset path}/models:/app/models"
       - "${APP_DATA_DIR:?set dataset path}/output:/app/output"
+      # Settings the web UI saves for the backends (read-only here; read by later releases).
+      - "${APP_DATA_DIR:?set dataset path}/backend-settings:/app/backend-settings:ro"
     labels: {diun.enable: "true", diun.watch_repo: "true", diun.sort_tags: semver, diun.max_tags: "3", diun.include_tags: '^\d+\.\d+\.\d+$$'}
     restart: unless-stopped
     stop_grace_period: 20s
@@ -298,6 +323,7 @@ services:
       # One model cache for every service: a model is downloaded once, and survives
       # container re-creation and updates.
       - "${APP_DATA_DIR:?set dataset path}/cache:/root/.cache"
+      - "${APP_DATA_DIR:?set dataset path}/backend-settings:/app/backend-settings:ro"
     labels: {diun.enable: "true", diun.watch_repo: "true", diun.sort_tags: semver, diun.max_tags: "3", diun.include_tags: '^\d+\.\d+\.\d+$$'}
     restart: unless-stopped
     stop_grace_period: 30s
@@ -342,6 +368,7 @@ services:
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${APP_DATA_DIR:?set dataset path}/cache:/root/.cache"
+      - "${APP_DATA_DIR:?set dataset path}/backend-settings:/app/backend-settings:ro"
     labels: {diun.enable: "true", diun.watch_repo: "true", diun.sort_tags: semver, diun.max_tags: "3", diun.include_tags: '^\d+\.\d+\.\d+$$'}
     restart: unless-stopped
     stop_grace_period: 30s
@@ -390,6 +417,7 @@ services:
     volumes:
       - "${APP_DATA_DIR:?set dataset path}/cache:/root/.cache"
       - "${APP_DATA_DIR:?set dataset path}/qwen3-voices:/app/voices"
+      - "${APP_DATA_DIR:?set dataset path}/backend-settings:/app/backend-settings:ro"
     labels: {diun.enable: "true", diun.watch_repo: "true", diun.sort_tags: semver, diun.max_tags: "3", diun.include_tags: '^\d+\.\d+\.\d+$$'}
     restart: unless-stopped
     stop_grace_period: 30s
@@ -413,8 +441,9 @@ services:
     networks: [tts-stt-network]
 
   # ===========================================================================
-  # OPTIONAL SERVICES. Off until you delete the `profiles:` line (and set the
-  # frontend flag). Each holds VRAM once its model is loaded: see the guide.
+  # OPTIONAL SERVICES. Off until you delete the `profiles:` line (then offer it in
+  # Settings -> Engines, or set the frontend flag). Each holds VRAM once its model
+  # is loaded: see the guide.
   # ===========================================================================
 
   # Canary-ASR: the fastest German STT in the stack (180M parameters).
@@ -445,6 +474,7 @@ services:
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${APP_DATA_DIR:?set dataset path}/cache:/root/.cache"
+      - "${APP_DATA_DIR:?set dataset path}/backend-settings:/app/backend-settings:ro"
     labels: {diun.enable: "true", diun.watch_repo: "true", diun.sort_tags: semver, diun.max_tags: "3", diun.include_tags: '^\d+\.\d+\.\d+$$'}
     restart: unless-stopped
     stop_grace_period: 30s
@@ -489,6 +519,7 @@ services:
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${APP_DATA_DIR:?set dataset path}/cache:/root/.cache"
+      - "${APP_DATA_DIR:?set dataset path}/backend-settings:/app/backend-settings:ro"
     labels: {diun.enable: "true", diun.watch_repo: "true", diun.sort_tags: semver, diun.max_tags: "3", diun.include_tags: '^\d+\.\d+\.\d+$$'}
     restart: unless-stopped
     stop_grace_period: 30s
@@ -535,6 +566,7 @@ services:
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${APP_DATA_DIR:?set dataset path}/cache:/root/.cache"
+      - "${APP_DATA_DIR:?set dataset path}/backend-settings:/app/backend-settings:ro"
     labels: {diun.enable: "true", diun.watch_repo: "true", diun.sort_tags: semver, diun.max_tags: "3", diun.include_tags: '^\d+\.\d+\.\d+$$'}
     restart: unless-stopped
     stop_grace_period: 30s
@@ -594,6 +626,7 @@ services:
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${APP_DATA_DIR:?set dataset path}/cache:/root/.cache"
+      - "${APP_DATA_DIR:?set dataset path}/backend-settings:/app/backend-settings:ro"
     labels: {diun.enable: "true", diun.watch_repo: "true", diun.sort_tags: semver, diun.max_tags: "3", diun.include_tags: '^\d+\.\d+\.\d+$$'}
     restart: unless-stopped
     stop_grace_period: 30s
@@ -613,7 +646,8 @@ services:
     networks: [tts-stt-network]
 
   # Voice training: run it on demand, not always-on. Stop qwen3-tts-service first on a
-  # small card. An idle container still holds a CUDA context (~0.5 GB).
+  # small card. An idle container still holds a CUDA context (~0.5 GB). Its tab in the
+  # web UI is ENABLE_TRAINING on frontend-service (or Settings -> Engines).
   piper-training-service:
     profiles: ["training"]
     image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-piper-training:${IMAGE_TAG:-0.2.0}
@@ -652,6 +686,7 @@ services:
       - "${APP_DATA_DIR:?set dataset path}/piper-training-service/models:/app/models"
       - "${APP_DATA_DIR:?set dataset path}/piper-training-service/configs:/app/configs"
       - "${APP_DATA_DIR:?set dataset path}/models:/app/shared_models"
+      - "${APP_DATA_DIR:?set dataset path}/backend-settings:/app/backend-settings:ro"
     shm_size: 1gb
     labels: {diun.enable: "true", diun.watch_repo: "true", diun.sort_tags: semver, diun.max_tags: "3", diun.include_tags: '^\d+\.\d+\.\d+$$'}
     restart: unless-stopped

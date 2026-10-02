@@ -53,13 +53,18 @@ deploy:
           capabilities: [gpu]
 {%- endmacro %}
 name: tts-stt
-# Read by the Apps UI for the Web UI button; ignored by Docker Compose.
+# Read by the Apps UI for the Web UI and Settings buttons; ignored by Docker Compose.
 x-portals:
   - name: Web UI
     scheme: http
     host: 0.0.0.0
     port: {{ values.frontend_port }}
     path: /
+  - name: Settings
+    scheme: http
+    host: 0.0.0.0
+    port: {{ values.frontend_port }}
+    path: /settings
 services:
   piper-voices-seed:
     image: {{ reg }}/tts-stt-piper-tts:{{ tag }}
@@ -108,6 +113,7 @@ services:
       ENABLE_CHATTERBOX_TTS: "{{ (values.use_gpu and values.enable_chatterbox) | lower }}"
       ENABLE_MAGPIE_TTS: "{{ (values.use_gpu and values.enable_magpie) | lower }}"
       ENABLE_WHISPER_CPP: "{{ values.enable_whisper_cpp | lower }}"
+      ENABLE_TRAINING: "{{ (values.use_gpu and values.enable_training) | lower }}"
       ALLOWED_ORIGINS: {{ q(values.allowed_origins) }}
       ALLOW_CREDENTIALS: "false"
       TRUSTED_ORIGINS: {{ q(values.trusted_origins) }}
@@ -115,6 +121,8 @@ services:
       TRUSTED_HOSTS: {{ q(values.trusted_hosts) }}
       ALLOWED_HOSTS: ""
       API_KEY: {{ q(values.api_key) }}
+      ENABLE_SETTINGS_UI: "true"
+      SETTINGS_LOCKED_KEYS: ""
       MAX_UPLOAD_MB: "512"
       MAX_TTS_CHARS: "5000"
       MAX_CONCURRENT_UPLOADS: "4"
@@ -129,6 +137,9 @@ services:
       UPSTREAM_MAX_CONNECTIONS: "100"
       UPSTREAM_MAX_KEEPALIVE: "20"
       UPSTREAM_KEEPALIVE_EXPIRY: "115"
+    volumes:
+      - "{{ data }}/settings:/app/settings"
+      - "{{ data }}/backend-settings:/app/backend-settings"
     restart: unless-stopped
     stop_grace_period: 20s
     {{ healthcheck(3000, 30) | indent(4) }}
@@ -172,6 +183,7 @@ services:
     volumes:
       - "{{ data }}/models:/app/models"
       - "{{ data }}/output:/app/output"
+      - "{{ data }}/backend-settings:/app/backend-settings:ro"
     restart: unless-stopped
     stop_grace_period: 20s
     {{ healthcheck(5000, 90) | indent(4) }}
@@ -225,6 +237,7 @@ services:
     volumes:
       - "{{ data }}/models:/app/models"
       - "{{ data }}/cache:/root/.cache"
+      - "{{ data }}/backend-settings:/app/backend-settings:ro"
     restart: unless-stopped
     stop_grace_period: 30s
     {{ healthcheck(8000, 600) | indent(4) }}
@@ -260,6 +273,7 @@ services:
       ALLOW_CREDENTIALS: "false"
     volumes:
       - "{{ data }}/cache:/root/.cache"
+      - "{{ data }}/backend-settings:/app/backend-settings:ro"
     restart: unless-stopped
     stop_grace_period: 30s
     {{ healthcheck(5002, 600) | indent(4) }}
@@ -296,6 +310,7 @@ services:
     volumes:
       - "{{ data }}/cache:/root/.cache"
       - "{{ data }}/qwen3-voices:/app/voices"
+      - "{{ data }}/backend-settings:/app/backend-settings:ro"
     restart: unless-stopped
     stop_grace_period: 30s
     {{ healthcheck(5004, 600) | indent(4) }}
@@ -337,6 +352,7 @@ services:
       ALLOW_CREDENTIALS: "false"
     volumes:
       - "{{ data }}/cache:/root/.cache"
+      - "{{ data }}/backend-settings:/app/backend-settings:ro"
     restart: unless-stopped
     stop_grace_period: 30s
     {{ healthcheck(5006, 900) | indent(4) }}
@@ -373,6 +389,7 @@ services:
       ALLOW_CREDENTIALS: "false"
     volumes:
       - "{{ data }}/cache:/root/.cache"
+      - "{{ data }}/backend-settings:/app/backend-settings:ro"
     restart: unless-stopped
     stop_grace_period: 30s
     {{ healthcheck(5005, 900) | indent(4) }}
@@ -411,6 +428,7 @@ services:
       ALLOW_CREDENTIALS: "false"
     volumes:
       - "{{ data }}/cache:/root/.cache"
+      - "{{ data }}/backend-settings:/app/backend-settings:ro"
     restart: unless-stopped
     stop_grace_period: 30s
     {{ healthcheck(5007, 900) | indent(4) }}
@@ -451,6 +469,7 @@ services:
       ALLOW_CREDENTIALS: "false"
     volumes:
       - "{{ data }}/cache:/root/.cache"
+      - "{{ data }}/backend-settings:/app/backend-settings:ro"
     restart: unless-stopped
     stop_grace_period: 30s
     {{ healthcheck(5008, 900) | indent(4) }}
@@ -501,6 +520,7 @@ services:
       - "{{ data }}/piper-training-service/models:/app/models"
       - "{{ data }}/piper-training-service/configs:/app/configs"
       - "{{ data }}/models:/app/shared_models"
+      - "{{ data }}/backend-settings:/app/backend-settings:ro"
     shm_size: 1gb
     restart: unless-stopped
     stop_grace_period: 60s

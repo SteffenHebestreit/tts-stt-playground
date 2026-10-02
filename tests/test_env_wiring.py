@@ -355,6 +355,8 @@ def test_truenas_app_matches_the_base_stack():
 DEFAULT_DIFFERS = {
     ("stt-service", "STT_DEFAULT_LANGUAGE"): "the TrueNAS file is German-first; the base file detects",
     ("stt-service", "WHISPER_COMPUTE_TYPE"): "the TrueNAS file targets one NVIDIA card (float16); the base file picks per device",
+    ("frontend-service", "ENABLE_TRAINING"): "the TrueNAS file installs no training container until its profiles line goes, "
+                                             "so its tab would be a red dot; the base file keeps the tab compose users had",
 }
 
 _NUMBER = r"(-?\d+(?:\.\d+)?)"
@@ -481,6 +483,77 @@ def test_truenas_app_defaults_match_the_base_stack():
         + "\n  ".join(differing)
         + "\nFix the file that is wrong, or list the pair in DEFAULT_DIFFERS with the reason."
     )
+
+
+def test_every_default_differs_entry_still_differs():
+    """An entry for a pair that agrees again would hide the next real drift of that pair."""
+    base = load_compose(COMPOSE).get("services") or {}
+    standalone = load_compose(TRUENAS_APP).get("services") or {}
+    stale = []
+    for service, key in DEFAULT_DIFFERS:
+        a = env_mapping(base.get(service) or {}).get(key)
+        b = env_mapping(standalone.get(service) or {}).get(key)
+        if a is None or b is None or interpolate(str(a)) == interpolate(str(b)):
+            stale.append(f"{service}.{key}")
+    assert not stale, f"DEFAULT_DIFFERS lists pairs that no longer differ: {stale}"
+
+
+# --- the Settings page's own switches -------------------------------------------
+#
+# Three gateway variables came with the Settings page (web UI -> gear). Two are the
+# switches the page must never hold over itself, so they exist only in the deployment
+# files: ENABLE_SETTINGS_UI=false makes the page read-only and its saved values
+# ignored, SETTINGS_LOCKED_KEYS pins settings to the file. The third, ENABLE_TRAINING,
+# hides voice training; the TrueNAS file defaults it to false because it installs no
+# training container (see DEFAULT_DIFFERS). Each must reach the gateway in every file
+# that deploys it, with the same default as .env.example says.
+
+SETTINGS_SWITCHES = {
+    # name: (default in docker-compose.yml and .env.example, default in the TrueNAS file)
+    "ENABLE_SETTINGS_UI": ("true", "true"),
+    "SETTINGS_LOCKED_KEYS": ("", ""),
+    "ENABLE_TRAINING": ("true", "false"),
+}
+
+
+def test_the_settings_page_switches_reach_the_gateway_everywhere_with_their_defaults():
+    documented = {name: value.strip() for name, value in
+                  re.findall(r"^([A-Z0-9_]+)=(.*)$", ENV_EXAMPLE.read_text(encoding="utf-8"), flags=re.M)}
+    base = env_mapping(load_compose(COMPOSE)["services"]["frontend-service"])
+    standalone = env_mapping(load_compose(TRUENAS_APP)["services"]["frontend-service"])
+    template = (REPO_ROOT / "truenas/tts-stt/templates/docker-compose.yaml").read_text(encoding="utf-8")
+    frontend_block = template.split("\n  frontend-service:", 1)[1].split("\n\n", 1)[0]
+    read = _consumed_by_service()["frontend-service"]
+
+    problems = []
+    for name, (base_default, truenas_default) in SETTINGS_SWITCHES.items():
+        if name not in read:
+            problems.append(f"frontend-service never reads {name}")
+        for label, environment, default in (("docker-compose.yml", base, base_default),
+                                             ("docker-compose.truenas-app.yml", standalone, truenas_default)):
+            if name not in environment:
+                problems.append(f"{label}: frontend-service does not get {name}")
+            elif interpolate(str(environment[name])) != default:
+                problems.append(f"{label}: {name} defaults to {interpolate(str(environment[name]))!r}, "
+                                f"expected {default!r}")
+        if documented.get(name) != base_default:
+            problems.append(f".env.example: {name}={documented.get(name)!r}, expected {base_default!r}")
+        if f"\n      {name}: " not in frontend_block:
+            problems.append(f"truenas template: frontend-service does not set {name}")
+    assert not problems, "\n  ".join(problems)
+
+
+def test_the_settings_folders_are_documented_as_path_overrides():
+    """SETTINGS_DIR and BACKEND_SETTINGS_DIR move the two folders, like MODELS_DIR moves models/.
+
+    They are mounts, not environment (the _DIR rule above), and are listed commented out in
+    .env.example with the other path overrides, since their default follows APP_DATA_DIR.
+    """
+    example = ENV_EXAMPLE.read_text(encoding="utf-8")
+    compose = COMPOSE.read_text(encoding="utf-8")
+    for name, folder in (("SETTINGS_DIR", "settings"), ("BACKEND_SETTINGS_DIR", "backend-settings")):
+        assert re.search(rf"^#\s*{name}=\s*$", example, flags=re.M), f".env.example does not document {name}"
+        assert f"${{{name}:-${{APP_DATA_DIR:-.}}/{folder}}}" in compose, f"docker-compose.yml does not read {name}"
 
 
 # --- the documentation has to say what the services do -----------------------

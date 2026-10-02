@@ -12,8 +12,10 @@ CI workflow (.github/workflows/truenas.yml) has it.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
+import posixpath
 import re
 import shutil
 import subprocess
@@ -300,6 +302,131 @@ def test_one_model_cache_is_shared_by_every_service_that_downloads_models():
     assert sources == {f"{DATA}/cache"}, "a model would download once per service"
 
 
+# --- the settings folders ----------------------------------------------------------------------------------------------
+#
+# The Settings page (web UI -> gear) saves into the dataset's settings/ folder, mounted into the gateway only.
+# backend-settings/ is the folder later releases save backend settings to: the gateway writes it, every Python
+# backend mounts the whole folder read-only. A container that could write a folder another one mounts (or a parent
+# of it) could swap that folder for a symlink before the other one starts, so no mount source may lie inside another
+# service's read-write mount. Checked in this file and in docker-compose.yml, which mounts the same two folders.
+
+BASE_COMPOSE = REPO_ROOT / "docker-compose.yml"
+DEPLOYMENT_FILES = [COMPOSE_APP, BASE_COMPOSE]
+PYTHON_BACKENDS = {"piper-tts-service", "piper-training-service", "stt-service", "qwen3-asr-service",
+                   "qwen3-tts-service", "parakeet-asr-service", "canary-asr-service", "chatterbox-tts-service",
+                   "magpie-tts-service"}
+
+
+def short_mounts(path: Path) -> dict[str, list[tuple[str, str, str]]]:
+    """{service: [(host source, container target, "ro" or "rw")]}, the dataset path filled in.
+
+    A named volume keeps its name as the source (it does not start with a slash).
+    """
+    out = {}
+    for name, service in load_compose(path)["services"].items():
+        entries = []
+        for volume in service.get("volumes", []):
+            text = interpolate(str(volume).replace(PLACEHOLDER, DATA), {"APP_DATA_DIR": DATA})
+            source, target, *options = text.split(":")
+            mode = "ro" if options and "ro" in options[0].split(",") else "rw"
+            entries.append((posixpath.normpath(source) if source.startswith("/") else source, target, mode))
+        out[name] = entries
+    return out
+
+
+def inside(path: str, folder: str) -> bool:
+    """Is ``path`` the folder itself or anything below it?"""
+    return path == folder or path.startswith(folder.rstrip("/") + "/")
+
+
+def containment_problems(mounts: dict[str, list[tuple[str, str, str]]]) -> list[str]:
+    """Host paths one service mounts that lie strictly inside a folder another service mounts read-write."""
+    problems = []
+    for writer, writes in mounts.items():
+        for folder, _, mode in writes:
+            if mode != "rw" or not folder.startswith("/"):
+                continue
+            for reader, reads in mounts.items():
+                for source, target, _ in reads:
+                    if reader != writer and source != folder and inside(source, folder):
+                        problems.append(f"{reader} mounts {source} (at {target}), inside {writer}'s "
+                                        f"read-write {folder}")
+    return problems
+
+
+def test_the_python_backends_are_the_services_built_from_this_repository():
+    """The premise of the checks below, so a new backend cannot slip past them unnoticed."""
+    for path in DEPLOYMENT_FILES:
+        built_here = {name for name in load_compose(path)["services"]
+                      if name != "frontend-service" and (REPO_ROOT / name / "app.py").is_file()}
+        assert built_here == PYTHON_BACKENDS, (path.name, sorted(built_here ^ PYTHON_BACKENDS))
+
+
+@pytest.mark.parametrize("path", DEPLOYMENT_FILES, ids=lambda p: p.name)
+def test_the_gateway_mounts_both_settings_folders_read_write(path):
+    gateway = {target: (source, mode) for source, target, mode in short_mounts(path)["frontend-service"]}
+    assert gateway.get("/app/settings") == (f"{DATA}/settings", "rw"), gateway
+    assert gateway.get("/app/backend-settings") == (f"{DATA}/backend-settings", "rw"), gateway
+
+
+@pytest.mark.parametrize("path", DEPLOYMENT_FILES, ids=lambda p: p.name)
+def test_every_python_backend_mounts_the_whole_backend_settings_folder_read_only(path):
+    mounts = short_mounts(path)
+    for name in sorted(PYTHON_BACKENDS):
+        found = [(source, mode) for source, target, mode in mounts[name] if target == "/app/backend-settings"]
+        assert found == [(f"{DATA}/backend-settings", "ro")], f"{name}: {found}"
+        assert not [s for s, t, _ in mounts[name]
+                    if inside(s, f"{DATA}/backend-settings") and t != "/app/backend-settings"], name
+    for name in sorted(set(mounts) - PYTHON_BACKENDS - {"frontend-service"}):
+        assert not [s for s, _, _ in mounts[name] if inside(s, f"{DATA}/backend-settings")], (
+            f"{name} is not a Python backend and has no business with backend-settings")
+
+
+@pytest.mark.parametrize("path", DEPLOYMENT_FILES, ids=lambda p: p.name)
+def test_only_the_gateway_mounts_the_settings_folder(path):
+    """It holds the API key digests and the audit log: no other container reads or writes it."""
+    for name, entries in short_mounts(path).items():
+        if name == "frontend-service":
+            continue
+        assert not [(s, t) for s, t, _ in entries if inside(s, f"{DATA}/settings") or inside(t, "/app/settings")], name
+
+
+@pytest.mark.parametrize("path", DEPLOYMENT_FILES, ids=lambda p: p.name)
+def test_no_mount_source_lies_inside_another_services_read_write_mount(path):
+    assert not containment_problems(short_mounts(path))
+
+
+def test_the_containment_check_notices_a_folder_mounted_inside_another_ones():
+    """Guards the guard: a backend that mounted a file of settings/, or the gateway mounting the parent of models/."""
+    planted = short_mounts(COMPOSE_APP)
+    planted["stt-service"].append((f"{DATA}/settings/keys.json", "/tmp/keys.json", "ro"))
+    assert containment_problems(planted) == [
+        f"stt-service mounts {DATA}/settings/keys.json (at /tmp/keys.json), inside frontend-service's "
+        f"read-write {DATA}/settings"]
+    planted = short_mounts(COMPOSE_APP)
+    planted["frontend-service"].append((DATA, "/data", "rw"))
+    assert len(containment_problems(planted)) > 10
+    assert not containment_problems({"a": [(f"{DATA}/settings-old", "/x", "rw")], "b": [(f"{DATA}/settings", "/y", "ro")]})
+
+
+def mount_lines_the_settings_page_shows() -> dict[str, list[str]]:
+    """frontend-service/app.py's _SETTINGS_MOUNT_LINES, read without importing the gateway."""
+    tree = ast.parse((REPO_ROOT / "frontend-service" / "app.py").read_text(encoding="utf-8"))
+    for node in tree.body:
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AnnAssign) else []
+        if any(getattr(target, "id", None) == "_SETTINGS_MOUNT_LINES" for target in targets):
+            return ast.literal_eval(node.value)
+    raise AssertionError("frontend-service/app.py no longer defines _SETTINGS_MOUNT_LINES")
+
+
+def test_the_lines_the_settings_page_shows_without_a_mount_are_the_lines_of_the_files():
+    """An install pasted before the Settings page has no mount: the page shows what to add. It must be this."""
+    shown = mount_lines_the_settings_page_shows()
+    for key, path in (("truenas", COMPOSE_APP), ("compose", BASE_COMPOSE)):
+        lines = [yaml.safe_load(line)[0] for line in shown[key]]
+        assert lines == load_compose(path)["services"]["frontend-service"]["volumes"], (key, path.name)
+
+
 def test_the_containers_run_as_root_which_is_what_the_guide_says_about_permissions():
     """The guide: 'every container runs as root, so no chown or ACL is needed'. True only while no
     compose service sets `user:` and no image switches user; this fails the day one does."""
@@ -400,3 +527,21 @@ def test_the_portal_and_notes_keys_match_what_truenas_accepts():
         assert portal["scheme"] in ("http", "https") and isinstance(portal["port"], int)
         assert portal.get("path", "/").startswith("/")
     assert isinstance(document["x-notes"], str) and document["x-notes"].strip()
+
+
+def test_a_second_portal_opens_the_settings_page_on_the_web_ui_port():
+    document = yaml.safe_load(COMPOSE_APP.read_text(encoding="utf-8"))
+    portals = {portal["name"]: portal for portal in document["x-portals"]}
+    assert list(portals) == ["Web UI", "Settings"]
+    assert (portals["Web UI"]["path"], portals["Settings"]["path"]) == ("/", "/settings")
+    assert portals["Settings"]["port"] == portals["Web UI"]["port"] == int(interpolate("${FRONTEND_PORT:-3000}"))
+    assert {portals["Settings"][k] for k in ("scheme", "host")} == {portals["Web UI"][k] for k in ("scheme", "host")}
+    header = COMPOSE_APP.read_text(encoding="utf-8").split("services:", 1)[0]
+    assert "both `port:` lines under x-portals" in header, "the port setting must say there are two portals now"
+
+
+def test_the_notes_say_where_the_settings_live_and_how_to_get_back_in():
+    """Comments are gone after Save; x-notes is what a locked-out owner still has."""
+    notes = " ".join(yaml.safe_load(COMPOSE_APP.read_text(encoding="utf-8"))["x-notes"].split())
+    for needle in ("/settings", "settings/gateway.json", "settings/SAFE-MODE", "by IP address", "frontend-service log"):
+        assert needle in notes, f"x-notes does not mention {needle!r}"

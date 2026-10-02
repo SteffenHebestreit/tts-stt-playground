@@ -22,6 +22,8 @@ copies all of it. It runs against *every* variant -- base, ``.rocm``,
 from __future__ import annotations
 
 import ast
+import posixpath
+import re
 from pathlib import Path
 
 import pytest
@@ -209,6 +211,166 @@ def test_every_service_with_python_is_covered():
     pairs = _dockerfiles()
     assert len(pairs) >= 9, f"expected to scan >=9 Dockerfiles, scanned {len(pairs)}"
     assert any(d.name == "Dockerfile.rocm" for _, d in pairs), "no .rocm variant scanned"
+
+
+# --- files a module opens next to itself ---------------------------------------
+#
+# The import closure sees modules, not the files they read. public_suffix.py opens
+# public_suffix_list.dat from its own directory, and an image without that file does
+# not die at import: the Settings page quietly refuses every wildcard host name with
+# "cannot be checked". So the data files a module names next to itself are held to
+# the same rule as the modules, in the image and in the dev overlay.
+
+_SIBLING_FILE = (
+    # os.path.join(os.path.dirname(os.path.abspath(__file__)), "name")
+    re.compile(r"os\.path\.join\(\s*os\.path\.dirname\(\s*(?:os\.path\.(?:abspath|realpath)\(\s*)?__file__\s*\)?\s*\)"
+               r"\s*,\s*[\"']([^\"'/\\]+)[\"']"),
+    # Path(__file__).parent / "name", Path(__file__).resolve().parent / "name"
+    re.compile(r"Path\(\s*__file__\s*\)(?:\.resolve\(\))?\.parent\s*/\s*[\"']([^\"'/\\]+)[\"']"),
+)
+
+
+def _sibling_files(service_dir: Path) -> set[str]:
+    """Files and folders that the app or a module it imports opens next to itself."""
+    names: set[str] = set()
+    for module in {"app", *_local_import_closure(service_dir)}:
+        source = (service_dir / f"{module}.py").read_text(encoding="utf-8")
+        for pattern in _SIBLING_FILE:
+            names.update(pattern.findall(source))
+    return names
+
+
+def _ships_file(name: str, copy_sources: list[str]) -> bool:
+    for src in copy_sources:
+        normalised = src.replace("\\", "/").lstrip("./").rstrip("/")
+        if src in (".", "./") or normalised in ("", name):
+            return True
+    return False
+
+
+@pytest.mark.parametrize(
+    "service_dir,dockerfile",
+    _dockerfiles(),
+    ids=[f"{s.name}/{d.name}" for s, d in _dockerfiles()],
+)
+def test_dockerfile_ships_every_file_a_module_opens_next_to_itself(service_dir: Path, dockerfile: Path):
+    copied = _copy_targets(dockerfile)
+    missing = sorted(name for name in _sibling_files(service_dir) if not _ships_file(name, copied))
+    assert not missing, (
+        f"{dockerfile.relative_to(REPO_ROOT)} does not ship {missing}, which {service_dir.name} opens next "
+        f"to its own modules. Add it to a COPY line. COPY sources found: {copied}")
+
+
+def test_the_dev_overlay_mounts_every_file_a_module_opens_next_to_itself():
+    overlay = _dev_overlay_mounts()
+    missing = [f"{service_dir.name}: {name}"
+               for service_dir in _service_dirs() if service_dir.name in overlay
+               for name in sorted(_sibling_files(service_dir)) if name not in overlay[service_dir.name]]
+    assert not missing, f"docker-compose.dev.yml does not mount {missing}"
+
+
+def test_the_gateway_ships_the_settings_page_modules_and_the_public_suffix_list():
+    """Named, so the two scans above cannot pass by finding nothing."""
+    service = REPO_ROOT / "frontend-service"
+    assert {"settings_schema", "settings_store", "public_suffix"} <= _local_import_closure(service)
+    assert {"public_suffix_list.dat", "static"} <= _sibling_files(service)
+    shipped = {"settings_schema.py", "settings_store.py", "public_suffix.py", "public_suffix_list.dat"}
+    assert all(_ships_file(name, _copy_targets(service / "Dockerfile")) for name in shipped)
+    assert shipped <= _dev_overlay_mounts()["frontend-service"]
+
+
+# --- the settings folders are bind mounts, never part of an image ----------------
+#
+# The Settings page saves into /app/settings (API key digests, the audit log), and
+# /app/backend-settings is the folder for backend settings saved there. Both must be
+# bind mounts from the app's dataset: a folder an image creates (RUN mkdir, a COPY into
+# it, WORKDIR) or declares (VOLUME) puts the saves in the container layer or an
+# anonymous volume, and the next recreate -- every TrueNAS Edit, Update and Stop/Start
+# -- drops them, admin keys included. The gateway refuses to save unless
+# /proc/self/mountinfo lists /app/settings as a mount; this keeps every image from
+# creating the folder in the first place.
+
+SETTINGS_FOLDERS = ("/app/settings", "/app/backend-settings")
+
+
+def _instructions(text: str) -> list[tuple[str, str]]:
+    """(INSTRUCTION, arguments) per Dockerfile instruction: continuations folded, comments dropped."""
+    out = []
+    for raw in text.replace("\\\r\n", " ").replace("\\\n", " ").splitlines():
+        line = raw.strip()
+        if line and not line.startswith("#"):
+            keyword, _, arguments = line.partition(" ")
+            out.append((keyword.upper(), arguments.strip()))
+    return out
+
+
+def _paths(arguments: str, workdir: str) -> list[str]:
+    """Every word of an instruction that could be a container path, made absolute against WORKDIR."""
+    found = []
+    for word in re.split(r"[\s,]+", arguments):
+        word = word.strip("\"'[]();&|")
+        if not word or word.startswith("-") or "$" in word or "=" in word:
+            continue
+        found.append(posixpath.normpath(posixpath.join(workdir, word)))
+    return found
+
+
+def _settings_folder_problems(text: str) -> list[str]:
+    """Instructions that create, declare or write into a settings folder."""
+    problems = []
+    workdir = "/"
+    for keyword, arguments in _instructions(text):
+        if keyword in ("COPY", "ADD"):
+            words = [w for w in arguments.split() if not w.startswith("--")]
+            candidates = _paths(words[-1], workdir) if len(words) >= 2 else []
+        elif keyword in ("RUN", "VOLUME", "WORKDIR"):
+            candidates = _paths(arguments, workdir)
+        else:
+            candidates = []
+        for path in candidates:
+            if any(path == folder or path.startswith(folder + "/") for folder in SETTINGS_FOLDERS):
+                problems.append(f"{keyword} {arguments}")
+                break
+        if keyword == "WORKDIR":
+            workdir = posixpath.normpath(posixpath.join(workdir, arguments.strip("\"'")))
+    return problems
+
+
+def _all_dockerfiles() -> list[Path]:
+    return sorted(p for p in REPO_ROOT.glob("**/Dockerfile*") if ".git" not in p.parts and p.is_file())
+
+
+def test_no_image_creates_or_declares_a_settings_folder():
+    scanned = _all_dockerfiles()
+    assert len(scanned) >= 15, scanned
+    problems = {str(p.relative_to(REPO_ROOT)): _settings_folder_problems(p.read_text(encoding="utf-8"))
+                for p in scanned}
+    problems = {name: found for name, found in problems.items() if found}
+    assert not problems, (
+        f"these images create or declare a settings folder, so saves would vanish with the container: {problems}")
+
+
+_FOLDER_CHECK_CASES = {
+    "relative-mkdir": ("WORKDIR /app\nRUN mkdir -p settings", True),
+    "mkdir-among-others": ("WORKDIR /app\nRUN mkdir -p /app/static /app/backend-settings && chmod 700 /app/backend-settings",
+                           True),
+    "volume-json-form": ('VOLUME ["/app/settings"]', True),
+    "volume-plain-form": ("VOLUME /app/backend-settings", True),
+    "workdir": ("WORKDIR /app/settings", True),
+    "copy-into-relative": ("WORKDIR /app\nCOPY defaults.json settings/", True),
+    "copy-continued-line": ("COPY --chown=0:0 keys.json \\\n    /app/settings/keys.json", True),
+    "run-touch": ("RUN touch /app/settings/gateway.json", True),
+    "the-real-copy-line": ("WORKDIR /app\nCOPY settings_schema.py settings_store.py ./\n"
+                           "RUN mkdir -p /app/static /app/templates", False),
+    "a-similar-name": ("WORKDIR /app\nRUN mkdir -p /app/settings-old", False),
+    "a-comment": ("# RUN mkdir -p /app/settings\nWORKDIR /app", False),
+}
+
+
+@pytest.mark.parametrize("dockerfile, caught", list(_FOLDER_CHECK_CASES.values()), ids=list(_FOLDER_CHECK_CASES))
+def test_the_settings_folder_check_catches_what_it_is_for(dockerfile, caught):
+    """Guards the guard: each way an image could create or declare the folder is noticed."""
+    assert bool(_settings_folder_problems(dockerfile)) is caught
 
 
 # --- ENV parity -------------------------------------------------------------

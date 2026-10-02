@@ -281,6 +281,10 @@ docker compose --env-file deploy/profiles/strixhalo.env \
   --profile frontend --profile piper-tts --profile whisper-cpp up -d
 ```
 
+None of these commands starts voice training (`--profile training`, which `all` does not include), so
+every preset sets `ENABLE_TRAINING=false`: the UI then shows no Voice Training tab and no status dot
+that could only be red. Set it to `true` when you add the profile.
+
 Two things to know about any of these. **Only the gateway (port 3000) is published to the network**:
 the backends are bound to `127.0.0.1` (`BACKEND_BIND_ADDR`) and the UI reaches them over the
 internal network, so nothing in the presets needs their ports opened. And **`IMAGE_TAG=latest`
