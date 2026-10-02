@@ -18,7 +18,8 @@ One page to tick off. The steps and the reasons are in
 
 - [ ] Apps -> Discover Apps -> Custom App -> Install via YAML, name `tts-stt`.
 - [ ] Paste `docker-compose.truenas-app.yml`; replace `${APP_DATA_DIR:?set dataset path}` with the dataset path.
-- [ ] Optional services: delete the `profiles:` line **and** set the `ENABLE_*` flag (training has none).
+- [ ] Optional services: delete the `profiles:` line, then offer the service under **Settings -> Engines**
+      in the web UI (or set its `ENABLE_*` flag; voice training's is `ENABLE_TRAINING`).
 - [ ] Install. The app shows **Running** within about a minute; model downloads continue in the background.
 
 ## After
@@ -26,6 +27,8 @@ One page to tick off. The steps and the reasons are in
 - [ ] `curl -s http://localhost:3000/api/health`: every backend `healthy`, GPU services `"device": "cuda"`.
 - [ ] Web UI at `http://<truenas-ip>:3000`: generate speech (Text-to-Speech tab).
 - [ ] Microphone test over `https://` or `localhost` (Live Transcription).
+- [ ] Settings (`http://<truenas-ip>:3000/settings`) loads. Without `API_KEY`, claim it: ask for a
+      one-time code and read it under Workloads -> frontend-service -> View Logs.
 - [ ] Snapshot the dataset (Datasets -> Data Protection) or add a periodic snapshot task.
 - [ ] Optional: `diun` for release notifications, `update-check.sh` in a cron job.
 

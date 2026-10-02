@@ -185,6 +185,23 @@ function pruneOptionalProviders() {
             providerRegistry.ui.default_stt_provider = 'whisper';
         }
     }
+    if (!isTrainingOffered()) removeTrainingUi();
+}
+
+/**
+ * Voice training is offered when the registry has its provider: ENABLE_TRAINING
+ * (the app YAML or the Settings page) or an operator's PROVIDER_REGISTRY_JSON
+ * entry. Without it the gateway answers every training route with a 404, so the
+ * tab and its start-up calls could only show errors.
+ */
+function isTrainingOffered() {
+    return getProvider(getTrainingProviderId())?.kind === 'training';
+}
+
+/** Take the Voice Training tab out of the page; switchTTSEngine() cannot bring a removed one back. */
+function removeTrainingUi() {
+    document.getElementById('training-tab-button')?.remove();
+    document.getElementById('training-tab')?.remove();
 }
 
 function getProvider(providerId) {
@@ -832,11 +849,12 @@ document.addEventListener('DOMContentLoaded', function() {
 /** Initialize UI widgets, voice lists, and background health polling. */
 function initializeApp() {
     pruneOptionalProviders();
+    const trainingOffered = isTrainingOffered();
     applyGlobalCopy();
-    applyTrainingProviderCopy();
+    if (trainingOffered) applyTrainingProviderCopy();
     applyQwen3ProviderCopy();
     applySTTProviderSettings();
-    applyTrainingProviderSettings();
+    if (trainingOffered) applyTrainingProviderSettings();
     applyQwen3ProviderSettings();
     applyTTSProviderSettings(currentTTSEngine);
     applyTTSProviderCopy(currentTTSEngine);
@@ -845,7 +863,7 @@ function initializeApp() {
     setupRangeSliders();
     if (ttsPanelControls(currentTTSEngine).voices) refreshTTSVoices();
     loadQwen3BuiltinSpeakers();
-    loadTrainingDeploymentTargets();
+    if (trainingOffered) loadTrainingDeploymentTargets();
     switchTTSEngine(currentTTSEngine);
 
     setTimeout(() => {
@@ -948,7 +966,7 @@ function showTab(tabId) {
     }
 
     // Tab-specific initialization
-    if (tabId === 'training-tab') {
+    if (tabId === 'training-tab' && isTrainingOffered()) {
         loadTrainingDeploymentTargets();
         refreshModels();
         refreshTrainingJobs();

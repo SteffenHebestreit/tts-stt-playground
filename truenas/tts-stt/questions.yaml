@@ -174,7 +174,9 @@ questions:
 
   - variable: enable_training
     label: Voice training
-    description: Run it on demand. An idle container still holds a CUDA context (about 0.5 GB).
+    description: >-
+      Runs the training service and shows the Voice Training tab in the web UI. Run it on demand:
+      an idle container still holds a CUDA context (about 0.5 GB).
     group: Optional services
     schema:
       type: boolean

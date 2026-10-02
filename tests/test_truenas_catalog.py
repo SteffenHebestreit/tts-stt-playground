@@ -228,10 +228,18 @@ def test_by_default_only_the_web_ui_port_is_published():
     assert published == {"frontend-service": ["0.0.0.0:3000:3000"]}
 
 
-def test_the_web_ui_port_answer_moves_the_mapping_and_the_portal():
+def test_the_web_ui_port_answer_moves_the_mapping_and_both_portals():
     document = render(frontend_port=8080)
     assert document["services"]["frontend-service"]["ports"] == ["0.0.0.0:8080:3000"]
-    assert document["x-portals"] == [{"name": "Web UI", "scheme": "http", "host": "0.0.0.0", "port": 8080, "path": "/"}]
+    assert document["x-portals"] == [
+        {"name": "Web UI", "scheme": "http", "host": "0.0.0.0", "port": 8080, "path": "/"},
+        {"name": "Settings", "scheme": "http", "host": "0.0.0.0", "port": 8080, "path": "/settings"},
+    ]
+
+
+def test_the_portals_are_the_custom_app_files_portals():
+    compose = yaml.safe_load(COMPOSE_APP.read_text(encoding="utf-8"))["x-portals"]
+    assert render()["x-portals"] == compose
 
 
 def test_publishing_backend_ports_binds_them_to_loopback_only():
@@ -260,13 +268,28 @@ def test_optional_services_appear_only_when_asked_for():
         assert service in render(**{flag: "true"})["services"], flag
 
 
+def engine_flags(environment: dict) -> dict:
+    """The gateway's ENABLE_* flags that show a service; ENABLE_SETTINGS_UI is the Settings page's own switch."""
+    return {k: v for k, v in environment.items() if k.startswith("ENABLE_") and k != "ENABLE_SETTINGS_UI"}
+
+
 def test_the_ui_flags_follow_the_services_that_run():
     env = env_mapping(render(**OPTIONAL_ON)["services"]["frontend-service"])
-    assert {k: env[k] for k in env if k.startswith("ENABLE_")} == {
+    assert engine_flags(env) == {
         "ENABLE_PARAKEET_ASR": "true", "ENABLE_CANARY_ASR": "true", "ENABLE_CHATTERBOX_TTS": "true",
-        "ENABLE_MAGPIE_TTS": "true", "ENABLE_WHISPER_CPP": "true"}
+        "ENABLE_MAGPIE_TTS": "true", "ENABLE_WHISPER_CPP": "true", "ENABLE_TRAINING": "true"}
     off = env_mapping(render()["services"]["frontend-service"])
-    assert {off[k] for k in off if k.startswith("ENABLE_")} == {"false"}, "a flag without its service is a red indicator"
+    assert set(engine_flags(off).values()) == {"false"}, "a flag without its service is a red indicator"
+
+
+def test_the_settings_page_is_on_and_reads_the_dataset_in_every_answer_set():
+    """The form has no question for the page's own switches: a catalog install gets the defaults."""
+    for scenario in ({}, {"use_gpu": "false"}, OPTIONAL_ON):
+        frontend = render(**scenario)["services"]["frontend-service"]
+        env = env_mapping(frontend)
+        assert (env["ENABLE_SETTINGS_UI"], env["SETTINGS_LOCKED_KEYS"]) == ("true", ""), scenario
+        assert frontend["volumes"] == [f"{DATA}/settings:/app/settings",
+                                       f"{DATA}/backend-settings:/app/backend-settings"], scenario
 
 
 def test_cpu_mode_starts_no_gpu_service_and_reserves_no_device():
@@ -279,7 +302,8 @@ def test_cpu_mode_starts_no_gpu_service_and_reserves_no_device():
     assert not [k for k in env if k.startswith("NVIDIA_")]
     frontend = env_mapping(document["services"]["frontend-service"])
     assert (frontend["ENABLE_CANARY_ASR"] == frontend["ENABLE_PARAKEET_ASR"] == frontend["ENABLE_CHATTERBOX_TTS"]
-            == frontend["ENABLE_MAGPIE_TTS"] == "false")
+            == frontend["ENABLE_MAGPIE_TTS"] == frontend["ENABLE_TRAINING"] == "false"), (
+        "training was asked for, but without a GPU its service is not rendered: the tab would be a red dot")
 
 
 def test_gpu_mode_gives_every_gpu_service_the_selected_device():
@@ -360,7 +384,7 @@ def differences(scenario: dict, compose_env: dict[str, str], dropped_services: s
 
 
 UI_FLAGS_ON = {"ENABLE_CANARY_ASR": "true", "ENABLE_PARAKEET_ASR": "true", "ENABLE_CHATTERBOX_TTS": "true",
-               "ENABLE_MAGPIE_TTS": "true", "ENABLE_WHISPER_CPP": "true"}
+               "ENABLE_MAGPIE_TTS": "true", "ENABLE_WHISPER_CPP": "true", "ENABLE_TRAINING": "true"}
 
 
 def test_at_the_default_answers_the_template_is_the_default_compose_stack():

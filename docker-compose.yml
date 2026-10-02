@@ -3,7 +3,8 @@ name: ttstt
 # This base file runs the stack from the built images and persists data through
 # configurable host paths. Override data locations with a single APP_DATA_DIR
 # (e.g. a TrueNAS dataset) or per-path vars (MODELS_DIR, OUTPUT_DIR, CACHE_DIR,
-# TRAINING_*_DIR, *_CACHE_DIR); all default to ./ so local use is unchanged.
+# SETTINGS_DIR, BACKEND_SETTINGS_DIR, TRAINING_*_DIR, *_CACHE_DIR); all default
+# to ./ so local use is unchanged.
 #
 #   Local dev (live-reload source):  -f docker-compose.yml -f docker-compose.dev.yml
 #   TrueNAS / single-GPU host:       -f docker-compose.yml -f docker-compose.truenas.yml
@@ -36,6 +37,19 @@ name: ttstt
 # takes minutes, optional backends may be absent, and a gate would keep the
 # gateway (and with it the whole UI) down for as long as the slowest backend.
 # The gateway reports each backend's state itself (GET /api/health).
+#
+# --- Settings saved in the web UI --------------------------------------------
+# The Settings page (http://<host>:3000/settings, the gear in the UI) changes
+# host names, engines, API keys and the gateway limits at once, and stores them
+# in SETTINGS_DIR (default ${APP_DATA_DIR}/settings, ./settings locally). Only
+# frontend-service mounts it. BACKEND_SETTINGS_DIR (default
+# ${APP_DATA_DIR}/backend-settings) is reserved for backend settings saved in
+# the page: the gateway mounts it read-write, every Python backend the whole
+# directory read-only. Both are bind mounts on purpose and no image creates
+# either folder: the gateway refuses to save unless /app/settings is a real
+# mount, so nothing saved can vanish with a container. Saved values win over
+# the environment below, key by key; SETTINGS_LOCKED_KEYS and
+# ENABLE_SETTINGS_UI=false (frontend-service) give the environment back the say.
 
 # One build recipe for the Piper TTS image. Two services run this image (the voice
 # seed and the service itself) and both name the same tag, so both builds write
@@ -142,6 +156,8 @@ services:
     volumes:
       - "${MODELS_DIR:-${APP_DATA_DIR:-.}/models}:/app/models"
       - "${OUTPUT_DIR:-${APP_DATA_DIR:-.}/output}:/app/output"
+      # Read-only, the whole folder: see "Settings saved in the web UI" at the top.
+      - "${BACKEND_SETTINGS_DIR:-${APP_DATA_DIR:-.}/backend-settings}:/app/backend-settings:ro"
     restart: unless-stopped
     stop_grace_period: 20s
     healthcheck:
@@ -218,6 +234,7 @@ services:
       - "${TRAINING_CHECKPOINTS_DIR:-${APP_DATA_DIR:-.}/piper-training-service/checkpoints}:/app/checkpoints"
       - "${TRAINING_CONFIGS_DIR:-${APP_DATA_DIR:-.}/piper-training-service/configs}:/app/configs"
       - "${MODELS_DIR:-${APP_DATA_DIR:-.}/models}:/app/shared_models"
+      - "${BACKEND_SETTINGS_DIR:-${APP_DATA_DIR:-.}/backend-settings}:/app/backend-settings:ro"
     shm_size: 2gb
     # Optional caps so a runaway job cannot take the whole host down. 0 = unlimited
     # (Compose drops a zero, so the default adds no limit at all). Examples:
@@ -347,6 +364,7 @@ services:
       - "${MODELS_DIR:-${APP_DATA_DIR:-.}/models}:/app/models"
       - "${CACHE_DIR:-${APP_DATA_DIR:-.}/.cache}:/root/.cache"
       - pip-cache:/root/.cache/pip
+      - "${BACKEND_SETTINGS_DIR:-${APP_DATA_DIR:-.}/backend-settings}:/app/backend-settings:ro"
     restart: unless-stopped
     # Time for an in-flight decode and live sessions to finish before SIGKILL.
     stop_grace_period: 30s
@@ -421,6 +439,7 @@ services:
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${QWEN3_ASR_CACHE_DIR:-qwen3-asr-cache}:/root/.cache"
+      - "${BACKEND_SETTINGS_DIR:-${APP_DATA_DIR:-.}/backend-settings}:/app/backend-settings:ro"
     deploy:
       resources:
         reservations:
@@ -500,6 +519,7 @@ services:
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${PARAKEET_ASR_CACHE_DIR:-parakeet-asr-cache}:/root/.cache"
+      - "${BACKEND_SETTINGS_DIR:-${APP_DATA_DIR:-.}/backend-settings}:/app/backend-settings:ro"
     deploy:
       resources:
         reservations:
@@ -569,6 +589,7 @@ services:
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${CANARY_ASR_CACHE_DIR:-canary-asr-cache}:/root/.cache"
+      - "${BACKEND_SETTINGS_DIR:-${APP_DATA_DIR:-.}/backend-settings}:/app/backend-settings:ro"
     deploy:
       resources:
         reservations:
@@ -651,6 +672,7 @@ services:
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${CHATTERBOX_TTS_CACHE_DIR:-chatterbox-tts-cache}:/root/.cache"
+      - "${BACKEND_SETTINGS_DIR:-${APP_DATA_DIR:-.}/backend-settings}:/app/backend-settings:ro"
     deploy:
       resources:
         reservations:
@@ -742,6 +764,7 @@ services:
       ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
     volumes:
       - "${MAGPIE_TTS_CACHE_DIR:-magpie-tts-cache}:/root/.cache"
+      - "${BACKEND_SETTINGS_DIR:-${APP_DATA_DIR:-.}/backend-settings}:/app/backend-settings:ro"
     deploy:
       resources:
         reservations:
@@ -819,6 +842,7 @@ services:
     volumes:
       - "${QWEN3_TTS_CACHE_DIR:-qwen3-tts-cache}:/root/.cache"
       - "${QWEN3_TTS_VOICES_DIR:-qwen3-tts-voices}:/app/voices"
+      - "${BACKEND_SETTINGS_DIR:-${APP_DATA_DIR:-.}/backend-settings}:/app/backend-settings:ro"
     deploy:
       resources:
         reservations:
@@ -913,6 +937,9 @@ services:
       ENABLE_MAGPIE_TTS: ${ENABLE_MAGPIE_TTS:-false}
       WHISPER_CPP_SERVICE_URL: ${WHISPER_CPP_SERVICE_URL:-http://whisper-cpp:8080}
       ENABLE_WHISPER_CPP: ${ENABLE_WHISPER_CPP:-false}
+      # Voice training in the UI (its tab, its status dot, /api/training). The
+      # service itself only runs with `--profile training`; false hides it.
+      ENABLE_TRAINING: ${ENABLE_TRAINING:-true}
       # Browser access control. Empty = same-origin only: no CORS headers, and a
       # state-changing request that carries a foreign Origin is refused (403).
       # List origins (comma separated) to allow other pages to call the API;
@@ -938,6 +965,15 @@ services:
       # /ws/stt upgrade, with no exemption for the bundled UI (it asks for the
       # key once and keeps it in sessionStorage). Not user authentication.
       API_KEY: ${API_KEY:-}
+      # The Settings page (the gear in the UI, /settings) changes the access,
+      # engine and limit settings of this block at once, stored in SETTINGS_DIR.
+      # A save needs an admin key: API_KEY, or a key made in the page (a keyless
+      # stack is claimed with a one-time code from `docker compose logs
+      # frontend-service`). false = the page is read-only and what it saved is
+      # ignored (keys made there stay in force). SETTINGS_LOCKED_KEYS names
+      # settings that always come from here, e.g. TRUSTED_HOSTS,MAX_UPLOAD_MB.
+      ENABLE_SETTINGS_UI: ${ENABLE_SETTINGS_UI:-true}
+      SETTINGS_LOCKED_KEYS: ${SETTINGS_LOCKED_KEYS:-}
       # Largest request body (MB) for uploads (training audio, voice samples,
       # STT files) and the longest text (characters) for TTS. Keep MAX_TTS_CHARS
       # <= the smallest backend limit in use (chatterbox, magpie-tts and qwen3-tts: 5000).
@@ -970,6 +1006,11 @@ services:
       UPSTREAM_MAX_CONNECTIONS: ${UPSTREAM_MAX_CONNECTIONS:-100}
       UPSTREAM_MAX_KEEPALIVE: ${UPSTREAM_MAX_KEEPALIVE:-20}
       UPSTREAM_KEEPALIVE_EXPIRY: ${UPSTREAM_KEEPALIVE_EXPIRY:-115}
+    volumes:
+      # What the Settings page saves, and the backends' settings folder (see
+      # "Settings saved in the web UI" at the top). Keep both lines.
+      - "${SETTINGS_DIR:-${APP_DATA_DIR:-.}/settings}:/app/settings"
+      - "${BACKEND_SETTINGS_DIR:-${APP_DATA_DIR:-.}/backend-settings}:/app/backend-settings"
     restart: unless-stopped
     stop_grace_period: 20s
     healthcheck:

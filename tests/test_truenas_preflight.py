@@ -64,9 +64,24 @@ def test_without_create_it_makes_no_directories(host):
 def test_create_makes_the_subdirectories_the_compose_file_mounts(host):
     result, out = preflight(host, "--create")
     assert result.returncode == 0, out
-    assert sorted(p.name for p in host.data_dir.iterdir()) == ["cache", "models", "output", "qwen3-voices"]
+    assert sorted(p.name for p in host.data_dir.iterdir()) == [
+        "backend-settings", "cache", "models", "output", "qwen3-voices", "settings"]
     _, again = preflight(host, "--create")
     assert "all data subdirectories exist" in again
+
+
+def test_create_makes_the_settings_folders_without_a_gpu_too(host):
+    """The web UI's Settings page saves into settings/ on every install, GPU or not.
+
+    On a free port, so that a web UI already running on this machine's port 3000 cannot decide it.
+    """
+    host.remove("nvidia-smi")
+    sock, port = listening_socket()
+    sock.close()
+    result, out = preflight(host, "--create", "--no-gpu", "--port", str(port))
+    assert result.returncode == 0, out
+    assert {"settings", "backend-settings"} <= {p.name for p in host.data_dir.iterdir()}
+    assert not list((host.data_dir / "settings").iterdir()), "preflight writes no settings, it only makes the folder"
 
 
 def test_create_adds_the_directories_of_the_optional_services_it_plans_for(host):

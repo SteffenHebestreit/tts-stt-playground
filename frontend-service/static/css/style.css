@@ -65,7 +65,15 @@ body {
 }
 
 .header-actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 12px;
     margin-bottom: 24px;
+}
+
+.settings-link-icon {
+    margin-right: 4px;
 }
 
 /* TTS Service Selector */
@@ -1148,5 +1156,680 @@ audio[id*="voice-sample-player"] {
     .file-upload:hover,
     .file-upload.drag-over {
         transform: none;
+    }
+}
+
+/* --- The Settings page (templates/settings.html, static/js/settings.js) -----------
+   Only that page (body.settings-page) uses the classes below, and rules on shared
+   elements are scoped to it, so the main page does not change. It runs under
+   style-src 'self': all of its styling is here, none in an attribute. It uses the
+   app's own tokens and its one (dark) theme. */
+.settings-page {
+    color-scheme: dark;
+}
+
+.settings-page [hidden] {
+    display: none !important;
+}
+
+.settings-container {
+    max-width: 960px;
+}
+
+.settings-header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 16px;
+    padding: 24px;
+    background: linear-gradient(135deg, var(--panel) 0%, var(--panel-2) 100%);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+}
+
+.settings-header h1 {
+    margin: 0;
+    font-size: 2rem;
+    background: linear-gradient(135deg, var(--primary) 0%, #8b5cf6 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+}
+
+.settings-subtitle {
+    margin: 8px 0 0;
+    color: var(--muted);
+    line-height: 1.5;
+}
+
+.settings-banners,
+.settings-status {
+    display: grid;
+    gap: 8px;
+    margin-bottom: 16px;
+}
+
+.settings-banners:empty,
+.settings-status:empty {
+    margin-bottom: 0;
+}
+
+.settings-page .banner p {
+    margin: 0;
+    line-height: 1.5;
+}
+
+.settings-page .banner .btn-sm {
+    margin-top: 8px;
+}
+
+.mount-lines p {
+    margin: 12px 0 4px;
+    color: var(--text);
+}
+
+.settings-page pre,
+.settings-page code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+}
+
+.settings-page code {
+    font-size: 0.9em;
+}
+
+.settings-page pre {
+    margin: 0;
+    padding: 8px 12px;
+    white-space: pre-wrap;
+    color: var(--text);
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-xs);
+}
+
+.settings-who {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 12px;
+    margin-bottom: 16px;
+    color: var(--muted);
+}
+
+.settings-readonly {
+    margin: 0 0 16px;
+    padding: 12px 16px;
+    color: var(--warning);
+    background: rgba(255, 184, 77, 0.08);
+    border: 1px solid rgba(255, 184, 77, 0.3);
+    border-radius: var(--radius-xs);
+}
+
+.settings-card {
+    margin-bottom: 16px;
+    padding: 24px;
+    background: linear-gradient(135deg, var(--panel) 0%, var(--panel-2) 100%);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+}
+
+.settings-card h2 {
+    margin: 0 0 8px;
+    font-size: 1.4rem;
+    color: var(--text);
+}
+
+.settings-card h3 {
+    margin: 24px 0 8px;
+    font-size: 1.1rem;
+    color: var(--text);
+}
+
+.card-intro {
+    margin: 0 0 16px;
+    color: var(--muted);
+    line-height: 1.5;
+}
+
+.card-footnote {
+    margin: 16px 0 0;
+    color: var(--muted);
+}
+
+.setting {
+    padding: 16px 0;
+    border-top: 1px solid var(--border);
+}
+
+.setting:first-child {
+    padding-top: 0;
+    border-top: none;
+}
+
+.setting.is-changed {
+    padding-left: 12px;
+    box-shadow: inset 3px 0 0 var(--warning);
+}
+
+.setting-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 8px;
+    margin-bottom: 8px;
+}
+
+.settings-page .setting-label {
+    margin: 0 4px 0 0;
+    font-weight: 600;
+    color: var(--text);
+}
+
+.settings-page .check {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    margin: 0 0 8px;
+    font-weight: 500;
+    line-height: 1.4;
+    cursor: pointer;
+}
+
+.settings-page .setting-head .check {
+    margin-bottom: 0;
+}
+
+.settings-page input[type="checkbox"],
+.settings-page input[type="radio"] {
+    flex: none;
+    width: 18px;
+    height: 18px;
+    margin: 1px 0 0;
+    padding: 0;
+    transform: none;
+    accent-color: var(--primary);
+}
+
+.setting-choice {
+    display: grid;
+    gap: 4px;
+}
+
+.settings-page fieldset {
+    margin: 16px 0 0;
+    padding: 12px 16px 4px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-xs);
+}
+
+.settings-page legend {
+    padding: 0 6px;
+    font-weight: 600;
+}
+
+.settings-page textarea {
+    min-height: 0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.settings-page input[type="number"] {
+    max-width: 240px;
+}
+
+.settings-page select {
+    max-width: 480px;
+}
+
+.settings-page input:disabled,
+.settings-page textarea:disabled,
+.settings-page select:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+.settings-page input:focus-visible,
+.settings-page textarea:focus-visible,
+.settings-page select:focus-visible,
+.settings-page summary:focus-visible,
+.settings-page h2:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
+.setting-help,
+.setting-note,
+.setting-hint,
+.setting-error {
+    margin: 8px 0 0;
+    font-size: 0.9rem;
+    line-height: 1.5;
+}
+
+.setting-help,
+.setting-note {
+    color: var(--muted);
+}
+
+.setting-hint {
+    color: var(--primary);
+}
+
+.setting-error {
+    color: var(--error);
+    font-weight: 500;
+}
+
+.note-warning,
+.note-readonly {
+    color: var(--warning);
+}
+
+.setting.has-error textarea,
+.setting.has-error input,
+.setting.has-error select {
+    border-color: var(--error);
+}
+
+.setting-actions,
+.button-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 12px;
+}
+
+.inline-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.inline-row input {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.inline-row button {
+    flex: none;
+}
+
+.settings-page .label-spaced {
+    margin-top: 16px;
+}
+
+.key-value {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.badge {
+    display: inline-block;
+    padding: 2px 8px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    line-height: 1.5;
+    white-space: nowrap;
+    color: var(--muted);
+    background: var(--accent);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+}
+
+.badge-saved {
+    color: var(--primary);
+    background: rgba(106, 163, 255, 0.12);
+    border-color: rgba(106, 163, 255, 0.4);
+}
+
+.badge-yaml {
+    color: var(--text);
+}
+
+.badge-locked,
+.badge-fail_closed,
+.badge-changed {
+    color: var(--warning);
+    background: rgba(255, 184, 77, 0.1);
+    border-color: rgba(255, 184, 77, 0.45);
+}
+
+.badge-apply {
+    background: transparent;
+}
+
+.chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 10px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    white-space: nowrap;
+    color: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+}
+
+.chip::before {
+    content: "\25CB";
+}
+
+.chip-running {
+    color: var(--success);
+    background: rgba(63, 191, 127, 0.1);
+    border-color: rgba(63, 191, 127, 0.4);
+}
+
+.chip-not_reachable {
+    color: var(--warning);
+    background: rgba(255, 184, 77, 0.1);
+    border-color: rgba(255, 184, 77, 0.4);
+}
+
+.chip-running::before,
+.chip-not_reachable::before {
+    content: "\25CF";
+}
+
+.install-hint {
+    margin-top: 8px;
+    font-size: 0.9rem;
+    color: var(--muted);
+}
+
+.install-hint summary {
+    color: var(--primary);
+    cursor: pointer;
+}
+
+.install-hint p {
+    margin: 6px 0 0;
+}
+
+.engines-line {
+    flex-wrap: wrap;
+    justify-content: space-between;
+    margin-bottom: 8px;
+}
+
+.engines-line p {
+    flex: 1 1 240px;
+    margin: 0;
+}
+
+.item-list {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+.item-list .item {
+    padding: 12px 0;
+    border-top: 1px solid var(--border);
+    overflow-wrap: anywhere;
+}
+
+.item-list .item:first-child {
+    border-top: none;
+}
+
+.item-main {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+}
+
+.item-list .item .setting-note {
+    margin: 4px 0 8px;
+}
+
+.item-empty {
+    color: var(--muted);
+}
+
+.claim-steps {
+    display: grid;
+    gap: 16px;
+    margin: 0 0 8px;
+    padding-left: 20px;
+}
+
+.claim-steps p {
+    margin: 0 0 8px;
+    line-height: 1.5;
+}
+
+.recovery-details {
+    margin-top: 16px;
+    color: var(--muted);
+}
+
+.recovery-details summary {
+    color: var(--text);
+    cursor: pointer;
+}
+
+.recovery-details li {
+    margin: 6px 0;
+    line-height: 1.5;
+}
+
+.yaml-list {
+    margin: 0;
+    padding-left: 20px;
+    color: var(--muted);
+    line-height: 1.6;
+}
+
+.yaml-list code,
+.yaml-facts code {
+    color: var(--text);
+}
+
+.yaml-facts {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 6px 16px;
+    margin: 0;
+}
+
+.yaml-facts dt,
+.yaml-facts dd {
+    margin: 0;
+}
+
+.yaml-facts dd {
+    color: var(--muted);
+    overflow-wrap: anywhere;
+}
+
+.save-bar {
+    position: sticky;
+    bottom: 12px;
+    z-index: 10;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px 16px;
+    margin-top: 16px;
+    padding: 12px 16px;
+    background: var(--panel);
+    border: 1px solid var(--primary);
+    border-radius: var(--radius-sm);
+    box-shadow: var(--shadow);
+}
+
+.save-bar .button-row {
+    margin-top: 0;
+}
+
+#save-bar-count {
+    font-weight: 600;
+}
+
+.settings-dialog {
+    width: min(680px, calc(100% - 32px));
+    max-height: calc(100% - 32px);
+    padding: 24px;
+    color: var(--text);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+}
+
+.settings-dialog::backdrop {
+    background: rgba(5, 7, 12, 0.7);
+}
+
+.settings-dialog h2 {
+    margin: 0 0 8px;
+    font-size: 1.3rem;
+}
+
+.dialog-actions {
+    justify-content: flex-end;
+    margin-top: 20px;
+}
+
+.review-rows {
+    display: grid;
+    gap: 12px;
+}
+
+.review-row {
+    padding: 12px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-xs);
+}
+
+.review-label,
+.review-change {
+    margin: 0;
+    overflow-wrap: anywhere;
+}
+
+.review-label {
+    margin-bottom: 6px;
+}
+
+.review-old {
+    color: var(--muted);
+}
+
+.review-new {
+    font-weight: 600;
+    color: var(--text);
+}
+
+.review-list {
+    display: grid;
+    gap: 4px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+.review-list li {
+    overflow-wrap: anywhere;
+}
+
+.review-mark {
+    display: inline-block;
+    min-width: 5.5em;
+    font-size: 0.75rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+.review-removed {
+    font-weight: 600;
+    color: var(--error);
+}
+
+.review-added {
+    color: var(--success);
+}
+
+.review-warnings-title {
+    margin: 16px 0 8px;
+    font-weight: 600;
+}
+
+.settings-page .warning-check {
+    padding: 10px 12px;
+    background: rgba(255, 184, 77, 0.06);
+    border: 1px solid rgba(255, 184, 77, 0.35);
+    border-radius: var(--radius-xs);
+}
+
+.link-button {
+    padding: 0;
+    font: inherit;
+    color: var(--primary);
+    text-decoration: underline;
+    background: none;
+    border: none;
+    cursor: pointer;
+}
+
+/* A phone: one column, a 16 px gutter, nothing wider than the screen. */
+@media (max-width: 640px) {
+    body.settings-page {
+        padding: 16px;
+    }
+
+    .settings-header,
+    .settings-card {
+        padding: 16px;
+    }
+
+    .settings-header h1 {
+        font-size: 1.6rem;
+    }
+
+    .settings-dialog {
+        width: calc(100% - 16px);
+        max-height: calc(100% - 16px);
+        padding: 16px;
+    }
+
+    .inline-row {
+        flex-wrap: wrap;
+    }
+
+    .inline-row input {
+        flex-basis: 100%;
+    }
+
+    .yaml-facts {
+        grid-template-columns: 1fr;
+        gap: 2px;
+    }
+
+    .yaml-facts dd {
+        margin-bottom: 8px;
+    }
+
+    .save-bar {
+        bottom: 8px;
+    }
+
+    .save-bar .button-row {
+        width: 100%;
+    }
+
+    .save-bar .button-row button {
+        flex: 1 1 auto;
+        justify-content: center;
     }
 }

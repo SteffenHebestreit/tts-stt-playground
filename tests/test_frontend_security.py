@@ -287,6 +287,9 @@ def test_preflight_is_never_asked_for_the_key(monkeypatch):
 
 
 def test_key_is_compared_in_constant_time(monkeypatch):
+    """As SHA-256 digests: equal length whatever was sent, so not even the key's length leaks."""
+    import hashlib
+
     module, _, client = _gateway(monkeypatch, {"API_KEY": KEY})
     seen = []
     real = module.hmac.compare_digest
@@ -297,7 +300,12 @@ def test_key_is_compared_in_constant_time(monkeypatch):
 
     monkeypatch.setattr(module.hmac, "compare_digest", spy)
     client.get("/v1/models", headers=AUTH)
-    assert seen == [(KEY.encode(), KEY.encode())]
+    digest = hashlib.sha256(KEY.encode()).digest()
+    assert seen == [(digest, digest)]
+
+    seen.clear()
+    assert client.get("/v1/models", headers={"Authorization": "Bearer x"}).status_code == 401
+    assert seen == [(hashlib.sha256(b"x").digest(), digest)]
 
 
 def test_no_key_configured_leaves_v1_open(monkeypatch):

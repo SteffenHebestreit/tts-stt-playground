@@ -11,11 +11,19 @@ template wire up, does the WebSocket handling hold under real frames) is in
 
 `FRONTEND_SERVICE_DIR` (see `frontend_loader`) points these at another checkout
 of the service, which is how they are shown to fail against the previous code.
+
+The Settings page's script (`settings.js`) has its own driver further down: it
+runs in the real `settings.html`, parsed into a small DOM, and is fed the
+answers a real gateway gave.
 """
 
 from __future__ import annotations
 
+import base64
 import json
+import logging
+import re
+import secrets
 import shutil
 import subprocess
 import textwrap
@@ -1233,3 +1241,1404 @@ def test_a_failed_auth_check_is_not_remembered_as_accepted(tmp_path):
         return harness.requests.length;
     """)
     assert out == 3
+
+
+# --- voice training offered or not -----------------------------------------------------------
+#
+# ENABLE_TRAINING=false (the Settings page or the app YAML) takes the piper-training entry out
+# of the registry, and the gateway then answers every training route with a 404.
+
+
+def _with_training() -> dict:
+    registry = json.loads(json.dumps(REGISTRY))
+    registry["providers"]["piper-training"] = {"kind": "training"}
+    return registry
+
+
+def test_without_a_training_provider_the_tab_goes_and_nothing_asks_the_training_api(tmp_path):
+    """The tab stayed, with every call in it a 404, and every page load asked the training
+    service for its deployment targets."""
+    out = run_js(tmp_path, """
+        initializeApp();
+        await harness.flush();
+        showTab('training-tab');
+        await harness.flush();
+        return {
+            urls: harness.requests.map((r) => r.method + ' ' + r.url),
+            removed: [Boolean(harness.el('training-tab-button').removed), Boolean(harness.el('training-tab').removed)],
+            offered: isTrainingOffered(),
+        };
+    """)
+    assert out["offered"] is False
+    assert out["removed"] == [True, True]
+    assert not [url for url in out["urls"] if "/api/training/" in url], out["urls"]
+
+
+def test_with_a_training_provider_the_tab_stays_and_its_targets_load(tmp_path):
+    out = run_js(tmp_path, """
+        initializeApp();
+        await harness.flush();
+        return {
+            urls: harness.requests.map((r) => r.method + ' ' + r.url),
+            removed: [Boolean(harness.el('training-tab-button').removed), Boolean(harness.el('training-tab').removed)],
+            offered: isTrainingOffered(),
+        };
+    """, _with_training())
+    assert out["offered"] is True
+    assert out["removed"] == [False, False]
+    assert "GET /api/training/deployment-targets" in out["urls"]
+
+
+# --- the Settings page (settings.js) -----------------------------------------------------------
+#
+# settings.js runs in the real settings.html, parsed into a small DOM that refuses what the
+# page's Content-Security-Policy refuses (innerHTML, on* and style attributes), and it is fed
+# the answers a real gateway gave to the same requests: if the API changes shape, these see
+# it. The numbers in the test names are the page tests of the phase-1 plan.
+
+SETTINGS_JS = SERVICE_DIR / "static" / "js" / "settings.js"
+SETTINGS_HTML = SERVICE_DIR / "templates" / "settings.html"
+NAS = "192.168.1.20:3000"
+YAML_KEY = "the-key-from-the-app-yaml"
+PAGE_KEY = re.compile(r"tts_[A-Za-z0-9_-]{43}")
+CLAIM_CODE = re.compile(r"\b[0-9A-Z]{5}(?:-[0-9A-Z]{5}){3}\b")
+
+SETTINGS_DRIVER = r"""
+const vm = require('vm');
+const fs = require('fs');
+const nodeCrypto = require('crypto');
+const [scriptPath, htmlPath, scenarioPath, fixturesPath] = process.argv.slice(2);
+const fixtures = JSON.parse(fs.readFileSync(fixturesPath, 'utf8'));
+
+// --- a small DOM: the real template, parsed, and what settings.js does with it ---------
+//
+// Strict where the page's CSP is strict: innerHTML/outerHTML/insertAdjacentHTML throw,
+// and so does setting an on* or style attribute.
+
+const VOID = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'source', 'track', 'wbr']);
+const ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: String.fromCharCode(160) };
+const kebab = (key) => String(key).replace(/[A-Z]/g, (c) => '-' + c.toLowerCase());
+
+function decode(text) {
+    return text.replace(/&(#x[0-9a-f]+|#[0-9]+|[a-z]+);/gi, (whole, name) => {
+        if (name[0] === '#') {
+            const hex = name[1] === 'x' || name[1] === 'X';
+            return String.fromCodePoint(parseInt(name.slice(hex ? 2 : 1), hex ? 16 : 10));
+        }
+        return ENTITIES[name.toLowerCase()] ?? whole;
+    });
+}
+
+let doc = null;
+
+class FakeEvent {
+    constructor(type, init = {}) {
+        this.type = type;
+        this.bubbles = init.bubbles !== false;
+        this.key = init.key;
+        this.target = null;
+        this.currentTarget = null;
+        this.defaultPrevented = false;
+        this.stopped = false;
+    }
+    preventDefault() { this.defaultPrevented = true; }
+    stopPropagation() { this.stopped = true; }
+}
+
+function dispatch(target, event) {
+    event.target = target;
+    const path = [];
+    for (let node = target; node; node = node.parentNode) path.push(node);
+    for (const node of event.bubbles ? path : [target]) {
+        event.currentTarget = node;
+        for (const listener of (node.listeners[event.type] || []).slice()) listener.call(node, event);
+        if (event.stopped) break;
+    }
+    return !event.defaultPrevented;
+}
+
+class TextNode {
+    constructor(data) {
+        this.nodeType = 3;
+        this.data = String(data);
+        this.parentNode = null;
+    }
+    get textContent() { return this.data; }
+    set textContent(value) { this.data = String(value); }
+}
+
+function walk(root, visit) {
+    for (const child of root.childNodes) {
+        if (child.nodeType !== 1) continue;
+        visit(child);
+        walk(child, visit);
+    }
+}
+
+// Selectors: tag, #id, .class, [attr], [attr="value"], compounds of these, and the
+// descendant and child combinators. Anything else throws, so a test never passes
+// because a selector silently matched nothing.
+const selectorCache = new Map();
+
+function parseCompound(text) {
+    const compound = { tag: null, id: null, classes: [], attrs: [] };
+    const token = /([a-zA-Z][a-zA-Z0-9-]*|\*)|#([\w-]+)|\.([\w-]+)|\[([\w-]+)(?:=(?:"([^"]*)"|'([^']*)'|([\w-]+)))?\]/y;
+    let index = 0;
+    while (index < text.length) {
+        token.lastIndex = index;
+        const m = token.exec(text);
+        if (!m) throw new Error(`unsupported selector: ${text}`);
+        if (m[1]) compound.tag = m[1].toLowerCase();
+        else if (m[2]) compound.id = m[2];
+        else if (m[3]) compound.classes.push(m[3]);
+        else compound.attrs.push({ name: m[4].toLowerCase(), value: m[5] ?? m[6] ?? m[7] ?? null });
+        index = token.lastIndex;
+    }
+    return compound;
+}
+
+function parseComplex(text) {
+    const parts = [];
+    const piece = /(\s*>\s*|\s+)?([^\s>]+)/g;
+    const source = text.trim();
+    let m;
+    while ((m = piece.exec(source)) !== null) {
+        const combinator = parts.length === 0 ? null : (m[1] && m[1].includes('>') ? '>' : ' ');
+        parts.push({ combinator, compound: parseCompound(m[2]) });
+    }
+    if (!parts.length) throw new Error(`empty selector: ${text}`);
+    return parts;
+}
+
+function selectorList(text) {
+    if (!selectorCache.has(text)) selectorCache.set(text, String(text).split(',').map(parseComplex));
+    return selectorCache.get(text);
+}
+
+function matchCompound(node, compound) {
+    if (!node || node.nodeType !== 1) return false;
+    if (compound.tag && compound.tag !== '*' && node.localName !== compound.tag) return false;
+    if (compound.id && node.getAttribute('id') !== compound.id) return false;
+    if (compound.classes.length) {
+        const classes = node._classes();
+        if (!compound.classes.every((name) => classes.has(name))) return false;
+    }
+    for (const attr of compound.attrs) {
+        const value = node.getAttribute(attr.name);
+        if (value === null || (attr.value !== null && value !== attr.value)) return false;
+    }
+    return true;
+}
+
+function matchesComplex(node, parts, index) {
+    if (!matchCompound(node, parts[index].compound)) return false;
+    if (index === 0) return true;
+    if (parts[index].combinator === '>') return matchesComplex(node.parentNode, parts, index - 1);
+    for (let up = node.parentNode; up && up.nodeType === 1; up = up.parentNode) {
+        if (matchesComplex(up, parts, index - 1)) return true;
+    }
+    return false;
+}
+
+function matchesAny(node, selector) {
+    return selectorList(selector).some((parts) => matchesComplex(node, parts, parts.length - 1));
+}
+
+/** Is the element out of sight: hidden itself or by an ancestor, or inside a closed dialog? */
+function hiddenByAncestor(node) {
+    for (let up = node; up && up.nodeType === 1; up = up.parentNode) {
+        if (up.hasAttribute('hidden')) return true;
+        if (up.localName === 'dialog' && !up.hasAttribute('open')) return true;
+    }
+    return false;
+}
+
+class Element {
+    constructor(tag) {
+        this.nodeType = 1;
+        this.localName = String(tag).toLowerCase();
+        this.tagName = this.localName.toUpperCase();
+        this.childNodes = [];
+        this.parentNode = null;
+        this.attrs = new Map();
+        this.listeners = {};
+        this._value = null;
+        this._checked = null;
+        this._selected = null;
+        this._noneSelected = false;
+        const self = this;
+        this.dataset = new Proxy({}, {
+            get: (target, key) => {
+                if (typeof key !== 'string') return undefined;
+                const name = 'data-' + kebab(key);
+                return self.attrs.has(name) ? self.attrs.get(name) : undefined;
+            },
+            set: (target, key, value) => { self.setAttribute('data-' + kebab(key), value); return true; },
+            has: (target, key) => self.attrs.has('data-' + kebab(key)),
+            deleteProperty: (target, key) => { self.removeAttribute('data-' + kebab(key)); return true; },
+        });
+        this.classList = {
+            contains: (name) => self._classes().has(name),
+            add: (...names) => { const set = self._classes(); names.forEach((n) => set.add(n)); self._setClasses(set); },
+            remove: (...names) => { const set = self._classes(); names.forEach((n) => set.delete(n)); self._setClasses(set); },
+            toggle: (name, force) => {
+                const set = self._classes();
+                const on = force === undefined ? !set.has(name) : Boolean(force);
+                if (on) set.add(name); else set.delete(name);
+                self._setClasses(set);
+                return on;
+            },
+        };
+    }
+    _classes() { return new Set((this.attrs.get('class') || '').split(/\s+/).filter(Boolean)); }
+    _setClasses(set) { this.attrs.set('class', Array.from(set).join(' ')); }
+    getAttribute(name) {
+        const key = String(name).toLowerCase();
+        return this.attrs.has(key) ? this.attrs.get(key) : null;
+    }
+    setAttribute(name, value) {
+        const key = String(name).toLowerCase();
+        if (key.startsWith('on')) throw new Error(`an inline handler attribute was set: ${key}`);
+        if (key === 'style') throw new Error('a style attribute was set (the page CSP refuses it)');
+        this.attrs.set(key, String(value));
+    }
+    hasAttribute(name) { return this.attrs.has(String(name).toLowerCase()); }
+    removeAttribute(name) { this.attrs.delete(String(name).toLowerCase()); }
+    get children() { return this.childNodes.filter((node) => node.nodeType === 1); }
+    get textContent() { return this.childNodes.map((node) => node.textContent).join(''); }
+    set textContent(value) {
+        this.replaceChildren();
+        const text = value == null ? '' : String(value);
+        if (text) this.appendChild(new TextNode(text));
+    }
+    get innerHTML() { throw new Error('innerHTML was read'); }
+    set innerHTML(value) { throw new Error('innerHTML was written'); }
+    get outerHTML() { throw new Error('outerHTML was read'); }
+    set outerHTML(value) { throw new Error('outerHTML was written'); }
+    insertAdjacentHTML() { throw new Error('insertAdjacentHTML was used'); }
+    appendChild(node) {
+        if (!node || typeof node !== 'object' || !('nodeType' in node)) throw new TypeError('appendChild: not a node');
+        if (node.parentNode) node.parentNode.removeChild(node);
+        node.parentNode = this;
+        this.childNodes.push(node);
+        return node;
+    }
+    append(...nodes) {
+        for (const node of nodes) this.appendChild(typeof node === 'string' ? new TextNode(node) : node);
+    }
+    removeChild(node) {
+        const index = this.childNodes.indexOf(node);
+        if (index >= 0) {
+            this.childNodes.splice(index, 1);
+            node.parentNode = null;
+        }
+        return node;
+    }
+    replaceChildren(...nodes) {
+        for (const node of this.childNodes) node.parentNode = null;
+        this.childNodes = [];
+        if (this.localName === 'select') this._noneSelected = false;
+        this.append(...nodes);
+    }
+    remove() { if (this.parentNode) this.parentNode.removeChild(this); }
+    contains(node) {
+        for (let up = node; up; up = up.parentNode) if (up === this) return true;
+        return false;
+    }
+    get isConnected() {
+        for (let up = this; up; up = up.parentNode) if (up === doc) return true;
+        return false;
+    }
+    matches(selector) { return matchesAny(this, selector); }
+    closest(selector) {
+        for (let up = this; up && up.nodeType === 1; up = up.parentNode) if (matchesAny(up, selector)) return up;
+        return null;
+    }
+    querySelectorAll(selector) {
+        const found = [];
+        walk(this, (node) => { if (matchesAny(node, selector)) found.push(node); });
+        return found;
+    }
+    querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
+    addEventListener(type, listener) { (this.listeners[type] = this.listeners[type] || []).push(listener); }
+    removeEventListener(type, listener) { this.listeners[type] = (this.listeners[type] || []).filter((l) => l !== listener); }
+    dispatchEvent(event) { return dispatch(this, event); }
+    focus() {
+        if (this.disabled || !this.isConnected || hiddenByAncestor(this)) return;
+        doc.activeElement = this;
+    }
+    blur() { if (doc.activeElement === this) doc.activeElement = doc.body; }
+    select() { harness.selected = this.value; }
+    scrollIntoView() {}
+    click() {
+        if (this.disabled) return;
+        if (this.localName === 'input' && (this.type === 'checkbox' || this.type === 'radio')) {
+            const before = this.checked;
+            this.checked = this.type === 'radio' ? true : !before;
+            dispatch(this, new FakeEvent('click'));
+            if (this.checked !== before) {
+                dispatch(this, new FakeEvent('input'));
+                dispatch(this, new FakeEvent('change'));
+            }
+            return;
+        }
+        dispatch(this, new FakeEvent('click'));
+    }
+    showModal() {
+        if (this.hasAttribute('open')) throw new Error(`InvalidStateError: #${this.id} is already open`);
+        if (!this.isConnected) throw new Error('InvalidStateError: the dialog is not in the document');
+        this.setAttribute('open', '');
+    }
+    close() {
+        if (!this.hasAttribute('open')) return;
+        this.removeAttribute('open');
+        // As in a browser: the close event comes a moment later, and does not bubble.
+        Promise.resolve().then(() => dispatch(this, new FakeEvent('close', { bubbles: false })));
+    }
+    get options() { return this.querySelectorAll('option'); }
+    _selectedOption() {
+        const options = this.options;
+        const chosen = options.find((option) => option._selected === true);
+        if (chosen) return chosen;
+        if (this._noneSelected) return null;
+        return options.find((option) => !option.disabled) || null;
+    }
+}
+
+const STRING_PROPS = {
+    id: 'id', className: 'class', name: 'name', title: 'title', htmlFor: 'for', placeholder: 'placeholder',
+    min: 'min', max: 'max', step: 'step', rows: 'rows', maxLength: 'maxlength', role: 'role', href: 'href',
+};
+for (const [prop, attr] of Object.entries(STRING_PROPS)) {
+    Object.defineProperty(Element.prototype, prop, {
+        get() { const value = this.getAttribute(attr); return value === null ? '' : value; },
+        set(value) { this.setAttribute(attr, value); },
+        configurable: true,
+    });
+}
+const BOOLEAN_PROPS = { hidden: 'hidden', disabled: 'disabled', readOnly: 'readonly', open: 'open', required: 'required' };
+for (const [prop, attr] of Object.entries(BOOLEAN_PROPS)) {
+    Object.defineProperty(Element.prototype, prop, {
+        get() { return this.hasAttribute(attr); },
+        set(value) { if (value) this.setAttribute(attr, ''); else this.removeAttribute(attr); },
+        configurable: true,
+    });
+}
+Object.defineProperty(Element.prototype, 'type', {
+    get() {
+        const value = this.getAttribute('type');
+        if (value !== null) return value.toLowerCase();
+        return this.localName === 'input' ? 'text' : this.localName === 'button' ? 'submit' : '';
+    },
+    set(value) { this.setAttribute('type', value); },
+    configurable: true,
+});
+Object.defineProperty(Element.prototype, 'value', {
+    get() {
+        if (this.localName === 'select') {
+            const option = this._selectedOption();
+            return option ? option.value : '';
+        }
+        if (this.localName === 'option') return this.hasAttribute('value') ? this.getAttribute('value') : this.textContent;
+        if (this._value !== null) return this._value;
+        if (this.localName === 'textarea') return this.textContent;
+        if (this.hasAttribute('value')) return this.getAttribute('value');
+        return this.type === 'checkbox' || this.type === 'radio' ? 'on' : '';
+    },
+    set(value) {
+        const text = value == null ? '' : String(value);
+        if (this.localName === 'select') {
+            let matched = false;
+            for (const option of this.options) {
+                option._selected = !matched && option.value === text;
+                if (option._selected) matched = true;
+            }
+            this._noneSelected = !matched;
+            return;
+        }
+        if (this.localName === 'option') {
+            this.setAttribute('value', text);
+            return;
+        }
+        this._value = text;
+    },
+    configurable: true,
+});
+Object.defineProperty(Element.prototype, 'checked', {
+    get() { return this._checked === null ? this.hasAttribute('checked') : this._checked; },
+    set(value) {
+        this._checked = Boolean(value);
+        if (this._checked && this.type === 'radio' && this.name && doc) {
+            for (const other of doc.querySelectorAll('input')) {
+                if (other !== this && other.type === 'radio' && other.name === this.name) other._checked = false;
+            }
+        }
+    },
+    configurable: true,
+});
+
+class FakeDocument {
+    constructor() {
+        this.nodeType = 9;
+        this.parentNode = null;
+        this.listeners = {};
+        this.readyState = 'loading';
+        this.documentElement = null;
+        this.body = null;
+        this.activeElement = null;
+    }
+    get childNodes() { return this.documentElement ? [this.documentElement] : []; }
+    createElement(tag) { return new Element(tag); }
+    createTextNode(text) { return new TextNode(text); }
+    getElementById(id) {
+        let found = null;
+        walk(this, (node) => { if (!found && node.getAttribute('id') === String(id)) found = node; });
+        return found;
+    }
+    querySelectorAll(selector) { return Element.prototype.querySelectorAll.call(this, selector); }
+    querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
+    addEventListener(type, listener) { (this.listeners[type] = this.listeners[type] || []).push(listener); }
+    removeEventListener(type, listener) { this.listeners[type] = (this.listeners[type] || []).filter((l) => l !== listener); }
+    dispatchEvent(event) { return dispatch(this, event); }
+    execCommand(name) { harness.execCommands.push(String(name)); return false; }
+}
+
+/** The template, parsed the simple way: it is our own, well-formed HTML. */
+function parseDocument(html) {
+    const document = new FakeDocument();
+    const top = new Element('#top');
+    const stack = [top];
+    const token = /<!--[\s\S]*?-->|<!DOCTYPE[^>]*>|<\/([a-zA-Z][a-zA-Z0-9-]*)\s*>|<([a-zA-Z][a-zA-Z0-9-]*)((?:\s+[^\s"'>\/=]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+))?)*)\s*(\/?)>|([^<]+)/gi;
+    let m;
+    while ((m = token.exec(html)) !== null) {
+        if (m[1]) {
+            const tag = m[1].toLowerCase();
+            for (let i = stack.length - 1; i > 0; i -= 1) {
+                if (stack[i].localName === tag) {
+                    stack.length = i;
+                    break;
+                }
+            }
+        } else if (m[2]) {
+            const element = new Element(m[2]);
+            const attrs = /([^\s"'>\/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
+            let a;
+            while ((a = attrs.exec(m[3])) !== null) element.attrs.set(a[1].toLowerCase(), decode(a[2] ?? a[3] ?? a[4] ?? ''));
+            stack[stack.length - 1].appendChild(element);
+            if (!VOID.has(element.localName) && !m[4]) stack.push(element);
+        } else if (m[5]) {
+            stack[stack.length - 1].appendChild(new TextNode(decode(m[5])));
+        }
+    }
+    const html_ = top.children.find((node) => node.localName === 'html');
+    if (!html_) throw new Error('the template has no <html> element');
+    html_.parentNode = document;
+    document.documentElement = html_;
+    document.body = html_.children.find((node) => node.localName === 'body');
+    document.activeElement = document.body;
+    return document;
+}
+
+doc = parseDocument(fs.readFileSync(htmlPath, 'utf8'));
+
+// --- the browser around it ------------------------------------------------------------------
+
+const storageData = new Map();
+const harness = {
+    requests: [],
+    routes: new Map(),
+    unmocked: [],
+    confirms: [],
+    confirmAnswer: true,
+    consoleErrors: [],
+    execCommands: [],
+    clipboard: null,
+    selected: null,
+    storage: storageData,
+    storageThrows: false,
+    FakeEvent,
+    /** Answer `method path` with these, in turn; the last one keeps answering. */
+    on(method, path, ...answers) {
+        this.routes.set(`${method.toUpperCase()} ${path}`, answers);
+    },
+    calls(method, path) {
+        return this.requests.filter((r) => r.method === method && r.path === path);
+    },
+    flush: async () => {
+        for (let i = 0; i < 3; i += 1) await new Promise((resolve) => setImmediate(resolve));
+    },
+    el: (id) => doc.getElementById(id),
+    find(target) {
+        if (typeof target !== 'string') return target;
+        const element = /^[\w-]+$/.test(target) ? doc.getElementById(target) : doc.querySelector(target);
+        if (!element) throw new Error(`nothing matches ${target}`);
+        return element;
+    },
+    visible(target) {
+        const element = typeof target === 'string' && /^[\w-]+$/.test(target) ? doc.getElementById(target) : doc.querySelector(target);
+        return Boolean(element) && !hiddenByAncestor(element);
+    },
+    text(target) {
+        const element = typeof target === 'string' && /^[\w-]+$/.test(target) ? doc.getElementById(target) : doc.querySelector(target);
+        return element ? element.textContent : null;
+    },
+    /** A user's click: refused on what nobody can see (a hidden element, a closed dialog). */
+    async click(target) {
+        const element = this.find(target);
+        if (hiddenByAncestor(element)) throw new Error(`clicked something that is not on screen: ${target}`);
+        element.click();
+        await this.flush();
+    },
+    async type(target, text) {
+        const element = this.find(target);
+        if (hiddenByAncestor(element)) throw new Error(`typed into something that is not on screen: ${target}`);
+        if (element.disabled) throw new Error(`typed into a disabled field: ${target}`);
+        element.value = text;
+        dispatch(element, new FakeEvent('input'));
+        dispatch(element, new FakeEvent('change'));
+        await this.flush();
+    },
+    async check(target, on = true) {
+        const element = this.find(target);
+        if (element.checked !== on) await this.click(element);
+    },
+    async choose(target, value) {
+        const element = this.find(target);
+        element.value = value;
+        dispatch(element, new FakeEvent('input'));
+        dispatch(element, new FakeEvent('change'));
+        await this.flush();
+    },
+    async press(target, key) {
+        dispatch(this.find(target), new FakeEvent('keydown', { key }));
+        await this.flush();
+    },
+    async boot() {
+        doc.readyState = 'interactive';
+        dispatch(doc, new FakeEvent('DOMContentLoaded', { bubbles: false }));
+        await this.flush();
+    },
+};
+
+function answer(spec) {
+    const status = spec.status ?? 200;
+    const headers = {};
+    for (const [name, value] of Object.entries(spec.headers || {})) headers[name.toLowerCase()] = String(value);
+    if (status === 401 && !('www-authenticate' in headers)) headers['www-authenticate'] = 'Bearer';
+    const text = spec.body === undefined ? '' : JSON.stringify(spec.body);
+    return {
+        status,
+        ok: status >= 200 && status < 300,
+        headers: { get: (name) => headers[String(name).toLowerCase()] ?? null },
+        json: async () => JSON.parse(text),
+    };
+}
+
+async function fakeFetch(url, init = {}) {
+    const method = String(init.method || 'GET').toUpperCase();
+    const path = String(url).split('?')[0];
+    const headers = {};
+    for (const [name, value] of Object.entries(init.headers || {})) headers[name.toLowerCase()] = String(value);
+    let body;
+    if (init.body !== undefined) {
+        try {
+            body = JSON.parse(init.body);
+        } catch {
+            body = init.body;
+        }
+    }
+    const request = { method, path, url: String(url), headers, body, cache: init.cache };
+    harness.requests.push(request);
+    const answers = harness.routes.get(`${method} ${path}`);
+    if (!answers || !answers.length) {
+        harness.unmocked.push(`${method} ${path}`);
+        return answer({ status: 404, body: { detail: 'unmocked' } });
+    }
+    let spec = answers.length > 1 ? answers.shift() : answers[0];
+    if (typeof spec === 'function') spec = spec(request);
+    if (spec && spec.networkError) throw new TypeError('Failed to fetch');
+    return answer(spec);
+}
+
+const sessionStorage = {
+    getItem: (key) => { if (harness.storageThrows) throw new Error('blocked'); return storageData.has(key) ? storageData.get(key) : null; },
+    setItem: (key, value) => { if (harness.storageThrows) throw new Error('blocked'); storageData.set(key, String(value)); },
+    removeItem: (key) => { if (harness.storageThrows) throw new Error('blocked'); storageData.delete(key); },
+};
+
+let timerSeq = 0;
+const timers = new Map();
+harness.pendingTimers = () => timers.size;
+harness.runTimers = async () => {
+    const due = Array.from(timers.values());
+    timers.clear();
+    for (const timer of due) await timer.fn();
+    await harness.flush();
+};
+
+const windowListeners = {};
+const context = {
+    document: doc,
+    console: { ...console, error: (...a) => harness.consoleErrors.push(a.map(String).join(' ')), warn: () => {} },
+    setTimeout: (fn, ms) => { const id = ++timerSeq; timers.set(id, { fn, ms }); return id; },
+    clearTimeout: (id) => timers.delete(id),
+    setInterval: (fn, ms) => { const id = ++timerSeq; timers.set(id, { fn, ms }); return id; },
+    clearInterval: (id) => timers.delete(id),
+    fetch: fakeFetch,
+    sessionStorage,
+    confirm: (message) => { harness.confirms.push(String(message)); return harness.confirmAnswer; },
+    navigator: { clipboard: { writeText: async (text) => { harness.clipboard = String(text); } } },
+    isSecureContext: false,
+    crypto: {
+        getRandomValues: (array) => {
+            const bytes = nodeCrypto.randomBytes(array.length);
+            for (let i = 0; i < array.length; i += 1) array[i] = bytes[i];
+            return array;
+        },
+    },
+    btoa,
+    atob,
+    location: { protocol: 'http:', host: '192.168.1.20:3000', hostname: '192.168.1.20' },
+    addEventListener: (type, listener) => { (windowListeners[type] = windowListeners[type] || []).push(listener); },
+    removeEventListener: () => {},
+    harness,
+    fixtures,
+};
+context.window = context;
+harness.windowListeners = windowListeners;
+vm.createContext(context);
+
+// Every route the page asks at start answers like the gateway did, unless a scenario says otherwise.
+if (fixtures.view) harness.on('GET', '/api/settings', { status: 200, body: fixtures.view });
+if (fixtures.engines) harness.on('GET', '/api/settings/engines', { status: 200, body: fixtures.engines });
+
+vm.runInContext(fs.readFileSync(scriptPath, 'utf8'), context, { filename: 'settings.js' });
+
+(async () => {
+    const source = fs.readFileSync(scenarioPath, 'utf8');
+    const result = await vm.runInContext(`(async () => {\n${source}\n})()`, context, { filename: 'scenario.js' });
+    process.stdout.write(JSON.stringify({ ok: true, result: result === undefined ? null : result }));
+})().catch((error) => {
+    process.stdout.write(JSON.stringify({ ok: false, error: String((error && error.stack) || error) }));
+    process.exitCode = 1;
+});
+"""
+
+
+def _new_page_key() -> str:
+    return "tts_" + base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii").rstrip("=")
+
+
+def _answer(response) -> dict:
+    """A gateway response, as the page's fetch replays it."""
+    headers = {name: value for name, value in response.headers.items()
+               if name.lower() in ("retry-after", "www-authenticate")}
+    return {"status": response.status_code, "body": response.json(), "headers": headers}
+
+
+class _LogLines(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.lines: list[str] = []
+
+    def emit(self, record):
+        self.lines.append(record.getMessage())
+
+
+@pytest.fixture(scope="module")
+def gateway_answers(tmp_path_factory):
+    """What real gateways answered the requests the page makes, by name.
+
+    One gateway's app YAML sets API_KEY, TRUSTED_HOSTS=truenas.k2o and offers Magpie as the
+    default TTS engine (installed: its name resolves; no other optional engine's does). The
+    other has no key and is claimed with the one-time code from its log.
+    """
+    async def magpie_installed(host):
+        return "magpie" in host
+
+    keyed = load_frontend_app({
+        "TTS_STT_SETTINGS_DIR": str(tmp_path_factory.mktemp("keyed")), "API_KEY": YAML_KEY,
+        "TRUSTED_HOSTS": "truenas.k2o", "ENABLE_MAGPIE_TTS": "true", "DEFAULT_TTS_PROVIDER": "magpie"})
+    keyless = load_frontend_app({"TTS_STT_SETTINGS_DIR": str(tmp_path_factory.mktemp("keyless"))})
+    keyed._engine_resolver = keyless._engine_resolver = magpie_installed
+    page = {"Host": NAS, "Origin": f"http://{NAS}"}
+
+    def call(client, method, path, body=None, headers=None):
+        return _answer(client.request(method, path, json=body, headers=headers or page))
+
+    answers: dict = {}
+    log = _LogLines()
+    claim_log = logging.getLogger("tts_stt.settings.claim")
+    claim_log.addHandler(log)
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            install_stub(patch, keyed, lambda method, url, kwargs: {"status": "ok"})
+            client = TestClient(keyed.app)
+            admin = {**page, "Authorization": f"Bearer {YAML_KEY}"}
+            answers["view"] = call(client, "GET", "/api/settings", headers=admin)
+            answers["engines"] = call(client, "GET", "/api/settings/engines", headers=admin)
+            dry_run = lambda changes, **extra: call(client, "PUT", "/api/settings", {  # noqa: E731
+                "base_revision": 0, "set": changes, "dry_run": True}, headers={**admin, **extra})
+            answers["dry_run_hosts"] = dry_run({"TRUSTED_HOSTS": ["truenas.k2o", "speach.k2o"]})
+            answers["dry_run_invalid_host"] = dry_run({"TRUSTED_HOSTS": ["truenas.k2o", "*.de"]})
+            answers["dry_run_unoffer"] = dry_run({"ENABLE_MAGPIE_TTS": False, "DEFAULT_TTS_PROVIDER": "piper"})
+            answers["would_lock_out"] = dry_run({"TRUSTED_HOSTS": []}, Host="truenas.k2o:3000",
+                                                Origin="http://truenas.k2o:3000")
+            answers["dry_run_proxy"] = dry_run({"TRUST_PROXY_HEADERS": True})
+            answers["save_proxy"] = call(client, "PUT", "/api/settings", {
+                "base_revision": 0, "set": {"TRUST_PROXY_HEADERS": True},
+                "acknowledge": ["TRUST_PROXY_HEADERS:proxy_headers_on"]}, headers=admin)
+            answers["confirm"] = call(client, "POST", "/api/settings/confirm",
+                                      {"revision": answers["save_proxy"]["body"]["confirm"]["revision"]}, headers=admin)
+            answers["view_saved"] = call(client, "GET", "/api/settings", headers=admin)
+            answers["conflict"] = dry_run({"MAX_TTS_CHARS": 100})
+            answers["access_refused"] = call(client, "PUT", "/api/settings/access", {
+                "base_revision": answers["view"]["body"]["keys_revision"], "deployment_key_role": "client"}, headers=admin)
+            answers["key_created"] = call(client, "POST", "/api/settings/keys", {
+                "name": "Home Assistant", "role": "client", "key": _new_page_key()}, headers=admin)
+
+            client = TestClient(keyless.app)
+            answers["view_unclaimed"] = call(client, "GET", "/api/settings")
+            answers["claim_code"] = call(client, "POST", "/api/settings/claim-code", {})
+            laptop = _new_page_key()
+            answers["claim"] = call(client, "POST", "/api/settings/claim", {
+                "code": CLAIM_CODE.findall(" ".join(log.lines))[-1], "name": "Laptop", "key": laptop})
+            owner = {**page, "Authorization": f"Bearer {laptop}"}
+            answers["view_claimed"] = call(client, "GET", "/api/settings", headers=owner)
+            answers["access_require"] = call(client, "PUT", "/api/settings/access", {
+                "base_revision": answers["view_claimed"]["body"]["keys_revision"], "require_key": True}, headers=owner)
+            answers["second_admin"] = call(client, "POST", "/api/settings/keys", {
+                "name": "Phone", "role": "admin", "key": _new_page_key()}, headers=owner)
+            answers["view_two_admins"] = call(client, "GET", "/api/settings", headers=owner)
+            answers["revoke_in_use"] = call(client, "DELETE", f"/api/settings/keys/{answers['claim']['body']['id']}",
+                                            headers=owner)
+    finally:
+        claim_log.removeHandler(log)
+    assert {name: answer["status"] for name, answer in answers.items()} == {
+        "view": 200, "engines": 200, "dry_run_hosts": 200, "dry_run_invalid_host": 400, "dry_run_unoffer": 200,
+        "would_lock_out": 409, "dry_run_proxy": 200, "save_proxy": 200, "confirm": 200, "view_saved": 200,
+        "conflict": 409, "access_refused": 403, "key_created": 201, "view_unclaimed": 200, "claim_code": 202,
+        "claim": 201, "view_claimed": 200, "access_require": 200, "second_admin": 201, "view_two_admins": 200,
+        "revoke_in_use": 200,
+    }
+    return answers
+
+
+def run_settings_js(tmp_path: Path, scenario: str, answers: dict, start: str | None = "view"):
+    """Open the Settings page (GET /api/settings answers `answers[start]`), then run `scenario`.
+
+    `harness` drives the page like a user (click, type, check), and `fixtures.answers` holds
+    the gateway's answers for `harness.on(method, path, ...answers)`.
+    """
+    driver = tmp_path / "settings_driver.js"
+    driver.write_text(SETTINGS_DRIVER, encoding="utf-8")
+    body = tmp_path / "scenario.js"
+    body.write_text(textwrap.dedent(scenario), encoding="utf-8")
+    fixtures = tmp_path / "fixtures.json"
+    fixtures.write_text(json.dumps({
+        "view": answers[start]["body"] if start else None,
+        "engines": answers["engines"]["body"],
+        "answers": answers,
+    }), encoding="utf-8")
+    completed = subprocess.run(
+        [NODE, str(driver), str(SETTINGS_JS), str(SETTINGS_HTML), str(body), str(fixtures)],
+        capture_output=True, text=True, encoding="utf-8", timeout=60,    # node writes UTF-8 on every platform
+    )
+    try:
+        outcome = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        pytest.fail(f"node produced no result.\nstdout: {completed.stdout}\nstderr: {completed.stderr}")
+    if not outcome["ok"]:
+        pytest.fail(f"scenario threw:\n{outcome['error']}\nstderr: {completed.stderr}")
+    return outcome["result"]
+
+
+# The key the page's tab holds when a scenario opens it as the admin.
+OPEN_AS_ADMIN = f"harness.storage.set('tts-stt.api-key', {json.dumps(YAML_KEY)});\nawait harness.boot();\n"
+
+
+def test_59_host_names_are_read_one_per_line_and_only_changes_are_sent(tmp_path, gateway_answers):
+    out = run_settings_js(tmp_path, OPEN_AS_ADMIN + """
+        const parsed = [
+            parseList('speach.k2o\\n\\n  TTS.Example.com \\r\\n*.K2O,truenas.k2o\\tspeach.k2o'),
+            parseList(' \\n , \\t'),
+            parseList('https://TTS.example.com, https://tts.example.com'),
+        ];
+        await harness.type('input-TRUSTED_HOSTS', 'truenas.k2o\\nSpeach.k2o\\n\\nspeach.k2o, ');
+        const bar = [harness.visible('save-bar'), harness.text('save-bar-count')];
+        harness.on('PUT', '/api/settings', fixtures.answers.dry_run_hosts);
+        await harness.click('review-button');
+        const review = harness.text('review-rows');
+        await harness.click('review-back');
+        await harness.type('input-TRUSTED_HOSTS', '  TRUENAS.k2o \\n');
+        return {
+            parsed, bar, review,
+            sent: harness.calls('PUT', '/api/settings').map((r) => r.body),
+            draftAfter: S.draft.size, barAfter: harness.visible('save-bar'), unmocked: harness.unmocked,
+        };
+    """, gateway_answers)
+    assert out["parsed"] == [["speach.k2o", "tts.example.com", "*.k2o", "truenas.k2o"], [], ["https://tts.example.com"]]
+    assert out["bar"] == [True, "1 unsaved change"]
+    assert out["sent"] == [{"base_revision": 0, "set": {"TRUSTED_HOSTS": ["truenas.k2o", "speach.k2o"]},
+                            "reset": [], "dry_run": True}]
+    assert "added speach.k2o" in out["review"] and "truenas.k2o" not in out["review"], "only what changes is listed"
+    assert (out["draftAfter"], out["barAfter"]) == (0, False), "typing the value in force back leaves nothing to save"
+    assert out["unmocked"] == []
+
+
+def test_59_a_removed_host_name_is_highlighted_in_the_review(tmp_path, gateway_answers):
+    out = run_settings_js(tmp_path, OPEN_AS_ADMIN + """
+        await harness.type('input-TRUSTED_HOSTS', 'speach.k2o');
+        harness.on('PUT', '/api/settings', fixtures.answers.dry_run_hosts);
+        await harness.click('review-button');
+        const removed = harness.el('review-rows').querySelectorAll('li.review-removed').map((li) => li.textContent);
+        return { removed, warning: harness.text('review-rows') };
+    """, gateway_answers)
+    assert out["removed"] == ["removed truenas.k2o"]
+    assert "Anyone who opens this server as truenas.k2o is refused after this change." in out["warning"]
+
+
+def test_60_un_offering_the_default_engine_moves_the_default_to_a_built_in_one(tmp_path, gateway_answers):
+    out = run_settings_js(tmp_path, OPEN_AS_ADMIN + """
+        const select = () => harness.el('input-DEFAULT_TTS_PROVIDER');
+        const before = { value: select().value, options: select().options.map((o) => o.value) };
+        await harness.click('input-ENABLE_MAGPIE_TTS');            // un-tick "Offer Magpie-TTS"
+        const after = {
+            value: select().value, options: select().options.map((o) => o.value),
+            hint: harness.text('hint-DEFAULT_TTS_PROVIDER'), stt: harness.el('input-DEFAULT_STT_PROVIDER').value,
+        };
+        harness.on('PUT', '/api/settings', fixtures.answers.dry_run_unoffer);
+        await harness.click('review-button');
+        const review = { sent: harness.calls('PUT', '/api/settings')[0].body.set,
+                         open: harness.el('review-dialog').open, rows: harness.text('review-rows') };
+        await harness.click('review-back');
+        await harness.click('input-ENABLE_MAGPIE_TTS');            // offered again: the default goes back
+        return {
+            before, after, review, again: { value: select().value, hint: harness.visible('hint-DEFAULT_TTS_PROVIDER'),
+                                            draft: S.draft.size, bar: harness.visible('save-bar') },
+        };
+    """, gateway_answers)
+    assert out["before"] == {"value": "magpie", "options": ["piper", "qwen3", "magpie"]}
+    assert out["after"]["value"] == "piper" and "magpie" not in out["after"]["options"]
+    assert out["after"]["hint"] == "Magpie-TTS is no longer offered, so the default moves to Piper."
+    assert out["after"]["stt"] == "whisper", "the speech-to-text default is not touched"
+    assert out["review"]["sent"] == {"ENABLE_MAGPIE_TTS": False, "DEFAULT_TTS_PROVIDER": "piper"}
+    assert out["review"]["open"] is True and "Magpie-TTS" in out["review"]["rows"] and "Piper" in out["review"]["rows"]
+    assert out["again"] == {"value": "magpie", "hint": False, "draft": 0, "bar": False},         "ticking Offer twice changes nothing"
+
+
+def test_59_an_edit_the_server_reads_as_the_value_in_force_is_not_saved(tmp_path, gateway_answers):
+    """http://Speach.k2o:3000/ is speach.k2o to the server: nothing to review, nothing kept as unsaved."""
+    out = run_settings_js(tmp_path, OPEN_AS_ADMIN + """
+        await harness.type('input-TRUSTED_HOSTS', 'http://TRUENAS.k2o:3000/');
+        const before = S.draft.size;
+        harness.on('PUT', '/api/settings', { status: 200, body: { revision: 0, changed: [], dry_run: true, written: false,
+            reload_main_ui: false, confirm: null, warnings: [], notes: {}, dropped: {} } });
+        await harness.click('review-button');
+        return { before, after: S.draft.size, open: harness.el('review-dialog').open, bar: harness.visible('save-bar'),
+                 status: harness.text('settings-status'), field: harness.el('input-TRUSTED_HOSTS').value };
+    """, gateway_answers)
+    assert out["before"] == 1
+    assert (out["after"], out["open"], out["bar"]) == (0, False, False)
+    assert "Nothing to save" in out["status"] and out["field"] == "truenas.k2o"
+
+
+def test_after_an_engine_change_the_page_offers_the_way_back_to_the_app(tmp_path, gateway_answers):
+    """The main page renders its engines on load: after a change it has to be loaded again."""
+    saved = {**gateway_answers["dry_run_unoffer"]["body"], "dry_run": False, "written": True}
+    assert saved["reload_main_ui"] is True
+    answers = {**gateway_answers, "save_unoffer": {"status": 200, "body": saved}}
+    out = run_settings_js(tmp_path, OPEN_AS_ADMIN + """
+        await harness.click('input-ENABLE_MAGPIE_TTS');
+        harness.on('PUT', '/api/settings', fixtures.answers.dry_run_unoffer, fixtures.answers.save_unoffer);
+        await harness.click('review-button');
+        await harness.click('review-save');
+        const link = harness.el('status-app-link');
+        return { href: link && link.getAttribute('href'), text: link && link.textContent,
+                 status: harness.text('settings-status'), draft: S.draft.size };
+    """, answers)
+    assert (out["href"], out["text"], out["draft"]) == ("/", "Back to the app", 0)
+    assert "engine changes" in out["status"]
+
+
+def test_61_a_new_key_is_saved_only_after_i_have_stored_it(tmp_path, gateway_answers):
+    out = run_settings_js(tmp_path, OPEN_AS_ADMIN + """
+        await harness.click('create-key-button');
+        const shown = harness.el('new-key-value').value;
+        const save = harness.el('key-dialog-save');
+        const states = [save.disabled];
+        await harness.type('new-key-name', 'Home Assistant');
+        states.push(save.disabled);
+        await harness.check('new-key-stored');
+        states.push(save.disabled);
+        await harness.check('new-key-stored', false);
+        states.push(save.disabled);
+        save.click();                                        // a disabled button does nothing
+        await harness.flush();
+        const early = harness.calls('POST', '/api/settings/keys').length;
+        await harness.check('new-key-stored');
+        harness.on('POST', '/api/settings/keys', fixtures.answers.key_created);
+        await harness.click('key-dialog-save');
+        return {
+            shown, states, early, posted: harness.calls('POST', '/api/settings/keys').map((r) => r.body),
+            done: harness.visible('key-dialog-done'), form: harness.visible('key-dialog-form'),
+            useHere: harness.visible('use-new-key'), text: harness.text('key-dialog-done-text'),
+            tabKey: harness.storage.get('tts-stt.api-key'),
+            elsewhere: harness.requests.filter((r) => JSON.stringify(r).includes(shown)).map((r) => r.method + ' ' + r.path),
+        };
+    """, gateway_answers)
+    assert PAGE_KEY.fullmatch(out["shown"]), out["shown"]
+    assert out["states"] == [True, True, False, True], "Save opens with the name and 'I have stored it' only"
+    assert out["early"] == 0
+    assert out["posted"] == [{"name": "Home Assistant", "role": "client", "key": out["shown"]}]
+    assert (out["done"], out["form"], out["useHere"]) == (True, False, False), "a client key is not offered for this tab"
+    assert out["shown"] not in out["text"]
+    assert out["tabKey"] == YAML_KEY
+    assert out["elsewhere"] == ["POST /api/settings/keys"], "the key went to the server once, in the create request"
+
+
+def test_61_the_claim_creates_the_admin_key_only_after_i_have_stored_it(tmp_path, gateway_answers):
+    out = run_settings_js(tmp_path, """
+        await harness.boot();
+        const card = harness.visible('claim-card');
+        const requireOffered = harness.visible('claim-require-row');
+        const shown = harness.el('claim-key').value;
+        const button = harness.el('claim-button');
+        const states = [button.disabled];
+        harness.on('POST', '/api/settings/claim-code', fixtures.answers.claim_code);
+        await harness.click('[data-action="print-code"]');
+        const printed = harness.text('claim-code-status');
+        await harness.type('claim-code', 'ABCDE-FGHJK-MNPQR-STVWX');
+        states.push(button.disabled);
+        await harness.check('claim-stored');
+        states.push(button.disabled);
+        harness.on('POST', '/api/settings/claim', fixtures.answers.claim);
+        harness.on('GET', '/api/settings', { status: 200, body: fixtures.answers.view_claimed.body });
+        await harness.click('claim-button');
+        return {
+            card, shown, states, printed, requireOffered,
+            posts: harness.requests.filter((r) => r.method === 'POST').map((r) => [r.path, r.body]),
+            tabKey: harness.storage.get('tts-stt.api-key'),
+            lastGet: harness.calls('GET', '/api/settings').slice(-1)[0].headers.authorization,
+            cardAfter: harness.visible('claim-card'), status: harness.text('settings-status'),
+            fieldsWritable: !harness.el('input-TRUSTED_HOSTS').disabled,
+        };
+    """, gateway_answers, start="view_unclaimed")
+    assert out["card"] is True and out["requireOffered"] is True
+    assert PAGE_KEY.fullmatch(out["shown"])
+    assert out["states"] == [True, True, False]
+    assert "log" in out["printed"]
+    assert out["posts"] == [["/api/settings/claim-code", {}],
+                            ["/api/settings/claim", {"code": "ABCDE-FGHJK-MNPQR-STVWX", "name": "Admin", "key": out["shown"]}]]
+    assert out["tabKey"] == out["shown"], "the new admin key is used in this tab (and on the main page)"
+    assert out["lastGet"] == f"Bearer {out['shown']}"
+    assert out["cardAfter"] is False and "claimed" in out["status"] and out["fieldsWritable"] is True
+
+
+def test_62_refused_values_are_shown_next_to_their_field_as_text(tmp_path, gateway_answers):
+    out = run_settings_js(tmp_path, OPEN_AS_ADMIN + """
+        const hostile = '<img src=x onerror="window.pwned=1"> is not a host name.';
+        await harness.type('input-TRUSTED_HOSTS', 'truenas.k2o\\n<img src=x onerror="window.pwned=1">');
+        await harness.type('input-MAX_TTS_CHARS', '0');
+        harness.on('PUT', '/api/settings', { status: 400, body: {
+            detail: 'Some values are not valid.', code: 'invalid_input', errors: {
+                TRUSTED_HOSTS: hostile, MAX_TTS_CHARS: 'Expected a whole number from 1 to 100000.',
+                base_revision: 'Expected the revision the change is based on.' } } });
+        await harness.click('review-button');
+        const box = harness.el('error-TRUSTED_HOSTS');
+        return {
+            text: box.textContent, nodes: box.childNodes.map((n) => n.nodeType), shown: harness.visible('error-TRUSTED_HOSTS'),
+            chars: harness.text('error-MAX_TTS_CHARS'),
+            invalid: harness.el('input-TRUSTED_HOSTS').getAttribute('aria-invalid'),
+            marked: harness.el('setting-TRUSTED_HOSTS').classList.contains('has-error'),
+            status: harness.text('settings-status'),
+            alert: Boolean(harness.el('settings-status').querySelector('[role="alert"]')),
+            open: harness.el('review-dialog').open, focus: document.activeElement.id,
+            pwned: window.pwned === 1, draft: S.draft.size, hostile,
+        };
+    """, gateway_answers)
+    assert out["text"] == out["hostile"] and out["nodes"] == [3], "one text node, no markup"
+    assert out["shown"] is True and out["pwned"] is False
+    assert out["chars"] == "Expected a whole number from 1 to 100000."
+    assert (out["invalid"], out["marked"]) == ("true", True)
+    assert "base_revision: Expected the revision the change is based on." in out["status"] and out["alert"] is True
+    assert out["open"] is False and out["focus"] == "input-TRUSTED_HOSTS"
+    assert out["draft"] == 2, "the edits are kept to be corrected"
+
+
+def test_62_the_gateways_own_refusal_of_a_public_suffix_wildcard_lands_on_the_field(tmp_path, gateway_answers):
+    out = run_settings_js(tmp_path, OPEN_AS_ADMIN + """
+        await harness.type('input-TRUSTED_HOSTS', 'truenas.k2o\\n*.de');
+        harness.on('PUT', '/api/settings', fixtures.answers.dry_run_invalid_host);
+        await harness.click('review-button');
+        return harness.text('error-TRUSTED_HOSTS');
+    """, gateway_answers)
+    assert out == gateway_answers["dry_run_invalid_host"]["body"]["errors"]["TRUSTED_HOSTS"]
+    assert "'*.de'" in out
+
+
+def test_63_a_proxy_change_is_confirmed_right_after_it_is_saved(tmp_path, gateway_answers):
+    revision = gateway_answers["save_proxy"]["body"]["confirm"]["revision"]
+    out = run_settings_js(tmp_path, OPEN_AS_ADMIN + """
+        await harness.click('input-TRUST_PROXY_HEADERS');
+        harness.on('PUT', '/api/settings', fixtures.answers.dry_run_proxy, fixtures.answers.save_proxy);
+        harness.on('POST', '/api/settings/confirm', fixtures.answers.confirm);
+        await harness.click('review-button');
+        const notice = harness.text('review-confirm');
+        const locked = harness.el('review-save').disabled;
+        await harness.check('#review-warnings input');
+        const unlocked = !harness.el('review-save').disabled;
+        harness.on('GET', '/api/settings', { status: 200, body: fixtures.answers.view_saved.body });
+        const before = harness.requests.length;
+        await harness.click('review-save');
+        return {
+            notice, locked, unlocked,
+            order: harness.requests.slice(before).map((r) => r.method + ' ' + r.path),
+            saved: harness.calls('PUT', '/api/settings')[1].body,
+            confirmed: harness.calls('POST', '/api/settings/confirm').map((r) => r.body),
+            status: harness.text('settings-status'), open: harness.el('review-dialog').open,
+        };
+    """, gateway_answers)
+    assert "confirmed within 60 seconds" in out["notice"]
+    assert out["locked"] is True and out["unlocked"] is True, "the warning has to be ticked first"
+    assert out["order"] == ["PUT /api/settings", "POST /api/settings/confirm", "GET /api/settings"]
+    assert out["saved"]["acknowledge"] == ["TRUST_PROXY_HEADERS:proxy_headers_on"] and "dry_run" not in out["saved"]
+    assert out["confirmed"] == [{"revision": revision}]
+    assert "is confirmed and stays" in out["status"] and out["open"] is False
+
+
+def test_63_a_confirmation_the_new_rules_refuse_says_when_the_change_is_undone(tmp_path, gateway_answers):
+    out = run_settings_js(tmp_path, OPEN_AS_ADMIN + """
+        await harness.click('input-TRUST_PROXY_HEADERS');
+        harness.on('PUT', '/api/settings', fixtures.answers.dry_run_proxy, fixtures.answers.save_proxy);
+        harness.on('POST', '/api/settings/confirm', { status: 403, body: {
+            detail: "Host 'proxy.example' is not allowed.", code: 'host_not_allowed' } });
+        await harness.click('review-button');
+        await harness.check('#review-warnings input');
+        harness.on('GET', '/api/settings', { status: 200, body: fixtures.answers.view_saved.body });
+        await harness.click('review-save');
+        return { status: harness.text('settings-status'),
+                 alert: Boolean(harness.el('settings-status').querySelector('[role="alert"]')) };
+    """, gateway_answers)
+    assert "could not be confirmed from this page" in out["status"] and "It is undone at" in out["status"]
+    assert out["alert"] is True
+
+
+# --- more of the page ----------------------------------------------------------------------------
+
+
+def test_the_key_is_shared_with_the_main_page_and_a_refused_one_is_forgotten(tmp_path, gateway_answers):
+    out = run_settings_js(tmp_path, """
+        harness.storage.set('tts-stt.api-key', 'an-old-key');
+        harness.on('GET', '/api/settings', { status: 401, body: { detail: 'An admin key is required.', code: 'invalid_api_key' } },
+                   { status: 200, body: fixtures.answers.view.body });
+        await harness.boot();
+        const refused = { panel: harness.visible('key-panel'), main: harness.visible('settings-main'),
+                          text: harness.text('key-panel-text'), stored: harness.storage.get('tts-stt.api-key') ?? null,
+                          focus: document.activeElement.id };
+        await harness.type('key-input', '  the-key-from-the-app-yaml  ');
+        await harness.press('key-input', 'Enter');
+        return {
+            refused, stored: harness.storage.get('tts-stt.api-key'),
+            sent: harness.calls('GET', '/api/settings').map((r) => r.headers.authorization || null),
+            panel: harness.visible('key-panel'), main: harness.visible('settings-main'), field: harness.el('key-input').value,
+        };
+    """, gateway_answers, start=None)
+    assert out["refused"] == {"panel": True, "main": False, "text": "This key was not accepted. Enter an admin key of this server.",
+                              "stored": None, "focus": "key-input"}
+    assert out["stored"] == YAML_KEY, "kept in the slot app.js reads, sessionStorage 'tts-stt.api-key'"
+    assert out["sent"] == ["Bearer an-old-key", f"Bearer {YAML_KEY}"]
+    assert (out["panel"], out["main"], out["field"]) == (False, True, "")
+
+
+def test_a_mistyped_key_does_not_replace_the_one_that_works(tmp_path, gateway_answers):
+    """Trying another key keeps the tab's key until the server takes the new one: a typo used to
+    end in a 401 that cleared the slot, here and on the main page."""
+    out = run_settings_js(tmp_path, OPEN_AS_ADMIN + """
+        await harness.click('[data-action="change-key"]');
+        await harness.type('key-input', 'tts_typo');
+        harness.on('GET', '/api/settings', { status: 401, body: { detail: 'An admin key is required.', code: 'invalid_api_key' } });
+        await harness.press('key-input', 'Enter');
+        return { stored: harness.storage.get('tts-stt.api-key'), error: harness.text('key-panel-error'),
+                 errorShown: harness.visible('key-panel-error'), main: harness.visible('settings-main'),
+                 tried: harness.calls('GET', '/api/settings').slice(-1)[0].headers.authorization };
+    """, gateway_answers)
+    assert out["tried"] == "Bearer tts_typo"
+    assert out["stored"] == YAML_KEY, "the working key stays"
+    assert (out["error"], out["errorShown"], out["main"]) == ("This key was not accepted.", True, True)
+
+
+def test_a_client_key_is_asked_for_an_admin_key_and_kept_for_the_api(tmp_path, gateway_answers):
+    out = run_settings_js(tmp_path, """
+        harness.storage.set('tts-stt.api-key', 'home-assistant');
+        harness.on('GET', '/api/settings', { status: 403, body: {
+            detail: 'This key may use the API but not the Settings; an admin key is required.', code: 'admin_key_required' } });
+        await harness.boot();
+        return { panel: harness.visible('key-panel'), text: harness.text('key-panel-text'),
+                 stored: harness.storage.get('tts-stt.api-key') };
+    """, gateway_answers, start=None)
+    assert out["panel"] is True and "may use the API but not change settings" in out["text"]
+    assert out["stored"] == "home-assistant"
+
+
+def test_reset_to_the_app_yaml_drops_the_saved_value(tmp_path, gateway_answers):
+    out = run_settings_js(tmp_path, OPEN_AS_ADMIN + """
+        const badge = harness.text('#setting-TRUST_PROXY_HEADERS .badge-saved');
+        const yaml = harness.text('#setting-TRUST_PROXY_HEADERS .setting-note');
+        await harness.click('reset-TRUST_PROXY_HEADERS');
+        const shown = { checked: harness.el('input-TRUST_PROXY_HEADERS').checked, undo: harness.visible('undo-TRUST_PROXY_HEADERS'),
+                        focus: document.activeElement.id, changed: harness.text('changed-TRUST_PROXY_HEADERS') };
+        harness.on('PUT', '/api/settings', { status: 200, body: { revision: 3, changed: ['TRUST_PROXY_HEADERS'], dry_run: true,
+            written: false, reload_main_ui: false, confirm: null, warnings: [], notes: {}, dropped: {} } });
+        await harness.click('review-button');
+        return { badge, yaml, shown, sent: harness.calls('PUT', '/api/settings')[0].body, rows: harness.text('review-rows') };
+    """, gateway_answers, start="view_saved")
+    assert out["badge"] == "Set here"
+    assert out["yaml"] == "App YAML: Off. Not used while the value set here applies."
+    assert out["shown"] == {"checked": False, "undo": True, "focus": "undo-TRUST_PROXY_HEADERS",
+                            "changed": "Back to the app YAML on save"}
+    assert out["sent"] == {"base_revision": gateway_answers["view_saved"]["body"]["revision"], "set": {},
+                           "reset": ["TRUST_PROXY_HEADERS"], "dry_run": True}
+    assert "Back to the app YAML value." in out["rows"]
+
+
+def test_api_access_is_changed_through_its_own_endpoint_and_revision(tmp_path, gateway_answers):
+    view = gateway_answers["view_claimed"]["body"]
+    out = run_settings_js(tmp_path, """
+        harness.storage.set('tts-stt.api-key', 'tts_laptop');
+        await harness.boot();
+        await harness.click('input-require_key-true');
+        await harness.click('review-button');
+        const rows = harness.text('review-rows');
+        harness.on('PUT', '/api/settings/access', fixtures.answers.access_require);
+        await harness.click('review-save');
+        return { rows, puts: harness.requests.filter((r) => r.method === 'PUT').map((r) => [r.path, r.body]),
+                 status: harness.text('settings-status') };
+    """, gateway_answers, start="view_claimed")
+    assert "Open on the network" in out["rows"] and "Require a key" in out["rows"]
+    assert "Every client then has to send a key" in out["rows"]
+    assert out["puts"] == [["/api/settings/access", {"base_revision": view["keys_revision"], "require_key": True}]], \
+        "no dry run and no gateway.json write for keys.json settings"
+    assert "API access is changed" in out["status"]
+
+
+def test_the_yaml_key_cannot_offer_to_make_itself_a_client_and_the_refusal_is_shown(tmp_path, gateway_answers):
+    out = run_settings_js(tmp_path, OPEN_AS_ADMIN + """
+        const client = harness.el('input-deployment_key_role').options.find((o) => o.value === 'client');
+        const disabled = client.disabled;
+        const note = harness.text('setting-deployment_key_role');
+        // what the server says when it is tried anyway
+        client.disabled = false;
+        await harness.choose('input-deployment_key_role', 'client');
+        harness.on('PUT', '/api/settings/access', fixtures.answers.access_refused);
+        await harness.click('review-button');
+        await harness.click('review-save');
+        return { disabled, note, open: harness.el('review-dialog').open, error: harness.text('review-error') };
+    """, gateway_answers)
+    assert out["disabled"] is True and "cannot make itself a client" in out["note"]
+    assert out["open"] is True, "the refusal is shown where the change was asked for"
+    assert out["error"] == gateway_answers["access_refused"]["body"]["detail"]
+
+
+def test_a_change_that_would_lock_me_out_cannot_be_saved(tmp_path, gateway_answers):
+    out = run_settings_js(tmp_path, OPEN_AS_ADMIN + """
+        await harness.type('input-TRUSTED_HOSTS', '');
+        harness.on('PUT', '/api/settings', fixtures.answers.would_lock_out);
+        await harness.click('review-button');
+        return { open: harness.el('review-dialog').open, error: harness.text('review-error'),
+                 save: harness.el('review-save').disabled, puts: harness.calls('PUT', '/api/settings').length };
+    """, gateway_answers)
+    assert out["open"] is True and out["save"] is True and out["puts"] == 1
+    assert out["error"] == gateway_answers["would_lock_out"]["body"]["detail"]
+    assert "speach" not in out["error"] and "truenas.k2o" in out["error"]
+
+
+def test_a_lockout_found_only_by_the_save_keeps_the_review_open_and_blocked(tmp_path, gateway_answers):
+    """The dry run passed, then something changed before Save (another worker, a proxy): the save's own
+    would_lock_out is shown in the review, and Save stays off."""
+    out = run_settings_js(tmp_path, OPEN_AS_ADMIN + """
+        await harness.type('input-TRUSTED_HOSTS', 'speach.k2o');
+        harness.on('PUT', '/api/settings', fixtures.answers.dry_run_hosts, fixtures.answers.would_lock_out);
+        await harness.click('review-button');
+        await harness.click('review-save');
+        return { open: harness.el('review-dialog').open, error: harness.text('review-error'),
+                 save: harness.el('review-save').disabled, puts: harness.calls('PUT', '/api/settings').length };
+    """, gateway_answers)
+    assert out["open"] is True and out["save"] is True and out["puts"] == 2
+    assert out["error"] == gateway_answers["would_lock_out"]["body"]["detail"]
+
+
+def test_a_conflicting_save_reloads_the_settings_and_keeps_the_edits(tmp_path, gateway_answers):
+    out = run_settings_js(tmp_path, OPEN_AS_ADMIN + """
+        await harness.type('input-MAX_TTS_CHARS', '100');
+        harness.on('PUT', '/api/settings', fixtures.answers.conflict);
+        harness.on('GET', '/api/settings', { status: 200, body: fixtures.answers.view_saved.body });
+        await harness.click('review-button');
+        return { gets: harness.calls('GET', '/api/settings').length, status: harness.text('settings-status'),
+                 draft: Array.from(S.draft.keys()), field: harness.el('input-MAX_TTS_CHARS').value,
+                 open: harness.el('review-dialog').open };
+    """, gateway_answers)
+    assert out["gets"] == 2 and "changed in the meantime" in out["status"]
+    assert out["draft"] == ["MAX_TTS_CHARS"] and out["field"] == "100" and out["open"] is False
+
+
+def test_revoking_the_key_this_tab_uses_asks_first_and_then_forgets_it(tmp_path, gateway_answers):
+    view = gateway_answers["view_two_admins"]["body"]
+    laptop = next(record for record in view["keys"] if record["name"] == "Laptop")
+    out = run_settings_js(tmp_path, f"""
+        harness.storage.set('tts-stt.api-key', 'tts_laptop');
+        await harness.boot();
+        harness.confirmAnswer = false;
+        await harness.click('[data-key-id="{laptop['id']}"]');
+        const declined = harness.calls('DELETE', '/api/settings/keys/{laptop['id']}').length;
+        harness.confirmAnswer = true;
+        harness.on('DELETE', '/api/settings/keys/{laptop['id']}', fixtures.answers.revoke_in_use);
+        harness.on('GET', '/api/settings', {{ status: 401, body: {{ detail: 'An admin key is required.', code: 'invalid_api_key' }} }});
+        await harness.click('[data-key-id="{laptop['id']}"]');
+        return {{ asked: harness.confirms, declined, stored: harness.storage.get('tts-stt.api-key') ?? null,
+                  panel: harness.visible('key-panel'), status: harness.text('settings-status'),
+                  reloadedWith: harness.calls('GET', '/api/settings').slice(-1)[0].headers.authorization ?? null }};
+    """, gateway_answers, start="view_two_admins")
+    assert out["declined"] == 0
+    assert len(out["asked"]) == 2 and "This tab uses it" in out["asked"][0]
+    assert out["stored"] is None and out["panel"] is True
+    assert out["reloadedWith"] is None, "a revoked key sent again would count as a wrong guess toward the 429"
+    assert 'The key "Laptop" is revoked.' in out["status"]
+
+
+def test_the_page_never_asks_for_more_than_it_needs_on_start(tmp_path, gateway_answers):
+    out = run_settings_js(tmp_path, OPEN_AS_ADMIN + """
+        return { requests: harness.requests.map((r) => [r.method, r.path, r.cache, r.headers['content-type'] || null]),
+                 chips: ['ENABLE_MAGPIE_TTS', 'ENABLE_CANARY_ASR'].map((key) => harness.text('engine-state-' + key)),
+                 install: harness.visible('install-ENABLE_CANARY_ASR'), status: harness.text('settings-status'),
+                 timers: harness.pendingTimers() };
+    """, gateway_answers)
+    assert out["requests"] == [["GET", "/api/settings", "no-store", None], ["GET", "/api/settings/engines", "no-store", None]]
+    assert out["chips"] == ["Running", "Not installed"] and out["install"] is True
+    assert out["status"] == "", "nothing left saying the page is still loading"
+    assert out["timers"] == 0, "no polling"
+
+
+def test_the_limits_say_what_they_cost_as_they_are_typed(tmp_path, gateway_answers):
+    out = run_settings_js(tmp_path, OPEN_AS_ADMIN + """
+        const memory = [harness.text('hint-MAX_UPLOAD_MB')];
+        await harness.type('input-MAX_CONCURRENT_UPLOADS', '8');
+        memory.push(harness.text('hint-MAX_UPLOAD_MB'));
+        const chars = [harness.visible('hint-MAX_TTS_CHARS')];
+        await harness.type('input-MAX_TTS_CHARS', '6000');
+        chars.push(harness.text('hint-MAX_TTS_CHARS'));
+        await harness.type('input-MAX_TTS_CHARS', '5000');
+        chars.push(harness.visible('hint-MAX_TTS_CHARS'));
+        return { memory, chars, workers: fixtures.answers.view.body.deployment.workers };
+    """, gateway_answers)
+    times = chr(0xd7)
+    assert out["workers"] == 2
+    assert out["memory"] == [f"Worst case: 2 workers {times} 4 uploads at once {times} 512 MB = 4.0 GB of memory.",
+                             f"Worst case: 2 workers {times} 8 uploads at once {times} 512 MB = 8.0 GB of memory."]
+    assert out["chars"][0] is False and out["chars"][2] is False
+    assert "refuse more than 5000 characters" in out["chars"][1]
+
+
+def test_every_server_banner_is_shown_and_the_pending_one_offers_to_keep_the_change(tmp_path, gateway_answers):
+    view = json.loads(json.dumps(gateway_answers["view_saved"]["body"]))
+    view["pending"] = {"revision": view["revision"], "deadline": 4102444800, "seconds_left": 30, "keys": ["TRUST_PROXY_HEADERS"]}
+    view["banners"] = [{"id": "pending", "level": "warning", "text": "The change of TRUST_PROXY_HEADERS is undone soon."},
+                       {"id": "not_mounted", "level": "error", "text": "Settings cannot be saved here."}]
+    answers = {**gateway_answers, "custom": {"status": 200, "body": view}}
+    out = run_settings_js(tmp_path, OPEN_AS_ADMIN + """
+        const banners = harness.el('settings-banners').children.map((b) => [b.dataset.banner, b.className]);
+        const lines = harness.text('settings-banners');
+        harness.on('POST', '/api/settings/confirm', fixtures.answers.confirm);
+        await harness.click('[data-action="confirm-pending"]');
+        return { banners, lines, confirmed: harness.calls('POST', '/api/settings/confirm').map((r) => r.body),
+                 live: harness.el('settings-banners').getAttribute('aria-live'), timers: harness.pendingTimers() };
+    """, answers, start="custom")
+    assert out["banners"] == [["pending", "banner warning"], ["not_mounted", "banner error"]]
+    assert '/app/settings"' in out["lines"], "the YAML lines to add are shown"
+    assert out["confirmed"] == [{"revision": view["revision"]}]
+    assert out["live"] == "polite"
+    assert out["timers"] == 1, "one reload after the deadline shows whether the change stayed"
+
+
+def _damaged_keys_answer(tmp_path) -> dict:
+    """What a gateway with API_KEY answers its own YAML key while keys.json is damaged."""
+    folder = tmp_path / "damaged-keys"
+    folder.mkdir()
+    module = load_frontend_app({"TTS_STT_SETTINGS_DIR": str(folder), "API_KEY": YAML_KEY})
+    (folder / "keys.json").write_text("{damaged", encoding="utf-8")
+    response = TestClient(module.app).get("/api/settings", headers={
+        "Host": NAS, "Origin": f"http://{NAS}", "Authorization": f"Bearer {YAML_KEY}"})
+    return _answer(response)
+
+
+def test_a_damaged_key_file_opens_the_repair_card_and_keeps_the_tabs_key(tmp_path, gateway_answers):
+    """keys.json damaged: no key can pass, so the page offers the repair (a claim with a one-time
+    code), not the key prompt, and keeps the tab's key, which the API may still take."""
+    damaged = _damaged_keys_answer(tmp_path)
+    assert damaged["status"] == 403 and damaged["body"]["code"] == "keys_damaged" and damaged["body"]["can_claim"]
+    answers = {**gateway_answers, "damaged": damaged}
+    out = run_settings_js(tmp_path, f"""
+        harness.storage.set('tts-stt.api-key', {json.dumps(YAML_KEY)});
+        harness.on('GET', '/api/settings', fixtures.answers.damaged);
+        await harness.boot();
+        const card = {{
+            shown: harness.visible('claim-card'), title: harness.text('claim-title'), intro: harness.text('claim-intro'),
+            keyPanel: harness.visible('key-panel'), main: harness.visible('settings-main'),
+            cancel: harness.visible('claim-cancel'), require: harness.visible('claim-require-row'),
+            stored: harness.storage.get('tts-stt.api-key'), status: harness.text('settings-status'),
+        }};
+        harness.on('POST', '/api/settings/claim-code', fixtures.answers.claim_code);
+        await harness.click('[data-action="print-code"]');
+        await harness.type('claim-code', 'ABCDE-FGHJK-MNPQR-STVWX');
+        await harness.check('claim-stored');
+        harness.on('POST', '/api/settings/claim', fixtures.answers.claim);
+        harness.on('GET', '/api/settings', {{ status: 200, body: fixtures.answers.view_claimed.body }});
+        await harness.click('claim-button');
+        return {{ card, status: harness.text('settings-status'), cardAfter: harness.visible('claim-card'),
+                  main: harness.visible('settings-main'), tabKey: harness.storage.get('tts-stt.api-key') }};
+    """, answers, start=None)
+    card = out["card"]
+    assert (card["shown"], card["keyPanel"], card["main"], card["cancel"], card["require"]) == (True, False, False, False, False)
+    assert card["title"] == "Repair the API keys" and "keys.json" in card["intro"] and "damaged" in card["intro"]
+    assert card["stored"] == YAML_KEY, "a 403 is no Bearer challenge: the tab's key is kept"
+    assert card["status"] == ""
+    assert "written again" in out["status"] and "make any that are missing again" in out["status"]
+    assert (out["cardAfter"], out["main"]) == (False, True)
+    assert PAGE_KEY.fullmatch(out["tabKey"]), "the new admin key is used in this tab"
+
+
+def test_a_damaged_key_file_that_the_page_cannot_repair_says_what_to_do(tmp_path, gateway_answers):
+    damaged = _damaged_keys_answer(tmp_path)
+    answers = {**gateway_answers, "damaged": {**damaged, "body": {**damaged["body"], "can_claim": False}}}
+    out = run_settings_js(tmp_path, """
+        harness.on('GET', '/api/settings', fixtures.answers.damaged);
+        await harness.boot();
+        return { card: harness.visible('claim-card'), keyPanel: harness.visible('key-panel'),
+                 status: harness.text('settings-status'),
+                 alert: Boolean(harness.el('settings-status').querySelector('[role="alert"]')) };
+    """, answers, start=None)
+    assert (out["card"], out["keyPanel"], out["alert"]) == (False, False, True)
+    assert "repair or delete settings/keys.json" in out["status"]
+
+
+def test_the_history_names_the_yaml_key_by_its_id_and_never_by_a_name_alone(tmp_path, gateway_answers):
+    """A page key named "deployment key" (made before such names were refused) is still a page key."""
+    saved_by = gateway_answers["view_saved"]["body"]["history"][0]["saved_by"]
+    assert saved_by["credential_id"] == "yaml:API_KEY", "the gateway records the YAML key by its id"
+    view = json.loads(json.dumps(gateway_answers["view_saved"]["body"]))
+    base = view["history"][0]
+    where = {"ip": "192.168.1.20", "host": NAS}
+    view["history"] = [
+        {**base, "id": "20261002T091203Z-r3", "revision": 3,
+         "saved_by": {**where, "credential": "deployment key", "credential_id": "0a1b2c3d"}},
+        {**base, "id": "20261002T091202Z-r2", "revision": 2,
+         "saved_by": {**where, "credential": "deployment key", "credential_id": "yaml:API_KEY"}},
+        {**base, "id": "20261002T091201Z-r1", "revision": 1, "saved_by": {**where, "credential": "deployment key"}},
+    ]
+    answers = {**gateway_answers, "custom": {"status": 200, "body": view}}
+    out = run_settings_js(tmp_path, OPEN_AS_ADMIN + """
+        return harness.el('history-list').children.map((item) => item.querySelector('.setting-note').textContent);
+    """, answers, start="custom")
+    assert out[0].endswith('By "deployment key" (192.168.1.20, 192.168.1.20:3000).')
+    assert "By the app YAML key (" in out[1]
+    assert "By the app YAML key (" in out[2], "a version saved before ids were recorded"
