@@ -14,7 +14,7 @@ phonemizer==3.4.0
 aiohttp==3.14.3
 aiofiles==25.1.0
 
-fastapi==0.141.1
+fastapi==0.142.2
 uvicorn[standard]==0.54.0
 pydantic==2.13.5
 python-multipart==0.0.32
@@ -23,5 +23,5 @@ python-multipart==0.0.32
 # onnx, and the export is verified by running it in onnxruntime (model_exporter.py).
 # onnxscript is not needed: it belongs to the torch.export-based exporter this
 # service does not use.
-onnx==1.23.0
+onnx==1.23.1
 onnxruntime==1.30.0
