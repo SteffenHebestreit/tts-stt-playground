@@ -1357,6 +1357,43 @@ def _load_voice_prompt(voice_id: str):
     )
 
 
+# A Base model's speaker-embedding width, by model size. The talker joins the
+# embedding to its own hidden states, so a saved voice plays back only on a model
+# of the size that made it: a 0.6B voice on 1.7B failed deep inside generation
+# with "Sizes of tensors must match ... Expected size 2048 but got size 1024".
+_SPEAKER_EMBEDDING_SIZES = {1024: "0.6B", 2048: "1.7B"}
+
+
+def _voice_model_size(meta: dict, prompt_item) -> Optional[str]:
+    """The model size a saved voice was made with, or None when it cannot be told.
+
+    ``model_used`` says so for every voice saved since it was recorded; for older
+    voices, and the ones the reaper race left blank, the embedding's width does.
+    """
+    size = AVAILABLE_MODELS.get(meta.get("model_used") or "", {}).get("size")
+    if size:
+        return size
+    shape = getattr(prompt_item.ref_spk_embedding, "shape", None)
+    return _SPEAKER_EMBEDDING_SIZES.get(int(shape[-1])) if shape else None
+
+
+def _require_voice_fits_model(voice_id: str, meta: dict, prompt_item, model_name: str) -> None:
+    """Refuse, with the way out, a saved voice the loaded model's size cannot play."""
+    voice_size = _voice_model_size(meta, prompt_item)
+    model_info = AVAILABLE_MODELS.get(model_name, {})
+    if voice_size is None or voice_size == model_info.get("size"):
+        return
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"Voice '{meta.get('name') or voice_id}' was saved with the {voice_size} Base model "
+            f"and only plays on that size; the current model is "
+            f"'{model_info.get('name', model_name or 'unknown')}'. Please switch to "
+            f"{voice_size} Base, or save the voice again with the current model."
+        ),
+    )
+
+
 def _list_voices() -> list:
     """List all saved voice profiles with their metadata."""
     voices = []
@@ -1639,12 +1676,14 @@ async def tts_with_saved_voice(
     prompt_item = await asyncio.to_thread(_load_voice_prompt, voice_id)
     if prompt_item is None:
         raise HTTPException(status_code=404, detail=f"Voice '{voice_id}' not found")
+    meta = await asyncio.to_thread(_load_voice_metadata, voice_id)
 
     with _as_server_error("Saved-voice TTS"):
         # Load the model before the capability check so a cold start
         # (failed preload) doesn't report a misleading capability error.
         async with _acquire_model() as (model, model_name):
             _require_capability(model_name, "voice_clone", _BASE_MODELS)
+            _require_voice_fits_model(voice_id, meta, prompt_item, model_name)
             start_time = time.time()
 
             audio, sr = await _synthesize_with_prompt(model, text, language, prompt_item)

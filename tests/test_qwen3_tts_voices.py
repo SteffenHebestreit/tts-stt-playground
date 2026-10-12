@@ -26,8 +26,8 @@ import pytest
 pytest.importorskip("numpy", reason="qwen3-tts app.py requires numpy")
 
 from qwen3_tts_loader import (  # noqa: E402
-    BASE_06, CUSTOM_17, FakeQwenModel, capture_wav, client, install_model,
-    install_qwen_tts, load_app, make_tensor,
+    BASE_06, BASE_17, CUSTOM_17, FakeQwenModel, VoiceClonePromptItem, capture_wav,
+    client, install_model, install_qwen_tts, load_app, make_tensor,
 )
 
 UPLOAD = b"RIFF" + b"\x01\x02\x03" * 40
@@ -459,6 +459,64 @@ def test_saved_voice_playback_on_the_wrong_variant_is_refused(monkeypatch, tmp_p
 
     assert r.status_code == 400 and "1.7B CustomVoice" in r.json()["detail"]
     assert custom.calls == [] and base.calls[-1][0] != "generate_voice_clone"
+
+
+def test_a_voice_saved_on_one_base_size_is_refused_on_the_other_with_the_way_out(monkeypatch, tmp_path):
+    """Live on the NAS: 'Luna' saved on 0.6B Base, the UI switched to 1.7B Base, and
+    every playback was a 500 ("Expected size 2048 but got size 1024")."""
+    m = load_app(str(tmp_path / "voices"))
+    install_qwen_tts(monkeypatch)
+    install_model(m, FakeQwenModel("base"), BASE_06)
+    c = client(m)
+    assert c.post("/voices/save", data={"name": "Luna", "ref_text": "Hallo."}, files=_audio()).status_code == 200
+    big = install_model(m, FakeQwenModel("base"), BASE_17)
+
+    r = c.post("/voices/luna/tts", data={"text": "Hallo."})
+
+    assert r.status_code == 400, r.text
+    detail = r.json()["detail"]
+    assert "Luna" in detail and "0.6B Base" in detail and "1.7B Base" in detail
+    assert big.calls == [], "the mismatched embedding must never reach generation"
+
+
+def test_a_voice_plays_on_a_model_of_its_own_size(lib):
+    m, model, _ = lib
+    c = client(m)
+    c.post("/voices/save", data={"name": "Luna", "ref_text": "Hallo."}, files=_audio())
+    install_model(m, model, BASE_06)          # a reload of the same model
+
+    assert c.post("/voices/luna/tts", data={"text": "Hallo."}).status_code == 200
+    assert len(_calls(model, "generate_voice_clone")) == 1
+
+
+def test_a_voice_without_model_used_is_told_apart_by_its_embedding_width(lib, monkeypatch):
+    """Voices saved before `model_used` existed, or that the reaper race left blank."""
+    m, model, voices = lib
+    (voices / "old").mkdir(parents=True)
+    (voices / "old" / "metadata.json").write_text(json.dumps({"name": "Old", "model_used": ""}))
+    wide = VoiceClonePromptItem(ref_code=None, ref_spk_embedding=type("T", (), {"shape": (2048,)})(),
+                                x_vector_only_mode=True, icl_mode=False)
+    monkeypatch.setattr(m, "_load_voice_prompt", lambda voice_id: wide)
+
+    r = client(m).post("/voices/old/tts", data={"text": "Hallo."})
+
+    assert r.status_code == 400 and "1.7B Base" in r.json()["detail"]
+    assert model.calls == []
+
+
+@pytest.mark.parametrize("meta,shape,expected", [
+    ({"model_used": BASE_06}, (2048,), "0.6B"),     # the recorded model wins over the width
+    ({"model_used": BASE_17}, None, "1.7B"),
+    ({}, (1024,), "0.6B"),
+    ({"model_used": ""}, (1, 2048), "1.7B"),
+    ({}, (512,), None),                              # an unknown width: let it through
+    ({}, None, None),
+])
+def test_the_size_a_voice_was_made_with(lib, meta, shape, expected):
+    m, _, _ = lib
+    emb = type("T", (), {"shape": shape})() if shape else [0.5, 0.25]
+    item = VoiceClonePromptItem(ref_code=None, ref_spk_embedding=emb, x_vector_only_mode=True, icl_mode=False)
+    assert m._voice_model_size(meta, item) == expected
 
 
 def test_playback_chunks_long_texts_and_applies_the_default_language(lib, monkeypatch):
