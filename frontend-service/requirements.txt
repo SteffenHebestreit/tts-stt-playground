@@ -11,4 +11,4 @@ httpx==0.28.1
 # is checked by the gateway itself; forwarding it would be refused by the STT
 # service's own origin guard). The >=14 floor is unchanged: from 14.0 on,
 # `websockets.connect` is the asyncio client whose keyword arguments the relay uses.
-websockets>=14.0
+websockets>=17.1
