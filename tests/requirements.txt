@@ -1,6 +1,6 @@
 pytest>=7.0
 pytest-asyncio>=0.21
-pytest-cov>=4.1
+pytest-cov>=7.1.0
 
 # Pins here must MATCH frontend-service/requirements.txt, not merely satisfy
 # it. The unit tests import frontend-service/app.py directly, so a floating
