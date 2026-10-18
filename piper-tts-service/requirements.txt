@@ -13,7 +13,7 @@ pydantic==2.13.5
 # with numpy 2 (the training service that exports these voices verifies its ONNX
 # with onnxruntime 1.30 too).
 numpy==2.4.6
-librosa==0.11.0
+librosa==1.0.0
 soundfile==0.14.0
 phonemizer==3.4.0
 onnxruntime==1.30.0
