@@ -11,4 +11,4 @@ soundfile>=0.12.0
 # transitively, which is not something to rely on.
 librosa>=0.10.0
 numpy>=1.24.0,<2.0.0
-httpx>=0.25.0
+httpx>=0.28.1
