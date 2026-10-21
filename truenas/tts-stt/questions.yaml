@@ -152,6 +152,42 @@ questions:
       default: false
       show_if: [["use_gpu", "=", true]]
 
+  - variable: enable_cohere
+    label: Cohere-ASR (Cohere Transcribe, 2B, 14 languages, about 4.2 GB VRAM)
+    description: >-
+      German, English, French, Spanish, Italian, Portuguese, Dutch, Polish, Greek, Arabic,
+      Chinese, Japanese, Korean and Vietnamese. No language detection: the language comes from
+      the request (German otherwise). Silence and noise are filtered out before the model.
+      Apache-2.0; downloaded from an ungated mirror whose weights are checked against Cohere's.
+    group: Optional services
+    schema:
+      type: boolean
+      default: false
+      show_if: [["use_gpu", "=", true]]
+
+  - variable: enable_granite
+    label: Granite-ASR (IBM Granite Speech 5.0, about 4.7 GB VRAM, or 1.2 GB with the 470m)
+    description: >-
+      German, English, French, Spanish, Portuguese and Japanese (the 470m also Italian).
+      The 2b is a speech LLM with punctuation, German noun capitalisation and keyword biasing;
+      the 470m TurboCTC is several times faster. Apache-2.0.
+    group: Optional services
+    schema:
+      type: boolean
+      default: false
+      show_if: [["use_gpu", "=", true]]
+
+  - variable: granite_asr_model
+    label: Granite model
+    group: Optional services
+    schema:
+      type: string
+      default: ibm-granite/granite-speech-5.0-2b
+      enum:
+        - {value: ibm-granite/granite-speech-5.0-2b, description: granite-speech-5.0-2b (speech LLM with keyword biasing, about 4.7 GB VRAM)}
+        - {value: ibm-granite/granite-speech-5.0-470m-turboctc, description: granite-speech-5.0-470m-turboctc (CTC, much faster, about 1.2 GB VRAM)}
+      show_if: [["enable_granite", "=", true]]
+
   - variable: enable_chatterbox
     label: Chatterbox-TTS (streaming German TTS with cloning, about 4 GB VRAM)
     description: The only TTS backend that streams sentence by sentence, so speech starts early.

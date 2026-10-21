@@ -76,6 +76,26 @@ services:
       - "./canary-asr-service/transcription.py:/app/transcription.py"
       - "./canary-asr-service/model_lifecycle.py:/app/model_lifecycle.py"
 
+  cohere-asr-service:
+    volumes:
+      - "./cohere-asr-service/app.py:/app/app.py"
+      - "./cohere-asr-service/cohere_support.py:/app/cohere_support.py"
+      - "./cohere-asr-service/transformers_asr.py:/app/transformers_asr.py"
+      - "./cohere-asr-service/audio_pipeline.py:/app/audio_pipeline.py"
+      - "./cohere-asr-service/body_limit.py:/app/body_limit.py"
+      - "./cohere-asr-service/origin_guard.py:/app/origin_guard.py"
+      - "./cohere-asr-service/model_lifecycle.py:/app/model_lifecycle.py"
+
+  granite-asr-service:
+    volumes:
+      - "./granite-asr-service/app.py:/app/app.py"
+      - "./granite-asr-service/granite_support.py:/app/granite_support.py"
+      - "./granite-asr-service/transformers_asr.py:/app/transformers_asr.py"
+      - "./granite-asr-service/audio_pipeline.py:/app/audio_pipeline.py"
+      - "./granite-asr-service/body_limit.py:/app/body_limit.py"
+      - "./granite-asr-service/origin_guard.py:/app/origin_guard.py"
+      - "./granite-asr-service/model_lifecycle.py:/app/model_lifecycle.py"
+
   chatterbox-tts-service:
     volumes:
       - "./chatterbox-tts-service/app.py:/app/app.py"

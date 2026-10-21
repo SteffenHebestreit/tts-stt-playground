@@ -39,6 +39,9 @@ names German.
 | Magpie-TTS Multilingual | German named among its languages ([model card](https://huggingface.co/nvidia/magpie_tts_multilingual_357m), 0.80 % CER for German on v2607). Measured here: a German sentence with a date, a price and a time, synthesized on an RTX 4080 and transcribed by Parakeet, came back word for word. NeMo 3.0.x routes only `de`, `en`, `es`, `fr`, `ja` and `zh` to a tokenizer; NVIDIA Open Model License |
 | `parakeet-tdt-0.6b-v3` | German WER **5.04 % FLEURS / 4.84 % CoVoST**, CC-BY-4.0 ([card](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)) |
 | `canary-180m-flash` | German WER **4.81 % MLS**, CC-BY-4.0 ([card](https://huggingface.co/nvidia/canary-180m-flash)) |
+| Cohere Transcribe `cohere-transcribe-03-2026` | German among its 14 languages, Apache-2.0 ([card](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026); gated, so `cohere-asr-service` loads an ungated mirror whose weights must match the official SHA-256). Measured here on an RTX 4080 (bf16): **5.12 % WER / 2.65 % CER** on 100 MLS German clips, 3.66 % WER on a 4-minute German file. No language identification |
+| IBM `granite-speech-5.0-2b` | German among its six languages, punctuated with German noun capitalisation, Apache-2.0 ([card](https://huggingface.co/ibm-granite/granite-speech-5.0-2b)). Measured here (RTX 4080, bf16): **6.55 % WER / 2.71 % CER** on the same 100 clips, 4.54 % on the 4-minute file |
+| IBM `granite-speech-5.0-470m-turboctc` | German among its seven languages, punctuated, Apache-2.0 ([card](https://huggingface.co/ibm-granite/granite-speech-5.0-470m-turboctc)). Measured here (RTX 4080, bf16): **5.69 % WER / 2.96 % CER** on the same 100 clips at 0.16 s per clip, 3.66 % on the 4-minute file, about 1.2 GB of VRAM |
 | `Qwen3-TTS-12Hz-0.6B-Base` | Declares `de` in its HF language metadata |
 | Gemma 4 E2B | German among the 35+ out-of-the-box languages ([model card](https://ai.google.dev/gemma/docs/core/model_card_4)) |
 
@@ -67,6 +70,7 @@ and only one spans the set:
 | CTranslate2 (faster-whisper) | ✅ aarch64 wheels | ✅ **fp16 only** — [INT8 disabled for sm120](https://github.com/OpenNMT/CTranslate2/releases) | ✅ | ❌ no prebuilt ROCm wheel |
 | ggml (whisper.cpp) | ✅ NEON | ✅ CUDA | ✅ CUDA | ✅ Vulkan + HIP |
 | NeMo (parakeet/canary) | ❌ | ✅ | ✅ | ❌ no AMD backend |
+| transformers (cohere-asr/granite-asr) | ❌ no image | ✅ | ✅ measured | ❌ no ROCm image |
 
 The NeMo images default to NeMo 3.0.x on torch 2.11 (cu128). Parakeet and Canary have a
 one-argument rollback to 2.7.x (`NEMO_TOOLKIT_SPEC='>=2.7.3,<3'`, or the prebuilt `-nemo2` images via
@@ -78,6 +82,13 @@ on NeMo 2.x and torch 2.5.1. Magpie-TTS has run on NeMo 3.0.0 and torch 2.11 on 
 (sm_89; see `magpie-tts-service/README.md`). The Parakeet and Canary GPU smoke test in
 `parakeet-asr-service/README.md` is still open, and no NeMo 3 image has run on a Blackwell card
 **(unverified)**.
+
+The two transformers images (`cohere-asr-service`, `granite-asr-service`) are torch 2.11 and
+torchaudio 2.11 from the cu128 index, checked for sm_120 kernels at build time, and ran on the RTX
+4080 (Cohere Transcribe about 4.2 GB of VRAM, Granite 2b about 4.7 GB, Granite 470m TurboCTC about
+1.2 GB). Neither has run on the 5060 Ti **(unverified)**. On a 16 GB card shared with Whisper,
+Magpie and Qwen3 they fit only when the idle TTLs give memory back; the 470m TurboCTC is the one
+that fits next to everything.
 
 **ggml is the only runtime covering all four.** If you want exactly one STT engine,
 `whisper-cpp` is the answer and it already exists in this repo. The cost is that it caps the SBC
@@ -203,8 +214,9 @@ mismatch instead of guessing shapes.
 
 ### What cannot run on ARM64 at all
 
-`stt-service`, `qwen3-asr`, `qwen3-tts`, `parakeet-asr`, `canary-asr`, `chatterbox-tts`,
-`magpie-tts`, `piper-training`. All are built on `nvidia/cuda:*` bases, and NeMo/Qwen/Chatterbox/Magpie require CUDA.
+`stt-service`, `qwen3-asr`, `qwen3-tts`, `parakeet-asr`, `canary-asr`, `cohere-asr`, `granite-asr`,
+`chatterbox-tts`, `magpie-tts`, `piper-training`. All are built on `nvidia/cuda:*` bases, and
+NeMo/Qwen/Chatterbox/Magpie require CUDA.
 **Do not add them to the arm64 CI matrix** — they would either fail to build or produce an image
 that cannot start, which is worse because it looks supported.
 

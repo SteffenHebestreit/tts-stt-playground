@@ -59,6 +59,8 @@ This repository now exposes a frontend provider registry that describes which se
 | `qwen3-asr` | stt | `qwen3-asr-service` | always | `transcribe: stt-form-v1`, `detect_language: stt-detect-language-v1` |
 | `parakeet` | stt | `parakeet-asr-service` | `ENABLE_PARAKEET_ASR=true` | `transcribe: stt-form-v1` |
 | `canary` | stt | `canary-asr-service` | `ENABLE_CANARY_ASR=true` | `transcribe: stt-form-v1` |
+| `cohere-asr` | stt | `cohere-asr-service` | `ENABLE_COHERE_ASR=true` | `transcribe: stt-form-v1` |
+| `granite-asr` | stt | `granite-asr-service` | `ENABLE_GRANITE_ASR=true` | `transcribe: stt-form-v1` |
 | `whisper-cpp` | stt | `whisper-cpp` | `ENABLE_WHISPER_CPP=true` | `transcribe: openai-audio-transcriptions-v1` |
 | `piper-training` | training | `piper-training-service` | always | `training: voice-training-job-v1` |
 
@@ -393,12 +395,16 @@ Used by:
 - `qwen3-asr`
 - `parakeet`
 - `canary`
+- `cohere-asr`
+- `granite-asr`
 
 Request:
 
 - `POST /transcribe`
 - multipart field `audio`
 - optional form field `language`
+- optional form field `initial_prompt` (what the gateway sends for `prompt`; read by `whisper`, and by
+  `granite-asr` as its keyword list; ignored, with a warning, by `cohere-asr`)
 
 Response:
 
@@ -409,9 +415,9 @@ Response:
 
 Status codes every implementation shares: **400** for an empty file or an unknown `language`/`task`,
 **413** when the upload exceeds the service's `MAX_UPLOAD_MB` or the recording its length limit,
-**422** for audio that cannot be decoded (and, on Canary, for a language its model cannot decode),
-**503** while the model cannot be loaded or the GPU is out of memory, and, on `qwen3-asr`, `parakeet`
-and `canary`, when the service is busy: `ASR_MAX_CONCURRENCY + ASR_MAX_QUEUE` requests are already
+**422** for audio that cannot be decoded (and, on Canary, Cohere-ASR and Granite-ASR, for a language
+their model cannot decode), **503** while the model cannot be loaded or the GPU is out of memory, and,
+on `qwen3-asr`, `parakeet`, `canary`, `cohere-asr` and `granite-asr`, when the service is busy: `ASR_MAX_CONCURRENCY + ASR_MAX_QUEUE` requests are already
 admitted, or this one waited `ASR_QUEUE_TIMEOUT_S` for its turn (always with `Retry-After`).
 `GET /ready` (see [`api.md`](./api.md#health-versus-ready-on-the-backends)) never blocks on a load.
 
@@ -422,6 +428,16 @@ Per-service differences worth knowing:
   Segments carry no `confidence`, because the model has none. `/detect_language` analyses only the
   first piece.
 - `parakeet` and `canary` add a per-file `status` to the error entries of `POST /transcribe-batch`.
+- `cohere-asr` and `granite-asr` have no timestamps from their models: each segment is one of the
+  service's own chunks, cut in pauses and at most `COHERE_ASR_CHUNK_S` / `GRANITE_ASR_CHUNK_S` seconds
+  long (30 by default). Only what the voice activity detector calls speech is transcribed. They add
+  `speech_seconds`, `chunks`, `truncated` and `warnings` at the top level (and `truncated` on a
+  segment that hit the token cap); `granite-asr` also takes a `keywords` field (and reads
+  `initial_prompt` the same way, a comma, semicolon or newline separated list of at most 2000) and
+  reports how many it applied in `keywords`. A failed SHA-256 check of the weights is a failed load
+  (`/ready` 503 `load_failed`, `weights_check: failed` in `/status`). `GET /status` reports
+  `supported_languages`, `default_language` and `current_model`; the gateway reads them for
+  `granite-asr`'s language list as it does for Canary's.
   `GET /status` reports the NeMo, torch and CUDA versions the image was built with under `runtime`.
 - `whisper` (`stt-service`) takes `language=null` to mean `STT_DEFAULT_LANGUAGE` (empty: detect) and
   reports `preferred_device`, `preferred_compute_type` and `degraded` in `/health`.
@@ -430,7 +446,7 @@ Per-service differences worth knowing:
 
 Used by `whisper` and `qwen3-asr`: `POST /detect_language` with the same multipart `audio`, returning
 the detected `language` and its probability. Parakeet has the route but always returns `null`, and
-Canary has no language identification at all: the registry's `language_detect` field says which
+Canary, Cohere-ASR and Granite-ASR have no language identification at all: the registry's `language_detect` field says which
 providers can actually do it.
 
 ### `openai-audio-transcriptions-v1`
@@ -593,8 +609,9 @@ Notes:
 
 ## Behaviour every backend shares
 
-These hold for all nine backend services (`stt-service`, `qwen3-asr`, `parakeet`, `canary`,
-`piper-tts`, `qwen3-tts`, `chatterbox`, `magpie`, `piper-training`), independent of the contract they
+These hold for all eleven backend services (`stt-service`, `qwen3-asr`, `parakeet`, `canary`,
+`cohere-asr`, `granite-asr`, `piper-tts`, `qwen3-tts`, `chatterbox`, `magpie`, `piper-training`),
+independent of the contract they
 implement. `whisper-cpp` is the unmodified upstream server and has none of them.
 
 - **Closed to browsers by default.** `ALLOWED_ORIGINS` (compose: `BACKEND_ALLOWED_ORIGINS`) is empty

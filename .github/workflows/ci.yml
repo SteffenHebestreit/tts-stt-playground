@@ -262,6 +262,7 @@ jobs:
           # The optional backends are outside `all`; their build args and images
           # must validate too.
           check "${ALL[@]}" --profile parakeet-asr --profile canary-asr \
+            --profile cohere-asr --profile granite-asr \
             --profile chatterbox-tts --profile magpie-tts --profile whisper-cpp -f docker-compose.yml
 
       # The ROCm overlay exists to remove NVIDIA reservations. Assert it, rather
@@ -292,7 +293,8 @@ jobs:
         run: |
           cp -n .env.example .env || true
           docker compose --profile all --profile training --profile parakeet-asr \
-            --profile canary-asr --profile chatterbox-tts --profile magpie-tts --profile whisper-cpp \
+            --profile canary-asr --profile cohere-asr --profile granite-asr \
+            --profile chatterbox-tts --profile magpie-tts --profile whisper-cpp \
             -f docker-compose.yml config --format json > /tmp/base.json
           exposed=$(jq -r '.services | to_entries[]
             | select(.key != "frontend-service")

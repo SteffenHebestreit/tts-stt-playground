@@ -6,7 +6,8 @@ OpenAI-compatible API, German first. Everything runs locally; no data leaves you
 - **TTS:** Piper (CPU, 40+ voices), Qwen3-TTS (voice cloning, GPU), optional Chatterbox
   (streaming German TTS with cloning), optional NVIDIA Magpie (five built-in voices)
 - **STT:** Whisper (live microphone transcription), Qwen3-ASR, optional Canary and Parakeet
-  (25 European languages), optional whisper.cpp (CPU only)
+  (25 European languages), optional Cohere Transcribe (14 languages) and IBM Granite Speech
+  (keyword biasing), optional whisper.cpp (CPU only)
 - **Voice training:** upload recordings, segment, train and export a Piper voice (optional)
 
 ## After install

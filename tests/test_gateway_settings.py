@@ -1474,7 +1474,8 @@ def test_44_the_engine_probe_tells_running_from_not_reachable_and_not_installed(
     engines = {engine["provider"]: engine for engine in r.json()["engines"]}
     assert {provider: engine["state"] for provider, engine in engines.items()} == {
         "canary": "not_reachable", "parakeet": "not_installed", "chatterbox": "running",
-        "magpie": "running", "whisper-cpp": "not_reachable", "piper-training": "not_installed"}
+        "magpie": "running", "whisper-cpp": "not_reachable", "piper-training": "not_installed",
+        "cohere-asr": "running", "granite-asr": "running"}
     assert (engines["magpie"]["offered"], engines["canary"]["offered"], engines["piper-training"]["offered"]) == (
         True, False, True)
     assert engines["parakeet"]["key"] == "ENABLE_PARAKEET_ASR" and engines["parakeet"]["kind"] == "stt"

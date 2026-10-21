@@ -24,6 +24,8 @@ COPY qwen3-tts-service/ /workspace/qwen3-tts-service/
 COPY qwen3-asr-service/ /workspace/qwen3-asr-service/
 COPY parakeet-asr-service/ /workspace/parakeet-asr-service/
 COPY canary-asr-service/ /workspace/canary-asr-service/
+COPY cohere-asr-service/ /workspace/cohere-asr-service/
+COPY granite-asr-service/ /workspace/granite-asr-service/
 COPY chatterbox-tts-service/ /workspace/chatterbox-tts-service/
 COPY magpie-tts-service/ /workspace/magpie-tts-service/
 

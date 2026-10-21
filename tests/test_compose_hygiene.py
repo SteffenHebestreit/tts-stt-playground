@@ -218,6 +218,8 @@ MODEL_SERVICES = (
     "stt-service", "qwen3-asr-service", "qwen3-tts-service",
     "parakeet-asr-service", "canary-asr-service", "chatterbox-tts-service",
     "magpie-tts-service",
+    "cohere-asr-service",
+    "granite-asr-service",
 )
 
 

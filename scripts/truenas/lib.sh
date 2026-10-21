@@ -26,6 +26,8 @@ stt-service|stt|8000|core||1.6|1.6
 qwen3-asr-service|qwen3-asr|5002|core||4|4
 qwen3-tts-service|qwen3-tts|5004|core||2.5|2.5
 canary-asr-service|canary-asr|5006|optional|canary-asr|2|1
+cohere-asr-service|cohere-asr|5009|optional|cohere-asr|4.2|4.1
+granite-asr-service|granite-asr|5010|optional|granite-asr|4.7|4.6
 parakeet-asr-service|parakeet-asr|5005|optional|parakeet-asr|3|2.5
 chatterbox-tts-service|chatterbox-tts|5007|optional|chatterbox-tts|4|3
 magpie-tts-service|magpie-tts|5008|optional|magpie-tts|4.2|2.5
