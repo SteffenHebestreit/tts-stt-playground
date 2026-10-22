@@ -42,6 +42,7 @@ BACKENDS = (
     "canary-asr-service",
     "cohere-asr-service",
     "granite-asr-service",
+    "vllm-asr-service",
 )
 
 # What each backend calls a multipart upload it accepts (None: it takes no uploads at all,
@@ -73,6 +74,8 @@ ROUTES = {
                            "json": None},
     "granite-asr-service": {"upload": ("POST", "/transcribe", "audio"), "probe": ("POST", "/unload"),
                             "json": None},
+    "vllm-asr-service": {"upload": ("POST", "/transcribe", "audio"), "probe": ("POST", "/unload"),
+                         "json": None},
 }
 
 
@@ -135,6 +138,10 @@ def load_backend(name: str, monkeypatch, tmp_path: Path, stack: contextlib.ExitS
         module = transformers_asr_loader.load_app(
             name.split("-")[0], monkeypatch,
             **{k: v for k, v in env.items() if k in transformers_asr_loader.MANAGED_ENV})
+    elif name == "vllm-asr-service":
+        import vllm_asr_loader
+        module = vllm_asr_loader.load_app(
+            monkeypatch, **{k: v for k, v in env.items() if k in vllm_asr_loader.MANAGED_ENV})
     else:
         raise KeyError(name)
     return Backend(name, module, tmp, ROUTES[name])

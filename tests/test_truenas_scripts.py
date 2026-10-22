@@ -17,7 +17,7 @@ import sys
 import pytest
 
 from compose_helpers import REPO_ROOT, load_compose, require_yaml
-from truenas_helpers import CORE, SERVICE_IMAGE, FakeHost, combined
+from truenas_helpers import CORE, LOCAL_BUILD, SERVICE_IMAGE, FakeHost, combined
 
 if shutil.which("bash") is None or not sys.platform.startswith("linux"):
     pytest.skip("the TrueNAS helper scripts target Linux (GNU coreutils) and need bash", allow_module_level=True)
@@ -155,7 +155,22 @@ def test_catalogue_images_ports_and_profiles_match_the_compose_file(host):
 
 
 def test_catalogue_matches_the_images_the_registry_fake_and_ci_publish(host):
-    assert {row["name"]: row["suffix"] for row in catalogue(host)} == SERVICE_IMAGE
+    assert {row["name"]: row["suffix"] for row in catalogue(host)} == {**SERVICE_IMAGE, **LOCAL_BUILD}
+
+
+def test_the_images_built_on_the_nas_are_the_ones_ci_does_not_publish(host):
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("plan_publish_for_truenas", REPO_ROOT / "scripts" / "plan_publish.py")
+    plan_publish = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = plan_publish
+    spec.loader.exec_module(plan_publish)
+    local = bash_value(host, "ts_local_builds").splitlines()
+    assert {row.split("|")[0] for row in local} == set(LOCAL_BUILD)
+    assert {name for name, _, _ in plan_publish.LOCAL_BUILD_ONLY} == set(LOCAL_BUILD.values())
+    for row in local:
+        name, context, driver = row.split("|")
+        assert (REPO_ROOT / context / "Dockerfile").is_file() and int(driver) >= 570, row
 
 
 def test_core_group_is_exactly_the_default_stack(host):
@@ -253,6 +268,17 @@ def test_a_failed_pull_exits_1_names_the_image_and_points_at_update_check(host):
     assert "update-check.sh --tag 9.9.9" in out
     # the others were still attempted: one failure does not hide the rest
     assert len([c for c in host.calls() if c[:2] == ["docker", "pull"]]) == len(CORE)
+
+
+def test_an_image_built_on_the_nas_is_never_pulled_and_its_build_command_is_printed(host):
+    result = host.run("pull-images.sh", "--tag", "0.2.0", "--with", "vllm-asr,canary-asr")
+    out = combined(result)
+    assert result.returncode == 0, out
+    pulls = [c[-1] for c in host.calls() if c[:2] == ["docker", "pull"]]
+    assert pulls == [f"ghcr.io/steffenhebestreit/tts-stt-{SERVICE_IMAGE[s]}:0.2.0" for s in CORE] + [
+        "ghcr.io/steffenhebestreit/tts-stt-canary-asr:0.2.0"]
+    assert ("docker build -t ghcr.io/steffenhebestreit/tts-stt-vllm-asr:0.2.0 "
+            "https://github.com/SteffenHebestreit/tts-stt-playground.git#develop:vllm-asr-service") in out
 
 
 def test_without_a_usable_docker_it_says_so(host):

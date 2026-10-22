@@ -207,7 +207,7 @@ services:
           # Cleared here, not in the anchor — see the note above `services:`.
           devices: !reset []
 
-  # NOTE: canary-asr-service, cohere-asr-service, granite-asr-service,
+  # NOTE: canary-asr-service, cohere-asr-service, granite-asr-service, vllm-asr-service,
   # chatterbox-tts-service and magpie-tts-service have NO Dockerfile.rocm, so they
   # are deliberately absent here rather than silently building a CUDA image. canary
   # is NeMo (same caveat as above). canary, chatterbox, cohere-asr and granite-asr

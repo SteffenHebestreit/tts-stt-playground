@@ -26,7 +26,8 @@ Usage: pull-images.sh --tag TAG [options]
   --tag TAG         release to pull, e.g. 0.2.0 (default: the version of this checkout, if any)
   --registry REG    image registry/owner (default: ghcr.io/steffenhebestreit)
   --with LIST       also pull optional services: canary-asr, parakeet-asr, cohere-asr,
-                    granite-asr, chatterbox-tts, magpie-tts, training, whisper-cpp
+                    granite-asr, vllm-asr, chatterbox-tts, magpie-tts, training, whisper-cpp
+                    (vllm-asr is not published: its build command is printed instead)
   --only LIST       pull just these services (names as in the compose file)
   --dry-run         print what would be pulled
   -h, --help        this text
@@ -90,8 +91,15 @@ if [ "$DRY" = 0 ] && ! ts_docker_usable; then
 fi
 
 failed=()
+built_here=()
 for svc in "${services[@]}"; do
   ref=$(ts_image_ref "$REGISTRY" "$svc" "$TAG")
+  if ts_is_local_build "$svc"; then
+    # Not on the registry (its base image is too big for CI): build it on this host instead.
+    built_here+=("$(ts_build_command "$REGISTRY" "$svc" "$TAG")")
+    echo "not published, build it here: $svc"
+    continue
+  fi
   if [ "$DRY" = 1 ]; then
     echo "would pull $ref"
     continue
@@ -102,6 +110,11 @@ for svc in "${services[@]}"; do
   fi
 done
 
+if [ "${#built_here[@]}" -gt 0 ]; then
+  echo
+  echo "Build these on this host (as root; once per release, with the tag the app runs):"
+  printf '  %s\n' "${built_here[@]}"
+fi
 if [ "$DRY" = 1 ]; then
   exit 0
 fi

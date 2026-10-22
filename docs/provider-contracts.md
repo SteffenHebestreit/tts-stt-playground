@@ -61,6 +61,7 @@ This repository now exposes a frontend provider registry that describes which se
 | `canary` | stt | `canary-asr-service` | `ENABLE_CANARY_ASR=true` | `transcribe: stt-form-v1` |
 | `cohere-asr` | stt | `cohere-asr-service` | `ENABLE_COHERE_ASR=true` | `transcribe: stt-form-v1` |
 | `granite-asr` | stt | `granite-asr-service` | `ENABLE_GRANITE_ASR=true` | `transcribe: stt-form-v1` |
+| `vllm-asr` | stt | `vllm-asr-service` | `ENABLE_VLLM_ASR=true` | `transcribe: stt-form-v1` |
 | `whisper-cpp` | stt | `whisper-cpp` | `ENABLE_WHISPER_CPP=true` | `transcribe: openai-audio-transcriptions-v1` |
 | `piper-training` | training | `piper-training-service` | always | `training: voice-training-job-v1` |
 
@@ -397,14 +398,16 @@ Used by:
 - `canary`
 - `cohere-asr`
 - `granite-asr`
+- `vllm-asr`
 
 Request:
 
 - `POST /transcribe`
 - multipart field `audio`
 - optional form field `language`
-- optional form field `initial_prompt` (what the gateway sends for `prompt`; read by `whisper`, and by
-  `granite-asr` as its keyword list; ignored, with a warning, by `cohere-asr`)
+- optional form field `initial_prompt` (what the gateway sends for `prompt`; read by `whisper`, by
+  `granite-asr` as its keyword list, by `vllm-asr` as its model takes it; ignored, with a warning, by
+  `cohere-asr`)
 
 Response:
 
@@ -415,9 +418,10 @@ Response:
 
 Status codes every implementation shares: **400** for an empty file or an unknown `language`/`task`,
 **413** when the upload exceeds the service's `MAX_UPLOAD_MB` or the recording its length limit,
-**422** for audio that cannot be decoded (and, on Canary, Cohere-ASR and Granite-ASR, for a language
-their model cannot decode), **503** while the model cannot be loaded or the GPU is out of memory, and,
-on `qwen3-asr`, `parakeet`, `canary`, `cohere-asr` and `granite-asr`, when the service is busy: `ASR_MAX_CONCURRENCY + ASR_MAX_QUEUE` requests are already
+**422** for audio that cannot be decoded (and, on Canary, Cohere-ASR, Granite-ASR and vLLM-ASR, for a
+language their model cannot decode), **503** while the model cannot be loaded or the GPU is out of
+memory, and, on `qwen3-asr`, `parakeet`, `canary`, `cohere-asr`, `granite-asr` and `vllm-asr`, when
+the service is busy: `ASR_MAX_CONCURRENCY + ASR_MAX_QUEUE` requests are already
 admitted, or this one waited `ASR_QUEUE_TIMEOUT_S` for its turn (always with `Retry-After`).
 `GET /ready` (see [`api.md`](./api.md#health-versus-ready-on-the-backends)) never blocks on a load.
 
@@ -438,7 +442,14 @@ Per-service differences worth knowing:
   (`/ready` 503 `load_failed`, `weights_check: failed` in `/status`). `GET /status` reports
   `supported_languages`, `default_language` and `current_model`; the gateway reads them for
   `granite-asr`'s language list as it does for Canary's.
-  `GET /status` reports the NeMo, torch and CUDA versions the image was built with under `runtime`.
+- `vllm-asr` answers like `cohere-asr`/`granite-asr` (chunks of at most `VLLM_ASR_CHUNK_S`, 28 s; the
+  same speech gate), but runs `vllm serve` for the model `VLLM_ASR_MODEL` names and sends every chunk
+  of a request to it at once. Its `/status` adds `model_family`, `offered_models` and an `engine`
+  block (`state` running/sleeping/stopped, `gpu_memory_utilization`, `kv_cache_tokens`,
+  `start_seconds`, `wake_seconds`); `/unload` puts the engine to sleep (`?mode=stop` ends it). A start
+  that does not fit the GPU share is `/ready` 503 `load_failed` with `detail: out_of_memory`, and the
+  engine process is gone.
+- `canary` and `parakeet`: `GET /status` reports the NeMo, torch and CUDA versions the image was built with under `runtime`.
 - `whisper` (`stt-service`) takes `language=null` to mean `STT_DEFAULT_LANGUAGE` (empty: detect) and
   reports `preferred_device`, `preferred_compute_type` and `degraded` in `/health`.
 
@@ -446,7 +457,7 @@ Per-service differences worth knowing:
 
 Used by `whisper` and `qwen3-asr`: `POST /detect_language` with the same multipart `audio`, returning
 the detected `language` and its probability. Parakeet has the route but always returns `null`, and
-Canary, Cohere-ASR and Granite-ASR have no language identification at all: the registry's `language_detect` field says which
+Canary, Cohere-ASR, Granite-ASR and vLLM-ASR have no `/detect_language` at all: the registry's `language_detect` field says which
 providers can actually do it.
 
 ### `openai-audio-transcriptions-v1`
@@ -609,8 +620,8 @@ Notes:
 
 ## Behaviour every backend shares
 
-These hold for all eleven backend services (`stt-service`, `qwen3-asr`, `parakeet`, `canary`,
-`cohere-asr`, `granite-asr`, `piper-tts`, `qwen3-tts`, `chatterbox`, `magpie`, `piper-training`),
+These hold for all twelve backend services (`stt-service`, `qwen3-asr`, `parakeet`, `canary`,
+`cohere-asr`, `granite-asr`, `vllm-asr`, `piper-tts`, `qwen3-tts`, `chatterbox`, `magpie`, `piper-training`),
 independent of the contract they
 implement. `whisper-cpp` is the unmodified upstream server and has none of them.
 

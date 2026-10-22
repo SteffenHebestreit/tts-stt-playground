@@ -406,18 +406,18 @@ def test_the_phase_one_keys():
     assert schema.PREFERENCE_KEYS == (
         "TRUSTED_HOSTS", "TRUSTED_ORIGINS", "TRUST_PROXY_HEADERS", "ALLOWED_ORIGINS",
         "ENABLE_CANARY_ASR", "ENABLE_PARAKEET_ASR", "ENABLE_COHERE_ASR", "ENABLE_GRANITE_ASR",
-        "ENABLE_CHATTERBOX_TTS", "ENABLE_MAGPIE_TTS",
+        "ENABLE_VLLM_ASR", "ENABLE_CHATTERBOX_TTS", "ENABLE_MAGPIE_TTS",
         "ENABLE_WHISPER_CPP", "ENABLE_TRAINING", "DEFAULT_TTS_PROVIDER", "DEFAULT_STT_PROVIDER",
         "MAX_UPLOAD_MB", "MAX_TTS_CHARS", "MAX_CONCURRENT_UPLOADS", "MAX_CONCURRENT_FFMPEG",
     )
     assert schema.ACCESS_KEYS == ("require_key", "deployment_key_role")
-    assert len(schema.SETTINGS) == 20
+    assert len(schema.SETTINGS) == 21
     assert schema.GUARD_KEYS == {"TRUSTED_HOSTS", "TRUSTED_ORIGINS", "TRUST_PROXY_HEADERS", "ALLOWED_ORIGINS",
                                  "require_key", "deployment_key_role"}
     assert schema.COMMIT_CONFIRM_KEYS == {"TRUSTED_ORIGINS", "TRUST_PROXY_HEADERS"}
     assert schema.OPTIONAL_ENGINE_FLAGS == {"ENABLE_CANARY_ASR", "ENABLE_PARAKEET_ASR", "ENABLE_COHERE_ASR",
-                                            "ENABLE_GRANITE_ASR", "ENABLE_CHATTERBOX_TTS", "ENABLE_MAGPIE_TTS",
-                                            "ENABLE_WHISPER_CPP"}
+                                            "ENABLE_GRANITE_ASR", "ENABLE_VLLM_ASR", "ENABLE_CHATTERBOX_TTS",
+                                            "ENABLE_MAGPIE_TTS", "ENABLE_WHISPER_CPP"}
     # The switches that govern the page itself, and the YAML-only knobs, are not in it.
     for kept_out in ("ALLOWED_HOSTS", "ALLOW_CREDENTIALS", "API_KEY", "ENABLE_SETTINGS_UI", "SETTINGS_LOCKED_KEYS",
                      "PROVIDER_REGISTRY_JSON", "FRONTEND_WORKERS", "MODEL_TTL"):

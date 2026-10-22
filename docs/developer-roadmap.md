@@ -18,18 +18,19 @@ The target architecture is:
 Status as of 2026-09-29. What exists, and what is still hardcoded:
 
 - **Registry and contracts (phase 1): done.** The gateway builds a provider registry (`GET /providers`),
-  the contracts are written down in [provider-contracts.md](provider-contracts.md), and twelve providers
+  the contracts are written down in [provider-contracts.md](provider-contracts.md), and thirteen providers
   are registered: Piper, Qwen3-TTS, Chatterbox and Magpie (TTS), faster-whisper, Qwen3-ASR, Parakeet,
-  Canary, Cohere-ASR, Granite-ASR and whisper.cpp (STT), and Piper training. `PROVIDER_REGISTRY_JSON`, `TRAINING_PROVIDER` and
+  Canary, Cohere-ASR, Granite-ASR, vLLM-ASR and whisper.cpp (STT), and Piper training. `PROVIDER_REGISTRY_JSON`, `TRAINING_PROVIDER` and
   `DEFAULT_*_PROVIDER` shape it at deploy time.
-- **STT is generalised.** Seven providers speak `stt-form-v1` (six of them) or
+- **STT is generalised.** Nine providers speak `stt-form-v1` (eight of them) or
   `openai-audio-transcriptions-v1` (whisper.cpp). The OpenAI-compatible `/v1` surface returns one response shape whichever backend
   answers, and falls back to the single healthy alternative when the default cannot be reached.
 - **Model services share one lifecycle contract.** `/health` (liveness, never loads a model),
   `/ready` (503 while the first load runs or after it failed), `POST /unload` (409 while busy) and an
-  idle TTL, implemented once in `model_lifecycle.ModelSlot` and shared by seven of the nine model
-  services (Qwen3-ASR, Parakeet, Canary, Cohere-ASR, Granite-ASR, Chatterbox, Magpie; `stt-service` has
-  its own residency module and Qwen3-TTS a bespoke reaper).
+  idle TTL, implemented once in `model_lifecycle.ModelSlot` and shared by eight of the ten model
+  services (Qwen3-ASR, Parakeet, Canary, Cohere-ASR, Granite-ASR, vLLM-ASR, Chatterbox, Magpie;
+  `stt-service` has its own residency module and Qwen3-TTS a bespoke reaper). For vLLM-ASR the
+  "model" in the slot is the `vllm serve` subprocess, and an idle release puts it to sleep.
 - **Contract tests exist for the gateway, not yet for the backends.** `tests/test_openai_v1_api.py`
   asserts the identical response shape across providers and the gateway adapters have unit suites; a
   test that runs the same request against every real STT backend needs a GPU stack and does not exist.
@@ -44,8 +45,8 @@ Status as of 2026-09-29. What exists, and what is still hardcoded:
   service's `default_language`; and the Qwen3-TTS adapter forwards `auto` and languages the model
   lacks instead of mapping them to English, and its registry defaults to `auto`, so
   `QWEN3_DEFAULT_LANGUAGE` and the service's 400 apply. These were hardcoded in the adapter when
-  this release was wired. Canary and Granite-ASR (whose language list follows `GRANITE_ASR_MODEL`)
-  are the only registry entries that are updated from their service; the others are static, which is
+  this release was wired. Canary, Granite-ASR (whose language list follows `GRANITE_ASR_MODEL`) and
+  vLLM-ASR (`VLLM_ASR_MODEL`) are the only registry entries that are updated from their service; the others are static, which is
   what phase 4 is for.
 - **Live transcription is not a shared contract.** Only `stt-service` implements
   `/ws/transcribe`; the gateway refuses the other providers with a reason (close code 1008).
@@ -83,6 +84,11 @@ one image recipe, a Silero speech gate and pause-based chunking, measured on 100
 TurboCTC's CTC frames (80 ms each), a run on the NAS's Blackwell 5060 Ti, faster long-form decoding for
 the Granite 2b (about 16x real time at batch 4), Cohere's decoder-context slot (a prompt is ignored
 today), and whether reading an OpenAI `prompt` as Granite keywords needs a smarter split than commas.
+`vllm-asr` (2026-10) serves the same candidates, plus Qwen3-ASR and the German Whisper, under vLLM's
+continuous batching, to measure production-like throughput. Open for it: publishing its image
+(the vLLM base does not fit a hosted runner), a run on the 5060 Ti, reporting the language Qwen3-ASR
+identifies on `auto`, and Whisper beam search / temperature fallback (vLLM 0.31 has
+`use_beam_search`), which is what would close the gap to faster-whisper on long speeches.
 The per-provider language lists and the live-transcription path are the remaining exceptions (see
 above).
 

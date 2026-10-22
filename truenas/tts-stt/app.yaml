@@ -23,8 +23,8 @@ sources:
 description: >-
   Self-hosted neural Text-to-Speech and Speech-to-Text platform, German first: Piper and
   Qwen3-TTS voices (with cloning), Chatterbox streaming TTS, NVIDIA Magpie TTS, Whisper,
-  Qwen3-ASR, Canary, Parakeet, Cohere Transcribe and IBM Granite Speech recognition with
-  live microphone transcription, and a voice-training pipeline, behind one web UI and an
+  Qwen3-ASR, Canary, Parakeet, Cohere Transcribe and IBM Granite Speech recognition (also
+  batched through vLLM) with live microphone transcription, and a voice-training pipeline, behind one web UI and an
   OpenAI-compatible API. GPU-accelerated (NVIDIA).
 keywords:
   - tts
@@ -38,5 +38,6 @@ keywords:
   - parakeet
   - cohere
   - granite
+  - vllm
   - voice-cloning
   - german

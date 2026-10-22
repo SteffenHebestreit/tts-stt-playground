@@ -142,6 +142,7 @@ def test_slot_is_wired_with_the_documented_ttl_names(service: str):
 LIFECYCLE_SERVICES = {
     "parakeet-asr-service", "canary-asr-service", "qwen3-asr-service",
     "chatterbox-tts-service", "magpie-tts-service", "cohere-asr-service", "granite-asr-service",
+    "vllm-asr-service",
 }
 
 

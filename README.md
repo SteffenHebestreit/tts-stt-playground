@@ -19,6 +19,7 @@ A self-hosted, Docker-based platform for text-to-speech synthesis, speech-to-tex
 | **Magpie-TTS** | 5008 | Optional multilingual TTS with five built-in voices, reads numbers and dates correctly (NVIDIA NeMo) |
 | **Cohere-ASR** | 5009 | Optional STT — Cohere Transcribe 2B, 14 languages incl. German (transformers) |
 | **Granite-ASR** | 5010 | Optional STT — IBM Granite Speech 5.0, keyword biasing, or the fast 470m TurboCTC (transformers) |
+| **vLLM-ASR** | 5011 | Optional STT — Granite, Cohere, Qwen3-ASR or Whisper turbo German under vLLM's continuous batching, for throughput (image built locally) |
 
 Only the **Frontend** is meant to be reached over the network: it proxies every backend call, the live
 microphone WebSocket included. The backend ports are published on `127.0.0.1` only (for `curl`, benchmarks
@@ -44,6 +45,7 @@ ENABLE_CHATTERBOX_TTS=true docker compose --profile all --profile chatterbox-tts
 ENABLE_MAGPIE_TTS=true docker compose --profile all --profile magpie-tts up -d         # plus NVIDIA Magpie
 ENABLE_COHERE_ASR=true docker compose --profile all --profile cohere-asr up -d         # plus Cohere Transcribe
 ENABLE_GRANITE_ASR=true docker compose --profile all --profile granite-asr up -d       # plus IBM Granite Speech
+ENABLE_VLLM_ASR=true docker compose --profile all --profile vllm-asr up -d             # plus vLLM-ASR (built here)
 
 # Check status
 docker compose ps
@@ -66,13 +68,15 @@ restart and kept in `./settings` (`SETTINGS_DIR`). A saved value wins over `.env
 needs an admin key: `API_KEY`, or on a stack without one a key created with a one-time code that only
 `docker compose logs frontend-service` shows.
 
-`whisper-cpp`, Parakeet, Canary, Cohere-ASR, Granite-ASR, Chatterbox and Magpie are opt-in. Starting a profile
-alone is not enough for the service to appear in the frontend; offer it under Settings -> Engines, or set the
-matching `ENABLE_WHISPER_CPP`, `ENABLE_PARAKEET_ASR`, `ENABLE_CANARY_ASR`, `ENABLE_COHERE_ASR`,
-`ENABLE_GRANITE_ASR`, `ENABLE_CHATTERBOX_TTS` or `ENABLE_MAGPIE_TTS=true` for the frontend service as well.
+`whisper-cpp`, Parakeet, Canary, Cohere-ASR, Granite-ASR, vLLM-ASR, Chatterbox and Magpie are opt-in. Starting a
+profile alone is not enough for the service to appear in the frontend; offer it under Settings -> Engines, or set
+the matching `ENABLE_WHISPER_CPP`, `ENABLE_PARAKEET_ASR`, `ENABLE_CANARY_ASR`, `ENABLE_COHERE_ASR`,
+`ENABLE_GRANITE_ASR`, `ENABLE_VLLM_ASR`, `ENABLE_CHATTERBOX_TTS` or `ENABLE_MAGPIE_TTS=true` for the frontend
+service as well.
 
 Images are pulled from GHCR as `ghcr.io/steffenhebestreit/tts-stt-*:${IMAGE_TAG}` (`latest` by default, which
-follows the newest release or master build). Pin `IMAGE_TAG=X.Y.Z` where a deployment has to be reproducible,
+follows the newest release or master build). The one exception is `tts-stt-vllm-asr`: its vLLM base is too big
+for CI to build, so it is not published, and compose builds it from `./vllm-asr-service` on the host. Pin `IMAGE_TAG=X.Y.Z` where a deployment has to be reproducible,
 and `PULL_POLICY=always` together with `latest` to fetch a moved tag on `up`.
 
 ## Developer Docs
@@ -82,7 +86,7 @@ and `PULL_POLICY=always` together with `latest` to fetch a moved tag on `up`.
 - [docs/developer-roadmap.md](docs/developer-roadmap.md) - planned architecture and migration steps for provider-generalization, with the current status
 - [docs/device-deployment-matrix.md](docs/device-deployment-matrix.md) - which services and models to run on which device, with ready-made presets in [`deploy/profiles/`](deploy/profiles/)
 - [docs/model-and-optimisation-research-2026-08.md](docs/model-and-optimisation-research-2026-08.md) - model and optimisation decisions, with an implementation-status addendum
-- [benchmarks/README.md](benchmarks/README.md) - measure German WER and latency of a backend on your own audio, and compare Whisper, Parakeet, Qwen3-ASR, Cohere, Granite and a German fine-tune
+- [benchmarks/README.md](benchmarks/README.md) - measure German WER and latency of a backend on your own audio, and compare Whisper, Parakeet, Qwen3-ASR, Cohere, Granite (also under vLLM) and a German fine-tune
 
 ---
 
@@ -103,6 +107,7 @@ Different services support different GPU backends. Choose based on your hardware
 | Canary-ASR | ✓ (slow) | ✓ | — | — |
 | Cohere-ASR | ✓ (slow) | ✓ | — | — |
 | Granite-ASR | ✓ (slow) | ✓ | — | — |
+| vLLM-ASR | — | ✓ (driver >= 580) | — | — |
 | Chatterbox-TTS | ✓ (slow) | ✓ | — | — |
 | Magpie-TTS | — | ✓ | — | — |
 | PiperTTS | CPU only | — | — | — |
@@ -303,6 +308,13 @@ Use smaller models (`WHISPER_MODEL_SIZE=small`, `WHISPER_MODEL=small`) to improv
 - About 4.7 GB of VRAM with the 2b (1.2 GB with the 470m) and a first-start download of 4.6 GB (0.95 GB). Measured on an RTX 4080 on 100 MLS German clips: 6.6 % WER at 1.7 s median (2b), 5.7 % WER at 0.16 s (470m)
 - Opt-in: profile `granite-asr` plus `ENABLE_GRANITE_ASR` on the frontend. Details: [granite-asr-service/README.md](granite-asr-service/README.md)
 
+### Speech Recognition — the candidates under vLLM (optional)
+- `vllm-asr-service`: a thin stt-form-v1 adapter that runs `vllm serve` (`vllm/vllm-openai:v0.31.0`, the release the NAS's luna-stt app runs on its Blackwell card) inside the same container, for production-like **throughput**: every chunk of every request goes to the engine at once and vLLM batches them
+- One model per service, `VLLM_ASR_MODEL`: `ibm-granite/granite-speech-5.0-2b` (default; through vLLM's chat endpoint with Granite-ASR's own prompt and keywords), `evewashere/cohere-transcribe-03-2026-ungated` (pinned and checked against Cohere's SHA-256 like Cohere-ASR), `Qwen/Qwen3-ASR-1.7B` (identifies the language, a prompt is its context) or `primeline/whisper-large-v3-turbo-german` (German only; for Whisper quality the `whisper` provider, faster-whisper, stays the reference)
+- The same speech gate and pause-based chunks (at most 28 s) as Cohere/Granite, chunk-level segments
+- The engine takes `VLLM_ASR_GPU_MEMORY_UTILIZATION` of the whole card while awake (0.45, about 7.2 GB of 16 GB) and sleeps after `ASR_MODEL_TTL` idle seconds (0.4-0.9 GB left, wakes in under a second); `VLLM_ASR_IDLE_MODE=stop` frees everything instead
+- Not published to GHCR (the base is 32 GB unpacked): compose builds it from `./vllm-asr-service`; on TrueNAS it is built on the NAS. Opt-in: profile `vllm-asr` plus `ENABLE_VLLM_ASR`. Measurements and details: [vllm-asr-service/README.md](vllm-asr-service/README.md)
+
 ### Text-to-Speech — Chatterbox (optional)
 - Multilingual TTS and voice cloning (MIT licence; every file carries a PerTh watermark)
 - Long texts are generated in chunks (up to `CHATTERBOX_MAX_TEXT_CHARS`, 5000, then HTTP 413) and can be streamed sentence by sentence (`/tts-stream`)
@@ -437,6 +449,15 @@ clone voices (`/clone`, `/voices/save`). No language means German (`QWEN3_DEFAUL
 | GET | `/ready` | Readiness (503 while the model loads or after a failed load, including weights that fail the SHA-256 check) |
 | GET | `/health` | Health check |
 
+### vLLM-ASR (port 5011)
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/transcribe` | Transcribe audio (`audio`, `language`, `initial_prompt`, `keywords`); the model's own languages only (422 otherwise); `chunks`, `truncated` and `warnings` in the answer |
+| POST | `/unload` | Put the engine to sleep now (`?mode=stop` ends it); 409 while a request is running |
+| GET | `/status` | Model, family, revision, weights check, languages, the engine's state, GPU share and KV-cache size, queue |
+| GET | `/ready` | Readiness (503 while the engine starts or after a failed start, `detail` says e.g. `out_of_memory`) |
+| GET | `/health` | Health check; `engine_state` is `running`, `sleeping` or `stopped` |
+
 ### Chatterbox-TTS (port 5007)
 | Method | Endpoint | Description |
 |--------|----------|-------------|
@@ -494,7 +515,7 @@ the per-service limits; the ones most people touch:
 | `SETTINGS_DIR`, `BACKEND_SETTINGS_DIR` | `${APP_DATA_DIR}/settings`, `.../backend-settings` | Where the Settings page saves (frontend only) and the folder kept for backend settings saved there (every Python backend mounts it read-only). Bind mounts: the page refuses to save into a container |
 | `MAX_UPLOAD_MB`, `MAX_TTS_CHARS` | `512`, `5000` | Gateway limits (`5000` is what Qwen3-TTS, Chatterbox and Magpie accept; a Piper-only setup can raise it). Each backend has its own (`ASR_MAX_UPLOAD_MB`, `PIPER_MAX_UPLOAD_MB`, `CHATTERBOX_MAX_TEXT_CHARS`, ... see `.env.example`) |
 | `MAX_CONCURRENT_UPLOADS`, `MAX_CONCURRENT_FFMPEG` | `4`, `4` | Per gateway worker: uploads forwarded at once and `ffmpeg` conversions for `/v1/audio/speech`; the next request gets `503` + `Retry-After` |
-| `ASR_MAX_QUEUE`, `ASR_QUEUE_TIMEOUT_S` | (empty: 4 x `ASR_MAX_CONCURRENCY`), `60` | Requests that may wait for the one inference slot of Qwen3-ASR, Parakeet, Canary, Cohere-ASR and Granite-ASR (`0` = nobody waits) and how long; beyond either the answer is `503` + `Retry-After`. `TTS_MAX_QUEUE` and `TTS_QUEUE_TIMEOUT_S` do the same for Qwen3-TTS, Chatterbox and Magpie |
+| `ASR_MAX_QUEUE`, `ASR_QUEUE_TIMEOUT_S` | (empty: 4 x `ASR_MAX_CONCURRENCY`), `60` | Requests that may wait for the one inference slot of Qwen3-ASR, Parakeet, Canary, Cohere-ASR and Granite-ASR (`0` = nobody waits) and how long; beyond either the answer is `503` + `Retry-After`. vLLM-ASR batches, so it has its own `VLLM_ASR_MAX_CONCURRENCY` (32) and `VLLM_ASR_MAX_QUEUE`. `TTS_MAX_QUEUE` and `TTS_QUEUE_TIMEOUT_S` do the same for Qwen3-TTS, Chatterbox and Magpie |
 | `PIPER_MAX_CUSTOM_VOICES`, `PIPER_MAX_CUSTOM_MB` | `20`, `2048` | Most uploaded Piper voices (`0` = no upload; `409` beyond it) and their total size (`413`); a new voice must also load and answer a test request within `PIPER_ONNX_VALIDATE_TIMEOUT_S` (30) |
 | `BACKEND_ALLOWED_ORIGINS` | (empty: closed) | CORS for the backends' own ports. Empty means no CORS headers and foreign-Origin POST/DELETE requests are refused (`403`); `*` must be set explicitly (each service logs a warning) |
 | `ALLOW_CREDENTIALS` | `false` | Enables CORS credentials only when origins are explicit |
@@ -533,6 +554,7 @@ tts-stt-playground/
 ├── magpie-tts-service/          # Magpie TTS (NVIDIA NeMo), optional
 ├── cohere-asr-service/          # Cohere Transcribe STT (transformers), optional
 ├── granite-asr-service/         # IBM Granite Speech STT (transformers), optional
+├── vllm-asr-service/            # the STT candidates under vLLM (adapter + `vllm serve`), optional, built locally
 │                                #   each service dir: app.py, Dockerfile (CUDA), Dockerfile.rocm where one exists
 ├── benchmarks/                  # German ASR evaluation (WER, latency, significance test)
 ├── scripts/                     # sync_openapi.py, plan_publish.py, check_no_skips.py, scripts/truenas/*
@@ -562,6 +584,7 @@ curl http://localhost:5007/ready    # Chatterbox-TTS (optional)
 curl http://localhost:5008/ready    # Magpie-TTS (optional)
 curl http://localhost:5009/ready    # Cohere-ASR (optional)
 curl http://localhost:5010/ready    # Granite-ASR (optional)
+curl http://localhost:5011/ready    # vLLM-ASR (optional)
 curl http://localhost:8080/ready    # Piper Training (names unwritable directories, a wrong PyTorch build, low disk)
 curl http://localhost:5003/         # whisper-cpp (any HTTP response = up)
 curl http://localhost:3000/health   # Frontend

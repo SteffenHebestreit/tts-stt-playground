@@ -37,6 +37,7 @@ UNLOAD_SERVICES = {
     "canary": "canary-asr-service",
     "cohere-asr": "cohere-asr-service",
     "granite-asr": "granite-asr-service",
+    "vllm-asr": "vllm-asr-service",
 }
 UNLOAD_CAPABILITY = "model_unload"
 
@@ -94,6 +95,7 @@ def declared_capabilities() -> dict[str, list[str]]:
         "ENABLE_MAGPIE_TTS": "true",
         "ENABLE_COHERE_ASR": "true",
         "ENABLE_GRANITE_ASR": "true",
+        "ENABLE_VLLM_ASR": "true",
     }
     previous_env = {k: os.environ.get(k) for k in optional}
     previous_cwd = Path.cwd()
@@ -347,6 +349,7 @@ def test_only_providers_with_a_websocket_claim_live_transcribe(declared_capabili
         "canary": "canary-asr-service",
         "cohere-asr": "cohere-asr-service",
         "granite-asr": "granite-asr-service",
+        "vllm-asr": "vllm-asr-service",
         "whisper-cpp": "whisper-cpp-service",
     }
     for provider, service_dir in service_of.items():
