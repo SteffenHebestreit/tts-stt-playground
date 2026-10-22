@@ -21,11 +21,13 @@ and end.
 """
 
 import asyncio
+import gc
 import json
 import logging
 import os
 import shutil
 import time
+import traceback
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -244,6 +246,16 @@ def _read_family(model_dir: str) -> str:
         return family_for(json.load(fh).get("model_type"))
 
 
+def _free_cuda_memory() -> None:
+    """Collect what nothing references any more and hand the cached blocks back to the card."""
+    gc.collect()
+    if device == "cuda":
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
 def _load_granite() -> LoadedModel:
     """Fetch, (optionally) verify and load the configured checkpoint."""
     global model_loaded, compute_dtype, weights_check, load_seconds, FAMILY, SUPPORTED_LANGUAGES, DEFAULT_LANGUAGE
@@ -281,7 +293,17 @@ def _load_granite() -> LoadedModel:
 
         processor = GraniteSpeechProcessor.from_pretrained(model_dir)
         model = GraniteSpeechForConditionalGeneration.from_pretrained(model_dir, dtype=dtype)
-    model.to(device)
+    try:
+        model.to(device)
+    except BaseException as e:
+        # A load that fails half-way (CUDA out of memory inside .to()) must give back
+        # what it had already moved: the finished frames of the traceback still hold the
+        # model, and the allocator keeps freed blocks reserved. On the NAS the process
+        # kept 3.3 GB this way while reporting "not resident".
+        traceback.clear_frames(e.__traceback__)
+        del model
+        _free_cuda_memory()
+        raise
     model.eval()
     if VAD_MODE == "silero":
         try:
