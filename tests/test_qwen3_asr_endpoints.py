@@ -597,3 +597,38 @@ def test_status_reports_the_limits_in_force(tmp_path, monkeypatch):
 def test_a_bad_concurrency_setting_cannot_stop_the_service_from_starting(tmp_path, monkeypatch):
     module, *_ = build(tmp_path, monkeypatch, ASR_MAX_CONCURRENCY="lots")
     assert module._gate.max_active == 1
+
+
+def test_a_load_that_runs_out_of_gpu_memory_gives_the_memory_back(monkeypatch):
+    """device_map puts the weights straight on the card: an OOM half-way must not leave them reserved.
+
+    On the NAS (2026-10-22) the process held 4.5 GB after such a load while reporting "not
+    resident", because the traceback's frames still held the half-built model and empty_cache()
+    never ran. The loader drops both before it re-raises.
+    """
+    import sys
+    import types
+    import weakref
+
+    built: list[weakref.ref] = []
+
+    class Partial:
+        pass
+
+    def from_pretrained(name, **kwargs):
+        partial = Partial()  # what from_pretrained had already placed on the card
+        built.append(weakref.ref(partial))
+        raise RuntimeError("CUDA out of memory. Tried to allocate 50.00 MiB")
+
+    fake = types.ModuleType("qwen_asr")
+    fake.Qwen3ASRModel = types.SimpleNamespace(from_pretrained=from_pretrained)
+    monkeypatch.setitem(sys.modules, "qwen_asr", fake)
+    module = load_app()
+    module.device = "cuda"
+    gone_at_empty_cache: list[bool] = []
+    module.torch.cuda.empty_cache = lambda: gone_at_empty_cache.append(built[0]() is None)
+
+    with pytest.raises(RuntimeError, match="out of memory"):
+        module._load_qwen3_asr()
+    assert gone_at_empty_cache == [True]
+    assert module.asr_model is None
