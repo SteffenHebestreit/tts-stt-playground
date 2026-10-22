@@ -20,10 +20,12 @@ CUDA GPU, float32 on the CPU.
 """
 
 import asyncio
+import gc
 import logging
 import os
 import shutil
 import time
+import traceback
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -258,6 +260,16 @@ def _model_dir() -> str:
         MODEL_NAME, revision=REVISION, allow_patterns=list(DOWNLOAD_PATTERNS), token=_HF_TOKEN)
 
 
+def _free_cuda_memory() -> None:
+    """Collect what nothing references any more and hand the cached blocks back to the card."""
+    gc.collect()
+    if device == "cuda":
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
 def _load_cohere() -> LoadedModel:
     """Fetch, verify and load the model (called by the lifecycle slot)."""
     global model_loaded, compute_dtype, weights_check, load_seconds
@@ -284,7 +296,17 @@ def _load_cohere() -> LoadedModel:
         dtype = torch.float32
     processor = CohereAsrProcessor.from_pretrained(model_dir)
     model = CohereAsrForConditionalGeneration.from_pretrained(model_dir, dtype=dtype)
-    model.to(device)
+    try:
+        model.to(device)
+    except BaseException as e:
+        # A load that fails half-way (CUDA out of memory inside .to()) must give back
+        # what it had already moved: the finished frames of the traceback still hold the
+        # model, and the allocator keeps freed blocks reserved. On the NAS the process
+        # kept 3.3 GB this way while reporting "not resident".
+        traceback.clear_frames(e.__traceback__)
+        del model
+        _free_cuda_memory()
+        raise
     model.eval()
     # The VAD's own model, loaded once (it ships in the wheel, nothing is downloaded).
     if VAD_MODE == "silero":

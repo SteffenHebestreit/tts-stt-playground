@@ -369,3 +369,23 @@ def test_a_failure_after_a_good_load_is_still_a_500(service, monkeypatch):
     monkeypatch.setattr(module, "_run_model", broken)
     r = post(module, words_wav(4)[0], language="de")
     assert r.status_code == 500 and "Request id" in r.json()["detail"] and "decoder" not in r.text
+
+
+@pytest.mark.parametrize("name, env", [("cohere", OK_WEIGHTS), ("granite", {})])
+def test_a_load_that_runs_out_of_gpu_memory_gives_the_memory_back(service, name, env):
+    """An OOM half-way through .to("cuda") must not leave the moved part reserved.
+
+    On the NAS (2026-10-22) both services kept 2.3-3.3 GB after such a load while
+    reporting "not resident": the traceback still held the model, so the gateway's
+    own empty_cache() ran while it was alive. The loader drops it before that.
+    """
+    module = service(name, **env)
+    module.device = "cuda"
+    module._fake.to_error = RuntimeError("CUDA error: out of memory")
+    r = post(module, words_wav(4)[0], language="de")
+    assert r.status_code == 503
+    assert any(module._fake.empty_cache_calls), "empty_cache never ran after the model was gone"
+    assert get(module, "/status").json().get("model_loaded") is not True
+
+    module._fake.to_error = None
+    assert post(module, words_wav(4)[0], language="de").status_code == 200
