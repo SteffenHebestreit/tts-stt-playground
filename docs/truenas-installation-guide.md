@@ -27,6 +27,8 @@ Commands in a `code block` run in the TrueNAS shell (System -> Shell, or SSH) as
 | `magpie-tts-service` | NVIDIA TTS with five built-in voices; reads numbers and dates correctly | yes | opt-in |
 | `canary-asr-service` | Fastest German speech recognition (180M parameters) | yes | opt-in |
 | `parakeet-asr-service` | Speech recognition for 25 European languages | yes | opt-in |
+| `cohere-asr-service` | Cohere Transcribe speech recognition, 14 languages including German | yes | opt-in |
+| `granite-asr-service` | IBM Granite Speech recognition with keyword biasing (or the fast 470m TurboCTC) | yes | opt-in |
 | `piper-training-service` | Train your own voice from recordings | yes | opt-in |
 | `whisper-cpp` | CPU-only speech recognition, no GPU needed | no | opt-in |
 | `diun` | Notifies you about new releases; never updates anything | no | opt-in |
@@ -172,7 +174,7 @@ the next request on, in every gateway worker, with no restart, and is kept in th
 |---|---|
 | Access | The host names the UI may be reached by (`TRUSTED_HOSTS`), the public URL behind a proxy that rewrites `Host` (`TRUSTED_ORIGINS`), whether to believe `X-Forwarded-Host` (`TRUST_PROXY_HEADERS`), other web pages that may call the API (`ALLOWED_ORIGINS`) |
 | API access & keys | Open on the network or a key required; what the YAML's `API_KEY` may do (admin or client); named API keys, created and revoked one by one |
-| Engines | Which optional engines are offered (Canary, Parakeet, Chatterbox, Magpie, whisper.cpp, voice training), each with whether its container answers; the default text-to-speech and speech-to-text engine |
+| Engines | Which optional engines are offered (Canary, Parakeet, Cohere-ASR, Granite-ASR, Chatterbox, Magpie, whisper.cpp, voice training), each with whether its container answers; the default text-to-speech and speech-to-text engine |
 | Limits | `MAX_UPLOAD_MB`, `MAX_TTS_CHARS`, `MAX_CONCURRENT_UPLOADS`, `MAX_CONCURRENT_FFMPEG` |
 | History & recovery | The last 20 versions with Restore, **Back to the app YAML** (drops every value saved here), and **Print a recovery code** for a lost admin key |
 
@@ -232,6 +234,8 @@ offered runs but never shows in the UI.
 |---|---|---|
 | Canary (fast German STT) | `canary-asr-service` | `ENABLE_CANARY_ASR` |
 | Parakeet (25 languages) | `parakeet-asr-service` | `ENABLE_PARAKEET_ASR` |
+| Cohere-ASR (Cohere Transcribe) | `cohere-asr-service` | `ENABLE_COHERE_ASR` |
+| Granite-ASR (IBM Granite Speech) | `granite-asr-service` | `ENABLE_GRANITE_ASR` (the 470m TurboCTC: `GRANITE_ASR_MODEL:-ibm-granite/granite-speech-5.0-470m-turboctc`) |
 | Chatterbox (streaming TTS) | `chatterbox-tts-service` | `ENABLE_CHATTERBOX_TTS` |
 | Magpie (NVIDIA TTS, 5 voices) | `magpie-tts-service` | `ENABLE_MAGPIE_TTS` |
 | whisper.cpp (CPU STT) | `whisper-cpp` | `ENABLE_WHISPER_CPP` |
@@ -429,11 +433,21 @@ start downloads), not measurements on your hardware. `preflight.sh` uses this ta
 | `parakeet-asr-service` | 3 GB | 2.5 GB | Estimate: 0.6B parameters at 4 bytes |
 | `chatterbox-tts-service` | 4 GB | 3 GB | Streaming German TTS |
 | `magpie-tts-service` | 4.2 GB | 2.5 GB | NVIDIA TTS, five built-in voices. Measured on an RTX 4080: 4.2 GB of the card with the model loaded, 2.5 GB downloaded, and about 7 GB of host RAM |
+| `cohere-asr-service` | 4.2 GB | 4.1 GB | Cohere Transcribe 2B, 14 languages. Measured on an RTX 4080: 4.2 GB of the card with the model loaded, 4.6 GB at the peak of a 4-minute file; the first load also hashes the 4.1 GB weights (about 13 s) |
+| `granite-asr-service` (`2b`) | 4.7 GB | 4.6 GB | IBM Granite Speech 5.0 2b, the default. Measured on an RTX 4080: 4.7 GB loaded, 4.8 GB at the peak of a 4-minute file |
+| `granite-asr-service` (`470m-turboctc`) | 1.2 GB | 0.95 GB | `GRANITE_ASR_MODEL=ibm-granite/granite-speech-5.0-470m-turboctc`. Measured on an RTX 4080: 1.15 GB loaded, 1.4 GB at the peak |
 | `piper-training-service` | 4 GB | 2 GB | On demand only. Download column is a data and checkpoint reserve |
 | `whisper-cpp` | 0 GB | 0.6 GB | CPU only; estimate for the q5_0 model |
 
 The default set (`stt` turbo + `qwen3-asr` + `qwen3-tts` 0.6B) is about **8.1 GB** resident. Images
-are about **25 GB** for that set, and each optional GPU image adds several GB more.
+are about **25 GB** for that set, and each optional GPU image adds several GB more. `cohere-asr` and
+`granite-asr` are about 10 GB unpacked each, but they share every layer except their own code, so the
+second one costs almost nothing more to pull.
+
+On a 16 GB card that already holds Whisper (about 2.2 GB), Magpie (about 3.3 GB) and Qwen3-ASR/TTS, or
+another application's model (a separate vLLM speech server takes 3 to 6 GB), Cohere-ASR or the Granite
+2b fits only while idle services have given their memory back (`ASR_MODEL_TTL`, `TTS_MODEL_TTL`);
+Granite's 470m TurboCTC is the one that fits next to everything.
 
 Resident figures are peaks, and none of them is permanent: every GPU service releases its weights
 after `MODEL_TTL` seconds idle (300) and reloads on the next request, so what has to fit is close
@@ -448,7 +462,7 @@ Unloading is reference counted, so a request in flight is never freed underneath
 |---|---|---|
 | 8 GB | `frontend`, `piper`, `stt` (turbo) and at most one more service | 2 to 6 GB |
 | 12 GB | the default set, with `MODEL_TTL` at 120 if you add one optional service | 8.1 GB, up to about 10 GB |
-| 16 GB | the default set plus `chatterbox`, `magpie` or `canary` | about 10 to 12 GB |
+| 16 GB | the default set plus `chatterbox`, `magpie`, `canary`, `cohere-asr` or `granite-asr` | about 10 to 13 GB |
 | Training | free the VRAM of `qwen3-tts-service` first (`POST /api/providers/qwen3/unload`, or stop the service), then enable `piper-training-service` | training wants several GB |
 
 **Lower latency** (set on `stt-service`; tune against the `decode NNN ms` readout in the live

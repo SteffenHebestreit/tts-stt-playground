@@ -238,6 +238,17 @@ def test_omitted_and_auto_language_both_auto_detect_by_default(client):
     assert _language_of_last_call(client) is None
 
 
+def test_no_prompt_reaches_the_model_as_none_not_an_empty_string(client):
+    # faster-whisper encodes "" as a real prompt; large-v3-turbo then truncated
+    # and looped on German (WER 45% on MLS clips against 6.2% without it).
+    assert _post(client).status_code == 200
+    assert client.fake_model.calls[-1]["initial_prompt"] is None
+    assert _post(client, data={"initial_prompt": ""}).status_code == 200
+    assert client.fake_model.calls[-1]["initial_prompt"] is None
+    assert _post(client, data={"initial_prompt": "Besprechung"}).status_code == 200
+    assert client.fake_model.calls[-1]["initial_prompt"] == "Besprechung"
+
+
 def test_the_default_language_fills_in_only_what_the_request_omits():
     app = load_stt_app({"STT_DEFAULT_LANGUAGE": "de"}, name="stt_app_http_default_lang")
     with TestClient(app.app) as test_client:

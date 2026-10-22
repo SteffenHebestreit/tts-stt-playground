@@ -29,7 +29,7 @@ CHOOSING WHAT IS MEASURED
     --base-url http://localhost:3000
 
     # one named provider through the gateway (POST /api/stt): whisper, qwen3-asr,
-    # parakeet, canary, whisper-cpp
+    # parakeet, canary, cohere-asr, granite-asr, whisper-cpp
     --base-url http://localhost:3000 --provider parakeet
 
     # a backend directly, no gateway in between (POST /transcribe, stt-form-v1)
@@ -296,7 +296,8 @@ def resolve_target(
             f"to talk to one directly."
         )
     if resolved == API_GATEWAY and not provider:
-        raise SystemExit("the gateway API needs --provider (whisper, qwen3-asr, parakeet, canary, whisper-cpp)")
+        raise SystemExit("the gateway API needs --provider (whisper, qwen3-asr, parakeet, canary, cohere-asr, "
+                         "granite-asr, whisper-cpp)")
 
     endpoint = full_url or root + _API_PATHS[resolved]
     return Target(api=resolved, url=endpoint, base_url=root, provider=provider)
@@ -721,7 +722,8 @@ def build_parser() -> argparse.ArgumentParser:
                              "/transcribe), gateway (audio+provider, the gateway's /api/stt). "
                              "auto picks from --url, and gateway when --provider is given.")
     parser.add_argument("--provider", help="STT provider to measure through the gateway "
-                                           "(whisper, qwen3-asr, parakeet, canary, whisper-cpp)")
+                                           "(whisper, qwen3-asr, parakeet, canary, cohere-asr, granite-asr, "
+                                           "whisper-cpp)")
     parser.add_argument("--api-key", default=os.getenv("EVAL_API_KEY", ""),
                         help="bearer token, for a gateway started with API_KEY (default $EVAL_API_KEY)")
     parser.add_argument("--model", default="whisper-1", help="advisory; the deployment serves what it has")

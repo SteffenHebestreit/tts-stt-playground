@@ -18,18 +18,18 @@ The target architecture is:
 Status as of 2026-09-29. What exists, and what is still hardcoded:
 
 - **Registry and contracts (phase 1): done.** The gateway builds a provider registry (`GET /providers`),
-  the contracts are written down in [provider-contracts.md](provider-contracts.md), and ten providers
+  the contracts are written down in [provider-contracts.md](provider-contracts.md), and twelve providers
   are registered: Piper, Qwen3-TTS, Chatterbox and Magpie (TTS), faster-whisper, Qwen3-ASR, Parakeet,
-  Canary and whisper.cpp (STT), and Piper training. `PROVIDER_REGISTRY_JSON`, `TRAINING_PROVIDER` and
+  Canary, Cohere-ASR, Granite-ASR and whisper.cpp (STT), and Piper training. `PROVIDER_REGISTRY_JSON`, `TRAINING_PROVIDER` and
   `DEFAULT_*_PROVIDER` shape it at deploy time.
-- **STT is generalised.** Five providers speak `stt-form-v1` (four of them) or
+- **STT is generalised.** Seven providers speak `stt-form-v1` (six of them) or
   `openai-audio-transcriptions-v1` (whisper.cpp). The OpenAI-compatible `/v1` surface returns one response shape whichever backend
   answers, and falls back to the single healthy alternative when the default cannot be reached.
 - **Model services share one lifecycle contract.** `/health` (liveness, never loads a model),
   `/ready` (503 while the first load runs or after it failed), `POST /unload` (409 while busy) and an
-  idle TTL, implemented once in `model_lifecycle.ModelSlot` and shared by five of the seven model
-  services (Qwen3-ASR, Parakeet, Canary, Chatterbox, Magpie; `stt-service` has its own residency module and
-  Qwen3-TTS a bespoke reaper).
+  idle TTL, implemented once in `model_lifecycle.ModelSlot` and shared by seven of the nine model
+  services (Qwen3-ASR, Parakeet, Canary, Cohere-ASR, Granite-ASR, Chatterbox, Magpie; `stt-service` has
+  its own residency module and Qwen3-TTS a bespoke reaper).
 - **Contract tests exist for the gateway, not yet for the backends.** `tests/test_openai_v1_api.py`
   asserts the identical response shape across providers and the gateway adapters have unit suites; a
   test that runs the same request against every real STT backend needs a GPU stack and does not exist.
@@ -44,8 +44,9 @@ Status as of 2026-09-29. What exists, and what is still hardcoded:
   service's `default_language`; and the Qwen3-TTS adapter forwards `auto` and languages the model
   lacks instead of mapping them to English, and its registry defaults to `auto`, so
   `QWEN3_DEFAULT_LANGUAGE` and the service's 400 apply. These were hardcoded in the adapter when
-  this release was wired. Canary is still the only registry entry that is updated from its
-  service; the others are static, which is what phase 4 is for.
+  this release was wired. Canary and Granite-ASR (whose language list follows `GRANITE_ASR_MODEL`)
+  are the only registry entries that are updated from their service; the others are static, which is
+  what phase 4 is for.
 - **Live transcription is not a shared contract.** Only `stt-service` implements
   `/ws/transcribe`; the gateway refuses the other providers with a reason (close code 1008).
 
@@ -75,8 +76,15 @@ Exit criteria:
 
 - adding a new STT backend that matches `stt-form-v1` or `openai-audio-transcriptions-v1` is configuration plus provider deployment
 
-Status: **mostly done.** Parakeet and Canary were added this way. The per-provider language lists
-and the live-transcription path are the remaining exceptions (see above).
+Status: **mostly done.** Parakeet and Canary were added this way, and so were Cohere Transcribe
+(`cohere-asr`) and IBM Granite Speech (`granite-asr`, 2026-10): two transformers services that share
+one image recipe, a Silero speech gate and pause-based chunking, measured on 100 MLS German clips
+(see [`benchmarks/README.md`](../benchmarks/README.md)). Open for them: word timestamps from the 470m
+TurboCTC's CTC frames (80 ms each), a run on the NAS's Blackwell 5060 Ti, faster long-form decoding for
+the Granite 2b (about 16x real time at batch 4), Cohere's decoder-context slot (a prompt is ignored
+today), and whether reading an OpenAI `prompt` as Granite keywords needs a smarter split than commas.
+The per-provider language lists and the live-transcription path are the remaining exceptions (see
+above).
 
 ### Phase 3: Contract Tests
 
@@ -124,8 +132,9 @@ training service serialises jobs (`TRAINING_MAX_CONCURRENT`), reports `/ready`, 
 
 ## Near-Term Priorities
 
-1. Move the remaining per-provider metadata (Canary languages, Piper's default language, the Qwen3
-   `auto` mapping) out of the gateway adapters and into registry data or the services' own `/status`.
+1. Move the remaining per-provider metadata (Canary and Granite languages, Piper's default language,
+   the Qwen3 `auto` mapping) out of the gateway adapters and into registry data or the services' own
+   `/status`.
 2. Keep growing the provider registry instead of adding new hardcoded frontend URLs.
 3. Prefer contract adapters over provider-specific branching when integrating new STT backends.
 4. Decide the live-transcription contract (`/ws/transcribe`) before a second provider implements it.

@@ -388,6 +388,7 @@ def test_the_image_catalogue_the_fake_registry_uses_is_the_one_the_script_checks
     """Guards the fake itself: a service name the script knows and the fake does not would pass vacuously."""
     host.publish("0.2.0")
     result, out = check(host, "--tag", "0.2.0", "--with",
-                         "canary-asr,parakeet-asr,chatterbox-tts,magpie-tts,training,whisper-cpp")
+                         "canary-asr,parakeet-asr,cohere-asr,granite-asr,chatterbox-tts,magpie-tts,training,"
+                         "whisper-cpp")
     assert result.returncode == 0, out
     assert out.count("published  ") == len(SERVICE_IMAGE)

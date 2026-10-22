@@ -80,6 +80,14 @@ STATE_CHANGING = {
         ("POST", "/transcribe", "/transcribe"),
         ("POST", "/unload", "/unload"),
     ],
+    "cohere-asr-service": [
+        ("POST", "/transcribe", "/transcribe"),
+        ("POST", "/unload", "/unload"),
+    ],
+    "granite-asr-service": [
+        ("POST", "/transcribe", "/transcribe"),
+        ("POST", "/unload", "/unload"),
+    ],
 }
 
 

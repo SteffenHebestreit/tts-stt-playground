@@ -207,8 +207,9 @@ services:
           # Cleared here, not in the anchor — see the note above `services:`.
           devices: !reset []
 
-  # NOTE: canary-asr-service, chatterbox-tts-service and magpie-tts-service have NO Dockerfile.rocm,
-  # so they are deliberately absent here rather than silently building a CUDA
-  # image. canary is NeMo (same caveat as above). canary and chatterbox may run on
-  # CPU; magpie-tts-service is NVIDIA-only. For AMD speech-to-text use the Vulkan
-  # whisper-cpp path.
+  # NOTE: canary-asr-service, cohere-asr-service, granite-asr-service,
+  # chatterbox-tts-service and magpie-tts-service have NO Dockerfile.rocm, so they
+  # are deliberately absent here rather than silently building a CUDA image. canary
+  # is NeMo (same caveat as above). canary, chatterbox, cohere-asr and granite-asr
+  # may run on CPU (cohere-asr and granite-asr slowly); magpie-tts-service is
+  # NVIDIA-only. For AMD speech-to-text use the Vulkan whisper-cpp path.

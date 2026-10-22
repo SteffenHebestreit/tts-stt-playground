@@ -29,6 +29,8 @@ SERVICES = [
     "piper-tts-service",
     "parakeet-asr-service",
     "canary-asr-service",
+    "cohere-asr-service",
+    "granite-asr-service",
 ]
 
 # Calls that either load weights or take a reference that blocks unloading.

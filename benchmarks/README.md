@@ -10,7 +10,8 @@ been measured on German:
 | Qwen3-ASR quantisation | fits alongside TTS | same |
 
 The same tool is the **decision gate** for choosing between ASR backends
-(Whisper, Parakeet, Qwen3-ASR, a German fine-tune): see
+(Whisper, Parakeet, Qwen3-ASR, Cohere Transcribe, IBM Granite Speech, a German
+fine-tune): see
 [Comparing providers](#comparing-whisper-parakeet-qwen3-asr-and-a-german-fine-tune).
 
 German is an acceptance criterion for this project, so "probably fine" is not
@@ -120,8 +121,9 @@ their samples happen to have in common.
 | `--url http://host:5005/transcribe` | that URL | `stt-form` (field `audio`) | one **backend directly**, no gateway in between |
 | `--url http://host:5003/v1/audio/transcriptions` | that URL | `openai` | whisper.cpp's OpenAI-compatible route |
 
-Provider ids are `whisper`, `qwen3-asr`, `parakeet`, `canary` and `whisper-cpp`;
-the non-default ones only exist in the gateway when their `ENABLE_*` flag is set.
+Provider ids are `whisper`, `qwen3-asr`, `parakeet`, `canary`, `cohere-asr`,
+`granite-asr` and `whisper-cpp`; the non-default ones only exist in the gateway when
+their `ENABLE_*` flag is set.
 
 `/v1/audio/transcriptions` **cannot select a provider**: it always uses the
 configured default and ignores form fields it does not know, so a `provider` field
@@ -268,6 +270,17 @@ python benchmarks/run_german_eval.py $EVAL --url http://localhost:5005/transcrib
 docker compose --profile qwen3-asr up -d qwen3-asr-service
 python benchmarks/run_german_eval.py $EVAL --url http://localhost:5002/transcribe \
   --label qwen3-asr --out r-qwen3.json
+
+# Cohere Transcribe (profile cohere-asr)
+docker compose --profile cohere-asr up -d cohere-asr-service
+python benchmarks/run_german_eval.py $EVAL --url http://localhost:5009/transcribe \
+  --label cohere-asr --out r-cohere.json
+
+# IBM Granite Speech 5.0 2b (profile granite-asr); the 470m TurboCTC is the same
+# service with GRANITE_ASR_MODEL=ibm-granite/granite-speech-5.0-470m-turboctc
+docker compose --profile granite-asr up -d granite-asr-service
+python benchmarks/run_german_eval.py $EVAL --url http://localhost:5010/transcribe \
+  --label granite-2b --out r-granite.json
 ```
 
 `--language de` (the default) goes to every backend. Parakeet auto-detects and only
@@ -277,7 +290,34 @@ errors, which is the right thing to measure.
 To measure through the gateway instead (the path a real client takes, including
 its response normalisation), use `--base-url http://localhost:3000 --provider
 parakeet` and so on. That needs the provider enabled in the gateway
-(`ENABLE_PARAKEET_ASR=true` etc.).
+(`ENABLE_PARAKEET_ASR=true` etc.), for example:
+
+```bash
+ENABLE_COHERE_ASR=true docker compose --profile frontend --profile cohere-asr up -d
+python benchmarks/run_german_eval.py $EVAL --base-url http://localhost:3000 \
+  --provider cohere-asr --label cohere-asr --out r-cohere.json
+```
+
+Cohere Transcribe and Granite take the language from the request (neither
+identifies it), so `--language de` decides what they transcribe in. Both put a
+voice activity detector in front of the model; on read speech such as MLS it
+changes nothing measurable (Cohere: 5.20 % WER with it off, 5.12 % on), and the
+detector itself costs about 0.1 s per clip.
+
+**Measured on the workstation** (RTX 4080, bf16, 100 MLS German clips, seed
+1234, through the gateway's `/api/stt`; one run each, so read the differences
+with the bootstrap, not as a ranking):
+
+| Provider | WER | CER | Warm median / p95 | RTF | VRAM |
+|---|---|---|---|---|---|
+| `cohere-asr` (Cohere Transcribe 03-2026) | 5.12 % | 2.65 % | 0.42 s / 0.62 s | 0.028 | 4.2 GB |
+| `granite-asr` (granite-speech-5.0-2b) | 6.55 % | 2.71 % | 1.68 s / 2.49 s | 0.108 | 4.7 GB |
+| `granite-asr` (granite-speech-5.0-470m-turboctc) | 5.69 % | 2.96 % | 0.16 s / 0.19 s | 0.010 | 1.2 GB |
+
+On one 4-minute German recording (11 chunks): Cohere 3.66 % WER in 4.7 s, the
+Granite 2b 4.54 % in 15.8 s, the 470m TurboCTC 3.66 % in 2.1 s. Cohere's output
+on read speech is mostly lowercase without punctuation, Granite's punctuated and
+cased; the scoring normalises both away.
 
 **3. Compare each candidate against the incumbent, not against each other:**
 

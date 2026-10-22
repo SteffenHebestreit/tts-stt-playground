@@ -17,13 +17,17 @@ card you select (`GPU_DEVICE_ID`).
 - `piper-training-service`: competes for VRAM with the Qwen services. Run it in a training window.
 - `parakeet-asr-service`: 25 European languages including German, heavy NeMo image.
 - `canary-asr-service`: the fastest German STT, also NeMo.
+- `cohere-asr-service`: Cohere Transcribe (2B, 14 languages including German), about 4.2 GB of VRAM.
+- `granite-asr-service`: IBM Granite Speech 5.0, the 2b with keyword biasing (about 4.7 GB of VRAM) or
+  the 470m TurboCTC (about 1.2 GB).
 - `chatterbox-tts-service`: streaming German TTS.
 - `magpie-tts-service`: NVIDIA TTS with five built-in voices that reads numbers and dates correctly.
 - `whisper-cpp`: CPU-only STT alternative; not needed while `stt-service` runs.
 
 The web UI only shows a backend that is offered: ticked under **Settings -> Engines** in the web
 UI, or its `ENABLE_*` flag true on `frontend-service` (`ENABLE_PARAKEET_ASR`, `ENABLE_CANARY_ASR`,
-`ENABLE_CHATTERBOX_TTS`, `ENABLE_MAGPIE_TTS`, `ENABLE_WHISPER_CPP`, and `ENABLE_TRAINING` for the
+`ENABLE_COHERE_ASR`, `ENABLE_GRANITE_ASR`, `ENABLE_CHATTERBOX_TTS`, `ENABLE_MAGPIE_TTS`,
+`ENABLE_WHISPER_CPP`, and `ENABLE_TRAINING` for the
 Voice Training tab, which the Custom App file sets to false).
 
 ## Modes

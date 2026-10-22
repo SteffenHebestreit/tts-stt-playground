@@ -115,7 +115,7 @@ def test_the_catalog_template_renders_the_release_into_every_image():
     answers = render_catalog.default_answers(render_catalog.load_questions(), {
         "host_path": "/mnt/tank/apps/tts-stt", "enable_canary": "true", "enable_parakeet": "true",
         "enable_chatterbox": "true", "enable_magpie": "true", "enable_training": "true",
-        "enable_whisper_cpp": "true"})
+        "enable_whisper_cpp": "true", "enable_cohere": "true", "enable_granite": "true"})
     rendered = yaml.safe_load(render_catalog.render(answers))
     tags = {n: tag_of(s["image"]) for n, s in rendered["services"].items()}
     assert set(tags.values()) == {release()}, tags

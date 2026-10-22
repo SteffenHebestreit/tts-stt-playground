@@ -1050,7 +1050,11 @@ async def transcribe_audio(
                         patience=patience,
                         temperature=temperature,
                         suppress_tokens=parsed_suppress_tokens,
-                        initial_prompt=initial_prompt,
+                        # The form default is "", but faster-whisper treats any
+                        # str as a prompt (it encodes " " behind <|startofprev|>),
+                        # and that empty prompt made large-v3-turbo stop early or
+                        # loop: German WER 45% instead of 6.2% on MLS clips.
+                        initial_prompt=initial_prompt or None,
                         condition_on_previous_text=condition_on_previous_text,
                         compression_ratio_threshold=compression_ratio_threshold,
                         no_speech_threshold=no_speech_threshold,
