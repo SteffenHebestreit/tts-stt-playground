@@ -88,6 +88,10 @@ STATE_CHANGING = {
         ("POST", "/transcribe", "/transcribe"),
         ("POST", "/unload", "/unload"),
     ],
+    "vllm-asr-service": [
+        ("POST", "/transcribe", "/transcribe"),
+        ("POST", "/unload", "/unload"),
+    ],
 }
 
 

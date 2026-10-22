@@ -50,6 +50,11 @@ SERVICE_IMAGE = {
     "piper-training-service": "piper-training",
     "whisper-cpp": "whisper-cpp",
 }
+# Images built on the NAS itself, never published (lib.sh ts_local_builds, plan_publish.LOCAL_BUILD_ONLY):
+# the fake registry never holds them.
+LOCAL_BUILD = {
+    "vllm-asr-service": "vllm-asr",
+}
 CORE = ["frontend-service", "piper-tts-service", "stt-service", "qwen3-asr-service", "qwen3-tts-service"]
 
 # Real programs a script may call. Anything else on the fake PATH is a stub or absent.
@@ -65,7 +70,7 @@ def digest_for(repo: str, tag: str) -> str:
 
 
 def image_repo(service: str, registry: str = REGISTRY) -> str:
-    return f"{registry}/tts-stt-{SERVICE_IMAGE[service]}"
+    return f"{registry}/tts-stt-{({**SERVICE_IMAGE, **LOCAL_BUILD})[service]}"
 
 
 def default_state(root: Path) -> dict:
@@ -161,11 +166,14 @@ class FakeHost:
         registry: str = REGISTRY,
         published_ports: dict[str, str] | None = None,
     ) -> None:
-        """Containers of an installed app. ``stale`` services run an older digest than the registry's."""
+        """Containers of an installed app. ``stale`` services run an older digest than the registry's.
+
+        An image built on the host (LOCAL_BUILD) has no registry digest, like a real `docker build`.
+        """
         stale = stale or []
         for service in services or CORE:
             repo = image_repo(service, registry)
-            local = digest_for(repo, tag + ("-old" if service in stale else ""))
+            local = None if service in LOCAL_BUILD else digest_for(repo, tag + ("-old" if service in stale else ""))
             self.state["docker"]["containers"].append(
                 {
                     "name": f"{project}-{service}-1",

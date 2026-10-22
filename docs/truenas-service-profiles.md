@@ -20,13 +20,16 @@ card you select (`GPU_DEVICE_ID`).
 - `cohere-asr-service`: Cohere Transcribe (2B, 14 languages including German), about 4.2 GB of VRAM.
 - `granite-asr-service`: IBM Granite Speech 5.0, the 2b with keyword biasing (about 4.7 GB of VRAM) or
   the 470m TurboCTC (about 1.2 GB).
+- `vllm-asr-service`: one of the STT candidates (`VLLM_ASR_MODEL`: Granite 2b, Cohere, Qwen3-ASR or
+  Whisper turbo German) under vLLM's batching, for throughput. 45 % of the card (about 7.2 GB of
+  16 GB) while awake, 0.4-0.9 GB asleep. Its image is built on the NAS (vllm-asr-service/README.md).
 - `chatterbox-tts-service`: streaming German TTS.
 - `magpie-tts-service`: NVIDIA TTS with five built-in voices that reads numbers and dates correctly.
 - `whisper-cpp`: CPU-only STT alternative; not needed while `stt-service` runs.
 
 The web UI only shows a backend that is offered: ticked under **Settings -> Engines** in the web
 UI, or its `ENABLE_*` flag true on `frontend-service` (`ENABLE_PARAKEET_ASR`, `ENABLE_CANARY_ASR`,
-`ENABLE_COHERE_ASR`, `ENABLE_GRANITE_ASR`, `ENABLE_CHATTERBOX_TTS`, `ENABLE_MAGPIE_TTS`,
+`ENABLE_COHERE_ASR`, `ENABLE_GRANITE_ASR`, `ENABLE_VLLM_ASR`, `ENABLE_CHATTERBOX_TTS`, `ENABLE_MAGPIE_TTS`,
 `ENABLE_WHISPER_CPP`, and `ENABLE_TRAINING` for the
 Voice Training tab, which the Custom App file sets to false).
 

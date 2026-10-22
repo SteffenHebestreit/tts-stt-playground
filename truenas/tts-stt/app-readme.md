@@ -7,7 +7,8 @@ OpenAI-compatible API, German first. Everything runs locally; no data leaves you
   (streaming German TTS with cloning), optional NVIDIA Magpie (five built-in voices)
 - **STT:** Whisper (live microphone transcription), Qwen3-ASR, optional Canary and Parakeet
   (25 European languages), optional Cohere Transcribe (14 languages) and IBM Granite Speech
-  (keyword biasing), optional whisper.cpp (CPU only)
+  (keyword biasing), optional vLLM-ASR (one of those models under vLLM's batching, for
+  throughput; its image is built on the NAS), optional whisper.cpp (CPU only)
 - **Voice training:** upload recordings, segment, train and export a Piper voice (optional)
 
 ## After install

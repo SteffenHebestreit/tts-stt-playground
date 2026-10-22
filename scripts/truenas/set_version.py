@@ -12,6 +12,7 @@ Only release-shaped tokens are touched, never a bare version number, so an unrel
 package version, a date) stays put:
 
     IMAGE_TAG:-X.Y.Z   IMAGE_TAG=X.Y.Z   --tag X.Y.Z   checkout vX.Y.Z   /vX.Y.Z/
+    tts-stt-<image>:X.Y.Z  (the tag an image built on the NAS must carry, e.g. vllm-asr)
 
 tests/test_truenas_release_consistency.py imports this module, so the rule the test enforces and
 the rule this script applies are the same code.
@@ -50,6 +51,7 @@ TOKEN_PATTERNS = (
     ("--tag", re.compile(rf"(--tag\s+)({SEMVER})(?![\d.])")),
     ("git checkout", re.compile(rf"(checkout\s+v)({SEMVER})(?![\d.])")),
     ("raw URL", re.compile(rf"(/v)({SEMVER})(?=/)")),
+    ("image tag", re.compile(rf"(tts-stt-[a-z0-9-]+:)({SEMVER})(?![\d.])")),
 )
 
 APP_YAML = "truenas/tts-stt/app.yaml"

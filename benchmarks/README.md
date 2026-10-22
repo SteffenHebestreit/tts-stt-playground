@@ -122,8 +122,8 @@ their samples happen to have in common.
 | `--url http://host:5003/v1/audio/transcriptions` | that URL | `openai` | whisper.cpp's OpenAI-compatible route |
 
 Provider ids are `whisper`, `qwen3-asr`, `parakeet`, `canary`, `cohere-asr`,
-`granite-asr` and `whisper-cpp`; the non-default ones only exist in the gateway when
-their `ENABLE_*` flag is set.
+`granite-asr`, `vllm-asr` and `whisper-cpp`; the non-default ones only exist in the
+gateway when their `ENABLE_*` flag is set.
 
 `/v1/audio/transcriptions` **cannot select a provider**: it always uses the
 configured default and ignores form fields it does not know, so a `provider` field
@@ -319,6 +319,22 @@ Granite 2b 4.54 % in 15.8 s, the 470m TurboCTC 3.66 % in 2.1 s. Cohere's output
 on read speech is mostly lowercase without punctuation, Granite's punctuated and
 cased; the scoring normalises both away.
 
+**The same candidates under vLLM** (`vllm-asr`, one model per service, `VLLM_ASR_MODEL`),
+measured the same way, plus throughput (next section):
+
+```bash
+ENABLE_VLLM_ASR=true VLLM_ASR_MODEL=Qwen/Qwen3-ASR-1.7B \
+  docker compose --profile frontend --profile vllm-asr up -d --build
+python benchmarks/run_german_eval.py $EVAL --base-url http://localhost:3000 \
+  --provider vllm-asr --label vllm-qwen3 --out r-vllm-qwen3.json
+```
+
+Measured the same way (RTX 4080, vLLM 0.31, 0.45 of the card, 100 MLS clips, seed 1234):
+Granite 2b 6.55 % WER / 2.68 % CER at 0.60 s median, Cohere 5.04 % / 2.66 % at 0.31 s,
+Qwen3-ASR 1.7B 6.85 % / 2.49 % at 0.67 s, Whisper turbo German (primeline) 7.04 % / 2.52 %
+at 0.29 s: Granite and Cohere transcribe as their transformers services do, one request
+2.8x and 1.4x faster. Details: `vllm-asr-service/README.md`.
+
 **3. Compare each candidate against the incumbent, not against each other:**
 
 ```bash
@@ -383,6 +399,38 @@ is not applied behind your back. There is a test pinning this.
 
 ---
 
+## Throughput under concurrency
+
+`run_german_eval.py` sends one clip at a time. What a batching engine is for shows only
+with many requests in flight, so `run_throughput.py` sends the same clips (the same
+`--limit`/`--seed` selection) with N requests at once, for each N, and reports audio
+seconds per wall second (`rtfx`), requests per second, latency p50/p95 and the WER/CER
+of what came back:
+
+```bash
+python benchmarks/run_throughput.py --base-url http://localhost:3000 --provider vllm-asr \
+  --manifest data/de.tsv --limit 200 --concurrency 1 8 32 --out tp-vllm.json
+```
+
+Through the gateway, `MAX_CONCURRENT_UPLOADS` (4 per gateway worker by default) refuses
+anything beyond it with 503: set it to at least the highest level for the run, or measure
+the backend directly (`--url http://localhost:5011/transcribe`). A failed request is
+counted, printed and not scored, and makes the exit status 1.
+
+Measured on the RTX 4080 (first 200 MLS clips, 3,039 s of audio, through `/api/stt` with
+`MAX_CONCURRENT_UPLOADS=40`), audio seconds per wall second at 1 / 8 / 32 requests at once:
+
+| `vllm-asr` model | 1 | 8 | 32 |
+|---|---|---|---|
+| granite-speech-5.0-2b | 25x | 146x | 293x |
+| cohere-transcribe-03-2026 | 50x | 224x | 392x |
+| Qwen3-ASR-1.7B | 24x | 151x | 343x |
+| whisper-large-v3-turbo-german | 53x | 225x | 326x |
+
+For the NAS's RTX 5060 Ti scale by about 0.63.
+
+---
+
 ## Long recordings
 
 The edit distance is exact and fast for ordinary utterances and for long-form
@@ -407,8 +455,10 @@ path so saved reports do not depend on what is installed. Set
 |---|---|
 | `asr_metrics.py` | Normalisation, WER/CER, paired bootstrap. Stdlib only (rapidfuzz optional), no I/O. |
 | `run_german_eval.py` | CLI: manifests, sampling, warmup, API calls to any of the three protocols, reports, comparison. Needs `httpx` to run. |
+| `run_throughput.py` | CLI: the same clips with N requests in flight, for several N; throughput, latency and WER per level. Needs `httpx`. |
 | `../tests/test_asr_metrics.py` | Offline tests of the normaliser, the metrics and the manifest reader. |
 | `../tests/test_benchmarks_runner.py` | `run()` and `compare()` end to end against a stub server that speaks all three protocols: wire fields, provider selection, sampling, warmup, failures, fallbacks, comparison. |
 | `../tests/test_benchmarks_metrics.py` | The fast edit distance and bootstrap against the implementations they replaced, operation for operation. |
+| `../tests/test_benchmarks_throughput.py` | `run_throughput.py` against a stub that records how many requests it held at once. |
 
 All of them are offline: no audio, no model, no network.

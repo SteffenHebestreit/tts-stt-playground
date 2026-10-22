@@ -46,8 +46,8 @@ Usage: preflight.sh --data-dir PATH [options]
   --data-dir PATH         the dataset you will use as APP_DATA_DIR (default: $APP_DATA_DIR)
   --create                create the data subdirectories (the dataset itself must already exist)
   --with LIST             optional services to plan for, comma separated:
-                          canary-asr, parakeet-asr, cohere-asr, granite-asr, chatterbox-tts,
-                          magpie-tts, training, whisper-cpp
+                          canary-asr, parakeet-asr, cohere-asr, granite-asr, vllm-asr,
+                          chatterbox-tts, magpie-tts, training, whisper-cpp
   --whisper-model NAME    stt-service model (default: large-v3-turbo)
   --qwen3-tts-model NAME  qwen3-tts model (default: Qwen/Qwen3-TTS-12Hz-0.6B-Base)
   --gpu-id ID             GPU index or UUID the app will use (default: 0)
@@ -119,7 +119,7 @@ if [ -n "$WITH" ]; then
     svc=$(ts_service_for_profile "$item")
     [ -z "$svc" ] && [ -n "$(ts_field "$item" 1)" ] && svc=$item
     if [ -z "$svc" ]; then
-      echo "unknown optional service: $item (try: canary-asr, parakeet-asr, cohere-asr, granite-asr, chatterbox-tts, magpie-tts, training, whisper-cpp)" >&2
+      echo "unknown optional service: $item (try: canary-asr, parakeet-asr, cohere-asr, granite-asr, vllm-asr, chatterbox-tts, magpie-tts, training, whisper-cpp)" >&2
       exit 2
     fi
     SELECTED+=("$svc")
@@ -236,6 +236,16 @@ if wants_gpu; then
         if [ "$blackwell" = 1 ]; then
           info "Blackwell GPU: the images ship cu128 kernels for compute capability 12.0."
         fi
+        # An image built on the host can need a newer driver than the CUDA 12.8 images
+        # (vllm-asr: vllm/vllm-openai is built for CUDA 13, R580 or newer).
+        while IFS='|' read -r local_svc _ local_min; do
+          selected_has "$local_svc" || continue
+          if [ "$drv_major" -lt "$local_min" ] 2>/dev/null; then
+            fail "$local_svc needs driver R$local_min or newer (its vLLM base is built for CUDA 13); this host has $drv."
+          else
+            ok "driver $drv is new enough for $local_svc (R$local_min or newer)"
+          fi
+        done < <(ts_local_builds)
         ok "GPU $idx will be used: ${GPU_VRAM_GB} GB VRAM"
       fi
     fi

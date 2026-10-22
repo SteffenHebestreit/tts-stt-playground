@@ -184,9 +184,26 @@ def _compose_images() -> dict[str, dict]:
 
 def test_the_planner_publishes_exactly_the_images_compose_runs():
     published = {name for name, _, _ in plan_publish.SERVICES}
-    assert published == set(_compose_images()), (
+    local = {name for name, _, _ in plan_publish.LOCAL_BUILD_ONLY}
+    assert published | local == set(_compose_images()), (
         "compose runs images this workflow never publishes (a deployment would pull "
-        "nothing), or publishes images nothing uses")
+        "nothing), or publishes images nothing uses; an image built on the host on "
+        "purpose is listed in LOCAL_BUILD_ONLY, with the reason")
+    assert not published & local
+
+
+def test_an_image_built_on_the_host_is_never_in_a_build_matrix():
+    """vllm-asr's base does not fit a hosted runner: a leg for it could only fail."""
+    local = {name for name, _, _ in plan_publish.LOCAL_BUILD_ONLY}
+    for event, ref in (("push", "refs/tags/v0.2.0"), ("push", "refs/heads/master"), ("workflow_dispatch", "refs/heads/x")):
+        plan = make_plan(event, ref)
+        assert not {leg["name"] for leg in plan.build} & local
+        assert not {leg["name"] for leg in plan.merge} & local
+    for name, context, reason in plan_publish.LOCAL_BUILD_ONLY:
+        compose = _compose_images()[name]
+        assert compose["context"].rstrip("/") == context.rstrip("/"), name
+        assert (REPO_ROOT / context / "Dockerfile").is_file()
+        assert reason, f"{name}: say why it is not published"
 
 
 def test_each_published_context_is_the_one_compose_builds_and_has_a_dockerfile():

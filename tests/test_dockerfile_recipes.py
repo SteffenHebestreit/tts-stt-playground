@@ -149,10 +149,17 @@ def test_the_stt_images_install_python_3_11_and_point_python3_at_it(dockerfile):
     assert "ln -sf /usr/bin/python3.11 /usr/bin/python " in links + " ", "start.sh execs `python -m uvicorn`"
 
 
+# Bases that bring their own, named Python: vllm-asr-service runs on the vLLM release's image
+# (Ubuntu 24.04, Python 3.12), whose Python the engine itself is built for.
+BASE_IMAGE_PYTHON = {"vllm/vllm-openai:v0.31.0": "3.12"}
+
+
 def _python_version(dockerfile: Path):
     for keyword, args in _instructions(dockerfile):
         if keyword == "FROM" and args.startswith("python:"):
             return Version(args.split(":", 1)[1].split("-")[0])
+        if keyword == "FROM" and args in BASE_IMAGE_PYTHON:
+            return Version(BASE_IMAGE_PYTHON[args])
     versions = [t.removeprefix("python") for t in _apt_packages(dockerfile)
                 if t.startswith("python3.") and not t.endswith("-dev")]
     return max(map(Version, versions)) if versions else None

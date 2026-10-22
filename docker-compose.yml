@@ -775,6 +775,105 @@ services:
     networks:
       - tts-stt-network
 
+  # vLLM-ASR service (vllm-asr-service/README.md): the candidate STT models under vLLM's
+  # continuous batching, for throughput. One model, VLLM_ASR_MODEL: Granite Speech 5.0 2b
+  # (default), Cohere Transcribe, Qwen3-ASR 1.7B or Whisper turbo German. Opt-in, not part
+  # of the `all` profile; ENABLE_VLLM_ASR=true on the frontend offers it.
+  # The engine takes VLLM_ASR_GPU_MEMORY_UTILIZATION of the WHOLE card at start-up (0.45 of
+  # 16 GB is ~7.2 GB) and keeps it while awake; asleep it holds ~0.5-0.9 GB.
+  # NOT PUBLISHED: the vllm/vllm-openai base is 9 GB to download and 32 GB unpacked, more
+  # than a CI runner holds. With PULL_POLICY=missing, `up` builds the image from
+  # ./vllm-asr-service when the host does not have it (`build vllm-asr-service` after a
+  # code change), which takes seconds once the base is on the host.
+  vllm-asr-service:
+    profiles: [vllm-asr]
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-vllm-asr:${IMAGE_TAG:-latest}
+    pull_policy: ${PULL_POLICY:-missing}
+    build:
+      context: ./vllm-asr-service
+      dockerfile: Dockerfile
+    ports:
+      - "${BACKEND_BIND_ADDR:-127.0.0.1}:${VLLM_ASR_PORT:-5011}:5011"
+    environment:
+      # Which of the visible GPUs the engine uses. The adapter itself hides every GPU from
+      # its own process and hands this value to the engine only.
+      CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-0}
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+      # ibm-granite/granite-speech-5.0-2b | evewashere/cohere-transcribe-03-2026-ungated |
+      # Qwen/Qwen3-ASR-1.7B | primeline/whisper-large-v3-turbo-german, or a local directory.
+      # Empty REVISION = the commit this repository measured (main for anything else);
+      # SHA256: empty = Cohere's official digest for the Cohere mirror, none otherwise.
+      VLLM_ASR_MODEL: ${VLLM_ASR_MODEL:-ibm-granite/granite-speech-5.0-2b}
+      VLLM_ASR_REVISION: ${VLLM_ASR_REVISION:-}
+      VLLM_ASR_SHA256: ${VLLM_ASR_SHA256:-}
+      # Only for a gated repository (the official Cohere one); never passed to the engine.
+      HF_TOKEN: ${HF_TOKEN:-}
+      # `auto` asks Qwen3-ASR to identify the language; everything else, and no language,
+      # is this one.
+      VLLM_ASR_DEFAULT_LANGUAGE: ${VLLM_ASR_DEFAULT_LANGUAGE:-de}
+      VLLM_ASR_SUPPORTED_LANGUAGES: ${VLLM_ASR_SUPPORTED_LANGUAGES:-}
+      # The engine's share of the whole GPU: more is a bigger KV cache (more chunks decoded
+      # at once), less leaves room for the other services on the card.
+      VLLM_ASR_GPU_MEMORY_UTILIZATION: ${VLLM_ASR_GPU_MEMORY_UTILIZATION:-0.45}
+      # Empty = the model's measured default (2048 for Granite and Qwen3-ASR).
+      VLLM_ASR_MAX_MODEL_LEN: ${VLLM_ASR_MAX_MODEL_LEN:-}
+      VLLM_ASR_MAX_NUM_SEQS: ${VLLM_ASR_MAX_NUM_SEQS:-}
+      VLLM_ASR_MAX_NUM_BATCHED_TOKENS: ${VLLM_ASR_MAX_NUM_BATCHED_TOKENS:-}
+      # More `vllm serve` arguments, e.g. --enforce-eager (not the ones above).
+      VLLM_ASR_EXTRA_ARGS: ${VLLM_ASR_EXTRA_ARGS:-}
+      # Idle release after ASR_MODEL_TTL: sleep (weights to host RAM, wakes in ~1 s) or
+      # stop (frees all VRAM, restarts in 30-70 s).
+      VLLM_ASR_IDLE_MODE: ${VLLM_ASR_IDLE_MODE:-sleep}
+      VLLM_ASR_START_TIMEOUT_S: ${VLLM_ASR_START_TIMEOUT_S:-900}
+      # Longest piece (5-30 s) a recording is cut into, in its pauses; every piece of a
+      # request goes to the engine at once. Empty MAX_NEW_TOKENS = 20 x VLLM_ASR_CHUNK_S.
+      VLLM_ASR_CHUNK_S: ${VLLM_ASR_CHUNK_S:-28}
+      VLLM_ASR_MAX_NEW_TOKENS: ${VLLM_ASR_MAX_NEW_TOKENS:-}
+      # What the model hears: silero (default) | energy | off, in VAD_WORKERS processes.
+      VLLM_ASR_VAD: ${VLLM_ASR_VAD:-silero}
+      VLLM_ASR_VAD_THRESHOLD: ${VLLM_ASR_VAD_THRESHOLD:-0.5}
+      VLLM_ASR_VAD_WORKERS: ${VLLM_ASR_VAD_WORKERS:-4}
+      MAX_UPLOAD_MB: ${ASR_MAX_UPLOAD_MB:-200}
+      MAX_AUDIO_SECONDS: ${ASR_MAX_AUDIO_SECONDS:-7200}
+      # Requests whose chunks go to the engine at the same time (vLLM batches them), and
+      # how many may wait beyond that (empty = 4 x). Not ASR_MAX_CONCURRENCY: the other
+      # services' 1 would serialise exactly what this one exists to batch.
+      ASR_MAX_CONCURRENCY: ${VLLM_ASR_MAX_CONCURRENCY:-32}
+      ASR_MAX_QUEUE: ${VLLM_ASR_MAX_QUEUE:-}
+      ASR_QUEUE_TIMEOUT_S: ${ASR_QUEUE_TIMEOUT_S:-60}
+      # Put the engine to sleep after this many idle seconds.
+      # >0 seconds | 0 = when idle | -1 = never.
+      ASR_MODEL_TTL: ${ASR_MODEL_TTL:-300}
+      # Global fallback the code reads when the specific TTL is unset.
+      MODEL_TTL: ${MODEL_TTL:-300}
+      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-}
+      ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
+    volumes:
+      # The checkpoint and vLLM's compile cache (a restart reuses both).
+      - "${VLLM_ASR_CACHE_DIR:-vllm-asr-cache}:/root/.cache"
+      - "${BACKEND_SETTINGS_DIR:-${APP_DATA_DIR:-.}/backend-settings}:/app/backend-settings:ro"
+    # vLLM's workers share tensors through /dev/shm; Docker's 64 MB default is too small.
+    shm_size: 2gb
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              count: 1
+    restart: unless-stopped
+    # The engine's own shutdown (API server, then its engine core) needs more than 10 s.
+    stop_grace_period: 60s
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5011/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 3
+    networks:
+      - tts-stt-network
+
   # Chatterbox-TTS service (Resemble AI, MIT — multilingual TTS + cloning incl. German)
   # Opt-in: enable in the browser UI with ENABLE_CHATTERBOX_TTS=true on the frontend.
   chatterbox-tts-service:
@@ -1102,6 +1201,8 @@ services:
       ENABLE_COHERE_ASR: ${ENABLE_COHERE_ASR:-false}
       GRANITE_ASR_SERVICE_URL: ${GRANITE_ASR_SERVICE_URL:-http://granite-asr-service:5010}
       ENABLE_GRANITE_ASR: ${ENABLE_GRANITE_ASR:-false}
+      VLLM_ASR_SERVICE_URL: ${VLLM_ASR_SERVICE_URL:-http://vllm-asr-service:5011}
+      ENABLE_VLLM_ASR: ${ENABLE_VLLM_ASR:-false}
       CHATTERBOX_TTS_SERVICE_URL: ${CHATTERBOX_TTS_SERVICE_URL:-http://chatterbox-tts-service:5007}
       ENABLE_CHATTERBOX_TTS: ${ENABLE_CHATTERBOX_TTS:-false}
       MAGPIE_TTS_SERVICE_URL: ${MAGPIE_TTS_SERVICE_URL:-http://magpie-tts-service:5008}
@@ -1221,6 +1322,8 @@ volumes:
   cohere-asr-cache:
     driver: local
   granite-asr-cache:
+    driver: local
+  vllm-asr-cache:
     driver: local
   chatterbox-tts-cache:
     driver: local

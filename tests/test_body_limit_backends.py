@@ -37,6 +37,7 @@ UPLOAD_ROUTES = {
     "canary-asr-service": ["/transcribe", "/v1/audio/transcriptions", "/detect_language", "/transcribe-batch"],
     "cohere-asr-service": ["/transcribe"],
     "granite-asr-service": ["/transcribe"],
+    "vllm-asr-service": ["/transcribe"],
 }
 
 OFFERED = 64 * MIB

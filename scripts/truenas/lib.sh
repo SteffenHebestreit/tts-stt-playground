@@ -28,6 +28,7 @@ qwen3-tts-service|qwen3-tts|5004|core||2.5|2.5
 canary-asr-service|canary-asr|5006|optional|canary-asr|2|1
 cohere-asr-service|cohere-asr|5009|optional|cohere-asr|4.2|4.1
 granite-asr-service|granite-asr|5010|optional|granite-asr|4.7|4.6
+vllm-asr-service|vllm-asr|5011|optional|vllm-asr|7.2|4.6
 parakeet-asr-service|parakeet-asr|5005|optional|parakeet-asr|3|2.5
 chatterbox-tts-service|chatterbox-tts|5007|optional|chatterbox-tts|4|3
 magpie-tts-service|magpie-tts|5008|optional|magpie-tts|4.2|2.5
@@ -38,6 +39,31 @@ CATALOGUE
 
 # Docker root free space the default image set needs (docs: "Container images ~25 GB").
 TS_IMAGES_CORE_GB=25
+
+# Images that are NOT published to the registry, because CI cannot build them
+# (scripts/plan_publish.py, LOCAL_BUILD_ONLY): they are built on the NAS itself, from a
+# checkout or a git URL, with the release tag. pull-images.sh prints the command instead of
+# pulling, update-check.sh does not ask the registry about them.
+#   name | build context in the repository | minimum NVIDIA driver branch
+ts_local_builds() {
+  cat <<'LOCAL'
+vllm-asr-service|vllm-asr-service|580
+LOCAL
+}
+
+TS_REPO_URL="https://github.com/SteffenHebestreit/tts-stt-playground.git"
+
+# ts_is_local_build SERVICE -> success when SERVICE is built on the host, not pulled.
+ts_is_local_build() {
+  ts_local_builds | awk -F'|' -v n="$1" '$1 == n { found = 1 } END { exit !found }'
+}
+
+# ts_build_command REGISTRY SERVICE TAG -> the `docker build` line that makes SERVICE's image.
+ts_build_command() {
+  local context
+  context=$(ts_local_builds | awk -F'|' -v n="$2" '$1 == n { print $2; exit }')
+  printf 'docker build -t %s %s#develop:%s\n' "$(ts_image_ref "$1" "$2" "$3")" "$TS_REPO_URL" "$context"
+}
 
 # ts_field NAME INDEX -> one field (1-based) of NAME's catalogue row.
 ts_field() {

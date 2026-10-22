@@ -115,7 +115,7 @@ def test_the_catalog_template_renders_the_release_into_every_image():
     answers = render_catalog.default_answers(render_catalog.load_questions(), {
         "host_path": "/mnt/tank/apps/tts-stt", "enable_canary": "true", "enable_parakeet": "true",
         "enable_chatterbox": "true", "enable_magpie": "true", "enable_training": "true",
-        "enable_whisper_cpp": "true", "enable_cohere": "true", "enable_granite": "true"})
+        "enable_whisper_cpp": "true", "enable_cohere": "true", "enable_granite": "true", "enable_vllm": "true"})
     rendered = yaml.safe_load(render_catalog.render(answers))
     tags = {n: tag_of(s["image"]) for n, s in rendered["services"].items()}
     assert set(tags.values()) == {release()}, tags
@@ -187,10 +187,22 @@ def compose_image_names(env: dict | None = None) -> set[str]:
 
 
 def test_the_images_the_compose_file_pulls_are_images_a_release_publishes():
-    """A service a release does not build is a pinned install that fails on `manifest unknown`."""
+    """A service a release does not build is a pinned install that fails on `manifest unknown`.
+
+    The exception is an image built on the NAS on purpose (plan_publish.LOCAL_BUILD_ONLY,
+    vllm-asr): the Custom App file says so where the service is, and it sits behind a profile.
+    """
     plan = plan_publish.make_plan("push", f"refs/tags/v{release()}")
     published = {leg["name"] for leg in plan.merge if not leg["suffix"]}
-    assert compose_image_names() <= published, sorted(compose_image_names() - published)
+    local = {name for name, _, _ in plan_publish.LOCAL_BUILD_ONLY}
+    assert compose_image_names() <= published | local, sorted(compose_image_names() - published - local)
+    services = load_compose(COMPOSE_APP)["services"]
+    text = COMPOSE_APP.read_text(encoding="utf-8")
+    for name in local:
+        service = f"{name}-service"
+        assert services[service].get("profiles"), f"{service} is built on the NAS: it must not be on by default"
+        assert f"docker build -t ghcr.io/steffenhebestreit/tts-stt-{name}:{release()}" in text, (
+            f"the Custom App file must say how to build {service} with the release tag")
 
 
 def test_the_nemo_rollback_images_the_suffix_selects_are_published_with_the_release():

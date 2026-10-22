@@ -99,6 +99,14 @@ services:
       CUDA_VISIBLE_DEVICES: "0"
       NVIDIA_VISIBLE_DEVICES: "0"
 
+  # Optional (--profile vllm-asr, plus ENABLE_VLLM_ASR=true for the UI). Not on GHCR: built
+  # from this checkout (`--build`, or automatically when the host does not have the tag).
+  vllm-asr-service:
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-vllm-asr:${IMAGE_TAG:-0.2.0}
+    environment:
+      CUDA_VISIBLE_DEVICES: "0"
+      NVIDIA_VISIBLE_DEVICES: "0"
+
   # Optional (--profile chatterbox-tts, plus ENABLE_CHATTERBOX_TTS=true for the UI).
   chatterbox-tts-service:
     image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-chatterbox-tts:${IMAGE_TAG:-0.2.0}

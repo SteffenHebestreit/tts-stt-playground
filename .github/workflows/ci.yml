@@ -262,8 +262,9 @@ jobs:
           # The optional backends are outside `all`; their build args and images
           # must validate too.
           check "${ALL[@]}" --profile parakeet-asr --profile canary-asr \
-            --profile cohere-asr --profile granite-asr \
+            --profile cohere-asr --profile granite-asr --profile vllm-asr \
             --profile chatterbox-tts --profile magpie-tts --profile whisper-cpp -f docker-compose.yml
+          check "${ALL[@]}" --profile vllm-asr -f docker-compose.yml -f docker-compose.dev.yml
 
       # The ROCm overlay exists to remove NVIDIA reservations. Assert it, rather
       # than trusting that the `!reset` merge behaved — it silently did not for
@@ -293,7 +294,7 @@ jobs:
         run: |
           cp -n .env.example .env || true
           docker compose --profile all --profile training --profile parakeet-asr \
-            --profile canary-asr --profile cohere-asr --profile granite-asr \
+            --profile canary-asr --profile cohere-asr --profile granite-asr --profile vllm-asr \
             --profile chatterbox-tts --profile magpie-tts --profile whisper-cpp \
             -f docker-compose.yml config --format json > /tmp/base.json
           exposed=$(jq -r '.services | to_entries[]
@@ -319,7 +320,8 @@ jobs:
         include:
           # Only the images that fit a runner. The CUDA and ROCm bases do not:
           # `rocm/dev-ubuntu-22.04:6.2-complete` alone is ~30 GB unpacked
-          # against ~14 GB of free disk. Those variants are covered statically
+          # against ~14 GB of free disk, and `vllm/vllm-openai` (vllm-asr-service)
+          # is 32 GB. Those images are covered statically
           # by tests/test_docker_image_contents.py, which asserts the same two
           # things a build would have caught — that every locally-imported
           # module is COPYd, and that runtime-critical ENVs survive into the

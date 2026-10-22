@@ -29,7 +29,8 @@ Usage: update-check.sh [options]
   --registry REG    image registry/owner (default: ghcr.io/steffenhebestreit)
   --tag TAG         do not inspect containers; check that TAG exists for every image
   --with LIST       with --tag: also check optional services (canary-asr, parakeet-asr,
-                    cohere-asr, granite-asr, chatterbox-tts, magpie-tts, training, whisper-cpp)
+                    cohere-asr, granite-asr, vllm-asr, chatterbox-tts, magpie-tts, training,
+                    whisper-cpp; vllm-asr is built on the host, so it is listed, not checked)
   --offline         list what runs, contact no registry
   --quiet           print only updates and problems
   -h, --help        this text
@@ -83,6 +84,10 @@ if [ -n "$TAG" ]; then
   unknown=0
   for svc in "${services[@]}"; do
     ref=$(ts_image_ref "$REGISTRY" "$svc" "$TAG")
+    if ts_is_local_build "$svc"; then
+      say "  built here $ref  (not published; ./pull-images.sh prints its build command)"
+      continue
+    fi
     if digest=$(ts_registry_digest "$ref"); then
       say "  published  $ref  ${digest:0:19}"
     else
@@ -153,6 +158,10 @@ for name in "${NAMES[@]}"; do
   if [ "$OFFLINE" = 1 ]; then
     status="not checked"
     detail="offline"
+  elif ts_is_local_build "$service"; then
+    # Built on this host, never published: there is nothing on the registry to compare with.
+    status="built here"
+    detail="not published; rebuild it with the new tag when you update"
   elif remote_digest=$(ts_registry_digest "$ref"); then
     if [ -z "$local_digest" ]; then
       status="unknown"
@@ -196,6 +205,7 @@ if [ "$OFFLINE" = 0 ] && [ -n "$CURRENT_TAG" ]; then
       # image this app runs exists under the new tag, or the update would fail on the lagging one.
       lagging=()
       for i in "${!ROW_REF[@]}"; do
+        ts_is_local_build "${ROW_SERVICE[i]}" && continue # built here, never published
         ts_split_ref "${ROW_REF[i]}"
         if ! ts_registry_digest "$TS_REF_REGISTRY/$TS_REF_NAME:$newest" >/dev/null 2>&1; then
           lagging+=("${ROW_SERVICE[i]}")

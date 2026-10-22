@@ -103,7 +103,7 @@ jobs:
             docker compose "$@" config -q
           }
           OPTIONAL=(--profile canary-asr --profile parakeet-asr --profile cohere-asr --profile granite-asr
-                    --profile chatterbox-tts --profile magpie-tts
+                    --profile vllm-asr --profile chatterbox-tts --profile magpie-tts
                     --profile training --profile whisper-cpp --profile update-watch)
           for env in .env.truenas.example .env.truenas.production.example; do
             check --env-file "$env" -f docker-compose.truenas-app.yml
@@ -138,7 +138,7 @@ jobs:
           set -e
           docker compose --env-file .env.truenas.example \
             --profile all --profile training --profile canary-asr --profile parakeet-asr \
-            --profile cohere-asr --profile granite-asr \
+            --profile cohere-asr --profile granite-asr --profile vllm-asr \
             --profile chatterbox-tts --profile magpie-tts --profile whisper-cpp \
             -f docker-compose.yml -f docker-compose.truenas.yml config -q
 
@@ -158,8 +158,10 @@ jobs:
           render --set use_gpu=false --set enable_whisper_cpp=true
           render --set enable_canary=true --set enable_parakeet=true --set enable_chatterbox=true \
                  --set enable_magpie=true --set enable_training=true --set enable_whisper_cpp=true \
-                 --set enable_cohere=true --set enable_granite=true --set expose_backend_ports=true
+                 --set enable_cohere=true --set enable_granite=true --set enable_vllm=true \
+                 --set expose_backend_ports=true
           render --set enable_granite=true --set granite_asr_model=ibm-granite/granite-speech-5.0-470m-turboctc
+          render --set enable_vllm=true --set vllm_asr_model=Qwen/Qwen3-ASR-1.7B
           render --set image_tag=latest --set pull_policy=always
           # An API key with characters that YAML and Compose treat specially must survive.
           # shellcheck disable=SC2016

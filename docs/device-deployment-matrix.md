@@ -71,6 +71,7 @@ and only one spans the set:
 | ggml (whisper.cpp) | ✅ NEON | ✅ CUDA | ✅ CUDA | ✅ Vulkan + HIP |
 | NeMo (parakeet/canary) | ❌ | ✅ | ✅ | ❌ no AMD backend |
 | transformers (cohere-asr/granite-asr) | ❌ no image | ✅ | ✅ measured | ❌ no ROCm image |
+| vLLM 0.31 (vllm-asr) | ❌ no image | ✅ the base luna-stt runs there | ✅ measured | ❌ no ROCm image |
 
 The NeMo images default to NeMo 3.0.x on torch 2.11 (cu128). Parakeet and Canary have a
 one-argument rollback to 2.7.x (`NEMO_TOOLKIT_SPEC='>=2.7.3,<3'`, or the prebuilt `-nemo2` images via
@@ -89,6 +90,12 @@ torchaudio 2.11 from the cu128 index, checked for sm_120 kernels at build time, 
 1.2 GB). Neither has run on the 5060 Ti **(unverified)**. On a 16 GB card shared with Whisper,
 Magpie and Qwen3 they fit only when the idle TTLs give memory back; the 470m TurboCTC is the one
 that fits next to everything.
+
+`vllm-asr-service` sits on `vllm/vllm-openai:v0.31.0` (CUDA 13, driver R580 or newer), the release
+Steffen's luna-stt app already runs on the 5060 Ti, so the engine is proven on Blackwell; the adapter
+itself ran on the RTX 4080 only **(unverified on the 5060 Ti)**. It takes 0.45 of the card while awake
+(about 7.2 GB of 16 GB), which a 12 GB card cannot spare for Granite or Qwen3-ASR. Its numbers are in
+`vllm-asr-service/README.md`.
 
 **ggml is the only runtime covering all four.** If you want exactly one STT engine,
 `whisper-cpp` is the answer and it already exists in this repo. The cost is that it caps the SBC
@@ -215,7 +222,8 @@ mismatch instead of guessing shapes.
 ### What cannot run on ARM64 at all
 
 `stt-service`, `qwen3-asr`, `qwen3-tts`, `parakeet-asr`, `canary-asr`, `cohere-asr`, `granite-asr`,
-`chatterbox-tts`, `magpie-tts`, `piper-training`. All are built on `nvidia/cuda:*` bases, and
+`vllm-asr`, `chatterbox-tts`, `magpie-tts`, `piper-training`. All are built on `nvidia/cuda:*` bases
+(vllm-asr on `vllm/vllm-openai`, whose arm64 variant is for Grace Hopper, not an SBC), and
 NeMo/Qwen/Chatterbox/Magpie require CUDA.
 **Do not add them to the arm64 CI matrix** — they would either fail to build or produce an image
 that cannot start, which is worse because it looks supported.

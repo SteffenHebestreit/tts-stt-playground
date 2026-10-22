@@ -67,6 +67,15 @@ SERVICES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("piper-training", "./piper-training-service", ("amd64",)),
 )
 
+# Images compose runs that this workflow does NOT publish, and why. They are built on
+# the host that runs them (compose builds a missing image from its context); their
+# Dockerfiles are covered statically by tests/test_docker_image_contents.py.
+#   vllm-asr: its base, vllm/vllm-openai, is ~9 GB to download and ~32 GB unpacked,
+#   more than a hosted runner has free even after the cleanup in the build job.
+LOCAL_BUILD_ONLY: tuple[tuple[str, str, str], ...] = (
+    ("vllm-asr", "./vllm-asr-service", "the vllm/vllm-openai base is ~32 GB unpacked"),
+)
+
 RUNNERS = {"amd64": "ubuntu-latest", "arm64": "ubuntu-24.04-arm"}
 
 # The rollback line for the two NeMo services. docker-compose.yml selects it with
