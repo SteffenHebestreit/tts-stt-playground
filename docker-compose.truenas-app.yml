@@ -44,9 +44,9 @@ name: tts-stt
 # WHAT RUNS
 #   Always : frontend-service (web UI + gateway), piper-tts-service (CPU TTS),
 #            stt-service (Whisper, GPU), qwen3-asr-service (GPU), qwen3-tts-service (GPU)
-#   Off    : canary-asr-service, parakeet-asr-service, chatterbox-tts-service,
-#            magpie-tts-service, piper-training-service, whisper-cpp (CPU STT),
-#            diun (update notices)
+#   Off    : canary-asr-service, parakeet-asr-service, cohere-asr-service,
+#            granite-asr-service, chatterbox-tts-service, magpie-tts-service,
+#            piper-training-service, whisper-cpp (CPU STT), diun (update notices)
 #
 # ENABLE AN OPTIONAL SERVICE:
 #   1. Delete its `profiles:` line (installs it) and Save.
@@ -150,6 +150,8 @@ services:
       QWEN3_ASR_SERVICE_URL: http://qwen3-asr-service:5002
       PARAKEET_ASR_SERVICE_URL: http://parakeet-asr-service:5005
       CANARY_ASR_SERVICE_URL: http://canary-asr-service:5006
+      COHERE_ASR_SERVICE_URL: http://cohere-asr-service:5009
+      GRANITE_ASR_SERVICE_URL: http://granite-asr-service:5010
       CHATTERBOX_TTS_SERVICE_URL: http://chatterbox-tts-service:5007
       MAGPIE_TTS_SERVICE_URL: http://magpie-tts-service:5008
       WHISPER_CPP_SERVICE_URL: http://whisper-cpp:8080
@@ -157,6 +159,8 @@ services:
       # (or offer them in Settings -> Engines, which says whether they answer).
       ENABLE_PARAKEET_ASR: ${ENABLE_PARAKEET_ASR:-false}
       ENABLE_CANARY_ASR: ${ENABLE_CANARY_ASR:-false}
+      ENABLE_COHERE_ASR: ${ENABLE_COHERE_ASR:-false}
+      ENABLE_GRANITE_ASR: ${ENABLE_GRANITE_ASR:-false}
       ENABLE_CHATTERBOX_TTS: ${ENABLE_CHATTERBOX_TTS:-false}
       ENABLE_MAGPIE_TTS: ${ENABLE_MAGPIE_TTS:-false}
       ENABLE_WHISPER_CPP: ${ENABLE_WHISPER_CPP:-false}
@@ -525,6 +529,118 @@ services:
     stop_grace_period: 30s
     healthcheck:
       test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:5005/health"]
+      interval: 15s
+      timeout: 10s
+      start_period: 900s
+      retries: 4
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${GPU_DEVICE_ID:-0}"]
+              capabilities: [gpu]
+    networks: [tts-stt-network]
+
+  # Cohere Transcribe (Apache-2.0): 2B, 14 languages including German, no language
+  # detection (the language comes from the request or COHERE_ASR_DEFAULT_LANGUAGE).
+  # ~4.2 GB of VRAM while loaded; unloads after ASR_MODEL_TTL idle seconds.
+  cohere-asr-service:
+    profiles: ["cohere-asr"]
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-cohere-asr:${IMAGE_TAG:-0.2.0}
+    pull_policy: ${PULL_POLICY:-missing}
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ${GPU_DEVICE_ID:-0}
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      # The official repository is gated; the default is an ungated mirror pinned to
+      # one commit, whose weights must match the official SHA-256 before they load.
+      COHERE_ASR_MODEL: ${COHERE_ASR_MODEL:-evewashere/cohere-transcribe-03-2026-ungated}
+      COHERE_ASR_REVISION: ${COHERE_ASR_REVISION:-}
+      COHERE_ASR_SHA256: ${COHERE_ASR_SHA256:-}
+      # Only for COHERE_ASR_MODEL=CohereLabs/cohere-transcribe-03-2026.
+      HF_TOKEN: ${HF_TOKEN:-}
+      COHERE_ASR_DEFAULT_LANGUAGE: ${COHERE_ASR_DEFAULT_LANGUAGE:-de}
+      COHERE_ASR_CHUNK_S: ${COHERE_ASR_CHUNK_S:-30}
+      COHERE_ASR_BATCH_SIZE: ${COHERE_ASR_BATCH_SIZE:-4}
+      COHERE_ASR_MAX_NEW_TOKENS: ${COHERE_ASR_MAX_NEW_TOKENS:-}
+      # silero | energy | off: only what the VAD calls speech is transcribed.
+      COHERE_ASR_VAD: ${COHERE_ASR_VAD:-silero}
+      COHERE_ASR_VAD_THRESHOLD: ${COHERE_ASR_VAD_THRESHOLD:-0.5}
+      MAX_UPLOAD_MB: ${ASR_MAX_UPLOAD_MB:-200}
+      MAX_AUDIO_SECONDS: ${ASR_MAX_AUDIO_SECONDS:-7200}
+      ASR_MAX_CONCURRENCY: ${ASR_MAX_CONCURRENCY:-1}
+      # Waiting requests (empty = 4 x ASR_MAX_CONCURRENCY, 0 = nobody waits) and how
+      # long one waits; beyond either the answer is 503 + Retry-After.
+      ASR_MAX_QUEUE: ${ASR_MAX_QUEUE:-}
+      ASR_QUEUE_TIMEOUT_S: ${ASR_QUEUE_TIMEOUT_S:-60}
+      PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+      ASR_MODEL_TTL: ${ASR_MODEL_TTL:-300}
+      MODEL_TTL: ${MODEL_TTL:-300}
+      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-}
+      ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
+    volumes:
+      - "${APP_DATA_DIR:?set dataset path}/cache:/root/.cache"
+      - "${APP_DATA_DIR:?set dataset path}/backend-settings:/app/backend-settings:ro"
+    labels: {diun.enable: "true", diun.watch_repo: "true", diun.sort_tags: semver, diun.max_tags: "3", diun.include_tags: '^\d+\.\d+\.\d+$$'}
+    restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:5009/health"]
+      interval: 15s
+      timeout: 10s
+      start_period: 900s
+      retries: 4
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${GPU_DEVICE_ID:-0}"]
+              capabilities: [gpu]
+    networks: [tts-stt-network]
+
+  # IBM Granite Speech 5.0 (Apache-2.0): the 2b speech LLM (de/en/fr/es/pt/ja, keyword
+  # biasing; ~4.7 GB of VRAM) or, with GRANITE_ASR_MODEL, the 470m TurboCTC (adds it;
+  # ~1.2 GB, much faster, no keywords). Unloads after ASR_MODEL_TTL idle seconds.
+  granite-asr-service:
+    profiles: ["granite-asr"]
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-granite-asr:${IMAGE_TAG:-0.2.0}
+    pull_policy: ${PULL_POLICY:-missing}
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ${GPU_DEVICE_ID:-0}
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      # ibm-granite/granite-speech-5.0-2b or ibm-granite/granite-speech-5.0-470m-turboctc
+      GRANITE_ASR_MODEL: ${GRANITE_ASR_MODEL:-ibm-granite/granite-speech-5.0-2b}
+      GRANITE_ASR_REVISION: ${GRANITE_ASR_REVISION:-}
+      GRANITE_ASR_SHA256: ${GRANITE_ASR_SHA256:-}
+      HF_TOKEN: ${HF_TOKEN:-}
+      GRANITE_ASR_DEFAULT_LANGUAGE: ${GRANITE_ASR_DEFAULT_LANGUAGE:-de}
+      GRANITE_SUPPORTED_LANGUAGES: ${GRANITE_SUPPORTED_LANGUAGES:-}
+      GRANITE_ASR_CHUNK_S: ${GRANITE_ASR_CHUNK_S:-30}
+      GRANITE_ASR_BATCH_SIZE: ${GRANITE_ASR_BATCH_SIZE:-4}
+      GRANITE_ASR_MAX_NEW_TOKENS: ${GRANITE_ASR_MAX_NEW_TOKENS:-}
+      GRANITE_ASR_VAD: ${GRANITE_ASR_VAD:-silero}
+      GRANITE_ASR_VAD_THRESHOLD: ${GRANITE_ASR_VAD_THRESHOLD:-0.5}
+      MAX_UPLOAD_MB: ${ASR_MAX_UPLOAD_MB:-200}
+      MAX_AUDIO_SECONDS: ${ASR_MAX_AUDIO_SECONDS:-7200}
+      ASR_MAX_CONCURRENCY: ${ASR_MAX_CONCURRENCY:-1}
+      # Waiting requests (empty = 4 x ASR_MAX_CONCURRENCY, 0 = nobody waits) and how
+      # long one waits; beyond either the answer is 503 + Retry-After.
+      ASR_MAX_QUEUE: ${ASR_MAX_QUEUE:-}
+      ASR_QUEUE_TIMEOUT_S: ${ASR_QUEUE_TIMEOUT_S:-60}
+      PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+      ASR_MODEL_TTL: ${ASR_MODEL_TTL:-300}
+      MODEL_TTL: ${MODEL_TTL:-300}
+      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-}
+      ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
+    volumes:
+      - "${APP_DATA_DIR:?set dataset path}/cache:/root/.cache"
+      - "${APP_DATA_DIR:?set dataset path}/backend-settings:/app/backend-settings:ro"
+    labels: {diun.enable: "true", diun.watch_repo: "true", diun.sort_tags: semver, diun.max_tags: "3", diun.include_tags: '^\d+\.\d+\.\d+$$'}
+    restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:5010/health"]
       interval: 15s
       timeout: 10s
       start_period: 900s

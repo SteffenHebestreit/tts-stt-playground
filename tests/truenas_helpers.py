@@ -42,6 +42,8 @@ SERVICE_IMAGE = {
     "qwen3-asr-service": "qwen3-asr",
     "qwen3-tts-service": "qwen3-tts",
     "canary-asr-service": "canary-asr",
+    "cohere-asr-service": "cohere-asr",
+    "granite-asr-service": "granite-asr",
     "parakeet-asr-service": "parakeet-asr",
     "chatterbox-tts-service": "chatterbox-tts",
     "magpie-tts-service": "magpie-tts",

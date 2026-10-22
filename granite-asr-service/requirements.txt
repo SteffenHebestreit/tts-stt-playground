@@ -1,0 +1,24 @@
+# Dependencies of the transformers ASR services (cohere-asr-service, granite-asr-service).
+# The two files are the same on purpose (tests/test_transformers_asr_shared.py): both
+# images then share every layer up to their own code, which a host pulling both
+# downloads once. torch is installed separately in the Dockerfile (CUDA 12.8 wheels).
+
+# Native model classes, no trust_remote_code: CohereAsrForConditionalGeneration (5.4+),
+# GraniteSpeechForConditionalGeneration and GraniteSpeech5ForCTC (5.16+, the
+# 470m-turboctc). Pinned exactly: the model code lives in transformers itself, so a
+# release can change what the services transcribe. Move it on purpose (Dependabot
+# proposes it) and re-run benchmarks/run_german_eval.py before merging.
+transformers==5.20.2
+# Silero VAD for the pause-based chunking and the non-speech gate (transformers_asr.py).
+# 6.x ships its model inside the wheel (nothing is downloaded at run time) and needs
+# only torch.
+silero-vad==6.2.3
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+# 0.0.18 fixed a multipart-parsing denial of service reachable by any upload.
+python-multipart>=0.0.18
+soundfile>=0.12.0
+# CohereAsrFeatureExtractor refuses to run without it (its mel filter bank); it is also
+# audio_pipeline's fallback decoder for files ffmpeg cannot open.
+librosa>=0.10.0
+numpy>=1.24.0

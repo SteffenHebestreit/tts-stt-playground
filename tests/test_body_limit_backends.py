@@ -35,6 +35,8 @@ UPLOAD_ROUTES = {
     "qwen3-asr-service": ["/transcribe", "/detect_language", "/transcribe-batch"],
     "parakeet-asr-service": ["/transcribe", "/v1/audio/transcriptions", "/detect_language", "/transcribe-batch"],
     "canary-asr-service": ["/transcribe", "/v1/audio/transcriptions", "/detect_language", "/transcribe-batch"],
+    "cohere-asr-service": ["/transcribe"],
+    "granite-asr-service": ["/transcribe"],
 }
 
 OFFERED = 64 * MIB

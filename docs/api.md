@@ -171,7 +171,7 @@ curl http://your-host:3000/v1/audio/speech \
 | `file` | — | **Required.** Max 25 MB (413 `file_too_large`), must not be empty. |
 | `model` | — | Accepted but **advisory** — this deployment serves whatever backend it has. Any string works. |
 | `language` | auto-detect | ISO-639-1 (`de`, `en`, …). Omit or send `auto` to detect. |
-| `prompt` | — | Forwarded as `initial_prompt` where the backend supports it. |
+| `prompt` | — | Forwarded as `initial_prompt` where the backend supports it: Whisper's initial prompt, and the keyword list (comma separated) of `granite-asr` when that is the default provider. Cohere-ASR ignores it with a warning. |
 | `response_format` | `json` | `json`, `text`, `verbose_json`, `srt` or `vtt`. |
 | `temperature` | `0` | Forwarded where supported. |
 | `stream` | `false` | Accepted and ignored (spec-legal for `whisper-1`). |
@@ -205,6 +205,20 @@ unreachable) rejected the request: ..."), not the caller's 400/413: the default 
 never asked and may well accept the request once it is back, and the SDKs retry a 502. A backend that
 answers with an error, or times out while working, is **not** retried: that would run the job twice.
 `/api/stt` never falls back; it does what you asked.
+
+**`/api/stt`** (the web UI's route) takes `provider`, `audio` and `language`, and `prompt`, which it
+passes on as `initial_prompt` like `/v1` does, only when it is not empty (Whisper reads even an empty
+string as a prompt). The answer is normalised to `text`, `segments`, `language` and `duration`.
+
+**Cohere-ASR and Granite-ASR** (`cohere-asr`, `granite-asr`) have no timestamps of their own. Each
+service cuts a recording in its pauses into pieces of at most `COHERE_ASR_CHUNK_S` /
+`GRANITE_ASR_CHUNK_S` seconds (30 by default) and each piece is one segment, so `srt`, `vtt` and
+`verbose_json` from them are as precise as those pieces, not word-level. Only what a voice activity
+detector calls speech reaches the model: a file of silence or noise comes back with empty text and a
+warning. Their own `/transcribe` answer adds `speech_seconds`, `chunks`, `truncated` and `warnings`,
+and on Granite `keywords` (how many were applied); Granite takes up to 2000 keywords in a `keywords`
+form field or in `initial_prompt`, and answers **422** for more, or for one longer than 100
+characters.
 
 ---
 
@@ -349,8 +363,10 @@ gateway sends `auto` explicitly to the former and omits the field for the latter
 it affects API callers that omit the field.
 
 **Unsupported languages are refused, not guessed.** `stt-service` answers 400 for an unknown
-language code, Canary answers 422 for a language its model cannot decode (it used to decode
-everything as German), and Qwen3-TTS answers 400.
+language code, Canary, Cohere-ASR and Granite-ASR answer 422 for a language their model cannot
+decode (Canary used to decode everything as German), and Qwen3-TTS answers 400. Canary, Cohere-ASR
+and Granite-ASR identify no language: `auto` and no language mean their `*_DEFAULT_LANGUAGE` (`de`),
+and Cohere-ASR and Granite-ASR say so in `warnings` when `auto` was sent.
 
 **TTS defaults to German.** A request that names no language (or `auto`, in any capitalisation) is
 spoken in `PIPER_DEFAULT_LANGUAGE` (`de`) after Piper has guessed German versus English from the
@@ -382,6 +398,8 @@ the truth in a machine-readable `language_detect` field:
 | `whisper-cpp` | yes (via `language=auto`) |
 | `parakeet` | **no** — route exists, always returns null |
 | `canary` | **no** — no language identification at all |
+| `cohere-asr` | **no** — the language is part of the model's prompt |
+| `granite-asr` | **no** — the 2b is told the language, the 470m TurboCTC only reports it |
 
 ---
 
@@ -395,8 +413,11 @@ The `canary` entry's language list follows the checkpoint the Canary service run
 `supported_languages` from the service's `GET /status` (refreshed every five minutes), so
 `CANARY_ASR_MODEL=nvidia/canary-1b-v2` shows 25 languages and the flash models four. While the
 service cannot be reached the entry falls back to `de`, `en`, `es`, `fr` (asked again after 20
-seconds), and after a first answer it keeps the last one. An entry you replace through
-`PROVIDER_REGISTRY_JSON` is left as you wrote it.
+seconds), and after a first answer it keeps the last one. The `granite-asr` entry works the same
+way: six languages with `granite-speech-5.0-2b`, seven (Italian added) with the 470m TurboCTC, and
+`de`, `en`, `fr`, `ja`, `pt`, `es` while the service cannot be asked. Cohere-ASR's 14 languages do
+not depend on a setting and are not asked for. An entry you replace through `PROVIDER_REGISTRY_JSON`
+is left as you wrote it.
 
 `GET /health` on the gateway is liveness only (the Docker healthcheck).
 
@@ -455,7 +476,8 @@ whether a retry is worthwhile. A client that disconnects mid-request no longer l
 behind that would answer 409 forever.
 
 Supported where the provider lists the `model_unload` capability — currently `whisper`,
-`qwen3-asr`, `qwen3` (TTS), `chatterbox`, `magpie`, `parakeet` and `canary`. Asking any other provider
+`qwen3-asr`, `qwen3` (TTS), `chatterbox`, `magpie`, `parakeet`, `canary`, `cohere-asr` and
+`granite-asr`. Asking any other provider
 returns 400. The two that cannot: `piper` is CPU-only ONNX with no VRAM to reclaim, and
 `whisper-cpp` is the upstream whisper-server binary with no Python layer to add a route to.
 
@@ -478,7 +500,7 @@ gives each its own host variable:
 | Service | Upload | Length or text | Host variables |
 |---|---|---|---|
 | gateway | 512 MB body, 1 MiB JSON, 25 MB per `/v1` file | 5000 characters of TTS text (`422`) | `MAX_UPLOAD_MB`, `MAX_TTS_CHARS` |
-| stt-service, qwen3-asr, parakeet, canary | 200 MB per file | 7200 s (stt, qwen3-asr) or 1500 s (NeMo) per recording | `ASR_MAX_UPLOAD_MB`, `ASR_MAX_AUDIO_SECONDS`, `NEMO_MAX_AUDIO_S` |
+| stt-service, qwen3-asr, parakeet, canary, cohere-asr, granite-asr | 200 MB per file | 7200 s (stt, qwen3-asr, cohere-asr, granite-asr) or 1500 s (NeMo) per recording | `ASR_MAX_UPLOAD_MB`, `ASR_MAX_AUDIO_SECONDS`, `NEMO_MAX_AUDIO_S` |
 | piper-tts | 100 MB model upload, 25 MB analysed audio | 20000 characters; 600 s of analysed audio | `PIPER_MAX_UPLOAD_MB`, `PIPER_MAX_ANALYZE_UPLOAD_MB`, `PIPER_MAX_TEXT_CHARS`, `PIPER_ANALYZE_MAX_SECONDS` |
 | piper-tts, uploaded voices | 20 voices, 2048 MB in total | a new voice has 30 s to load and answer a test request | `PIPER_MAX_CUSTOM_VOICES` (0 = no upload), `PIPER_MAX_CUSTOM_MB`, `PIPER_ONNX_VALIDATE_TIMEOUT_S` |
 | qwen3-tts | 20 MB reference audio | 5000 characters; 60 s reference clip | `QWEN3_TTS_MAX_UPLOAD_MB`, `QWEN3_TTS_MAX_TEXT_CHARS`, `QWEN3_TTS_REF_MAX_SECONDS` |
@@ -504,7 +526,7 @@ them up until every client times out:
 | Service | Runs at once | May wait | Waits at most | Host variables |
 |---|---|---|---|---|
 | gateway (per worker process) | 4 uploads, 4 `ffmpeg` conversions | nobody | not at all | `MAX_CONCURRENT_UPLOADS`, `MAX_CONCURRENT_FFMPEG` |
-| qwen3-asr, parakeet, canary | 1 | 4 x the concurrency (`0` = nobody waits) | 60 s | `ASR_MAX_CONCURRENCY`, `ASR_MAX_QUEUE`, `ASR_QUEUE_TIMEOUT_S` |
+| qwen3-asr, parakeet, canary, cohere-asr, granite-asr | 1 | 4 x the concurrency (`0` = nobody waits) | 60 s | `ASR_MAX_CONCURRENCY`, `ASR_MAX_QUEUE`, `ASR_QUEUE_TIMEOUT_S` |
 | qwen3-tts, chatterbox, magpie | 1 | 4 x the concurrency (`0` = nobody waits) | 60 s | `TTS_MAX_CONCURRENCY`, `TTS_MAX_QUEUE`, `TTS_QUEUE_TIMEOUT_S` |
 | piper-tts | half the CPU cores | any number, for `PIPER_TIMEOUT_S` | 60 s | `PIPER_MAX_CONCURRENCY`, `PIPER_TIMEOUT_S` |
 

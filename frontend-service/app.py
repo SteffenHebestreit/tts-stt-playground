@@ -225,6 +225,8 @@ MAX_TTS_CHARS = _env_number("MAX_TTS_CHARS", 5000, int)
 ENABLE_WHISPER_CPP = _env_flag("ENABLE_WHISPER_CPP", False)
 ENABLE_PARAKEET_ASR = _env_flag("ENABLE_PARAKEET_ASR", False)
 ENABLE_CANARY_ASR = _env_flag("ENABLE_CANARY_ASR", False)
+ENABLE_COHERE_ASR = _env_flag("ENABLE_COHERE_ASR", False)
+ENABLE_GRANITE_ASR = _env_flag("ENABLE_GRANITE_ASR", False)
 ENABLE_CHATTERBOX_TTS = _env_flag("ENABLE_CHATTERBOX_TTS", False)
 ENABLE_MAGPIE_TTS = _env_flag("ENABLE_MAGPIE_TTS", False)
 # Voice training is on unless switched off: installs without the training
@@ -598,6 +600,8 @@ _ENV_VALUES: Mapping[str, Any] = MappingProxyType({
     "ALLOWED_ORIGINS": _ENV_ALLOWED_ORIGINS,
     "ENABLE_CANARY_ASR": ENABLE_CANARY_ASR,
     "ENABLE_PARAKEET_ASR": ENABLE_PARAKEET_ASR,
+    "ENABLE_COHERE_ASR": ENABLE_COHERE_ASR,
+    "ENABLE_GRANITE_ASR": ENABLE_GRANITE_ASR,
     "ENABLE_CHATTERBOX_TTS": ENABLE_CHATTERBOX_TTS,
     "ENABLE_MAGPIE_TTS": ENABLE_MAGPIE_TTS,
     "ENABLE_WHISPER_CPP": ENABLE_WHISPER_CPP,
@@ -1315,6 +1319,8 @@ QWEN3_TTS_SERVICE_URL = os.getenv("QWEN3_TTS_SERVICE_URL", "http://qwen3-tts-ser
 QWEN3_ASR_SERVICE_URL = os.getenv("QWEN3_ASR_SERVICE_URL", "http://qwen3-asr-service:5002")
 PARAKEET_ASR_SERVICE_URL = os.getenv("PARAKEET_ASR_SERVICE_URL", "http://parakeet-asr-service:5005")
 CANARY_ASR_SERVICE_URL = os.getenv("CANARY_ASR_SERVICE_URL", "http://canary-asr-service:5006")
+COHERE_ASR_SERVICE_URL = os.getenv("COHERE_ASR_SERVICE_URL", "http://cohere-asr-service:5009")
+GRANITE_ASR_SERVICE_URL = os.getenv("GRANITE_ASR_SERVICE_URL", "http://granite-asr-service:5010")
 CHATTERBOX_TTS_SERVICE_URL = os.getenv("CHATTERBOX_TTS_SERVICE_URL", "http://chatterbox-tts-service:5007")
 MAGPIE_TTS_SERVICE_URL = os.getenv("MAGPIE_TTS_SERVICE_URL", "http://magpie-tts-service:5008")
 WHISPER_CPP_SERVICE_URL = os.getenv("WHISPER_CPP_SERVICE_URL", "http://whisper-cpp:8080")
@@ -1351,6 +1357,10 @@ def _build_stt_messages() -> dict:
 
 
 _BUILT_ENTRIES: dict = {}
+# Providers whose language list follows the checkpoint their service runs: the
+# service's /status replaces the built-in list (see "settings the backends report"),
+# and the value names them in the selector, "<name> (<model>, <languages>)".
+_LANGUAGE_DISCOVERY = {"canary": "Canary", "granite-asr": "Granite Speech"}
 
 
 _NO_OVERRIDE = object()
@@ -2028,6 +2038,95 @@ def _build_provider_registry(flags: Mapping[str, Any], defaults: Mapping[str, An
             },
         }
 
+    if flags["ENABLE_COHERE_ASR"]:
+        providers["cohere-asr"] = {
+            "kind": "stt",
+            "display_name": "Cohere Transcribe (2B, 14 languages)",
+            "short_name": "Cohere ASR",
+            "internal_url": COHERE_ASR_SERVICE_URL,
+            "health_endpoint": "/health",
+            # Segments are the service's own chunks (cut in pauses, at most 30 s):
+            # the model has no timestamps.
+            "capabilities": ["transcribe", "segments", "model_unload"],
+            # No language identification at all: "auto" and no language mean
+            # COHERE_ASR_DEFAULT_LANGUAGE, so there is no "auto" entry below.
+            "language_detect": False,
+            "contracts": {
+                "transcribe": "stt-form-v1",
+            },
+            "settings": {
+                "defaults": {
+                    "language": "de",
+                    "enable_segmentation": True,
+                },
+                # The model's 14 languages (cohere-asr-service/cohere_support.py),
+                # the default first, then by name.
+                "languages": [
+                    {"value": "de", "label": "German"},
+                    {"value": "ar", "label": "Arabic"},
+                    {"value": "zh", "label": "Chinese"},
+                    {"value": "nl", "label": "Dutch"},
+                    {"value": "en", "label": "English"},
+                    {"value": "fr", "label": "French"},
+                    {"value": "el", "label": "Greek"},
+                    {"value": "it", "label": "Italian"},
+                    {"value": "ja", "label": "Japanese"},
+                    {"value": "ko", "label": "Korean"},
+                    {"value": "pl", "label": "Polish"},
+                    {"value": "pt", "label": "Portuguese"},
+                    {"value": "es", "label": "Spanish"},
+                    {"value": "vi", "label": "Vietnamese"},
+                ],
+            },
+            "ui": {
+                "selectable_as_stt": True,
+                "show_status": True,
+                "messages": {
+                    "transcription": _build_stt_messages(),
+                },
+            },
+        }
+
+    if flags["ENABLE_GRANITE_ASR"]:
+        providers["granite-asr"] = {
+            "kind": "stt",
+            "display_name": "Granite Speech 5.0 (IBM, de/en/fr/ja/pt/es)",
+            "short_name": "Granite ASR",
+            "internal_url": GRANITE_ASR_SERVICE_URL,
+            "health_endpoint": "/health",
+            "capabilities": ["transcribe", "segments", "model_unload"],
+            # The 2b is told the language in its prompt and the 470m TurboCTC only
+            # reports it; neither identifies it.
+            "language_detect": False,
+            "contracts": {
+                "transcribe": "stt-form-v1",
+            },
+            "settings": {
+                "defaults": {
+                    "language": "de",
+                    "enable_segmentation": True,
+                },
+                # The default checkpoint's (granite-speech-5.0-2b). The service's /status
+                # replaces it with what the configured checkpoint takes (the 470m
+                # TurboCTC adds Italian): see _LANGUAGE_DISCOVERY.
+                "languages": [
+                    {"value": "de", "label": "German"},
+                    {"value": "en", "label": "English"},
+                    {"value": "fr", "label": "French"},
+                    {"value": "ja", "label": "Japanese"},
+                    {"value": "pt", "label": "Portuguese"},
+                    {"value": "es", "label": "Spanish"},
+                ],
+            },
+            "ui": {
+                "selectable_as_stt": True,
+                "show_status": True,
+                "messages": {
+                    "transcription": _build_stt_messages(),
+                },
+            },
+        }
+
     if flags["ENABLE_CHATTERBOX_TTS"]:
         providers["chatterbox"] = {
             "kind": "tts",
@@ -2189,6 +2288,8 @@ def _build_provider_registry(flags: Mapping[str, Any], defaults: Mapping[str, An
             "enable_whisper_cpp": flags["ENABLE_WHISPER_CPP"],
             "enable_parakeet_asr": flags["ENABLE_PARAKEET_ASR"],
             "enable_canary_asr": flags["ENABLE_CANARY_ASR"],
+            "enable_cohere_asr": flags["ENABLE_COHERE_ASR"],
+            "enable_granite_asr": flags["ENABLE_GRANITE_ASR"],
             "enable_chatterbox_tts": flags["ENABLE_CHATTERBOX_TTS"],
             "enable_magpie_tts": flags["ENABLE_MAGPIE_TTS"],
             "enable_training": flags["ENABLE_TRAINING"],
@@ -2203,7 +2304,8 @@ def _build_provider_registry(flags: Mapping[str, Any], defaults: Mapping[str, An
 
     # Remembered before the override below can replace it: an entry the operator
     # supplied is theirs, and nothing may rewrite it from what a backend reports.
-    _BUILT_ENTRIES["canary"] = providers.get("canary")
+    for provider_id in _LANGUAGE_DISCOVERY:
+        _BUILT_ENTRIES[provider_id] = providers.get(provider_id)
 
     if _REGISTRY_OVERRIDE is not _NO_OVERRIDE:
         # A copy per build: the operator's entries in one registry are never the
@@ -2225,13 +2327,15 @@ _registry_built_from = {key: _ENV_VALUES[key] for key in _ENGINE_KEYS}
 
 # --- settings the backends report ---------------------------------------------------
 #
-# Canary decodes only the languages its checkpoint was trained on, and which those
-# are depends on CANARY_ASR_MODEL: en/de/es/fr for the flash models, 25 European
-# languages for canary-1b-v2 (or whatever CANARY_SUPPORTED_LANGUAGES says). The
-# list in the registry above is only the fallback for a service that cannot be
-# asked; when it answers, its own /status (`supported_languages`, `default_language`,
-# `current_model`) replaces it, so the selector offers exactly what the service will
-# accept instead of a copy that goes stale.
+# Canary and Granite accept only the languages of the checkpoint they run, and which
+# those are depends on their *_MODEL setting: en/de/es/fr for the Canary flash models,
+# 25 European languages for canary-1b-v2 (or whatever CANARY_SUPPORTED_LANGUAGES
+# says); six for granite-speech-5.0-2b, seven for the 470m TurboCTC (or
+# GRANITE_SUPPORTED_LANGUAGES). The lists in the registry above are only the fallback
+# for a service that cannot be asked; when it answers, its own /status
+# (`supported_languages`, `default_language`, `current_model`) replaces it, so the
+# selector offers exactly what the service will accept instead of a copy that goes
+# stale. Every discovered provider has its own state and clock budget.
 
 _LANGUAGE_NAMES = {
     "ar": "Arabic", "bg": "Bulgarian", "cs": "Czech", "da": "Danish", "de": "German",
@@ -2240,23 +2344,30 @@ _LANGUAGE_NAMES = {
     "ko": "Korean", "lt": "Lithuanian", "lv": "Latvian", "mt": "Maltese", "nl": "Dutch",
     "pl": "Polish", "pt": "Portuguese", "ro": "Romanian", "ru": "Russian", "sk": "Slovak",
     "sl": "Slovenian", "sv": "Swedish", "tr": "Turkish", "uk": "Ukrainian", "zh": "Chinese",
+    "vi": "Vietnamese",
 }
 _CANARY_LANGUAGE_REFRESH_S = 300.0    # how long a discovered list is trusted
 _CANARY_LANGUAGE_RETRY_S = 20.0       # how soon to ask again after a failed attempt
-# `epoch` counts resets: an answer to a question asked before the last one is dropped.
+# Per provider: `next_at` is when to ask again, and `epoch` counts resets (an answer to
+# a question asked before the last one is dropped). Canary's keeps its own name.
 _canary_languages = {"next_at": None, "epoch": 0}
+_discovered_languages = {
+    provider_id: (_canary_languages if provider_id == "canary" else {"next_at": None, "epoch": 0})
+    for provider_id in _LANGUAGE_DISCOVERY
+}
 # Injectable so tests can move time instead of sleeping.
 _language_clock = time.monotonic
 
 
 def _reset_canary_languages() -> None:
-    """Ask canary again on the next page load, and drop an answer that is still on its way."""
-    _canary_languages["next_at"] = None
-    _canary_languages["epoch"] += 1
+    """Ask every discovered provider again on the next page load, and drop answers still on their way."""
+    for state in _discovered_languages.values():
+        state["next_at"] = None
+        state["epoch"] += 1
 
 
-def _apply_canary_status(entry: dict, payload: Any) -> bool:
-    """Put the languages (and model) a canary /status reports into its registry entry."""
+def _apply_language_status(entry: dict, payload: Any, label: str) -> bool:
+    """Put the languages (and model) a /status reports into the provider's registry entry."""
     if not isinstance(payload, dict) or not isinstance(payload.get("supported_languages"), list):
         return False
     codes = []
@@ -2279,42 +2390,57 @@ def _apply_canary_status(entry: dict, payload: Any) -> bool:
     model = payload.get("current_model")
     model = model.rsplit("/", 1)[-1] if isinstance(model, str) and model.strip() else "realtime"
     shown = "/".join(ordered) if len(ordered) <= 6 else f"{len(ordered)} languages"
-    entry["display_name"] = f"Canary ({model}, {shown})"
+    entry["display_name"] = f"{label} ({model}, {shown})"
     return True
 
 
-async def _refresh_canary_languages() -> None:
-    """Ask the canary service which languages it decodes, at most once per interval.
+def _apply_canary_status(entry: dict, payload: Any) -> bool:
+    return _apply_language_status(entry, payload, _LANGUAGE_DISCOVERY["canary"])
+
+
+async def _refresh_provider_languages(provider_id: str) -> None:
+    """Ask one service which languages it takes, at most once per interval.
 
     Never raises and never waits long: the page that calls it must render even
-    when canary is down (the built-in list is then used, and the next attempt is
-    held back for `_CANARY_LANGUAGE_RETRY_S` so a dead service costs one short
+    when the service is down (the built-in list is then used, and the next attempt
+    is held back for `_CANARY_LANGUAGE_RETRY_S` so a dead service costs one short
     connect attempt per interval rather than one per page load).
     """
-    entry = PROVIDER_REGISTRY["providers"].get("canary")
+    entry = PROVIDER_REGISTRY["providers"].get(provider_id)
     # An operator who replaced the entry through PROVIDER_REGISTRY_JSON chose those
     # languages on purpose and is left alone.
-    if entry is None or entry is not _BUILT_ENTRIES.get("canary"):
+    if entry is None or entry is not _BUILT_ENTRIES.get(provider_id):
         return
+    state = _discovered_languages[provider_id]
     now = _language_clock()
-    if _canary_languages["next_at"] is not None and now < _canary_languages["next_at"]:
+    if state["next_at"] is not None and now < state["next_at"]:
         return
     # Provisional, so concurrent page loads do not each probe a dead service.
-    _canary_languages["next_at"] = now + _CANARY_LANGUAGE_RETRY_S
-    epoch = _canary_languages["epoch"]
+    state["next_at"] = now + _CANARY_LANGUAGE_RETRY_S
+    epoch = state["epoch"]
     try:
         response = await _get_http_client().get(
             f"{entry['internal_url']}/status", timeout=_timeout(2.0))
         payload = response.json() if response.status_code == 200 else None
     except Exception as exc:
-        logger.info("canary /status could not be read (%s); keeping the built-in language list", type(exc).__name__)
+        logger.info("%s /status could not be read (%s); keeping the built-in language list",
+                    provider_id, type(exc).__name__)
         return
     # A settings change rebuilt the registry while /status was awaited (_apply): `entry` is no
     # longer shown, and the reset it made has to stand, so the next page load asks for the new one.
-    if _canary_languages["epoch"] != epoch or PROVIDER_REGISTRY["providers"].get("canary") is not entry:
+    if state["epoch"] != epoch or PROVIDER_REGISTRY["providers"].get(provider_id) is not entry:
         return
-    if _apply_canary_status(entry, payload):
-        _canary_languages["next_at"] = now + _CANARY_LANGUAGE_REFRESH_S
+    if _apply_language_status(entry, payload, _LANGUAGE_DISCOVERY[provider_id]):
+        state["next_at"] = now + _CANARY_LANGUAGE_REFRESH_S
+
+
+async def _refresh_canary_languages() -> None:
+    """Refresh the language lists of every enabled provider that reports its own (Canary, Granite)."""
+    await asyncio.gather(*(
+        _refresh_provider_languages(provider_id)
+        for provider_id in _LANGUAGE_DISCOVERY
+        if provider_id in PROVIDER_REGISTRY["providers"]
+    ))
 
 
 def _template_provider_lists() -> tuple[list[tuple[str, dict]], list[tuple[str, dict]], list[tuple[str, dict]]]:
@@ -3274,6 +3400,13 @@ async def _build_frontend_stt_payload(provider_id: str, form, contract: str) -> 
         # names no language still names none.
         if language:
             data["language"] = language
+        # `prompt` is /v1's field of the same name, under the name the stt-form-v1
+        # services read: Whisper's initial prompt, Granite's keyword list (comma
+        # separated). Only a prompt that says something is sent; Whisper reads an
+        # empty one as a prompt of its own (#64).
+        prompt = form.get("prompt")
+        if isinstance(prompt, str) and prompt.strip():
+            data["initial_prompt"] = prompt.strip()
         return "/transcribe", data, files
 
     if contract == "openai-audio-transcriptions-v1":
@@ -4116,7 +4249,7 @@ def _access_in_force(keys: settings_store.KeysState) -> tuple[bool, str]:
 
 
 def _effective(state: settings_store.SettingsState) -> dict[str, Any]:
-    """Every setting's value in force: the 16 of gateway.json, require_key and deployment_key_role."""
+    """Every setting's value in force: the 18 of gateway.json, require_key and deployment_key_role."""
     values = dict(_ENV_VALUES)
     values.update(_file_values_in_force(state))
     values["require_key"], values["deployment_key_role"] = _access_in_force(state.keys)
@@ -4135,7 +4268,7 @@ def _apply(state: settings_store.SettingsState, *, initial: bool = False) -> Non
     global _policy, _keyring, _applied_state, _applied_values, _registry_built_from
     global TRUST_PROXY_HEADERS, MAX_UPLOAD_MB, MAX_REQUEST_BYTES, MAX_TTS_CHARS, MAX_CONCURRENT_UPLOADS
     global ENABLE_WHISPER_CPP, ENABLE_PARAKEET_ASR, ENABLE_CANARY_ASR, ENABLE_CHATTERBOX_TTS
-    global ENABLE_MAGPIE_TTS, ENABLE_TRAINING
+    global ENABLE_MAGPIE_TTS, ENABLE_TRAINING, ENABLE_COHERE_ASR, ENABLE_GRANITE_ASR
 
     values = _effective(state)
     policy = _build_access_policy(values)
@@ -4156,6 +4289,8 @@ def _apply(state: settings_store.SettingsState, *, initial: bool = False) -> Non
     ENABLE_WHISPER_CPP = values["ENABLE_WHISPER_CPP"]
     ENABLE_PARAKEET_ASR = values["ENABLE_PARAKEET_ASR"]
     ENABLE_CANARY_ASR = values["ENABLE_CANARY_ASR"]
+    ENABLE_COHERE_ASR = values["ENABLE_COHERE_ASR"]
+    ENABLE_GRANITE_ASR = values["ENABLE_GRANITE_ASR"]
     ENABLE_CHATTERBOX_TTS = values["ENABLE_CHATTERBOX_TTS"]
     ENABLE_MAGPIE_TTS = values["ENABLE_MAGPIE_TTS"]
     ENABLE_TRAINING = values["ENABLE_TRAINING"]
@@ -4688,6 +4823,8 @@ _engine_probe_cache: dict = {"at": None, "value": None, "inflight": None}
 # The profile that installs each engine's container, and what installing it downloads.
 _ENGINE_PROFILES = {
     "canary": ("canary-asr", "about 5 GB"),
+    "cohere-asr": ("cohere-asr", "about 9 GB"),
+    "granite-asr": ("granite-asr", "about 10 GB"),
     "parakeet": ("parakeet-asr", "about 5 GB"),
     "chatterbox": ("chatterbox-tts", "about 5 GB"),
     "magpie": ("magpie-tts", "about 5 GB"),
@@ -4700,6 +4837,8 @@ def _engine_targets() -> dict[str, tuple[str, str]]:
     """{provider id: (base URL, health path)} of the engines the Settings page offers or hides."""
     targets = {
         "canary": (CANARY_ASR_SERVICE_URL, "/health"),
+        "cohere-asr": (COHERE_ASR_SERVICE_URL, "/health"),
+        "granite-asr": (GRANITE_ASR_SERVICE_URL, "/health"),
         "parakeet": (PARAKEET_ASR_SERVICE_URL, "/health"),
         "chatterbox": (CHATTERBOX_TTS_SERVICE_URL, "/health"),
         "magpie": (MAGPIE_TTS_SERVICE_URL, "/health"),

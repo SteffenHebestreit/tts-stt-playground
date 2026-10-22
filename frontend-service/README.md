@@ -64,7 +64,8 @@ Every `/v1` failure - including the ones FastAPI raises itself (missing form fie
 - Serves static assets with restart-based cache busting
 - Exposes health data for all backend services used by the UI
 - Exposes optional providers such as `whisper-cpp` only when explicitly enabled in the frontend environment
-- Takes Canary's language list (and the model it runs) from the canary service's own `/status`, re-read at most every five minutes and only while the page or `/providers` is requested; the built-in `de/en/fr/es` list is the fallback while the service cannot be asked. A `canary` entry in `PROVIDER_REGISTRY_JSON` is never overwritten
+- Takes Canary's and Granite-ASR's language lists (and the model each runs) from the service's own `/status`, re-read at most every five minutes and only while the page or `/providers` is requested; the built-in lists (`de/en/fr/es` for Canary, the 2b's `de/en/fr/ja/pt/es` for Granite) are the fallback while the service cannot be asked. A `canary` or `granite-asr` entry in `PROVIDER_REGISTRY_JSON` is never overwritten
+- Passes the `prompt` of `/api/stt` (and of `/v1/audio/transcriptions`) to the stt-form-v1 backends as `initial_prompt`, only when it is not empty: Whisper's initial prompt, Granite-ASR's keyword list
 - Supports multiple STT request contracts, including OpenAI-compatible `/v1/audio/transcriptions`
 - Exposes a normalized basic TTS adapter so multiple providers can share one browser-facing synthesis contract
 - Exposes a normalized basic STT adapter so multiple providers can share one browser-facing transcription contract
@@ -91,10 +92,12 @@ Every `/v1` failure - including the ones FastAPI raises itself (missing form fie
 | `WHISPER_CPP_SERVICE_URL` | `http://whisper-cpp:8080` | Internal whisper.cpp URL |
 | `PARAKEET_ASR_SERVICE_URL` | `http://parakeet-asr-service:5005` | Internal Parakeet URL |
 | `CANARY_ASR_SERVICE_URL` | `http://canary-asr-service:5006` | Internal Canary URL |
+| `COHERE_ASR_SERVICE_URL` | `http://cohere-asr-service:5009` | Internal Cohere-ASR URL |
+| `GRANITE_ASR_SERVICE_URL` | `http://granite-asr-service:5010` | Internal Granite-ASR URL |
 | `CHATTERBOX_TTS_SERVICE_URL` | `http://chatterbox-tts-service:5007` | Internal Chatterbox URL |
 | `MAGPIE_TTS_SERVICE_URL` | `http://magpie-tts-service:5008` | Internal Magpie URL |
 | `ENABLE_WHISPER_CPP` | `false` | Include whisper.cpp in the provider registry, STT selector, and health polling |
-| `ENABLE_PARAKEET_ASR`, `ENABLE_CANARY_ASR`, `ENABLE_CHATTERBOX_TTS`, `ENABLE_MAGPIE_TTS` | `false` | The same for Parakeet, Canary, Chatterbox and Magpie |
+| `ENABLE_PARAKEET_ASR`, `ENABLE_CANARY_ASR`, `ENABLE_COHERE_ASR`, `ENABLE_GRANITE_ASR`, `ENABLE_CHATTERBOX_TTS`, `ENABLE_MAGPIE_TTS` | `false` | The same for Parakeet, Canary, Cohere-ASR, Granite-ASR, Chatterbox and Magpie |
 | `ENABLE_TRAINING` | `true` | The training provider: the Voice Training tab, its status dot and `/api/training/*` (404 when off). Only `1`, `true`, `yes` or `on` count as on; unset or empty means on. The TrueNAS file sets `false` |
 | `ENABLE_SETTINGS_UI` | `true` | `false` makes the Settings page read-only and the gateway ignore what it saved; keys made in the page stay in force |
 | `SETTINGS_LOCKED_KEYS` | *(empty)* | Settings that always come from the environment (comma or space separated, any case), e.g. `TRUSTED_HOSTS,MAX_UPLOAD_MB`; the page shows them read-only. `require_key` and `deployment_key_role` can be locked too |

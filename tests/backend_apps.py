@@ -1,4 +1,4 @@
-"""Load any of the eight backends in-process, for the request-hardening tests (no tests of its own).
+"""Load any of the backends in-process, for the request-hardening tests (no tests of its own).
 
 `tests/test_body_limit_backends.py` and `tests/test_origin_guard_backends.py` ask the
 same question of every backend (does a chunked upload get cut off? does a foreign
@@ -40,6 +40,8 @@ BACKENDS = (
     "qwen3-asr-service",
     "parakeet-asr-service",
     "canary-asr-service",
+    "cohere-asr-service",
+    "granite-asr-service",
 )
 
 # What each backend calls a multipart upload it accepts (None: it takes no uploads at all,
@@ -67,6 +69,10 @@ ROUTES = {
                              "json": None},
     "canary-asr-service": {"upload": ("POST", "/transcribe", "audio"), "probe": ("POST", "/unload"),
                            "json": None},
+    "cohere-asr-service": {"upload": ("POST", "/transcribe", "audio"), "probe": ("POST", "/unload"),
+                           "json": None},
+    "granite-asr-service": {"upload": ("POST", "/transcribe", "audio"), "probe": ("POST", "/unload"),
+                            "json": None},
 }
 
 
@@ -124,6 +130,11 @@ def load_backend(name: str, monkeypatch, tmp_path: Path, stack: contextlib.ExitS
     elif name in ("parakeet-asr-service", "canary-asr-service"):
         from test_nemo_services_harness import load_app
         module = load_app(name.split("-")[0], **env)
+    elif name in ("cohere-asr-service", "granite-asr-service"):
+        import transformers_asr_loader
+        module = transformers_asr_loader.load_app(
+            name.split("-")[0], monkeypatch,
+            **{k: v for k, v in env.items() if k in transformers_asr_loader.MANAGED_ENV})
     else:
         raise KeyError(name)
     return Backend(name, module, tmp, ROUTES[name])

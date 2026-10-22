@@ -105,11 +105,15 @@ services:
       QWEN3_ASR_SERVICE_URL: "http://qwen3-asr-service:5002"
       PARAKEET_ASR_SERVICE_URL: "http://parakeet-asr-service:5005"
       CANARY_ASR_SERVICE_URL: "http://canary-asr-service:5006"
+      COHERE_ASR_SERVICE_URL: "http://cohere-asr-service:5009"
+      GRANITE_ASR_SERVICE_URL: "http://granite-asr-service:5010"
       CHATTERBOX_TTS_SERVICE_URL: "http://chatterbox-tts-service:5007"
       MAGPIE_TTS_SERVICE_URL: "http://magpie-tts-service:5008"
       WHISPER_CPP_SERVICE_URL: "http://whisper-cpp:8080"
       ENABLE_PARAKEET_ASR: "{{ (values.use_gpu and values.enable_parakeet) | lower }}"
       ENABLE_CANARY_ASR: "{{ (values.use_gpu and values.enable_canary) | lower }}"
+      ENABLE_COHERE_ASR: "{{ (values.use_gpu and values.enable_cohere) | lower }}"
+      ENABLE_GRANITE_ASR: "{{ (values.use_gpu and values.enable_granite) | lower }}"
       ENABLE_CHATTERBOX_TTS: "{{ (values.use_gpu and values.enable_chatterbox) | lower }}"
       ENABLE_MAGPIE_TTS: "{{ (values.use_gpu and values.enable_magpie) | lower }}"
       ENABLE_WHISPER_CPP: "{{ values.enable_whisper_cpp | lower }}"
@@ -393,6 +397,93 @@ services:
     restart: unless-stopped
     stop_grace_period: 30s
     {{ healthcheck(5005, 900) | indent(4) }}
+    {%- if values.use_gpu %}
+    {{ gpu_deploy() | indent(4) }}
+    {%- endif %}
+    networks: [tts-stt-network]
+  {%- endif %}
+
+  {%- if values.use_gpu and values.enable_cohere %}
+
+  cohere-asr-service:
+    image: {{ reg }}/tts-stt-cohere-asr:{{ tag }}
+    pull_policy: "{{ values.pull_policy }}"
+    {%- if values.expose_backend_ports %}
+    ports: ["127.0.0.1:5009:5009"]
+    {%- endif %}
+    environment:
+      NVIDIA_VISIBLE_DEVICES: {{ q(values.gpu_device_id) }}
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      COHERE_ASR_MODEL: "evewashere/cohere-transcribe-03-2026-ungated"
+      COHERE_ASR_REVISION: ""
+      COHERE_ASR_SHA256: ""
+      HF_TOKEN: ""
+      COHERE_ASR_DEFAULT_LANGUAGE: "de"
+      COHERE_ASR_CHUNK_S: "30"
+      COHERE_ASR_BATCH_SIZE: "4"
+      COHERE_ASR_MAX_NEW_TOKENS: ""
+      COHERE_ASR_VAD: "silero"
+      COHERE_ASR_VAD_THRESHOLD: "0.5"
+      MAX_UPLOAD_MB: "200"
+      MAX_AUDIO_SECONDS: "7200"
+      ASR_MAX_CONCURRENCY: "1"
+      ASR_MAX_QUEUE: ""
+      ASR_QUEUE_TIMEOUT_S: "60"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+      ASR_MODEL_TTL: "{{ values.model_ttl }}"
+      MODEL_TTL: "{{ values.model_ttl }}"
+      ALLOWED_ORIGINS: ""
+      ALLOW_CREDENTIALS: "false"
+    volumes:
+      - "{{ data }}/cache:/root/.cache"
+      - "{{ data }}/backend-settings:/app/backend-settings:ro"
+    restart: unless-stopped
+    stop_grace_period: 30s
+    {{ healthcheck(5009, 900) | indent(4) }}
+    {%- if values.use_gpu %}
+    {{ gpu_deploy() | indent(4) }}
+    {%- endif %}
+    networks: [tts-stt-network]
+  {%- endif %}
+
+  {%- if values.use_gpu and values.enable_granite %}
+
+  granite-asr-service:
+    image: {{ reg }}/tts-stt-granite-asr:{{ tag }}
+    pull_policy: "{{ values.pull_policy }}"
+    {%- if values.expose_backend_ports %}
+    ports: ["127.0.0.1:5010:5010"]
+    {%- endif %}
+    environment:
+      NVIDIA_VISIBLE_DEVICES: {{ q(values.gpu_device_id) }}
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      GRANITE_ASR_MODEL: {{ q(values.granite_asr_model) }}
+      GRANITE_ASR_REVISION: ""
+      GRANITE_ASR_SHA256: ""
+      HF_TOKEN: ""
+      GRANITE_ASR_DEFAULT_LANGUAGE: "de"
+      GRANITE_SUPPORTED_LANGUAGES: ""
+      GRANITE_ASR_CHUNK_S: "30"
+      GRANITE_ASR_BATCH_SIZE: "4"
+      GRANITE_ASR_MAX_NEW_TOKENS: ""
+      GRANITE_ASR_VAD: "silero"
+      GRANITE_ASR_VAD_THRESHOLD: "0.5"
+      MAX_UPLOAD_MB: "200"
+      MAX_AUDIO_SECONDS: "7200"
+      ASR_MAX_CONCURRENCY: "1"
+      ASR_MAX_QUEUE: ""
+      ASR_QUEUE_TIMEOUT_S: "60"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+      ASR_MODEL_TTL: "{{ values.model_ttl }}"
+      MODEL_TTL: "{{ values.model_ttl }}"
+      ALLOWED_ORIGINS: ""
+      ALLOW_CREDENTIALS: "false"
+    volumes:
+      - "{{ data }}/cache:/root/.cache"
+      - "{{ data }}/backend-settings:/app/backend-settings:ro"
+    restart: unless-stopped
+    stop_grace_period: 30s
+    {{ healthcheck(5010, 900) | indent(4) }}
     {%- if values.use_gpu %}
     {{ gpu_deploy() | indent(4) }}
     {%- endif %}

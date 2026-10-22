@@ -17,6 +17,8 @@ A self-hosted, Docker-based platform for text-to-speech synthesis, speech-to-tex
 | **Canary-ASR** | 5006 | Optional fastest STT — en/de/es/fr with punctuation (NeMo) |
 | **Chatterbox-TTS** | 5007 | Optional multilingual TTS + voice cloning (MIT, watermarked) |
 | **Magpie-TTS** | 5008 | Optional multilingual TTS with five built-in voices, reads numbers and dates correctly (NVIDIA NeMo) |
+| **Cohere-ASR** | 5009 | Optional STT — Cohere Transcribe 2B, 14 languages incl. German (transformers) |
+| **Granite-ASR** | 5010 | Optional STT — IBM Granite Speech 5.0, keyword biasing, or the fast 470m TurboCTC (transformers) |
 
 Only the **Frontend** is meant to be reached over the network: it proxies every backend call, the live
 microphone WebSocket included. The backend ports are published on `127.0.0.1` only (for `curl`, benchmarks
@@ -40,6 +42,8 @@ ENABLE_WHISPER_CPP=true docker compose --profile whisper-cpp --profile frontend 
 ENABLE_WHISPER_CPP=true docker compose --profile all --profile whisper-cpp up -d       # plus whisper.cpp
 ENABLE_CHATTERBOX_TTS=true docker compose --profile all --profile chatterbox-tts up -d # plus Chatterbox
 ENABLE_MAGPIE_TTS=true docker compose --profile all --profile magpie-tts up -d         # plus NVIDIA Magpie
+ENABLE_COHERE_ASR=true docker compose --profile all --profile cohere-asr up -d         # plus Cohere Transcribe
+ENABLE_GRANITE_ASR=true docker compose --profile all --profile granite-asr up -d       # plus IBM Granite Speech
 
 # Check status
 docker compose ps
@@ -62,10 +66,10 @@ restart and kept in `./settings` (`SETTINGS_DIR`). A saved value wins over `.env
 needs an admin key: `API_KEY`, or on a stack without one a key created with a one-time code that only
 `docker compose logs frontend-service` shows.
 
-`whisper-cpp`, Parakeet, Canary, Chatterbox and Magpie are opt-in. Starting a profile alone is not enough for the
-service to appear in the frontend; offer it under Settings -> Engines, or set the matching `ENABLE_WHISPER_CPP`,
-`ENABLE_PARAKEET_ASR`, `ENABLE_CANARY_ASR`, `ENABLE_CHATTERBOX_TTS` or `ENABLE_MAGPIE_TTS=true` for the frontend
-service as well.
+`whisper-cpp`, Parakeet, Canary, Cohere-ASR, Granite-ASR, Chatterbox and Magpie are opt-in. Starting a profile
+alone is not enough for the service to appear in the frontend; offer it under Settings -> Engines, or set the
+matching `ENABLE_WHISPER_CPP`, `ENABLE_PARAKEET_ASR`, `ENABLE_CANARY_ASR`, `ENABLE_COHERE_ASR`,
+`ENABLE_GRANITE_ASR`, `ENABLE_CHATTERBOX_TTS` or `ENABLE_MAGPIE_TTS=true` for the frontend service as well.
 
 Images are pulled from GHCR as `ghcr.io/steffenhebestreit/tts-stt-*:${IMAGE_TAG}` (`latest` by default, which
 follows the newest release or master build). Pin `IMAGE_TAG=X.Y.Z` where a deployment has to be reproducible,
@@ -78,7 +82,7 @@ and `PULL_POLICY=always` together with `latest` to fetch a moved tag on `up`.
 - [docs/developer-roadmap.md](docs/developer-roadmap.md) - planned architecture and migration steps for provider-generalization, with the current status
 - [docs/device-deployment-matrix.md](docs/device-deployment-matrix.md) - which services and models to run on which device, with ready-made presets in [`deploy/profiles/`](deploy/profiles/)
 - [docs/model-and-optimisation-research-2026-08.md](docs/model-and-optimisation-research-2026-08.md) - model and optimisation decisions, with an implementation-status addendum
-- [benchmarks/README.md](benchmarks/README.md) - measure German WER and latency of a backend on your own audio, and compare Whisper, Parakeet, Qwen3-ASR and a German fine-tune
+- [benchmarks/README.md](benchmarks/README.md) - measure German WER and latency of a backend on your own audio, and compare Whisper, Parakeet, Qwen3-ASR, Cohere, Granite and a German fine-tune
 
 ---
 
@@ -97,6 +101,8 @@ Different services support different GPU backends. Choose based on your hardware
 | Qwen3-TTS | ✓ (slow) | ✓ | ✓ | — |
 | Parakeet-ASR | ✓ (slow) | ✓ | ✓ (NeMo 2.x image) | — |
 | Canary-ASR | ✓ (slow) | ✓ | — | — |
+| Cohere-ASR | ✓ (slow) | ✓ | — | — |
+| Granite-ASR | ✓ (slow) | ✓ | — | — |
 | Chatterbox-TTS | ✓ (slow) | ✓ | — | — |
 | Magpie-TTS | — | ✓ | — | — |
 | PiperTTS | CPU only | — | — | — |
@@ -282,6 +288,21 @@ Use smaller models (`WHISPER_MODEL_SIZE=small`, `WHISPER_MODEL=small`) to improv
 - A local `.nemo` checkpoint (for example a German fine-tune) can be used through `PARAKEET_ASR_MODEL` / `CANARY_ASR_MODEL`
 - Opt-in: profile `parakeet-asr` / `canary-asr` plus `ENABLE_PARAKEET_ASR` / `ENABLE_CANARY_ASR` on the frontend
 
+### Speech Recognition — Cohere Transcribe (optional)
+- Cohere's `cohere-transcribe-03-2026` (2B, Apache-2.0, conformer encoder-decoder) through transformers' own classes, no remote code: Arabic, Chinese, Dutch, English, French, German, Greek, Italian, Japanese, Korean, Polish, Portuguese, Spanish, Vietnamese
+- No language detection: `auto` and no language mean `COHERE_ASR_DEFAULT_LANGUAGE` (`de`); a language it does not know is a 422
+- The official repository is gated. The default is an ungated mirror pinned to one commit, and the service loads its `model.safetensors` only if it has the official SHA-256 (`COHERE_ASR_SHA256`); `COHERE_ASR_MODEL=CohereLabs/cohere-transcribe-03-2026` with `HF_TOKEN` uses the original
+- A voice activity detector (Silero) decides what the model hears, so silence and noise do not come back as words, and long recordings are cut in their pauses into pieces of at most 30 s. The model has no timestamps: each segment is one such piece
+- About 4.2 GB of VRAM and a first-start download of 4.1 GB. Measured on an RTX 4080 on 100 MLS German clips: 5.1 % WER, 0.4 s median per clip
+- Opt-in: profile `cohere-asr` plus `ENABLE_COHERE_ASR` on the frontend. Details: [cohere-asr-service/README.md](cohere-asr-service/README.md)
+
+### Speech Recognition — IBM Granite Speech (optional)
+- `ibm-granite/granite-speech-5.0-2b` (Apache-2.0), a speech LLM: English, French, German, Spanish, Portuguese, Japanese, punctuated and cased (German nouns capitalised), told the language in its prompt, and biased towards up to 2000 keywords (the `keywords` field, or the OpenAI `prompt`, read as a comma-separated list)
+- Or `GRANITE_ASR_MODEL=ibm-granite/granite-speech-5.0-470m-turboctc`: a 470M CTC model that adds Italian, needs about a quarter of the VRAM and is ten times faster, without keywords
+- `auto` and no language mean `GRANITE_ASR_DEFAULT_LANGUAGE` (`de`); another language is a 422. The same speech gate and pause-based chunking as Cohere-ASR, and chunk-level segments
+- About 4.7 GB of VRAM with the 2b (1.2 GB with the 470m) and a first-start download of 4.6 GB (0.95 GB). Measured on an RTX 4080 on 100 MLS German clips: 6.6 % WER at 1.7 s median (2b), 5.7 % WER at 0.16 s (470m)
+- Opt-in: profile `granite-asr` plus `ENABLE_GRANITE_ASR` on the frontend. Details: [granite-asr-service/README.md](granite-asr-service/README.md)
+
 ### Text-to-Speech — Chatterbox (optional)
 - Multilingual TTS and voice cloning (MIT licence; every file carries a PerTh watermark)
 - Long texts are generated in chunks (up to `CHATTERBOX_MAX_TEXT_CHARS`, 5000, then HTTP 413) and can be streamed sentence by sentence (`/tts-stream`)
@@ -407,6 +428,15 @@ clone voices (`/clone`, `/voices/save`). No language means German (`QWEN3_DEFAUL
 | GET | `/ready` | Readiness (503 while the model loads or after a failed load) |
 | GET | `/health` | Health check |
 
+### Cohere-ASR (port 5009) and Granite-ASR (port 5010)
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/transcribe` | Transcribe audio (`audio`, `language`; Granite also `keywords`, and reads `initial_prompt` as keywords). 422 for a language the model does not know; `speech_seconds`, `chunks`, `truncated` and `warnings` in the answer |
+| POST | `/unload` | Free the VRAM now (409 while a request is running) |
+| GET | `/status` | Model, revision, weights check, supported languages, VAD, queue and GPU memory |
+| GET | `/ready` | Readiness (503 while the model loads or after a failed load, including weights that fail the SHA-256 check) |
+| GET | `/health` | Health check |
+
 ### Chatterbox-TTS (port 5007)
 | Method | Endpoint | Description |
 |--------|----------|-------------|
@@ -446,7 +476,7 @@ the per-service limits; the ones most people touch:
 | `STT_DEFAULT_LANGUAGE` | (empty: auto-detect) | Language `stt-service` uses when a request names none; the web UI sends `auto` itself |
 | `FORCE_ACCELERATION` | (empty: auto-detect) | Only `rocm` changes behaviour (faster-whisper on AMD); use `USE_CUDA=false` to force the CPU |
 | `WHISPER_CPP_PORT` | `5003` | Host port for whisper-cpp |
-| `ENABLE_WHISPER_CPP`, `ENABLE_PARAKEET_ASR`, `ENABLE_CANARY_ASR`, `ENABLE_CHATTERBOX_TTS`, `ENABLE_MAGPIE_TTS` | `false` | Expose the optional backend in the frontend provider registry and status checks |
+| `ENABLE_WHISPER_CPP`, `ENABLE_PARAKEET_ASR`, `ENABLE_CANARY_ASR`, `ENABLE_COHERE_ASR`, `ENABLE_GRANITE_ASR`, `ENABLE_CHATTERBOX_TTS`, `ENABLE_MAGPIE_TTS` | `false` | Expose the optional backend in the frontend provider registry and status checks |
 | `ENABLE_TRAINING` | `true` (`false` in the TrueNAS file) | The Voice Training tab, its status dot and `/api/training`; the service itself runs with `--profile training` |
 | `DEFAULT_STT_PROVIDER`, `DEFAULT_TTS_PROVIDER` | `whisper`, `piper` | Engine the UI preselects; the ARM64 and Strix Halo presets use `whisper-cpp` because `stt-service` does not run there |
 | `GGML_VULKAN_DEVICE` | `0` | Vulkan GPU device index |
@@ -464,7 +494,7 @@ the per-service limits; the ones most people touch:
 | `SETTINGS_DIR`, `BACKEND_SETTINGS_DIR` | `${APP_DATA_DIR}/settings`, `.../backend-settings` | Where the Settings page saves (frontend only) and the folder kept for backend settings saved there (every Python backend mounts it read-only). Bind mounts: the page refuses to save into a container |
 | `MAX_UPLOAD_MB`, `MAX_TTS_CHARS` | `512`, `5000` | Gateway limits (`5000` is what Qwen3-TTS, Chatterbox and Magpie accept; a Piper-only setup can raise it). Each backend has its own (`ASR_MAX_UPLOAD_MB`, `PIPER_MAX_UPLOAD_MB`, `CHATTERBOX_MAX_TEXT_CHARS`, ... see `.env.example`) |
 | `MAX_CONCURRENT_UPLOADS`, `MAX_CONCURRENT_FFMPEG` | `4`, `4` | Per gateway worker: uploads forwarded at once and `ffmpeg` conversions for `/v1/audio/speech`; the next request gets `503` + `Retry-After` |
-| `ASR_MAX_QUEUE`, `ASR_QUEUE_TIMEOUT_S` | (empty: 4 x `ASR_MAX_CONCURRENCY`), `60` | Requests that may wait for the one inference slot of Qwen3-ASR, Parakeet and Canary (`0` = nobody waits) and how long; beyond either the answer is `503` + `Retry-After`. `TTS_MAX_QUEUE` and `TTS_QUEUE_TIMEOUT_S` do the same for Qwen3-TTS, Chatterbox and Magpie |
+| `ASR_MAX_QUEUE`, `ASR_QUEUE_TIMEOUT_S` | (empty: 4 x `ASR_MAX_CONCURRENCY`), `60` | Requests that may wait for the one inference slot of Qwen3-ASR, Parakeet, Canary, Cohere-ASR and Granite-ASR (`0` = nobody waits) and how long; beyond either the answer is `503` + `Retry-After`. `TTS_MAX_QUEUE` and `TTS_QUEUE_TIMEOUT_S` do the same for Qwen3-TTS, Chatterbox and Magpie |
 | `PIPER_MAX_CUSTOM_VOICES`, `PIPER_MAX_CUSTOM_MB` | `20`, `2048` | Most uploaded Piper voices (`0` = no upload; `409` beyond it) and their total size (`413`); a new voice must also load and answer a test request within `PIPER_ONNX_VALIDATE_TIMEOUT_S` (30) |
 | `BACKEND_ALLOWED_ORIGINS` | (empty: closed) | CORS for the backends' own ports. Empty means no CORS headers and foreign-Origin POST/DELETE requests are refused (`403`); `*` must be set explicitly (each service logs a warning) |
 | `ALLOW_CREDENTIALS` | `false` | Enables CORS credentials only when origins are explicit |
@@ -501,6 +531,8 @@ tts-stt-playground/
 ├── canary-asr-service/          # Canary STT (NeMo), optional
 ├── chatterbox-tts-service/      # Chatterbox TTS + cloning, optional
 ├── magpie-tts-service/          # Magpie TTS (NVIDIA NeMo), optional
+├── cohere-asr-service/          # Cohere Transcribe STT (transformers), optional
+├── granite-asr-service/         # IBM Granite Speech STT (transformers), optional
 │                                #   each service dir: app.py, Dockerfile (CUDA), Dockerfile.rocm where one exists
 ├── benchmarks/                  # German ASR evaluation (WER, latency, significance test)
 ├── scripts/                     # sync_openapi.py, plan_publish.py, check_no_skips.py, scripts/truenas/*
@@ -528,6 +560,8 @@ curl http://localhost:5005/ready    # Parakeet-ASR (optional)
 curl http://localhost:5006/ready    # Canary-ASR (optional)
 curl http://localhost:5007/ready    # Chatterbox-TTS (optional)
 curl http://localhost:5008/ready    # Magpie-TTS (optional)
+curl http://localhost:5009/ready    # Cohere-ASR (optional)
+curl http://localhost:5010/ready    # Granite-ASR (optional)
 curl http://localhost:8080/ready    # Piper Training (names unwritable directories, a wrong PyTorch build, low disk)
 curl http://localhost:5003/         # whisper-cpp (any HTTP response = up)
 curl http://localhost:3000/health   # Frontend
@@ -632,7 +666,7 @@ hardware has room.
 - For training: reduce batch size
 
 **Port conflicts**
-Default ports: 3000, 5000-5008, 8080. Override with env vars: `FRONTEND_PORT`, `PIPER_TTS_PORT`, `STT_PORT`, `QWEN3_ASR_PORT`, `WHISPER_CPP_PORT`, `QWEN3_TTS_PORT`, `PARAKEET_ASR_PORT`, `CANARY_ASR_PORT`, `CHATTERBOX_TTS_PORT`, `MAGPIE_TTS_PORT`, `TRAINING_PORT`.
+Default ports: 3000, 5000-5010, 8080. Override with env vars: `FRONTEND_PORT`, `PIPER_TTS_PORT`, `STT_PORT`, `QWEN3_ASR_PORT`, `WHISPER_CPP_PORT`, `QWEN3_TTS_PORT`, `PARAKEET_ASR_PORT`, `CANARY_ASR_PORT`, `CHATTERBOX_TTS_PORT`, `MAGPIE_TTS_PORT`, `COHERE_ASR_PORT`, `GRANITE_ASR_PORT`, `TRAINING_PORT`.
 
 ---
 
@@ -728,7 +762,7 @@ instead, and an optional `diun` service sends notifications only. Details are in
 - An NVIDIA driver that supports CUDA 12.8 for the GPU services (R570 or newer; RTX 50 series
   cards require it), installed from Apps → Settings → Install NVIDIA Drivers.
 - The default set (Whisper `large-v3-turbo`, Qwen3-ASR, Qwen3-TTS 0.6B) is about 8 GB of VRAM
-  resident; optional services add more (Canary, Parakeet, Chatterbox, Magpie, training). Every GPU model is
+  resident; optional services add more (Canary, Parakeet, Cohere, Granite, Chatterbox, Magpie, training). Every GPU model is
   freed after `MODEL_TTL` seconds idle (300), so the sum need not fit at once. Budget against what
   `nvidia-smi` reports for your card; the per-service table is in the guide.
 - Remote browser access needs nothing beyond port 3000 (`ALLOWED_ORIGINS` stays empty) as long as you

@@ -31,7 +31,8 @@ const LIST_KINDS = new Set(['hosts', 'origins']);
 
 const ENGINE_NAMES = {
     piper: 'Piper', qwen3: 'Qwen3-TTS', whisper: 'Whisper', 'qwen3-asr': 'Qwen3-ASR',
-    canary: 'Canary-ASR', parakeet: 'Parakeet-ASR', chatterbox: 'Chatterbox-TTS',
+    canary: 'Canary-ASR', parakeet: 'Parakeet-ASR', 'cohere-asr': 'Cohere-ASR',
+    'granite-asr': 'Granite-ASR', chatterbox: 'Chatterbox-TTS',
     magpie: 'Magpie-TTS', 'whisper-cpp': 'whisper.cpp', 'piper-training': 'Voice training',
 };
 const SOURCE_LABELS = {

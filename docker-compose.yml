@@ -608,6 +608,173 @@ services:
     networks:
       - tts-stt-network
 
+  # Cohere-ASR service (Cohere Transcribe 03-2026, Apache-2.0: 2B, 14 languages incl. German)
+  # Opt-in, not part of the `all` profile. Enable it in the browser UI with
+  # ENABLE_COHERE_ASR=true on the frontend. ~4.2 GB of VRAM while resident (bf16).
+  cohere-asr-service:
+    profiles: [cohere-asr]
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-cohere-asr:${IMAGE_TAG:-latest}
+    pull_policy: ${PULL_POLICY:-missing}
+    build:
+      context: ./cohere-asr-service
+      dockerfile: Dockerfile
+      # torch 2.11 from the cu128 index, shared with granite-asr-service (both images
+      # are the same up to their own code). Override only to a release that publishes
+      # a cu128 wheel; the build fails unless the result has sm_120 kernels.
+      args:
+        - TORCH_VERSION=${TRANSFORMERS_ASR_TORCH_VERSION:-2.11.0}
+        - TORCHAUDIO_VERSION=${TRANSFORMERS_ASR_TORCHAUDIO_VERSION:-2.11.0}
+    ports:
+      - "${BACKEND_BIND_ADDR:-127.0.0.1}:${COHERE_ASR_PORT:-5009}:5009"
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+      # The official CohereLabs repository is gated (a token is needed); the default
+      # is an ungated mirror pinned to one commit whose weights are checked against
+      # the official SHA-256 before loading (cohere-asr-service/README.md).
+      # Empty REVISION = that commit for the mirror, main for anything else. SHA256:
+      # empty = the official digest for the mirror and no check otherwise; a hex
+      # digest = that one; off = no check.
+      COHERE_ASR_MODEL: ${COHERE_ASR_MODEL:-evewashere/cohere-transcribe-03-2026-ungated}
+      COHERE_ASR_REVISION: ${COHERE_ASR_REVISION:-}
+      COHERE_ASR_SHA256: ${COHERE_ASR_SHA256:-}
+      # Only for COHERE_ASR_MODEL=CohereLabs/cohere-transcribe-03-2026 (accept the
+      # terms on Hugging Face first). Never logged or shown by the service.
+      HF_TOKEN: ${HF_TOKEN:-}
+      # No language detection: `auto` and no language mean this one.
+      COHERE_ASR_DEFAULT_LANGUAGE: ${COHERE_ASR_DEFAULT_LANGUAGE:-de}
+      # Longest piece (5-30 s) a recording is cut into, in its pauses, and pieces per
+      # generate() call (bounds the activations; lower it on OOM). Empty
+      # MAX_NEW_TOKENS = 20 x COHERE_ASR_CHUNK_S; a piece that reaches it is flagged
+      # truncated in the response.
+      COHERE_ASR_CHUNK_S: ${COHERE_ASR_CHUNK_S:-30}
+      COHERE_ASR_BATCH_SIZE: ${COHERE_ASR_BATCH_SIZE:-4}
+      COHERE_ASR_MAX_NEW_TOKENS: ${COHERE_ASR_MAX_NEW_TOKENS:-}
+      # What the model hears: silero (default) | energy | off. The model turns
+      # silence and noise into words, so only what the VAD calls speech reaches it.
+      COHERE_ASR_VAD: ${COHERE_ASR_VAD:-silero}
+      COHERE_ASR_VAD_THRESHOLD: ${COHERE_ASR_VAD_THRESHOLD:-0.5}
+      MAX_UPLOAD_MB: ${ASR_MAX_UPLOAD_MB:-200}
+      MAX_AUDIO_SECONDS: ${ASR_MAX_AUDIO_SECONDS:-7200}
+      # One shared model on one GPU: bound concurrent inference rather than
+      # letting the default thread pool multiply peak VRAM.
+      ASR_MAX_CONCURRENCY: ${ASR_MAX_CONCURRENCY:-1}
+      # Requests that may wait for a free inference slot. Empty = 4 x
+      # ASR_MAX_CONCURRENCY; 0 = nobody waits. A request beyond that, or one that
+      # waited ASR_QUEUE_TIMEOUT_S seconds without getting its turn, is answered
+      # 503 + Retry-After instead of hanging.
+      ASR_MAX_QUEUE: ${ASR_MAX_QUEUE:-}
+      ASR_QUEUE_TIMEOUT_S: ${ASR_QUEUE_TIMEOUT_S:-60}
+      PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+      # Release the model after this many idle seconds.
+      # >0 seconds | 0 = unload when idle | -1 = never unload.
+      ASR_MODEL_TTL: ${ASR_MODEL_TTL:-300}
+      # Global fallback the code reads when the specific TTL is unset.
+      MODEL_TTL: ${MODEL_TTL:-300}
+      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-}
+      ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
+    volumes:
+      - "${COHERE_ASR_CACHE_DIR:-cohere-asr-cache}:/root/.cache"
+      - "${BACKEND_SETTINGS_DIR:-${APP_DATA_DIR:-.}/backend-settings}:/app/backend-settings:ro"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              count: 1
+    restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5009/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 180s
+      retries: 3
+    networks:
+      - tts-stt-network
+
+  # Granite-ASR service (IBM Granite Speech 5.0, Apache-2.0: the 2b speech LLM with
+  # keyword biasing, or the 470m TurboCTC; en/de/fr/es/pt/ja, the 470m also it).
+  # Opt-in, not part of the `all` profile. Enable it in the browser UI with
+  # ENABLE_GRANITE_ASR=true on the frontend. ~4.7 GB of VRAM resident with the 2b,
+  # ~1.2 GB with the 470m (bf16).
+  granite-asr-service:
+    profiles: [granite-asr]
+    image: ${IMAGE_REGISTRY:-ghcr.io/steffenhebestreit}/tts-stt-granite-asr:${IMAGE_TAG:-latest}
+    pull_policy: ${PULL_POLICY:-missing}
+    build:
+      context: ./granite-asr-service
+      dockerfile: Dockerfile
+      args:
+        - TORCH_VERSION=${TRANSFORMERS_ASR_TORCH_VERSION:-2.11.0}
+        - TORCHAUDIO_VERSION=${TRANSFORMERS_ASR_TORCHAUDIO_VERSION:-2.11.0}
+    ports:
+      - "${BACKEND_BIND_ADDR:-127.0.0.1}:${GRANITE_ASR_PORT:-5010}:5010"
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+      # ibm-granite/granite-speech-5.0-2b (speech LLM, keyword biasing) or
+      # ibm-granite/granite-speech-5.0-470m-turboctc (CTC, ~4x less VRAM, much faster,
+      # no prompt). Empty REVISION = the commit this repository measured for either,
+      # main for anything else. SHA256: a hex digest of model.safetensors to require.
+      GRANITE_ASR_MODEL: ${GRANITE_ASR_MODEL:-ibm-granite/granite-speech-5.0-2b}
+      GRANITE_ASR_REVISION: ${GRANITE_ASR_REVISION:-}
+      GRANITE_ASR_SHA256: ${GRANITE_ASR_SHA256:-}
+      # Only for a private checkpoint; the IBM repositories are public.
+      HF_TOKEN: ${HF_TOKEN:-}
+      # `auto` and no language mean this one (the 2b is told the language).
+      GRANITE_ASR_DEFAULT_LANGUAGE: ${GRANITE_ASR_DEFAULT_LANGUAGE:-de}
+      # Comma/space separated codes to accept instead of the model's own list.
+      GRANITE_SUPPORTED_LANGUAGES: ${GRANITE_SUPPORTED_LANGUAGES:-}
+      # Longest piece (5-120 s) a recording is cut into, in its pauses; pieces per
+      # batch; empty MAX_NEW_TOKENS = 20 x GRANITE_ASR_CHUNK_S (the 2b only).
+      GRANITE_ASR_CHUNK_S: ${GRANITE_ASR_CHUNK_S:-30}
+      GRANITE_ASR_BATCH_SIZE: ${GRANITE_ASR_BATCH_SIZE:-4}
+      GRANITE_ASR_MAX_NEW_TOKENS: ${GRANITE_ASR_MAX_NEW_TOKENS:-}
+      # What the model hears: silero (default) | energy | off.
+      GRANITE_ASR_VAD: ${GRANITE_ASR_VAD:-silero}
+      GRANITE_ASR_VAD_THRESHOLD: ${GRANITE_ASR_VAD_THRESHOLD:-0.5}
+      MAX_UPLOAD_MB: ${ASR_MAX_UPLOAD_MB:-200}
+      MAX_AUDIO_SECONDS: ${ASR_MAX_AUDIO_SECONDS:-7200}
+      # One shared model on one GPU: bound concurrent inference rather than
+      # letting the default thread pool multiply peak VRAM.
+      ASR_MAX_CONCURRENCY: ${ASR_MAX_CONCURRENCY:-1}
+      # Requests that may wait for a free inference slot. Empty = 4 x
+      # ASR_MAX_CONCURRENCY; 0 = nobody waits. A request beyond that, or one that
+      # waited ASR_QUEUE_TIMEOUT_S seconds without getting its turn, is answered
+      # 503 + Retry-After instead of hanging.
+      ASR_MAX_QUEUE: ${ASR_MAX_QUEUE:-}
+      ASR_QUEUE_TIMEOUT_S: ${ASR_QUEUE_TIMEOUT_S:-60}
+      PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+      # Release the model after this many idle seconds.
+      # >0 seconds | 0 = unload when idle | -1 = never unload.
+      ASR_MODEL_TTL: ${ASR_MODEL_TTL:-300}
+      # Global fallback the code reads when the specific TTL is unset.
+      MODEL_TTL: ${MODEL_TTL:-300}
+      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-}
+      ALLOW_CREDENTIALS: ${ALLOW_CREDENTIALS:-false}
+    volumes:
+      - "${GRANITE_ASR_CACHE_DIR:-granite-asr-cache}:/root/.cache"
+      - "${BACKEND_SETTINGS_DIR:-${APP_DATA_DIR:-.}/backend-settings}:/app/backend-settings:ro"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              count: 1
+    restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5010/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 180s
+      retries: 3
+    networks:
+      - tts-stt-network
+
   # Chatterbox-TTS service (Resemble AI, MIT — multilingual TTS + cloning incl. German)
   # Opt-in: enable in the browser UI with ENABLE_CHATTERBOX_TTS=true on the frontend.
   chatterbox-tts-service:
@@ -931,6 +1098,10 @@ services:
       ENABLE_PARAKEET_ASR: ${ENABLE_PARAKEET_ASR:-false}
       CANARY_ASR_SERVICE_URL: ${CANARY_ASR_SERVICE_URL:-http://canary-asr-service:5006}
       ENABLE_CANARY_ASR: ${ENABLE_CANARY_ASR:-false}
+      COHERE_ASR_SERVICE_URL: ${COHERE_ASR_SERVICE_URL:-http://cohere-asr-service:5009}
+      ENABLE_COHERE_ASR: ${ENABLE_COHERE_ASR:-false}
+      GRANITE_ASR_SERVICE_URL: ${GRANITE_ASR_SERVICE_URL:-http://granite-asr-service:5010}
+      ENABLE_GRANITE_ASR: ${ENABLE_GRANITE_ASR:-false}
       CHATTERBOX_TTS_SERVICE_URL: ${CHATTERBOX_TTS_SERVICE_URL:-http://chatterbox-tts-service:5007}
       ENABLE_CHATTERBOX_TTS: ${ENABLE_CHATTERBOX_TTS:-false}
       MAGPIE_TTS_SERVICE_URL: ${MAGPIE_TTS_SERVICE_URL:-http://magpie-tts-service:5008}
@@ -1046,6 +1217,10 @@ volumes:
   parakeet-asr-cache:
     driver: local
   canary-asr-cache:
+    driver: local
+  cohere-asr-cache:
+    driver: local
+  granite-asr-cache:
     driver: local
   chatterbox-tts-cache:
     driver: local

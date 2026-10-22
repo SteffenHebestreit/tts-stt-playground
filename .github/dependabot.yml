@@ -106,6 +106,17 @@ updates:
     ignore:
       - {dependency-name: nemo-toolkit}
 
+  # The two transformers ASR images: one entry for both directories, so a bump reaches
+  # both requirements files in one PR (they must stay identical, see
+  # tests/test_transformers_asr_shared.py). transformers is pinned exactly on purpose:
+  # re-run benchmarks/run_german_eval.py before merging its bump.
+  - package-ecosystem: pip
+    directories: [/cohere-asr-service, /granite-asr-service]
+    schedule: {interval: weekly, day: monday}
+    groups:
+      minor-and-patch: {patterns: ["*"], update-types: [minor, patch]}
+    commit-message: {prefix: "build(deps)"}
+
   - package-ecosystem: pip
     directory: /chatterbox-tts-service
     schedule: {interval: weekly, day: monday}
@@ -209,6 +220,15 @@ updates:
 
   - package-ecosystem: docker
     directory: /canary-asr-service
+    schedule: {interval: weekly, day: monday}
+    groups:
+      docker: {patterns: ["*"]}
+    commit-message: {prefix: "build(docker)"}
+    ignore:
+      - {dependency-name: nvidia/cuda}
+
+  - package-ecosystem: docker
+    directories: [/cohere-asr-service, /granite-asr-service]
     schedule: {interval: weekly, day: monday}
     groups:
       docker: {patterns: ["*"]}
