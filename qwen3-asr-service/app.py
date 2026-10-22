@@ -13,9 +13,11 @@ are per piece, not per word, and segments carry no confidence.
 
 import os
 import time
+import traceback
 import uuid
 import shutil
 import asyncio
+import gc
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -336,6 +338,18 @@ def _load_qwen3_asr():
         return asr_model
     except Exception as e:
         logger.error(f"Failed to load Qwen3-ASR model: {e}", exc_info=True)
+        # A load that runs out of GPU memory half-way (device_map puts the weights straight
+        # on the card) leaves what it already placed reachable from the traceback's frames,
+        # and the allocator keeps the blocks: on the NAS (2026-10-22) the process held 4.5 GB
+        # while reporting "not resident", so vLLM-ASR could not start. Give it back first.
+        traceback.clear_frames(e.__traceback__)
+        asr_model = None
+        gc.collect()
+        if device == "cuda":
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
         raise
 
 
