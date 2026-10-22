@@ -33,6 +33,7 @@ import sys
 import tempfile
 import threading
 import types
+import weakref
 from importlib.util import module_from_spec, spec_from_file_location
 from itertools import count
 from pathlib import Path
@@ -190,8 +191,16 @@ class Fakes:
         self.vad_calls = 0
         self.vad_error: Exception | None = None
         self.load_error: Exception | None = None
+        # .to(<not cpu>) raises this, like a CUDA out-of-memory half-way through a move.
+        self.to_error: Exception | None = None
+        self.model_ref: weakref.ref | None = None
+        # One entry per torch.cuda.empty_cache(): was the last loaded model already gone?
+        self.empty_cache_calls: list[bool] = []
         self.generate_gate: threading.Event | None = None
         self.generate_entered = threading.Event()
+
+    def empty_cache(self):
+        self.empty_cache_calls.append(self.model_ref is not None and self.model_ref() is None)
 
     # huggingface_hub
     def snapshot_download(self, repo_id, revision=None, allow_patterns=None, token=None, **kwargs):
@@ -229,6 +238,8 @@ class _FakeModelBase:
         self.fakes = fakes
 
     def to(self, *args, **kwargs):
+        if self.fakes.to_error is not None and args and args[0] != "cpu":
+            raise self.fakes.to_error
         return self
 
     def eval(self):
@@ -244,7 +255,10 @@ def _class_factory(fakes: Fakes, cls, kind: str):
             fakes.loads.append({"kind": kind, "path": str(path), **kwargs})
             if fakes.load_error is not None and kind == "model":
                 raise fakes.load_error
-            return cls(fakes)
+            built = cls(fakes)
+            if kind == "model":
+                fakes.model_ref = weakref.ref(built)
+            return built
 
     Loader.__name__ = cls.__name__
     return Loader
@@ -410,6 +424,7 @@ def load_app(service: str, monkeypatch, *, model_type: str | None = None, **env)
             else:
                 sys.modules[mod_name] = previous
     module._fake = fakes
+    module.torch.cuda.empty_cache = fakes.empty_cache
     # The Silero wrapper imports torch lazily at first use; give it the fake for good.
     gate = module._speech_gate
     if getattr(gate, "_silero", None) is not None and hasattr(gate._silero, "_torch"):
