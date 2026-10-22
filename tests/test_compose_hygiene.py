@@ -220,6 +220,7 @@ MODEL_SERVICES = (
     "magpie-tts-service",
     "cohere-asr-service",
     "granite-asr-service",
+    "vllm-asr-service",
 )
 
 

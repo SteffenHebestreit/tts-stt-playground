@@ -31,6 +31,7 @@ SERVICES = [
     "canary-asr-service",
     "cohere-asr-service",
     "granite-asr-service",
+    "vllm-asr-service",
 ]
 
 # Calls that either load weights or take a reference that blocks unloading.

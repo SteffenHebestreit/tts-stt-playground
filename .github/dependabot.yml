@@ -117,6 +117,14 @@ updates:
       minor-and-patch: {patterns: ["*"], update-types: [minor, patch]}
     commit-message: {prefix: "build(deps)"}
 
+  # vllm-asr-service adds only the Silero VAD to its vLLM base (installed --no-deps).
+  - package-ecosystem: pip
+    directory: /vllm-asr-service
+    schedule: {interval: weekly, day: monday}
+    groups:
+      minor-and-patch: {patterns: ["*"], update-types: [minor, patch]}
+    commit-message: {prefix: "build(deps)"}
+
   - package-ecosystem: pip
     directory: /chatterbox-tts-service
     schedule: {interval: weekly, day: monday}
@@ -235,6 +243,16 @@ updates:
     commit-message: {prefix: "build(docker)"}
     ignore:
       - {dependency-name: nvidia/cuda}
+
+  # vllm/vllm-openai is the engine itself (the release luna-stt runs on the NAS card): a
+  # bump changes what every model transcribes and how fast, so re-measure before merging
+  # (vllm-asr-service/README.md).
+  - package-ecosystem: docker
+    directory: /vllm-asr-service
+    schedule: {interval: weekly, day: monday}
+    groups:
+      docker: {patterns: ["*"]}
+    commit-message: {prefix: "build(docker)"}
 
   - package-ecosystem: docker
     directory: /chatterbox-tts-service

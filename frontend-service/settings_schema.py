@@ -5,10 +5,10 @@ environment and touches no file, except that the first wildcard host name checke
 reads the vendored Public Suffix List (public_suffix.py).
 
 Keys (phase 1), in page order
-    gateway.json, the 18 preference keys (named like the app YAML's variables):
+    gateway.json, the 19 preference keys (named like the app YAML's variables):
         access   TRUSTED_HOSTS, TRUSTED_ORIGINS, TRUST_PROXY_HEADERS, ALLOWED_ORIGINS
         engines  ENABLE_CANARY_ASR, ENABLE_PARAKEET_ASR, ENABLE_COHERE_ASR, ENABLE_GRANITE_ASR,
-                 ENABLE_CHATTERBOX_TTS, ENABLE_MAGPIE_TTS, ENABLE_WHISPER_CPP, ENABLE_TRAINING,
+                 ENABLE_VLLM_ASR, ENABLE_CHATTERBOX_TTS, ENABLE_MAGPIE_TTS, ENABLE_WHISPER_CPP, ENABLE_TRAINING,
                  DEFAULT_TTS_PROVIDER, DEFAULT_STT_PROVIDER
         limits   MAX_UPLOAD_MB, MAX_TTS_CHARS, MAX_CONCURRENT_UPLOADS, MAX_CONCURRENT_FFMPEG
     keys.json, the 2 access keys (group api_access):
@@ -220,6 +220,7 @@ SETTINGS: tuple[Setting, ...] = (
     _engine_flag("ENABLE_PARAKEET_ASR", "parakeet", "stt", "Parakeet-ASR"),
     _engine_flag("ENABLE_COHERE_ASR", "cohere-asr", "stt", "Cohere-ASR", " (Cohere Transcribe)"),
     _engine_flag("ENABLE_GRANITE_ASR", "granite-asr", "stt", "Granite-ASR", " (IBM Granite Speech)"),
+    _engine_flag("ENABLE_VLLM_ASR", "vllm-asr", "stt", "vLLM-ASR", " (batched speech-to-text through vLLM)"),
     _engine_flag("ENABLE_CHATTERBOX_TTS", "chatterbox", "tts", "Chatterbox-TTS"),
     _engine_flag("ENABLE_MAGPIE_TTS", "magpie", "tts", "Magpie-TTS"),
     _engine_flag("ENABLE_WHISPER_CPP", "whisper-cpp", "stt", "whisper.cpp", " (CPU speech-to-text)"),
@@ -281,7 +282,7 @@ BUILTIN_ENGINES: Mapping[str, str] = MappingProxyType(
 
 _ENGINE_NAMES = {
     "canary": "Canary-ASR", "parakeet": "Parakeet-ASR", "cohere-asr": "Cohere-ASR",
-    "granite-asr": "Granite-ASR", "chatterbox": "Chatterbox-TTS",
+    "granite-asr": "Granite-ASR", "vllm-asr": "vLLM-ASR", "chatterbox": "Chatterbox-TTS",
     "magpie": "Magpie-TTS", "whisper-cpp": "whisper.cpp", "piper-training": "Voice training",
 }
 _KIND_NAMES = {"tts": "text-to-speech", "stt": "speech-to-text", "training": "training"}

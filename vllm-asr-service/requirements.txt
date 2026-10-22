@@ -1,0 +1,7 @@
+# What vllm-asr-service adds to vllm/vllm-openai (the Dockerfile installs it with
+# --no-deps: torch, fastapi, uvicorn, httpx, numpy and huggingface_hub are the
+# base image's, pinned by its vLLM release).
+#
+# Silero VAD for the pause-based chunking and the non-speech gate, the same release as
+# cohere-asr-service and granite-asr-service (tests/test_vllm_asr_shared.py).
+silero-vad==6.2.3

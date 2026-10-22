@@ -107,6 +107,7 @@ services:
       CANARY_ASR_SERVICE_URL: "http://canary-asr-service:5006"
       COHERE_ASR_SERVICE_URL: "http://cohere-asr-service:5009"
       GRANITE_ASR_SERVICE_URL: "http://granite-asr-service:5010"
+      VLLM_ASR_SERVICE_URL: "http://vllm-asr-service:5011"
       CHATTERBOX_TTS_SERVICE_URL: "http://chatterbox-tts-service:5007"
       MAGPIE_TTS_SERVICE_URL: "http://magpie-tts-service:5008"
       WHISPER_CPP_SERVICE_URL: "http://whisper-cpp:8080"
@@ -114,6 +115,7 @@ services:
       ENABLE_CANARY_ASR: "{{ (values.use_gpu and values.enable_canary) | lower }}"
       ENABLE_COHERE_ASR: "{{ (values.use_gpu and values.enable_cohere) | lower }}"
       ENABLE_GRANITE_ASR: "{{ (values.use_gpu and values.enable_granite) | lower }}"
+      ENABLE_VLLM_ASR: "{{ (values.use_gpu and values.enable_vllm) | lower }}"
       ENABLE_CHATTERBOX_TTS: "{{ (values.use_gpu and values.enable_chatterbox) | lower }}"
       ENABLE_MAGPIE_TTS: "{{ (values.use_gpu and values.enable_magpie) | lower }}"
       ENABLE_WHISPER_CPP: "{{ values.enable_whisper_cpp | lower }}"
@@ -484,6 +486,57 @@ services:
     restart: unless-stopped
     stop_grace_period: 30s
     {{ healthcheck(5010, 900) | indent(4) }}
+    {%- if values.use_gpu %}
+    {{ gpu_deploy() | indent(4) }}
+    {%- endif %}
+    networks: [tts-stt-network]
+  {%- endif %}
+
+  {%- if values.use_gpu and values.enable_vllm %}
+
+  vllm-asr-service:
+    image: {{ reg }}/tts-stt-vllm-asr:{{ tag }}
+    pull_policy: "{{ values.pull_policy }}"
+    {%- if values.expose_backend_ports %}
+    ports: ["127.0.0.1:5011:5011"]
+    {%- endif %}
+    environment:
+      NVIDIA_VISIBLE_DEVICES: {{ q(values.gpu_device_id) }}
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      VLLM_ASR_MODEL: {{ q(values.vllm_asr_model) }}
+      VLLM_ASR_REVISION: ""
+      VLLM_ASR_SHA256: ""
+      HF_TOKEN: ""
+      VLLM_ASR_DEFAULT_LANGUAGE: "de"
+      VLLM_ASR_SUPPORTED_LANGUAGES: ""
+      VLLM_ASR_GPU_MEMORY_UTILIZATION: "0.45"
+      VLLM_ASR_MAX_MODEL_LEN: ""
+      VLLM_ASR_MAX_NUM_SEQS: ""
+      VLLM_ASR_MAX_NUM_BATCHED_TOKENS: ""
+      VLLM_ASR_EXTRA_ARGS: ""
+      VLLM_ASR_IDLE_MODE: "sleep"
+      VLLM_ASR_START_TIMEOUT_S: "900"
+      VLLM_ASR_CHUNK_S: "28"
+      VLLM_ASR_MAX_NEW_TOKENS: ""
+      VLLM_ASR_VAD: "silero"
+      VLLM_ASR_VAD_THRESHOLD: "0.5"
+      VLLM_ASR_VAD_WORKERS: "4"
+      MAX_UPLOAD_MB: "200"
+      MAX_AUDIO_SECONDS: "7200"
+      ASR_MAX_CONCURRENCY: "32"
+      ASR_MAX_QUEUE: ""
+      ASR_QUEUE_TIMEOUT_S: "60"
+      ASR_MODEL_TTL: "{{ values.model_ttl }}"
+      MODEL_TTL: "{{ values.model_ttl }}"
+      ALLOWED_ORIGINS: ""
+      ALLOW_CREDENTIALS: "false"
+    volumes:
+      - "{{ data }}/cache:/root/.cache"
+      - "{{ data }}/backend-settings:/app/backend-settings:ro"
+    shm_size: 2gb
+    restart: unless-stopped
+    stop_grace_period: 60s
+    {{ healthcheck(5011, 900) | indent(4) }}
     {%- if values.use_gpu %}
     {{ gpu_deploy() | indent(4) }}
     {%- endif %}

@@ -384,6 +384,31 @@ def test_update_check_never_changes_anything(host, args, stale):
     assert sorted(p.name for p in host.data_dir.rglob("*")) == before
 
 
+def test_a_tag_check_lists_an_image_built_on_the_nas_without_asking_the_registry(host):
+    host.publish("0.2.0")
+    result, out = check(host, "--tag", "0.2.0", "--with", "vllm-asr")
+    assert result.returncode == 0, out
+    assert "built here ghcr.io/steffenhebestreit/tts-stt-vllm-asr:0.2.0" in out
+    assert "MISSING" not in out and "UNKNOWN" not in out
+
+
+def test_a_running_image_built_on_the_nas_is_neither_an_update_nor_unknown(host):
+    host.publish("0.2.0")
+    host.run_app("0.2.0", services=CORE + ["vllm-asr-service"])
+    result, out = check(host)
+    assert result.returncode == 0, out
+    assert "built here" in out and "Up to date." in out
+
+
+def test_a_newer_release_is_not_held_back_by_an_image_built_on_the_nas(host):
+    host.publish("0.2.0")
+    host.publish("0.3.0")
+    host.run_app("0.2.0", services=CORE + ["vllm-asr-service"])
+    result, out = check(host)
+    assert result.returncode == 10, out
+    assert "release 0.3.0 is published" in out and "--with vllm-asr" in out
+
+
 def test_the_image_catalogue_the_fake_registry_uses_is_the_one_the_script_checks(host):
     """Guards the fake itself: a service name the script knows and the fake does not would pass vacuously."""
     host.publish("0.2.0")

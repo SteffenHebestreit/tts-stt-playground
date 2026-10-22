@@ -227,6 +227,7 @@ ENABLE_PARAKEET_ASR = _env_flag("ENABLE_PARAKEET_ASR", False)
 ENABLE_CANARY_ASR = _env_flag("ENABLE_CANARY_ASR", False)
 ENABLE_COHERE_ASR = _env_flag("ENABLE_COHERE_ASR", False)
 ENABLE_GRANITE_ASR = _env_flag("ENABLE_GRANITE_ASR", False)
+ENABLE_VLLM_ASR = _env_flag("ENABLE_VLLM_ASR", False)
 ENABLE_CHATTERBOX_TTS = _env_flag("ENABLE_CHATTERBOX_TTS", False)
 ENABLE_MAGPIE_TTS = _env_flag("ENABLE_MAGPIE_TTS", False)
 # Voice training is on unless switched off: installs without the training
@@ -602,6 +603,7 @@ _ENV_VALUES: Mapping[str, Any] = MappingProxyType({
     "ENABLE_PARAKEET_ASR": ENABLE_PARAKEET_ASR,
     "ENABLE_COHERE_ASR": ENABLE_COHERE_ASR,
     "ENABLE_GRANITE_ASR": ENABLE_GRANITE_ASR,
+    "ENABLE_VLLM_ASR": ENABLE_VLLM_ASR,
     "ENABLE_CHATTERBOX_TTS": ENABLE_CHATTERBOX_TTS,
     "ENABLE_MAGPIE_TTS": ENABLE_MAGPIE_TTS,
     "ENABLE_WHISPER_CPP": ENABLE_WHISPER_CPP,
@@ -1321,6 +1323,7 @@ PARAKEET_ASR_SERVICE_URL = os.getenv("PARAKEET_ASR_SERVICE_URL", "http://parakee
 CANARY_ASR_SERVICE_URL = os.getenv("CANARY_ASR_SERVICE_URL", "http://canary-asr-service:5006")
 COHERE_ASR_SERVICE_URL = os.getenv("COHERE_ASR_SERVICE_URL", "http://cohere-asr-service:5009")
 GRANITE_ASR_SERVICE_URL = os.getenv("GRANITE_ASR_SERVICE_URL", "http://granite-asr-service:5010")
+VLLM_ASR_SERVICE_URL = os.getenv("VLLM_ASR_SERVICE_URL", "http://vllm-asr-service:5011")
 CHATTERBOX_TTS_SERVICE_URL = os.getenv("CHATTERBOX_TTS_SERVICE_URL", "http://chatterbox-tts-service:5007")
 MAGPIE_TTS_SERVICE_URL = os.getenv("MAGPIE_TTS_SERVICE_URL", "http://magpie-tts-service:5008")
 WHISPER_CPP_SERVICE_URL = os.getenv("WHISPER_CPP_SERVICE_URL", "http://whisper-cpp:8080")
@@ -1360,7 +1363,7 @@ _BUILT_ENTRIES: dict = {}
 # Providers whose language list follows the checkpoint their service runs: the
 # service's /status replaces the built-in list (see "settings the backends report"),
 # and the value names them in the selector, "<name> (<model>, <languages>)".
-_LANGUAGE_DISCOVERY = {"canary": "Canary", "granite-asr": "Granite Speech"}
+_LANGUAGE_DISCOVERY = {"canary": "Canary", "granite-asr": "Granite Speech", "vllm-asr": "vLLM"}
 
 
 _NO_OVERRIDE = object()
@@ -2127,6 +2130,48 @@ def _build_provider_registry(flags: Mapping[str, Any], defaults: Mapping[str, An
             },
         }
 
+    if flags["ENABLE_VLLM_ASR"]:
+        providers["vllm-asr"] = {
+            "kind": "stt",
+            "display_name": "vLLM (granite-speech-5.0-2b, de/en/fr/ja/pt/es)",
+            "short_name": "vLLM ASR",
+            "internal_url": VLLM_ASR_SERVICE_URL,
+            "health_endpoint": "/health",
+            # Segments are the service's own chunks (cut in pauses, at most 30 s), which
+            # it sends to the engine all at once so vLLM batches them.
+            "capabilities": ["transcribe", "segments", "model_unload"],
+            # Whether the model identifies the language depends on VLLM_ASR_MODEL
+            # (Qwen3-ASR does, Granite, Cohere and the German Whisper do not); the
+            # contract is not declared for any of them, and "auto" is not listed.
+            "language_detect": False,
+            "contracts": {
+                "transcribe": "stt-form-v1",
+            },
+            "settings": {
+                "defaults": {
+                    "language": "de",
+                    "enable_segmentation": True,
+                },
+                # The default model's (granite-speech-5.0-2b). The service's /status
+                # replaces it with what VLLM_ASR_MODEL takes: see _LANGUAGE_DISCOVERY.
+                "languages": [
+                    {"value": "de", "label": "German"},
+                    {"value": "en", "label": "English"},
+                    {"value": "fr", "label": "French"},
+                    {"value": "ja", "label": "Japanese"},
+                    {"value": "pt", "label": "Portuguese"},
+                    {"value": "es", "label": "Spanish"},
+                ],
+            },
+            "ui": {
+                "selectable_as_stt": True,
+                "show_status": True,
+                "messages": {
+                    "transcription": _build_stt_messages(),
+                },
+            },
+        }
+
     if flags["ENABLE_CHATTERBOX_TTS"]:
         providers["chatterbox"] = {
             "kind": "tts",
@@ -2290,6 +2335,7 @@ def _build_provider_registry(flags: Mapping[str, Any], defaults: Mapping[str, An
             "enable_canary_asr": flags["ENABLE_CANARY_ASR"],
             "enable_cohere_asr": flags["ENABLE_COHERE_ASR"],
             "enable_granite_asr": flags["ENABLE_GRANITE_ASR"],
+            "enable_vllm_asr": flags["ENABLE_VLLM_ASR"],
             "enable_chatterbox_tts": flags["ENABLE_CHATTERBOX_TTS"],
             "enable_magpie_tts": flags["ENABLE_MAGPIE_TTS"],
             "enable_training": flags["ENABLE_TRAINING"],
@@ -4268,7 +4314,7 @@ def _apply(state: settings_store.SettingsState, *, initial: bool = False) -> Non
     global _policy, _keyring, _applied_state, _applied_values, _registry_built_from
     global TRUST_PROXY_HEADERS, MAX_UPLOAD_MB, MAX_REQUEST_BYTES, MAX_TTS_CHARS, MAX_CONCURRENT_UPLOADS
     global ENABLE_WHISPER_CPP, ENABLE_PARAKEET_ASR, ENABLE_CANARY_ASR, ENABLE_CHATTERBOX_TTS
-    global ENABLE_MAGPIE_TTS, ENABLE_TRAINING, ENABLE_COHERE_ASR, ENABLE_GRANITE_ASR
+    global ENABLE_MAGPIE_TTS, ENABLE_TRAINING, ENABLE_COHERE_ASR, ENABLE_GRANITE_ASR, ENABLE_VLLM_ASR
 
     values = _effective(state)
     policy = _build_access_policy(values)
@@ -4291,6 +4337,7 @@ def _apply(state: settings_store.SettingsState, *, initial: bool = False) -> Non
     ENABLE_CANARY_ASR = values["ENABLE_CANARY_ASR"]
     ENABLE_COHERE_ASR = values["ENABLE_COHERE_ASR"]
     ENABLE_GRANITE_ASR = values["ENABLE_GRANITE_ASR"]
+    ENABLE_VLLM_ASR = values["ENABLE_VLLM_ASR"]
     ENABLE_CHATTERBOX_TTS = values["ENABLE_CHATTERBOX_TTS"]
     ENABLE_MAGPIE_TTS = values["ENABLE_MAGPIE_TTS"]
     ENABLE_TRAINING = values["ENABLE_TRAINING"]
@@ -4825,6 +4872,7 @@ _ENGINE_PROFILES = {
     "canary": ("canary-asr", "about 5 GB"),
     "cohere-asr": ("cohere-asr", "about 9 GB"),
     "granite-asr": ("granite-asr", "about 10 GB"),
+    "vllm-asr": ("vllm-asr", "about 9 GB for the vLLM base image and 2-5 GB for the model"),
     "parakeet": ("parakeet-asr", "about 5 GB"),
     "chatterbox": ("chatterbox-tts", "about 5 GB"),
     "magpie": ("magpie-tts", "about 5 GB"),
@@ -4839,6 +4887,7 @@ def _engine_targets() -> dict[str, tuple[str, str]]:
         "canary": (CANARY_ASR_SERVICE_URL, "/health"),
         "cohere-asr": (COHERE_ASR_SERVICE_URL, "/health"),
         "granite-asr": (GRANITE_ASR_SERVICE_URL, "/health"),
+        "vllm-asr": (VLLM_ASR_SERVICE_URL, "/health"),
         "parakeet": (PARAKEET_ASR_SERVICE_URL, "/health"),
         "chatterbox": (CHATTERBOX_TTS_SERVICE_URL, "/health"),
         "magpie": (MAGPIE_TTS_SERVICE_URL, "/health"),
@@ -4933,12 +4982,20 @@ async def _engine_status_for(changes: Mapping[str, Any]) -> Optional[dict[str, s
     return (await _engine_states())["states"]
 
 
+# What has to happen before an engine's profile line can go. vllm-asr's image is not
+# published (its vLLM base is 32 GB unpacked, more than CI can build): the NAS builds it.
+_ENGINE_FIRST_STEPS = {
+    "vllm-asr": "Build its image on the NAS first (vllm-asr-service/README.md), then: ",
+}
+
+
 def _install_hint(profile: Optional[str], download: Optional[str]) -> Optional[dict]:
     if profile is None:
         return None
     size = f" ({download} download)" if download else ""
+    first = _ENGINE_FIRST_STEPS.get(profile, "")
     return {"profile": profile,
-            "truenas": f'Apps -> tts-stt -> Edit -> delete the line profiles: ["{profile}"] -> Save{size}',
+            "truenas": f'{first}Apps -> tts-stt -> Edit -> delete the line profiles: ["{profile}"] -> Save{size}',
             "compose": f"docker compose --profile {profile} up -d"}
 
 

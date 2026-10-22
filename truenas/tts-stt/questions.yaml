@@ -188,6 +188,33 @@ questions:
         - {value: ibm-granite/granite-speech-5.0-470m-turboctc, description: granite-speech-5.0-470m-turboctc (CTC, much faster, about 1.2 GB VRAM)}
       show_if: [["enable_granite", "=", true]]
 
+  - variable: enable_vllm
+    label: vLLM-ASR (batched STT through vLLM, about 7.2 GB VRAM; image built on the NAS)
+    description: >-
+      One of the STT candidates (Granite Speech 5.0 2b, Cohere Transcribe, Qwen3-ASR 1.7B or
+      Whisper turbo German) under vLLM's continuous batching, for throughput. The engine takes 45 %
+      of the card while awake and sleeps when idle. Needs an NVIDIA driver 580 or newer. The image
+      is not published: build ghcr.io/steffenhebestreit/tts-stt-vllm-asr with the release tag on
+      the NAS first (vllm-asr-service/README.md in the repository).
+    group: Optional services
+    schema:
+      type: boolean
+      default: false
+      show_if: [["use_gpu", "=", true]]
+
+  - variable: vllm_asr_model
+    label: vLLM-ASR model
+    group: Optional services
+    schema:
+      type: string
+      default: ibm-granite/granite-speech-5.0-2b
+      enum:
+        - {value: ibm-granite/granite-speech-5.0-2b, description: granite-speech-5.0-2b (de en fr es pt ja, keyword biasing)}
+        - {value: evewashere/cohere-transcribe-03-2026-ungated, description: Cohere Transcribe 03-2026 (14 languages, weights checked against Cohere's digest)}
+        - {value: Qwen/Qwen3-ASR-1.7B, description: Qwen3-ASR 1.7B (28 languages, identifies the language)}
+        - {value: primeline/whisper-large-v3-turbo-german, description: Whisper large-v3-turbo German fine-tune (German only)}
+      show_if: [["enable_vllm", "=", true]]
+
   - variable: enable_chatterbox
     label: Chatterbox-TTS (streaming German TTS with cloning, about 4 GB VRAM)
     description: The only TTS backend that streams sentence by sentence, so speech starts early.

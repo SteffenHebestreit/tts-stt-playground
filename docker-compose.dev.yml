@@ -96,6 +96,20 @@ services:
       - "./granite-asr-service/origin_guard.py:/app/origin_guard.py"
       - "./granite-asr-service/model_lifecycle.py:/app/model_lifecycle.py"
 
+  vllm-asr-service:
+    volumes:
+      - "./vllm-asr-service/app.py:/app/app.py"
+      - "./vllm-asr-service/vllm_engine.py:/app/vllm_engine.py"
+      - "./vllm-asr-service/vllm_support.py:/app/vllm_support.py"
+      - "./vllm-asr-service/vad_pool.py:/app/vad_pool.py"
+      - "./vllm-asr-service/cohere_support.py:/app/cohere_support.py"
+      - "./vllm-asr-service/granite_support.py:/app/granite_support.py"
+      - "./vllm-asr-service/transformers_asr.py:/app/transformers_asr.py"
+      - "./vllm-asr-service/audio_pipeline.py:/app/audio_pipeline.py"
+      - "./vllm-asr-service/body_limit.py:/app/body_limit.py"
+      - "./vllm-asr-service/origin_guard.py:/app/origin_guard.py"
+      - "./vllm-asr-service/model_lifecycle.py:/app/model_lifecycle.py"
+
   chatterbox-tts-service:
     volumes:
       - "./chatterbox-tts-service/app.py:/app/app.py"

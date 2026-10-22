@@ -197,6 +197,21 @@ def test_a_blackwell_card_on_r570_or_newer_is_fine(host, driver):
     assert "supports CUDA 12.8" in out
 
 
+@pytest.mark.parametrize("driver, ok", [("575.51.03", False), ("580.65.06", True), ("590.44.01", True)])
+def test_vllm_asr_needs_a_driver_for_cuda_13(host, driver, ok):
+    """Its base, vllm/vllm-openai:v0.31.0, is a CUDA 13 build: R580 or newer, more than the other images."""
+    gpu(host, driver=driver)
+    result, out = preflight(host, "--with", "vllm-asr")
+    lines = lines_with(out, "vllm-asr-service")
+    if ok:
+        assert any("new enough for vllm-asr-service" in line for line in lines), out
+        # Only its own verdict: a host's other findings (a busy port) are not this test's business.
+        assert not [line for line in lines_with(out, "[FAIL]") if "vllm-asr" in line or "R580" in line], out
+    else:
+        assert result.returncode == 1, out
+        assert any("[FAIL]" in line and "R580" in line for line in lines), out
+
+
 def test_the_blackwell_check_works_from_the_name_when_compute_cap_is_unavailable(host):
     """Older nvidia-smi cannot query compute_cap; the model name then decides."""
     host.state["nvidia"]["compute_cap"] = False
