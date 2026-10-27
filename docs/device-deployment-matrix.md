@@ -23,6 +23,9 @@ they were.
 Ready-made presets: [`deploy/profiles/`](../deploy/profiles/) — `rk3588.env`,
 `truenas-5060ti.env`, `workstation-4080.env`, `strixhalo.env`.
 
+Without Docker on a Strix Halo host that already runs llama-swap: [`deploy/native-strixhalo/`](../deploy/native-strixhalo/README.md)
+(API only; whisper.cpp `large-v3-turbo-q8_0` on Vulkan, 25 s of German in ~0.8 s, 1.7 % WER on the test dialogue).
+
 ---
 
 ## German evidence, per component
