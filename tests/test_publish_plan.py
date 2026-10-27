@@ -352,6 +352,35 @@ def test_the_digest_check_names_the_architecture_that_is_missing(tmp_path):
     assert _bash(step, tmp_path, lonely, tmp_path).returncode == 1
 
 
+
+@needs_shell
+def test_each_digest_artifact_carries_its_own_directory(tmp_path):
+    """download-artifact extracts a pattern that matches ONE artifact straight into
+    its path, without the per-artifact sub-directory it creates when several match.
+    Every single-architecture image's manifest job then found no digests-<key>_amd64
+    and failed, although its build had pushed it (the first publish run with
+    download-artifact v8). The artifact now holds that directory itself and the
+    download merges, so one artifact and several give the same layout."""
+    build_steps = _workflow()["jobs"]["build"]["steps"]
+    export = next(s for s in build_steps if s.get("name") == "Export digest")
+    upload = next(s for s in build_steps if s.get("name") == "Upload digest")
+    assert _step("Download digests")["with"].get("merge-multiple") is True
+    assert export["env"]["ARTIFACT"] == upload["with"]["name"] == "${{ matrix.artifact }}"
+    assert upload["with"]["path"] == "/tmp/digests/*", "the wildcard keeps the sub-directory in the artifact"
+
+    root = tmp_path / "digests"
+    step = {**export, "run": export["run"].replace("/tmp/digests", str(root))}
+    env = {**os.environ, "DIGEST": "sha256:abc123", "ARTIFACT": "digests-stt_amd64"}
+    assert _bash(step, tmp_path, env, tmp_path).returncode == 0
+    files = sorted(p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file())
+    assert files == ["digests-stt_amd64/abc123"]
+
+    # what the merged download of that one artifact leaves passes the check
+    check = _step("Check every architecture of this image was built")
+    check = {**check, "run": check["run"].replace("/tmp/digests", str(root))}
+    assert _bash(check, tmp_path, {**os.environ, "KEY": "stt", "EXPECTED": "amd64"}, tmp_path).returncode == 0
+
+
 @needs_shell
 def test_the_manifest_is_assembled_from_the_exported_json_and_this_images_digests(tmp_path):
     step = _step("Create and push manifest list")
