@@ -5,7 +5,7 @@ Provides batch transcription, streaming SSE, live WebSocket transcription and
 language detection endpoints.
 """
 
-from fastapi import FastAPI, UploadFile, HTTPException, File, Form, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, UploadFile, HTTPException, File, Form, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse, JSONResponse
 import numpy as np
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,7 +14,7 @@ try:
     from faster_whisper import BatchedInferencePipeline
 except ImportError:  # pragma: no cover - only an old or stubbed faster-whisper lacks it
     BatchedInferencePipeline = None
-from typing import Any, Union, List
+from typing import Any, Optional, Union, List
 from contextlib import asynccontextmanager
 import torch
 import os
@@ -931,6 +931,31 @@ def _enforce_duration_cap(path):
         _check_audio_seconds(_probe_duration_s(path))
 
 
+# Declared defaults of the boolean form fields. FastAPI 0.147.0 to 0.161.x read a
+# bool form field the request left out as False (HTML-checkbox semantics), not as
+# its declared default; 0.162.0 restored the default. A client that omits
+# vad_filter must get the VAD on whichever FastAPI the image resolves, so the
+# upload routes put the default back themselves for a flag that is not in the
+# submitted form at all (_form_flag). `Optional[bool] = Form(None)` would not do:
+# those versions read an omitted `bool | None` as False too. The Form(...)
+# declarations keep the defaults, so the OpenAPI schema documents them unchanged.
+VAD_FILTER_DEFAULT = True
+CONDITION_ON_PREVIOUS_TEXT_DEFAULT = True
+
+
+async def _submitted_form(request: Optional[Request]):
+    """The form as the client sent it, or None for a route called directly in-process."""
+    # FastAPI parsed it before the route ran; Starlette caches it on the request.
+    return None if request is None else await request.form()
+
+
+def _form_flag(form, name: str, parsed: bool, default: bool) -> bool:
+    """`parsed` when the client sent `name`, else the declared `default`."""
+    if form is None or name in form:
+        return parsed
+    return default
+
+
 def _transcribe_file(model, path, *, vad_filter, **kwargs):
     """model.transcribe for a file, via the batched pipeline when opted in."""
     # The batched pipeline chunks by VAD; without it, audio past 30 s raises.
@@ -944,6 +969,7 @@ def _transcribe_file(model, path, *, vad_filter, **kwargs):
 # Add better error handling and logging
 @app.post("/transcribe")
 async def transcribe_audio(
+    request: Request = None,
     # Accept either a single file (legacy) or multiple files (batch)
     audio: UploadFile = File(None),
     audios: List[UploadFile] = File(None),
@@ -956,10 +982,10 @@ async def transcribe_audio(
     temperature: Union[float, str] = Form("0.0,0.2,0.4,0.6,0.8,1.0"),
     suppress_tokens: str = Form("-1"),
     initial_prompt: str = Form(""),
-    condition_on_previous_text: bool = Form(True),
+    condition_on_previous_text: bool = Form(CONDITION_ON_PREVIOUS_TEXT_DEFAULT),
     compression_ratio_threshold: float = Form(2.4),
     no_speech_threshold: float = Form(0.6),
-    vad_filter: bool = Form(True),
+    vad_filter: bool = Form(VAD_FILTER_DEFAULT),
     vad_threshold: float = Form(0.5),
 ):
     """Transcribe one or more audio files to text.
@@ -967,6 +993,11 @@ async def transcribe_audio(
     Supports single-file (``audio``) and multi-file (``audios``) uploads.
     Returns per-file results with segments, language, and timing information.
     """
+    form = await _submitted_form(request)
+    vad_filter = _form_flag(form, "vad_filter", vad_filter, VAD_FILTER_DEFAULT)
+    condition_on_previous_text = _form_flag(
+        form, "condition_on_previous_text", condition_on_previous_text, CONDITION_ON_PREVIOUS_TEXT_DEFAULT
+    )
     logger.info(f"Transcription request - task: {task}, language: {language}")
 
     _validate_task(task)
@@ -1200,16 +1231,18 @@ class _HeldStreamingResponse(StreamingResponse):
 
 @app.post("/transcribe-stream")
 async def transcribe_audio_stream(
+    request: Request = None,
     audio: UploadFile = File(...),
     language: str = Form(None),
     task: str = Form("transcribe"),
     target_language: str = Form("english"),
     beam_size: int = Form(5),
-    vad_filter: bool = Form(True),
+    vad_filter: bool = Form(VAD_FILTER_DEFAULT),
     vad_threshold: float = Form(0.5),
     no_speech_threshold: float = Form(0.6),
 ):
     """Stream transcription results via Server-Sent Events as segments are decoded."""
+    vad_filter = _form_flag(await _submitted_form(request), "vad_filter", vad_filter, VAD_FILTER_DEFAULT)
     _validate_task(task)
     _reject_unsupported_translate(task)
 

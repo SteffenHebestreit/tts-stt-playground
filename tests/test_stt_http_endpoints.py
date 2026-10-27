@@ -376,6 +376,60 @@ def test_the_batched_pipeline_serves_files_when_enabled_but_never_the_live_path(
         assert FakeBatchedPipeline.instances == [], "the WebSocket decoder must never use the batched pipeline"
 
 
+
+# --- omitted boolean form fields keep their declared defaults ----------------
+# FastAPI 0.147.0 to 0.161.x read a `bool = Form(True)` field the request left
+# out as False (HTML-checkbox semantics): a client that omitted vad_filter got the
+# VAD off. The routes put the declared default back themselves (_form_flag), so
+# these hold on every FastAPI the image may resolve, not only on the pinned one.
+
+
+def test_transcribe_without_vad_filter_runs_the_vad(client):
+    response = _post(client, data={"language": "de"})
+    assert response.status_code == 200
+    call = client.fake_model.calls[-1]
+    assert call["vad_filter"] is True, "an omitted vad_filter must mean the declared default (on)"
+    assert call["vad_parameters"] is not None
+    assert call["condition_on_previous_text"] is True
+
+
+def test_transcribe_honours_flags_the_client_turned_off(client):
+    response = _post(client, data={"vad_filter": "false", "condition_on_previous_text": "false"})
+    assert response.status_code == 200
+    call = client.fake_model.calls[-1]
+    assert call["vad_filter"] is False and call["vad_parameters"] is None
+    assert call["condition_on_previous_text"] is False
+
+
+def test_the_stream_without_vad_filter_runs_the_vad(client):
+    response = client.post("/transcribe-stream", files={"audio": ("a.wav", WAV, "audio/wav")})
+    assert response.status_code == 200
+    assert client.fake_model.calls[-1]["vad_filter"] is True
+    response = client.post(
+        "/transcribe-stream", data={"vad_filter": "false"}, files={"audio": ("a.wav", WAV, "audio/wav")}
+    )
+    assert response.status_code == 200
+    assert client.fake_model.calls[-1]["vad_filter"] is False
+
+
+def test_form_flag_puts_back_the_default_fastapi_dropped(stt_app):
+    """What FastAPI 0.147-0.161 hand the route for an omitted bool field: False."""
+    assert stt_app._form_flag({"language": "de"}, "vad_filter", False, True) is True
+    assert stt_app._form_flag({"vad_filter": "false"}, "vad_filter", False, True) is False
+    assert stt_app._form_flag({"vad_filter": "true"}, "vad_filter", True, True) is True
+    # Called in-process without a request: the values passed are the values used.
+    assert stt_app._form_flag(None, "vad_filter", False, True) is False
+
+
+def test_the_openapi_schema_still_documents_the_flag_defaults(stt_app):
+    schema = stt_app.app.openapi()["components"]["schemas"]
+    for name in ("Body_transcribe_audio_transcribe_post", "Body_transcribe_audio_stream_transcribe_stream_post"):
+        properties = schema[name]["properties"]
+        assert properties["vad_filter"] == {"type": "boolean", "title": "Vad Filter", "default": True}
+        assert "request" not in properties
+    assert schema["Body_transcribe_audio_transcribe_post"]["properties"]["condition_on_previous_text"]["default"] is True
+
+
 # --- /detect_language --------------------------------------------------------
 
 
