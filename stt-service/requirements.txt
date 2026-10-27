@@ -1,4 +1,4 @@
-fastapi==0.141.1
+fastapi==0.162.0
 uvicorn[standard]==0.54.0
 python-multipart==0.0.32
 # PyTorch - will be installed based on hardware availability in Dockerfile
@@ -12,14 +12,14 @@ python-multipart==0.0.32
 # when the Hub is unreachable - huggingface-hub's own snapshot_download does.
 faster-whisper==1.2.1
 # ctranslate2 >=4.5 requires cuDNN 9 — provided by the cuda:12.8.1-cudnn base image
-ctranslate2>=4.5,<5
-tokenizers>=0.13.0
+ctranslate2>=4.8.3,<5
+tokenizers>=0.23.3
 # huggingface-hub 1.x replaced `requests` with httpx. faster-whisper 1.2.1 no
 # longer imports requests itself, but its model download has only been exercised
 # against hub 0.x, so the cap stays until that is checked against 1.x.
 huggingface-hub>=0.23,<1.0
 # Still needed by huggingface-hub 0.x; declared so the cap above and this line
 # are lifted together.
-requests>=2.31.0
-onnxruntime>=1.18.0
+requests>=2.34.2
+onnxruntime>=1.31.0
 librosa
