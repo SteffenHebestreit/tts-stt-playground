@@ -178,16 +178,23 @@ jobs:
           cache-from: ${{ matrix.cache_from }}
           cache-to: ${{ matrix.cache_to }}
 
+      # The digest goes into a sub-directory named after the artifact
+      # (digests-<key>_<arch>), and the artifact carries that directory. So the
+      # manifest job finds each architecture under its own name however many
+      # artifacts its download matched (see "Download digests" there).
       - name: Export digest
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
+          ARTIFACT: ${{ matrix.artifact }}
         run: |
-          mkdir -p /tmp/digests
+          mkdir -p "/tmp/digests/${ARTIFACT}"
           # The digest is "sha256:<hex>"; the manifest job re-adds the prefix, so
           # store just the hex as the filename. Strip in the shell — GitHub
           # Actions expressions have no parameter-expansion syntax.
-          touch "/tmp/digests/${DIGEST#sha256:}"
+          touch "/tmp/digests/${ARTIFACT}/${DIGEST#sha256:}"
 
+      # The hierarchy after the wildcard is kept: the artifact holds
+      # digests-<key>_<arch>/<hex>.
       - name: Upload digest
         uses: actions/upload-artifact@v7
         with:
@@ -212,13 +219,20 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.merge) }}
     steps:
-      # One sub-directory per architecture artifact (no merge-multiple), so the
-      # next step can tell which architecture is missing.
+      # One sub-directory per architecture, so the next step can tell which one is
+      # missing. download-artifact extracts a pattern that matches a single artifact
+      # straight into `path`, without the sub-directory it creates when several
+      # match: every single-architecture image then had no digests-<key>_amd64
+      # directory, and its manifest job failed although the build had pushed it
+      # (first seen with download-artifact v8). Each artifact therefore carries its
+      # own directory (build job, "Export digest"), and merge-multiple puts them
+      # side by side, giving the same layout for one artifact as for several.
       - name: Download digests
         uses: actions/download-artifact@v8
         with:
           pattern: digests-${{ matrix.key }}_*
           path: /tmp/digests
+          merge-multiple: true
 
       - name: Check every architecture of this image was built
         env:
