@@ -12,6 +12,11 @@
 # Those are decisions with a test plan, not routine bumps.
 #
 # GitHub Actions stay pinned by tag; this keeps the tags fresh.
+#
+# Every entry sets target-branch: "develop": update PRs go into develop like any other
+# change and reach master with the next release (develop -> master), so nothing lands
+# on master, and so in the published images, without a release. Dependabot reads this
+# file from the default branch (master), so a change here takes effect once released.
 
 version: 2
 
@@ -19,6 +24,7 @@ updates:
   # --- GitHub Actions -------------------------------------------------------------
   - package-ecosystem: github-actions
     directory: /
+    target-branch: "develop"
     schedule:
       interval: weekly
       day: monday
@@ -31,6 +37,7 @@ updates:
   # --- Python requirements (one entry per service, plus the test environment) -------
   - package-ecosystem: pip
     directory: /tests
+    target-branch: "develop"
     schedule: {interval: weekly, day: monday}
     groups:
       minor-and-patch: {patterns: ["*"], update-types: [minor, patch]}
@@ -47,6 +54,7 @@ updates:
 
   - package-ecosystem: pip
     directory: /frontend-service
+    target-branch: "develop"
     schedule: {interval: weekly, day: monday}
     groups:
       minor-and-patch: {patterns: ["*"], update-types: [minor, patch]}
@@ -54,6 +62,7 @@ updates:
 
   - package-ecosystem: pip
     directory: /stt-service
+    target-branch: "develop"
     schedule: {interval: weekly, day: monday}
     groups:
       minor-and-patch: {patterns: ["*"], update-types: [minor, patch]}
@@ -61,6 +70,7 @@ updates:
 
   - package-ecosystem: pip
     directory: /piper-tts-service
+    target-branch: "develop"
     schedule: {interval: weekly, day: monday}
     groups:
       minor-and-patch: {patterns: ["*"], update-types: [minor, patch]}
@@ -68,6 +78,7 @@ updates:
 
   - package-ecosystem: pip
     directory: /piper-training-service
+    target-branch: "develop"
     schedule: {interval: weekly, day: monday}
     groups:
       minor-and-patch: {patterns: ["*"], update-types: [minor, patch]}
@@ -75,6 +86,7 @@ updates:
 
   - package-ecosystem: pip
     directory: /qwen3-asr-service
+    target-branch: "develop"
     schedule: {interval: weekly, day: monday}
     groups:
       minor-and-patch: {patterns: ["*"], update-types: [minor, patch]}
@@ -82,6 +94,7 @@ updates:
 
   - package-ecosystem: pip
     directory: /qwen3-tts-service
+    target-branch: "develop"
     schedule: {interval: weekly, day: monday}
     groups:
       minor-and-patch: {patterns: ["*"], update-types: [minor, patch]}
@@ -89,6 +102,7 @@ updates:
 
   - package-ecosystem: pip
     directory: /parakeet-asr-service
+    target-branch: "develop"
     schedule: {interval: weekly, day: monday}
     groups:
       minor-and-patch: {patterns: ["*"], update-types: [minor, patch]}
@@ -99,6 +113,7 @@ updates:
 
   - package-ecosystem: pip
     directory: /canary-asr-service
+    target-branch: "develop"
     schedule: {interval: weekly, day: monday}
     groups:
       minor-and-patch: {patterns: ["*"], update-types: [minor, patch]}
@@ -112,6 +127,7 @@ updates:
   # re-run benchmarks/run_german_eval.py before merging its bump.
   - package-ecosystem: pip
     directories: [/cohere-asr-service, /granite-asr-service]
+    target-branch: "develop"
     schedule: {interval: weekly, day: monday}
     groups:
       minor-and-patch: {patterns: ["*"], update-types: [minor, patch]}
@@ -120,6 +136,7 @@ updates:
   # vllm-asr-service adds only the Silero VAD to its vLLM base (installed --no-deps).
   - package-ecosystem: pip
     directory: /vllm-asr-service
+    target-branch: "develop"
     schedule: {interval: weekly, day: monday}
     groups:
       minor-and-patch: {patterns: ["*"], update-types: [minor, patch]}
@@ -127,6 +144,7 @@ updates:
 
   - package-ecosystem: pip
     directory: /chatterbox-tts-service
+    target-branch: "develop"
     schedule: {interval: weekly, day: monday}
     groups:
       minor-and-patch: {patterns: ["*"], update-types: [minor, patch]}
@@ -138,6 +156,7 @@ updates:
 
   - package-ecosystem: pip
     directory: /magpie-tts-service
+    target-branch: "develop"
     schedule: {interval: weekly, day: monday}
     groups:
       minor-and-patch: {patterns: ["*"], update-types: [minor, patch]}
@@ -151,6 +170,7 @@ updates:
   # left in; see the header for what is ignored.
   - package-ecosystem: docker
     directory: /frontend-service
+    target-branch: "develop"
     schedule: {interval: weekly, day: monday}
     groups:
       docker: {patterns: ["*"]}
@@ -160,6 +180,7 @@ updates:
 
   - package-ecosystem: docker
     directory: /piper-tts-service
+    target-branch: "develop"
     schedule: {interval: weekly, day: monday}
     groups:
       docker: {patterns: ["*"]}
@@ -169,6 +190,7 @@ updates:
 
   - package-ecosystem: docker
     directory: /whisper-cpp-service
+    target-branch: "develop"
     schedule: {interval: weekly, day: monday}
     groups:
       docker: {patterns: ["*"]}
@@ -178,6 +200,7 @@ updates:
 
   - package-ecosystem: docker
     directory: /stt-service
+    target-branch: "develop"
     schedule: {interval: weekly, day: monday}
     groups:
       docker: {patterns: ["*"]}
@@ -188,6 +211,7 @@ updates:
 
   - package-ecosystem: docker
     directory: /piper-training-service
+    target-branch: "develop"
     schedule: {interval: weekly, day: monday}
     groups:
       docker: {patterns: ["*"]}
@@ -198,6 +222,7 @@ updates:
 
   - package-ecosystem: docker
     directory: /qwen3-asr-service
+    target-branch: "develop"
     schedule: {interval: weekly, day: monday}
     groups:
       docker: {patterns: ["*"]}
@@ -208,6 +233,7 @@ updates:
 
   - package-ecosystem: docker
     directory: /qwen3-tts-service
+    target-branch: "develop"
     schedule: {interval: weekly, day: monday}
     groups:
       docker: {patterns: ["*"]}
@@ -218,6 +244,7 @@ updates:
 
   - package-ecosystem: docker
     directory: /parakeet-asr-service
+    target-branch: "develop"
     schedule: {interval: weekly, day: monday}
     groups:
       docker: {patterns: ["*"]}
@@ -228,6 +255,7 @@ updates:
 
   - package-ecosystem: docker
     directory: /canary-asr-service
+    target-branch: "develop"
     schedule: {interval: weekly, day: monday}
     groups:
       docker: {patterns: ["*"]}
@@ -237,6 +265,7 @@ updates:
 
   - package-ecosystem: docker
     directories: [/cohere-asr-service, /granite-asr-service]
+    target-branch: "develop"
     schedule: {interval: weekly, day: monday}
     groups:
       docker: {patterns: ["*"]}
@@ -249,6 +278,7 @@ updates:
   # (vllm-asr-service/README.md).
   - package-ecosystem: docker
     directory: /vllm-asr-service
+    target-branch: "develop"
     schedule: {interval: weekly, day: monday}
     groups:
       docker: {patterns: ["*"]}
@@ -256,6 +286,7 @@ updates:
 
   - package-ecosystem: docker
     directory: /chatterbox-tts-service
+    target-branch: "develop"
     schedule: {interval: weekly, day: monday}
     groups:
       docker: {patterns: ["*"]}
@@ -265,6 +296,7 @@ updates:
 
   - package-ecosystem: docker
     directory: /magpie-tts-service
+    target-branch: "develop"
     schedule: {interval: weekly, day: monday}
     groups:
       docker: {patterns: ["*"]}
@@ -274,6 +306,7 @@ updates:
 
   - package-ecosystem: docker
     directory: /tests
+    target-branch: "develop"
     schedule: {interval: weekly, day: monday}
     groups:
       docker: {patterns: ["*"]}
