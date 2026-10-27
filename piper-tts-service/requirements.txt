@@ -4,7 +4,7 @@
 # fastapi/uvicorn/python-multipart/pydantic are the set the rest of the repo uses.
 # python-multipart <0.0.18 and starlette 0.27 (fastapi 0.104) carry multipart
 # DoS advisories, and /upload_model and /analyze_audio take unauthenticated uploads.
-fastapi==0.161.1
+fastapi==0.141.1
 uvicorn[standard]==0.54.0
 python-multipart==0.0.32
 pydantic==2.14.1
