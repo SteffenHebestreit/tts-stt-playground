@@ -135,8 +135,9 @@ updates:
       - {dependency-name: nemo-toolkit}
       # Decided in #109: the numpy floor stays open (the -nemo2 rollback needs numpy 1.26.4).
       - {dependency-name: numpy}
-      # Decided in #109: cuda-bindings stays on 12.x while torch is a CUDA 12.8 build.
-      - {dependency-name: cuda-bindings, versions: [">=13.0.0,<14.0.0"]}
+      # Decided in #109: cuda-bindings stays on 12.x while torch is a CUDA 12.8 build. Within 12.x the
+      # version comes from torch's cu128 index (12.9.7); a higher floor would pull it from PyPI instead (#154).
+      - {dependency-name: cuda-bindings}
       # Decided in #109: no librosa 1.x (needs Python 3.12, drops the audioread fallback).
       - {dependency-name: librosa, versions: [">=1.0.0,<2.0.0"]}
 
@@ -151,8 +152,9 @@ updates:
       - {dependency-name: nemo-toolkit}
       # Decided in #109: the numpy floor stays open (the -nemo2 rollback needs numpy 1.26.4).
       - {dependency-name: numpy}
-      # Decided in #109: cuda-bindings stays on 12.x while torch is a CUDA 12.8 build.
-      - {dependency-name: cuda-bindings, versions: [">=13.0.0,<14.0.0"]}
+      # Decided in #109: cuda-bindings stays on 12.x while torch is a CUDA 12.8 build. Within 12.x the
+      # version comes from torch's cu128 index (12.9.7); a higher floor would pull it from PyPI instead (#154).
+      - {dependency-name: cuda-bindings}
       # Decided in #109: no librosa 1.x (needs Python 3.12, drops the audioread fallback).
       - {dependency-name: librosa, versions: [">=1.0.0,<2.0.0"]}
 
@@ -216,8 +218,9 @@ updates:
       - {dependency-name: nemo-toolkit}
       # Decided in #109: the numpy floor stays open (test_numpy_is_not_capped_below_2 wants 1.26.4 and 2.4.6).
       - {dependency-name: numpy}
-      # Decided in #109: cuda-bindings stays on 12.x while torch is a CUDA 12.8 build.
-      - {dependency-name: cuda-bindings, versions: [">=13.0.0,<14.0.0"]}
+      # Decided in #109: cuda-bindings stays on 12.x while torch is a CUDA 12.8 build. Within 12.x the
+      # version comes from torch's cu128 index (12.9.7); a higher floor would pull it from PyPI instead (#154).
+      - {dependency-name: cuda-bindings}
 
   # --- Dockerfiles (one entry per directory that holds one) -------------------------------
   # Only the Python and Debian/Ubuntu-flavoured bases that are safe to move are
