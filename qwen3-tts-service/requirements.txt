@@ -6,7 +6,7 @@ qwen-tts>=0.1.1
 fastapi>=0.162.0
 uvicorn[standard]>=0.54.0
 python-multipart>=0.0.32
-soundfile>=0.12.0
+soundfile>=0.14.0
 # Used directly by the reference-audio fallback reader; qwen-tts pulls it in
 # transitively, which is not something to rely on.
 librosa>=0.10.0
