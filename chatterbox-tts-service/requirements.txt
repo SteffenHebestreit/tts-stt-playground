@@ -43,5 +43,5 @@ setuptools<82
 # Service
 fastapi>=0.162.0
 uvicorn[standard]>=0.54.0
-python-multipart>=0.0.6
+python-multipart>=0.0.32
 soundfile>=0.14.0
