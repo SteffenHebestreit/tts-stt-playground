@@ -120,6 +120,8 @@ updates:
     ignore:
       # Decided in #109: no librosa 1.x (needs Python 3.12, drops the audioread fallback).
       - {dependency-name: librosa, versions: [">=1.0.0,<2.0.0"]}
+      # As for qwen3-asr in #109 (#74): numpy stays on 1.26.x; 2.x is a real switch no service needs (#133).
+      - {dependency-name: numpy, versions: [">=2.0.0,<3.0.0"]}
 
   - package-ecosystem: pip
     directory: /parakeet-asr-service
