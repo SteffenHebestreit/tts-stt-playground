@@ -36,4 +36,4 @@ websockets>=17.3
 # Optional: benchmarks/asr_metrics.py uses it for long recordings, and
 # test_benchmarks_metrics.py compares it with the pure-Python edit distance. A
 # small pure wheel; without it that one comparison is skipped.
-rapidfuzz>=3.0
+rapidfuzz>=3.14.6
