@@ -51,6 +51,8 @@ updates:
       - {dependency-name: python-multipart}
       - {dependency-name: httpx}
       - {dependency-name: uvicorn}
+      # Decided in #109: no numpy floor raise; the training job also installs piper-training's numpy 1.26.4.
+      - {dependency-name: numpy}
 
   - package-ecosystem: pip
     directory: /frontend-service
@@ -67,6 +69,9 @@ updates:
     groups:
       minor-and-patch: {patterns: ["*"], update-types: [minor, patch]}
     commit-message: {prefix: "build(deps)"}
+    ignore:
+      # Decided in #109: the huggingface-hub<1.0 cap stays (hub 2.x was tested compatible, no gain).
+      - {dependency-name: huggingface-hub, versions: [">=1.0.0,<3.0.0"]}
 
   - package-ecosystem: pip
     directory: /piper-tts-service
@@ -75,6 +80,9 @@ updates:
     groups:
       minor-and-patch: {patterns: ["*"], update-types: [minor, patch]}
     commit-message: {prefix: "build(deps)"}
+    ignore:
+      # Decided in #109: no librosa 1.x (drops the audioread fallback for webm/m4a uploads).
+      - {dependency-name: librosa, versions: [">=1.0.0,<2.0.0"]}
 
   - package-ecosystem: pip
     directory: /piper-training-service
@@ -83,6 +91,11 @@ updates:
     groups:
       minor-and-patch: {patterns: ["*"], update-types: [minor, patch]}
     commit-message: {prefix: "build(deps)"}
+    ignore:
+      # Decided in #109: training and ONNX export stay on the validated numpy 1.26.4.
+      - {dependency-name: numpy, versions: [">=2.0.0,<3.0.0"]}
+      # Decided in #109: no librosa 1.x (needs Python 3.12, drops the audioread fallback).
+      - {dependency-name: librosa, versions: [">=1.0.0,<2.0.0"]}
 
   - package-ecosystem: pip
     directory: /qwen3-asr-service
@@ -91,6 +104,11 @@ updates:
     groups:
       minor-and-patch: {patterns: ["*"], update-types: [minor, patch]}
     commit-message: {prefix: "build(deps)"}
+    ignore:
+      # Decided in #109: stays on the validated numpy 1.26; nothing here needs numpy 2.
+      - {dependency-name: numpy, versions: [">=2.0.0,<3.0.0"]}
+      # Decided in #109: no librosa 1.x (needs Python 3.12, drops the audioread fallback).
+      - {dependency-name: librosa, versions: [">=1.0.0,<2.0.0"]}
 
   - package-ecosystem: pip
     directory: /qwen3-tts-service
@@ -99,6 +117,9 @@ updates:
     groups:
       minor-and-patch: {patterns: ["*"], update-types: [minor, patch]}
     commit-message: {prefix: "build(deps)"}
+    ignore:
+      # Decided in #109: no librosa 1.x (needs Python 3.12, drops the audioread fallback).
+      - {dependency-name: librosa, versions: [">=1.0.0,<2.0.0"]}
 
   - package-ecosystem: pip
     directory: /parakeet-asr-service
@@ -110,6 +131,12 @@ updates:
     # The NeMo line (3.0.x default, 2.7.x rollback) is chosen by a build ARG.
     ignore:
       - {dependency-name: nemo-toolkit}
+      # Decided in #109: the numpy floor stays open (the -nemo2 rollback needs numpy 1.26.4).
+      - {dependency-name: numpy}
+      # Decided in #109: cuda-bindings stays on 12.x while torch is a CUDA 12.8 build.
+      - {dependency-name: cuda-bindings, versions: [">=13.0.0,<14.0.0"]}
+      # Decided in #109: no librosa 1.x (needs Python 3.12, drops the audioread fallback).
+      - {dependency-name: librosa, versions: [">=1.0.0,<2.0.0"]}
 
   - package-ecosystem: pip
     directory: /canary-asr-service
@@ -120,6 +147,12 @@ updates:
     commit-message: {prefix: "build(deps)"}
     ignore:
       - {dependency-name: nemo-toolkit}
+      # Decided in #109: the numpy floor stays open (the -nemo2 rollback needs numpy 1.26.4).
+      - {dependency-name: numpy}
+      # Decided in #109: cuda-bindings stays on 12.x while torch is a CUDA 12.8 build.
+      - {dependency-name: cuda-bindings, versions: [">=13.0.0,<14.0.0"]}
+      # Decided in #109: no librosa 1.x (needs Python 3.12, drops the audioread fallback).
+      - {dependency-name: librosa, versions: [">=1.0.0,<2.0.0"]}
 
   # The two transformers ASR images: one entry for both directories, so a bump reaches
   # both requirements files in one PR (they must stay identical, see
@@ -132,6 +165,11 @@ updates:
     groups:
       minor-and-patch: {patterns: ["*"], update-types: [minor, patch]}
     commit-message: {prefix: "build(deps)"}
+    ignore:
+      # Decided in #109: the numpy floor stays open (the images already resolve numpy 2.4).
+      - {dependency-name: numpy}
+      # Decided in #109: no librosa 1.x (needs Python 3.12, drops the audioread fallback).
+      - {dependency-name: librosa, versions: [">=1.0.0,<2.0.0"]}
 
   # vllm-asr-service adds only the Silero VAD to its vLLM base (installed --no-deps).
   - package-ecosystem: pip
@@ -153,6 +191,16 @@ updates:
     # which setuptools 82 removed.
     ignore:
       - {dependency-name: setuptools}
+      # Decided in #109: stays on numpy 1.26 (upstream chatterbox-tts declares numpy<2).
+      - {dependency-name: numpy, versions: [">=2.0.0,<3.0.0"]}
+      # Decided in #109: no librosa 1.x (needs Python 3.12, drops the audioread fallback).
+      - {dependency-name: librosa, versions: [">=1.0.0,<2.0.0"]}
+      # Decided in #109: mirrors chatterbox-tts's own transformers==5.2.0 pin (installed --no-deps).
+      - {dependency-name: transformers}
+      # Decided in #109: mirrors chatterbox-tts's own diffusers==0.29.0 pin (installed --no-deps).
+      - {dependency-name: diffusers}
+      # Decided in #109: mirrors chatterbox-tts's own safetensors==0.5.3 pin (installed --no-deps).
+      - {dependency-name: safetensors}
 
   - package-ecosystem: pip
     directory: /magpie-tts-service
@@ -164,6 +212,10 @@ updates:
     # The NeMo line (3.0.x) is chosen by a build ARG.
     ignore:
       - {dependency-name: nemo-toolkit}
+      # Decided in #109: the numpy floor stays open (test_numpy_is_not_capped_below_2 wants 1.26.4 and 2.4.6).
+      - {dependency-name: numpy}
+      # Decided in #109: cuda-bindings stays on 12.x while torch is a CUDA 12.8 build.
+      - {dependency-name: cuda-bindings, versions: [">=13.0.0,<14.0.0"]}
 
   # --- Dockerfiles (one entry per directory that holds one) -------------------------------
   # Only the Python and Debian/Ubuntu-flavoured bases that are safe to move are
@@ -283,6 +335,9 @@ updates:
     groups:
       docker: {patterns: ["*"]}
     commit-message: {prefix: "build(docker)"}
+    ignore:
+      # Decided in #109: v0.32 was re-measured against v0.31 with no gain (Ruby syntax: the 0.32.x line).
+      - {dependency-name: vllm/vllm-openai, versions: ["~> 0.32.0"]}
 
   - package-ecosystem: docker
     directory: /chatterbox-tts-service

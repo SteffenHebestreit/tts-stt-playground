@@ -14,7 +14,7 @@ transformers==5.20.2
 # only torch.
 silero-vad==6.2.3
 fastapi>=0.162.0
-uvicorn[standard]>=0.24.0
+uvicorn[standard]>=0.54.0
 # 0.0.18 fixed a multipart-parsing denial of service reachable by any upload.
 python-multipart>=0.0.32
 soundfile>=0.14.0
