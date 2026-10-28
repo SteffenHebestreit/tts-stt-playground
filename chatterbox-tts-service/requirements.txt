@@ -25,7 +25,7 @@ diffusers==0.29.0
 # 0.1.7 wheel asks for. It declares no dependencies of its own and swallows an
 # ImportError by setting PerthImplicitWatermarker = None, which then fails at model
 # construction: it needs torchaudio, librosa, scipy and pyyaml, all present here.
-resemble-perth>=1.0.0
+resemble-perth>=1.0.1
 conformer==0.3.2
 safetensors==0.5.3
 spacy-pkuseg
