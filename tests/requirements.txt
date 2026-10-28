@@ -27,7 +27,7 @@ numpy>=1.24
 # The config-drift suites (test_env_wiring, test_docker_image_contents) parse
 # compose files and `importorskip` this. Without it they were reported as
 # skips in CI and silently guarded nothing.
-pyyaml>=6.0
+pyyaml>=6.0.3
 
 # stt-service WebSocket tests and the frontend /ws/stt relay client
 # (`additional_headers=` needs >=14).
