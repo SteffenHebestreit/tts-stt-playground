@@ -12,4 +12,4 @@ httpx==0.28.1
 # service's own origin guard). From 14.0 on, `websockets.connect` is the asyncio
 # client whose keyword arguments the relay uses; the floor is now 17.1 (17.x is what
 # a fresh build resolves to anyway, and what tests/requirements.txt runs against).
-websockets>=17.1
+websockets>=17.3
