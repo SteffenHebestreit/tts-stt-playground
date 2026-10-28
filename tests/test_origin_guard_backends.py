@@ -47,7 +47,7 @@ STATE_CHANGING = {
     "piper-tts-service": [
         ("POST", "/upload_model", "/upload_model"),
         ("POST", "/tts", "/tts"),
-        ("DELETE", "/voice/{voice_name}", "/voice/luna"),
+        ("DELETE", "/voice/{voice_name}", "/voice/marlene"),
         ("POST", "/refresh_voices", "/refresh_voices"),
     ],
     "qwen3-tts-service": [

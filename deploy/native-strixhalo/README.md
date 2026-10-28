@@ -4,7 +4,7 @@ On a Strix Halo host that already serves LLMs natively through [llama-swap](http
 
 This is the API-only deployment. The web UI and voice training need the Docker stack (`deploy/profiles/strixhalo.env`).
 
-Running on **evox2** (Ryzen AI Max+ 395, Radeon 8060S, Ubuntu 26.04) since 2026-10-17.
+Tested on a Ryzen AI Max+ 395 (Radeon 8060S, Ubuntu 26.04) since 2026-10-17.
 
 | Endpoint | Model id (aliases) | Engine |
 |---|---|---|
@@ -52,7 +52,3 @@ curl -s https://<host>/v1/audio/speech -H "Authorization: Bearer $KEY" -H "Conte
 curl -s https://<host>/v1/audio/transcriptions -H "Authorization: Bearer $KEY" \
      -F file=@hallo.wav -F model=whisper-1 -F language=de -F response_format=json
 ```
-
-## Who uses it
-
-LUNA-Cloud's transcription worker sends speech recognition (`whisper-1`) and its summaries (`qwen3.6-35b-a3b`) to evox2, with its own key (`HALO_KEY_LUNA`). See the luna-cloud repository, `deploy/k8s/README.md`, "Transcription".

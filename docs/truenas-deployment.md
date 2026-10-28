@@ -120,5 +120,5 @@ In the repository checkout (not the dataset), only if these paths are not in use
 
 ```bash
 rm -rf cache/tts cache/xtts-cache
-rm -f models/luna.json models/luna.onnx
+rm -f models/<voice>.json models/<voice>.onnx   # old root-level export of a trained voice
 ```

@@ -309,7 +309,7 @@ Use smaller models (`WHISPER_MODEL_SIZE=small`, `WHISPER_MODEL=small`) to improv
 - Opt-in: profile `granite-asr` plus `ENABLE_GRANITE_ASR` on the frontend. Details: [granite-asr-service/README.md](granite-asr-service/README.md)
 
 ### Speech Recognition — the candidates under vLLM (optional)
-- `vllm-asr-service`: a thin stt-form-v1 adapter that runs `vllm serve` (`vllm/vllm-openai:v0.31.0`, the release the NAS's luna-stt app runs on its Blackwell card) inside the same container, for production-like **throughput**: every chunk of every request goes to the engine at once and vLLM batches them
+- `vllm-asr-service`: a thin stt-form-v1 adapter that runs `vllm serve` (`vllm/vllm-openai:v0.31.0`, a release proven on a Blackwell card) inside the same container, for production-like **throughput**: every chunk of every request goes to the engine at once and vLLM batches them
 - One model per service, `VLLM_ASR_MODEL`: `ibm-granite/granite-speech-5.0-2b` (default; through vLLM's chat endpoint with Granite-ASR's own prompt and keywords), `evewashere/cohere-transcribe-03-2026-ungated` (pinned and checked against Cohere's SHA-256 like Cohere-ASR), `Qwen/Qwen3-ASR-1.7B` (identifies the language, a prompt is its context) or `primeline/whisper-large-v3-turbo-german` (German only; for Whisper quality the `whisper` provider, faster-whisper, stays the reference)
 - The same speech gate and pause-based chunks (at most 28 s) as Cohere/Granite, chunk-level segments
 - The engine takes `VLLM_ASR_GPU_MEMORY_UTILIZATION` of the whole card while awake (0.45, about 7.2 GB of 16 GB) and sleeps after `ASR_MODEL_TTL` idle seconds (0.4-0.9 GB left, wakes in under a second); `VLLM_ASR_IDLE_MODE=stop` frees everything instead
@@ -799,7 +799,7 @@ Remove leftover XTTS cache from an earlier version, in the repository checkout (
 
 ```bash
 sudo rm -rf cache/tts cache/xtts-cache   # ~3.6 GB
-sudo rm -f models/luna.json models/luna.onnx  # old root-level export
+sudo rm -f models/<voice>.json models/<voice>.onnx  # old root-level export of a trained voice
 ```
 
 ## API

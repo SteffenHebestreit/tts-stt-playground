@@ -222,9 +222,9 @@ def test_api_stt_reaches_the_service_with_the_language_and_normalises_the_answer
 
 def test_api_stt_passes_a_prompt_on_as_the_initial_prompt(monkeypatch):
     _, stub, client = _gateway(monkeypatch, lambda m, u, k: {"text": "x"}, BOTH)
-    client.post("/api/stt", data={"provider": "granite-asr", "language": "de", "prompt": " LUNA, Bautzen "},
+    client.post("/api/stt", data={"provider": "granite-asr", "language": "de", "prompt": " ACME, Leipzig "},
                 files={"audio": ("a.wav", wav_bytes(), "audio/wav")})
-    assert stub.calls[-1][2]["data"] == {"language": "de", "initial_prompt": "LUNA, Bautzen"}
+    assert stub.calls[-1][2]["data"] == {"language": "de", "initial_prompt": "ACME, Leipzig"}
 
 
 @pytest.mark.parametrize("prompt", ["", "   "])
@@ -281,5 +281,5 @@ def test_the_settings_page_names_both_engines():
 def test_a_file_part_called_prompt_is_not_turned_into_one(monkeypatch):
     _, stub, client = _gateway(monkeypatch, lambda m, u, k: {"text": "x"}, BOTH)
     client.post("/api/stt", data={"provider": "granite-asr", "language": "de"},
-                files={"audio": ("a.wav", wav_bytes(), "audio/wav"), "prompt": ("p.txt", b"LUNA", "text/plain")})
+                files={"audio": ("a.wav", wav_bytes(), "audio/wav"), "prompt": ("p.txt", b"ACME", "text/plain")})
     assert "initial_prompt" not in stub.calls[-1][2]["data"]

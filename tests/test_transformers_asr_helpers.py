@@ -416,11 +416,11 @@ def test_each_model_accepts_its_own_languages_and_the_override_wins():
 
 
 @pytest.mark.parametrize("values, expected", [
-    (("LUNA, Bautzen, Satellite",), ["LUNA", "Bautzen", "Satellite"]),
-    (("LUNA;Bautzen\nSatellite\r\nSpot",), ["LUNA", "Bautzen", "Satellite", "Spot"]),
+    (("ACME, Leipzig, Grafana",), ["ACME", "Leipzig", "Grafana"]),
+    (("ACME;Leipzig\nGrafana\r\nHelm",), ["ACME", "Leipzig", "Grafana", "Helm"]),
     (("  St.  Louis ,, ",), ["St. Louis"]),
-    (("LUNA, luna, Luna",), ["LUNA"]),
-    (("LUNA", "Bautzen, luna"), ["LUNA", "Bautzen"]),
+    (("ACME, acme, Acme",), ["ACME"]),
+    (("ACME", "Leipzig, acme"), ["ACME", "Leipzig"]),
     ((None, ""), []),
 ])
 def test_keyword_lists_are_split_trimmed_and_deduplicated(values, expected):
@@ -443,6 +443,6 @@ def test_the_prompt_names_the_language_asks_for_punctuation_and_lists_keywords()
         "<|audio|>The speech is in German. Transcribe it exactly; do not translate. "
         "transcribe the speech with proper punctuation and capitalization.")
     assert gs.build_prompt(None) == "<|audio|>transcribe the speech with proper punctuation and capitalization."
-    assert gs.build_prompt("pt", ["LUNA", "Bautzen"]).endswith(
-        "capitalization. Keywords: LUNA, Bautzen")
+    assert gs.build_prompt("pt", ["ACME", "Leipzig"]).endswith(
+        "capitalization. Keywords: ACME, Leipzig")
     assert "Italian" in gs.build_prompt("it")

@@ -105,7 +105,7 @@ def parse_keywords(*values: Optional[str]) -> list[str]:
     """The keyword list of a request: every value split at commas, semicolons and line breaks.
 
     The ``keywords`` form field and ``initial_prompt`` (what the gateway's /v1 sends
-    for OpenAI's ``prompt``) are both read this way, so ``"LUNA, Bautzen, Satellite"``
+    for OpenAI's ``prompt``) are both read this way, so ``"ACME, Leipzig, Grafana"``
     biases towards those three words. Duplicates (ignoring case) are dropped, the
     first spelling kept. More than ``MAX_KEYWORDS`` keywords, or one longer than
     ``MAX_KEYWORD_CHARS`` characters, is refused: silently using part of a list
