@@ -10,5 +10,5 @@ soundfile>=0.14.0
 # Used directly by the reference-audio fallback reader; qwen-tts pulls it in
 # transitively, which is not something to rely on.
 librosa>=0.10.0
-numpy>=1.24.0,<2.0.0
+numpy>=2.5.4,<3.0.0
 httpx>=0.28.1
