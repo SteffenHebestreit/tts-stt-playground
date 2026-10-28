@@ -12,7 +12,7 @@
 # or on the NAS `docker build -t ghcr.io/steffenhebestreit/tts-stt-vllm-asr:local
 # <checkout>/vllm-asr-service`. tests/test_docker_image_contents.py checks statically
 # that every module app.py imports is copied below.
-FROM vllm/vllm-openai:v0.31.0
+FROM vllm/vllm-openai:v0.32.0
 
 WORKDIR /app
 
