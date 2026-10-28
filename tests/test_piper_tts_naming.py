@@ -35,7 +35,7 @@ def test_sanitize_accepts_valid(value):
     assert naming.sanitize_voice_name(value) == value
 
 
-@pytest.mark.parametrize("value", ["", "../x", "a/b", "a b", "naïve", "a.b", "a\\b", None, "marlene\n", "marlene\r\n", "\nluna", 42])
+@pytest.mark.parametrize("value", ["", "../x", "a/b", "a b", "naïve", "a.b", "a\\b", None, "marlene\n", "marlene\r\n", "\nmarlene", 42])
 def test_sanitize_rejects_invalid(value):
     with pytest.raises(HTTPException) as exc:
         naming.sanitize_voice_name(value)
