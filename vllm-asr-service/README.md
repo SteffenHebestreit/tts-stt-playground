@@ -12,7 +12,7 @@ Provider id `vllm-asr` in the gateway (`ENABLE_VLLM_ASR=true`), compose profile
 `vllm-asr`, port 5011, image `ghcr.io/steffenhebestreit/tts-stt-vllm-asr` (built on the
 host, not published: see [Image](#image)).
 
-The base is `vllm/vllm-openai:v0.31.0`, the exact release Steffen's luna-stt app runs on
+The base is `vllm/vllm-openai:v0.31.0`, a release already running on
 the NAS's RTX 5060 Ti (Blackwell, driver 580.173): the engine is proven on that card. It
 is a CUDA 13 build and needs an NVIDIA driver 580 or newer.
 
@@ -84,7 +84,7 @@ speech. Each chunk is one segment with the chunk's start and end; the texts are 
 order with `audio_pipeline.join_texts`. The service never joins segments the engine cut
 itself: if that is ever added (Whisper's `verbose_json` segments), a segment whose raw
 text starts without a space continues the previous word, the convention whose neglect
-turned "europäischen" into "europ äischen" in luna-cloud.
+turns "europäischen" into "europ äischen".
 
 `VLLM_ASR_MAX_NEW_TOKENS` (empty: 20 per second of chunk, 560 at 28 s) caps each chunk; a
 Granite chunk that reaches it is flagged `truncated` (the transcription endpoint does not
@@ -101,7 +101,7 @@ threads reached 250x, four processes 390-405x. `0` runs it in the adapter proces
 `VLLM_ASR_GPU_MEMORY_UTILIZATION` (default **0.45**) is the share of the **whole card**
 the engine takes at start-up, weights, activations, CUDA graphs and KV cache together,
 and keeps while it is awake: about 7.2 GiB of a 16 GB card. That fits next to Whisper
-(about 2.3 GB), Magpie (about 3.3 GB) and Steffen's luna-stt vLLM app (about 3.3 GB) on
+(about 2.3 GB), Magpie (about 3.3 GB) and another vLLM app (about 3.3 GB) on
 the 5060 Ti. The share minus weights and activations is the KV cache, which decides how
 many chunks are decoded at once (`/status` reports `engine.kv_cache_tokens`):
 
@@ -195,8 +195,8 @@ not on these clips.
 
 **For the NAS (RTX 5060 Ti 16 GB), scale by about 0.63** (the factor used between the
 two cards): roughly 16-31x real time for one request, 90-150x at 8 and 185-250x at 32.
-The 5060 Ti's 16 GB give the same 0.45 share as here; with Whisper, Magpie and luna-stt
-resident there are about 7.5 GB free, so 0.45 (7.3 GiB requested) is at the edge: if the
+The 5060 Ti's 16 GB give the same 0.45 share as here; with Whisper, Magpie and that other vLLM
+app resident there are about 7.5 GB free, so 0.45 (7.3 GiB requested) is at the edge: if the
 start fails with `out_of_memory`, use 0.42 (Granite then keeps about 0.5 GiB of KV cache).
 
 ## Endpoints

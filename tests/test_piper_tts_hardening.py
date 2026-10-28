@@ -42,13 +42,13 @@ from test_piper_tts_harness import (
 
 CONFIG = {
     "audio": {"sample_rate": 22050, "quality": "medium"},
-    "model_card": {"language": "de", "speaker": "luna"},
+    "model_card": {"language": "de", "speaker": "marlene"},
     "phoneme_id_map": {"<pad>": 0, "<start>": 1, "<end>": 2, "a": 3, "b": 4},
     "phonemizer_language": "de",
 }
 
 
-def _upload(svc, name="luna", model=b"\x08\x07onnx", config=CONFIG, **form):
+def _upload(svc, name="marlene", model=b"\x08\x07onnx", config=CONFIG, **form):
     files = {"model_file": ("m.onnx", model, "application/octet-stream")}
     if config is not None:
         payload = config if isinstance(config, (bytes, str)) else json.dumps(config)
@@ -79,16 +79,16 @@ def test_a_failing_custom_synthesis_does_not_reveal_the_exception(start, monkeyp
     assert _upload(svc).status_code == 200
 
     def explode(*_args):
-        raise RuntimeError("cannot open /app/models/custom/luna/luna.onnx: Traceback (most recent call last)")
+        raise RuntimeError("cannot open /app/models/custom/marlene/marlene.onnx: Traceback (most recent call last)")
 
     monkeypatch.setattr(svc.module, "_custom_onnx_infer", explode)
 
     with caplog.at_level("ERROR"):
-        via_tts = svc.client.post("/tts", json={"text": "Hallo", "voice": "luna"})
-        via_synthesize = svc.client.post("/synthesize", json={"text": "Hallo", "voice_name": "luna"})
+        via_tts = svc.client.post("/tts", json={"text": "Hallo", "voice": "marlene"})
+        via_synthesize = svc.client.post("/synthesize", json={"text": "Hallo", "voice_name": "marlene"})
 
-    _assert_generic(via_tts, 500, caplog, "/app/models/custom/luna/luna.onnx")
-    _assert_generic(via_synthesize, 500, caplog, "/app/models/custom/luna/luna.onnx")
+    _assert_generic(via_tts, 500, caplog, "/app/models/custom/marlene/marlene.onnx")
+    _assert_generic(via_synthesize, 500, caplog, "/app/models/custom/marlene/marlene.onnx")
     assert via_tts.headers["X-Request-ID"] != via_synthesize.headers["X-Request-ID"]
 
 
@@ -106,7 +106,7 @@ def test_a_failed_upload_does_not_reveal_the_exception_and_leaves_nothing(start,
     svc = start()
 
     def refuse(*_args, **_kwargs):
-        raise OSError(28, "No space left on device: '/app/models/custom/luna/luna.onnx'")
+        raise OSError(28, "No space left on device: '/app/models/custom/marlene/marlene.onnx'")
 
     monkeypatch.setattr(svc.module.os, "replace", refuse)
 
@@ -123,12 +123,12 @@ def test_a_failed_delete_does_not_reveal_the_exception(start, monkeypatch, caplo
     assert _upload(svc).status_code == 200
 
     def refuse(*_args, **_kwargs):
-        raise PermissionError(13, "Permission denied: '/app/models/custom/luna'")
+        raise PermissionError(13, "Permission denied: '/app/models/custom/marlene'")
 
     monkeypatch.setattr(svc.module.shutil, "rmtree", refuse)
 
     with caplog.at_level("ERROR"):
-        r = svc.client.delete("/voice/luna")
+        r = svc.client.delete("/voice/marlene")
 
     _assert_generic(r, 500, caplog, "Permission denied")
 
@@ -325,8 +325,8 @@ def test_a_valid_verdict_publishes_the_voice(validating):
     r = _upload(svc)
 
     assert r.status_code == 200
-    assert _custom_dir_listing(svc) == ["luna"]
-    assert sorted(p.name for p in (svc.models / "custom" / "luna").iterdir()) == ["luna.json", "luna.onnx"]
+    assert _custom_dir_listing(svc) == ["marlene"]
+    assert sorted(p.name for p in (svc.models / "custom" / "marlene").iterdir()) == ["marlene.json", "marlene.onnx"]
 
 
 def test_the_checker_runs_beside_nothing_else_and_gets_ids_from_the_config(validating):
@@ -479,7 +479,7 @@ def test_a_timed_out_custom_synthesis_stops_its_run_and_frees_the_slot(start, mo
     monkeypatch.setattr(svc.module, "_custom_onnx_infer", endless)
 
     began = time.monotonic()
-    overran = svc.client.post("/tts", json={"text": "Hallo", "voice": "luna"})
+    overran = svc.client.post("/tts", json={"text": "Hallo", "voice": "marlene"})
     assert overran.status_code == 504 and time.monotonic() - began < 10
     assert runs[0].terminate is True, "the overrun run was not told to stop"
 
@@ -493,7 +493,7 @@ def test_a_timed_out_custom_synthesis_stops_its_run_and_frees_the_slot(start, mo
     assert wait_for_the_slot() == 1, "the timed-out synthesis kept its slot"
     assert svc.speak().status_code == 200
     for _ in range(3):  # and it stays that way, however many overruns there are
-        again = svc.client.post("/synthesize", json={"text": "Hallo", "voice_name": "luna"})
+        again = svc.client.post("/synthesize", json={"text": "Hallo", "voice_name": "marlene"})
         assert again.status_code == 504
         assert wait_for_the_slot() == 1
     assert svc.speak().status_code == 200

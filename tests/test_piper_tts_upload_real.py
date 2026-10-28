@@ -25,7 +25,7 @@ from test_piper_tts_harness import start  # noqa: E402,F401  (fixture)
 
 CONFIG = {
     "audio": {"sample_rate": 22050, "quality": "medium"},
-    "model_card": {"language": "de", "speaker": "luna"},
+    "model_card": {"language": "de", "speaker": "marlene"},
     "phoneme_id_map": {"<pad>": 0, "<start>": 1, "<end>": 2, "a": 3, "b": 4},
     "phonemizer_language": "de",
 }
@@ -69,7 +69,7 @@ def _graph(inputs, trip=None) -> bytes:
     return model.SerializeToString()
 
 
-def _upload(svc, model, name="luna", config=CONFIG):
+def _upload(svc, model, name="marlene", config=CONFIG):
     return svc.client.post(
         "/upload_model",
         files={"model_file": ("m.onnx", model, "application/octet-stream"),
@@ -93,7 +93,7 @@ def test_a_model_with_the_training_export_interface_passes_validation(start):
     r = _upload(svc, _graph(["text", "text_lengths"]))
 
     assert r.status_code == 200, r.text
-    assert _published(svc) == ["luna"]
+    assert _published(svc) == ["marlene"]
 
 
 def test_a_model_with_another_interface_is_refused(start):

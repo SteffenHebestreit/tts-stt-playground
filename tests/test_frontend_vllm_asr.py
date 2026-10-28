@@ -151,14 +151,14 @@ def test_api_stt_reaches_the_service_with_the_language_and_the_prompt(monkeypatc
                 "language": "de", "duration": 1.5, "warnings": [], "engine": "vllm"}
 
     _, stub, client = _gateway(monkeypatch, handler, ON)
-    r = client.post("/api/stt", data={"provider": "vllm-asr", "language": "de", "prompt": " LUNA, Bautzen "},
+    r = client.post("/api/stt", data={"provider": "vllm-asr", "language": "de", "prompt": " ACME, Leipzig "},
                     files={"audio": ("a.wav", wav_bytes(), "audio/wav")})
     assert r.status_code == 200 and r.headers["x-provider"] == "vllm-asr"
     assert r.json() == {"text": "Guten Tag.", "segments": [{"start": 0.3, "end": 1.2, "text": "Guten Tag."}],
                         "language": "de", "duration": 1.5}
     method, url, kwargs = stub.calls[-1]
     assert url == f"{URL}/transcribe"
-    assert kwargs["data"] == {"language": "de", "initial_prompt": "LUNA, Bautzen"}
+    assert kwargs["data"] == {"language": "de", "initial_prompt": "ACME, Leipzig"}
 
 
 def test_auto_reaches_the_service_as_auto(monkeypatch):

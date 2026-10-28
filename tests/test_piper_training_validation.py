@@ -22,13 +22,13 @@ validation = _load_validation()
 
 # --- safe_name (path-traversal guard) ---
 
-@pytest.mark.parametrize("value", ["luna", "my_voice", "Voice-1", "a1b2c3", "550e8400-e29b-41d4-a716-446655440000"])
+@pytest.mark.parametrize("value", ["marlene", "my_voice", "Voice-1", "a1b2c3", "550e8400-e29b-41d4-a716-446655440000"])
 def test_safe_name_accepts_normal_names(value):
     assert validation.safe_name(value) == value
 
 
 def test_safe_name_strips_whitespace():
-    assert validation.safe_name("  luna  ") == "luna"
+    assert validation.safe_name("  marlene  ") == "marlene"
 
 
 @pytest.mark.parametrize("value", [

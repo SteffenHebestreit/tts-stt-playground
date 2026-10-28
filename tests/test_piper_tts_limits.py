@@ -27,12 +27,12 @@ from test_piper_tts_harness import (
 
 CUSTOM_CONFIG = {
     "audio": {"sample_rate": 22050, "quality": "medium"},
-    "model_card": {"language": "de", "speaker": "luna"},
+    "model_card": {"language": "de", "speaker": "marlene"},
     "phoneme_id_map": {"<pad>": 0, "a": 1},
 }
 
 
-def _upload(svc, name="luna", model=b"\x08\x07onnx", config=CUSTOM_CONFIG, **form):
+def _upload(svc, name="marlene", model=b"\x08\x07onnx", config=CUSTOM_CONFIG, **form):
     files = {"model_file": ("m.onnx", model, "application/octet-stream")}
     if config is not None:
         payload = config if isinstance(config, (bytes, str)) else json.dumps(config)
@@ -181,7 +181,7 @@ def test_custom_voice_inference_shares_the_concurrency_limit(start, monkeypatch)
 
     with ThreadPoolExecutor(max_workers=3) as pool:
         responses = list(pool.map(
-            lambda _: svc.client.post("/synthesize", json={"text": "Hallo", "voice_name": "luna"}), range(3)))
+            lambda _: svc.client.post("/synthesize", json={"text": "Hallo", "voice_name": "marlene"}), range(3)))
 
     assert [r.status_code for r in responses] == [200, 200, 200]
     assert seen[0]["peak"] == 1
@@ -191,7 +191,7 @@ def test_custom_voice_inference_that_overruns_answers_504(start, monkeypatch):
     svc = start(PIPER_TIMEOUT_S="1")
     _slow_custom_voice(svc, monkeypatch, 1.6, [])
 
-    r = svc.client.post("/synthesize", json={"text": "Hallo", "voice_name": "luna"})
+    r = svc.client.post("/synthesize", json={"text": "Hallo", "voice_name": "marlene"})
 
     assert r.status_code == 504
     assert "PIPER_TIMEOUT_S" in r.json()["detail"]
@@ -315,7 +315,7 @@ def test_a_model_upload_over_the_limit_is_413_and_leaves_nothing_behind(start):
     r = _upload(svc, model=b"m" * 2000)
 
     assert r.status_code == 413
-    assert not (svc.models / "custom" / "luna").exists()
+    assert not (svc.models / "custom" / "marlene").exists()
     assert svc.client.get("/voices").json()["custom_count"] == 0
 
 
@@ -327,11 +327,11 @@ def test_an_uploaded_voice_is_registered_and_synthesises(start, monkeypatch):
 
     assert r.status_code == 200
     assert r.json()["voice_info"]["language"] == "de"
-    voice_dir = svc.models / "custom" / "luna"
-    assert (voice_dir / "luna.onnx").read_bytes() == b"\x08\x07onnx"
-    assert sorted(p.name for p in voice_dir.iterdir()) == ["luna.json", "luna.onnx"]
+    voice_dir = svc.models / "custom" / "marlene"
+    assert (voice_dir / "marlene.onnx").read_bytes() == b"\x08\x07onnx"
+    assert sorted(p.name for p in voice_dir.iterdir()) == ["marlene.json", "marlene.onnx"]
     assert svc.client.get("/voices").json()["custom_count"] == 1
-    synthesised = svc.client.post("/synthesize", json={"text": "Hallo", "voice_name": "luna"})
+    synthesised = svc.client.post("/synthesize", json={"text": "Hallo", "voice_name": "marlene"})
     assert synthesised.status_code == 200 and synthesised.content == WAV_BYTES
 
 
@@ -341,8 +341,8 @@ def test_an_upload_without_a_config_gets_a_generated_one(start):
     r = _upload(svc, config=None)
 
     assert r.status_code == 200
-    generated = json.loads((svc.models / "custom" / "luna" / "luna.json").read_text())
-    assert generated["model_card"]["speaker"] == "luna"
+    generated = json.loads((svc.models / "custom" / "marlene" / "marlene.json").read_text())
+    assert generated["model_card"]["speaker"] == "marlene"
 
 
 def test_a_bad_config_upload_keeps_the_existing_voice_intact(start):
@@ -353,10 +353,10 @@ def test_a_bad_config_upload_keeps_the_existing_voice_intact(start):
         r = _upload(svc, model=b"replacement", config=bad)
         assert r.status_code == 400, bad
 
-    voice_dir = svc.models / "custom" / "luna"
-    assert (voice_dir / "luna.onnx").read_bytes() == b"good-model"
-    assert sorted(p.name for p in voice_dir.iterdir()) == ["luna.json", "luna.onnx"]
-    assert svc.client.get("/voice/luna").status_code == 200
+    voice_dir = svc.models / "custom" / "marlene"
+    assert (voice_dir / "marlene.onnx").read_bytes() == b"good-model"
+    assert sorted(p.name for p in voice_dir.iterdir()) == ["marlene.json", "marlene.onnx"]
+    assert svc.client.get("/voice/marlene").status_code == 200
 
 
 def test_a_failed_first_upload_does_not_leave_an_empty_voice_directory(start):
@@ -364,7 +364,7 @@ def test_a_failed_first_upload_does_not_leave_an_empty_voice_directory(start):
 
     assert _upload(svc, config="{not json").status_code == 400
 
-    assert not (svc.models / "custom" / "luna").exists()
+    assert not (svc.models / "custom" / "marlene").exists()
 
 
 def test_an_oversized_config_is_413(start):
@@ -372,13 +372,13 @@ def test_an_oversized_config_is_413(start):
     huge = json.dumps({"padding": "x" * (5 * 1024 * 1024 + 10)})
 
     assert _upload(svc, config=huge).status_code == 413
-    assert not (svc.models / "custom" / "luna").exists()
+    assert not (svc.models / "custom" / "marlene").exists()
 
 
 def test_upload_rejects_unsafe_voice_names(start):
     svc = start()
 
-    for name in ("../evil", "a/b", "luna\n"):
+    for name in ("../evil", "a/b", "marlene\n"):
         assert _upload(svc, name=name).status_code == 400, name
     assert not (svc.models / "custom").exists() or list((svc.models / "custom").iterdir()) == []
 
@@ -390,17 +390,17 @@ def test_refresh_voices_keeps_serving_custom_voices_while_it_rescans(start):
     r = svc.client.post("/refresh_voices")
 
     assert r.json()["custom_voices"] == 1
-    assert "luna" in svc.client.get("/voices").json()["voices"]
+    assert "marlene" in svc.client.get("/voices").json()["voices"]
 
 
 def test_delete_removes_files_and_registration(start):
     svc = start()
     assert _upload(svc).status_code == 200
 
-    assert svc.client.delete("/voice/luna").status_code == 200
+    assert svc.client.delete("/voice/marlene").status_code == 200
 
-    assert not (svc.models / "custom" / "luna").exists()
-    assert svc.client.get("/voice/luna").status_code == 404
+    assert not (svc.models / "custom" / "marlene").exists()
+    assert svc.client.get("/voice/marlene").status_code == 404
 
 
 def test_default_voices_installed_next_to_custom_ones_stay_separate(start):

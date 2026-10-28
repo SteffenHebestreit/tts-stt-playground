@@ -1,8 +1,7 @@
 # vllm-asr-service: the playground's stt-form-v1 adapter in front of `vllm serve`.
 #
-# The base is the exact vLLM release Steffen's luna-stt app runs on the TrueNAS card
-# (RTX 5060 Ti, Blackwell, driver 580.173), so its CUDA 13 build is proven on
-# Blackwell; it needs a driver >= 580. vLLM, torch, fastapi, uvicorn, httpx,
+# The base is a vLLM release already running on the TrueNAS card (RTX 5060 Ti,
+# Blackwell, driver 580.173), so its CUDA 13 build is proven on Blackwell; it needs a driver >= 580. vLLM, torch, fastapi, uvicorn, httpx,
 # huggingface_hub, numpy, python-multipart and ffmpeg all come with it: this image
 # adds the Silero VAD and the adapter's own code, nothing else.
 #

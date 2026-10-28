@@ -4,7 +4,8 @@
 # with the same keys and on the same base URL as the LLMs:
 #   POST /v1/audio/transcriptions   model whisper-1 (or whisper, stt)
 #   POST /v1/audio/speech           model tts-1     (or tts-1-hd, tts)
-# This is the block running on evox2 since 2026-10-17. ${PORT} is llama-swap's.
+# ${PORT} is llama-swap's. Replace /home/USER with the home directory install.sh
+# ran in (llama-swap does not expand ~ or $HOME in cmd).
 
   # speech-to-text: whisper.cpp on the iGPU via Vulkan. large-v3-turbo q8_0:
   # measured 2026-10-17 on a German dialogue, 1.7% WER vs 5.0% for q5_0 at the
@@ -13,12 +14,12 @@
   # concurrent requests queue there instead of getting a 429 from llama-swap.
   whisper-large-v3-turbo:
     cmd: >
-      /home/steffen/whisper.cpp/build/bin/whisper-server
-      -m /home/steffen/models/whisper/ggml-large-v3-turbo-q8_0.bin
+      /home/USER/whisper.cpp/build/bin/whisper-server
+      -m /home/USER/models/whisper/ggml-large-v3-turbo-q8_0.bin
       --host 127.0.0.1 --port ${PORT}
       --inference-path /v1/audio/transcriptions
       -l auto -t 8
-      --vad --vad-model /home/steffen/models/whisper/ggml-silero-v5.1.2.bin
+      --vad --vad-model /home/USER/models/whisper/ggml-silero-v5.1.2.bin
     checkEndpoint: /health
     ttl: 0
     concurrencyLimit: 16
@@ -32,9 +33,9 @@
   # names (alloy, ...) select the default voice.
   piper:
     cmd: >
-      /home/steffen/.venv-piper/bin/python /home/steffen/bin/piper_openai_shim.py
+      /home/USER/.venv-piper/bin/python /home/USER/bin/piper_openai_shim.py
       --host 127.0.0.1 --listen-port ${PORT}
-      --voices /home/steffen/models/piper --default-voice de_DE-thorsten-high
+      --voices /home/USER/models/piper --default-voice de_DE-thorsten-high
     checkEndpoint: /health
     ttl: 0
     concurrencyLimit: 16

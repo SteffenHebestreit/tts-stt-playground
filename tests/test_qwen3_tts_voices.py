@@ -462,30 +462,30 @@ def test_saved_voice_playback_on_the_wrong_variant_is_refused(monkeypatch, tmp_p
 
 
 def test_a_voice_saved_on_one_base_size_is_refused_on_the_other_with_the_way_out(monkeypatch, tmp_path):
-    """Live on the NAS: 'Luna' saved on 0.6B Base, the UI switched to 1.7B Base, and
+    """Live on the NAS: 'Marlene' saved on 0.6B Base, the UI switched to 1.7B Base, and
     every playback was a 500 ("Expected size 2048 but got size 1024")."""
     m = load_app(str(tmp_path / "voices"))
     install_qwen_tts(monkeypatch)
     install_model(m, FakeQwenModel("base"), BASE_06)
     c = client(m)
-    assert c.post("/voices/save", data={"name": "Luna", "ref_text": "Hallo."}, files=_audio()).status_code == 200
+    assert c.post("/voices/save", data={"name": "Marlene", "ref_text": "Hallo."}, files=_audio()).status_code == 200
     big = install_model(m, FakeQwenModel("base"), BASE_17)
 
-    r = c.post("/voices/luna/tts", data={"text": "Hallo."})
+    r = c.post("/voices/marlene/tts", data={"text": "Hallo."})
 
     assert r.status_code == 400, r.text
     detail = r.json()["detail"]
-    assert "Luna" in detail and "0.6B Base" in detail and "1.7B Base" in detail
+    assert "Marlene" in detail and "0.6B Base" in detail and "1.7B Base" in detail
     assert big.calls == [], "the mismatched embedding must never reach generation"
 
 
 def test_a_voice_plays_on_a_model_of_its_own_size(lib):
     m, model, _ = lib
     c = client(m)
-    c.post("/voices/save", data={"name": "Luna", "ref_text": "Hallo."}, files=_audio())
+    c.post("/voices/save", data={"name": "Marlene", "ref_text": "Hallo."}, files=_audio())
     install_model(m, model, BASE_06)          # a reload of the same model
 
-    assert c.post("/voices/luna/tts", data={"text": "Hallo."}).status_code == 200
+    assert c.post("/voices/marlene/tts", data={"text": "Hallo."}).status_code == 200
     assert len(_calls(model, "generate_voice_clone")) == 1
 
 
