@@ -910,7 +910,7 @@ def test_copy_reports_failure_instead_of_claiming_success(tmp_path):
 
 def test_training_form_rejects_unparseable_numbers_instead_of_sending_nan(tmp_path):
     out = run_js(tmp_path, """
-        harness.el('training-voice-name').value = 'luna';
+        harness.el('training-voice-name').value = 'marlene';
         harness.el('training-files').files = [{ name: 'a.wav' }];
         harness.el('training-epochs').value = '';
         harness.el('training-batch-size').value = '32';

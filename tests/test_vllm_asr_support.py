@@ -150,29 +150,29 @@ def test_a_chunk_beyond_full_scale_is_clipped_not_wrapped():
 
 
 def test_the_prompt_is_whispers_initial_prompt_and_qwens_context_and_nothing_for_the_others():
-    assert support.prompt_text("whisper", " Bautzen, LUNA ", []) == "Bautzen, LUNA"
-    assert support.prompt_text("qwen3-asr", None, ["LUNA", "Bautzen"]) == "LUNA, Bautzen"
-    assert support.prompt_text("qwen3-asr", "Ein Gespräch", ["LUNA"]) == "Ein Gespräch"
+    assert support.prompt_text("whisper", " Leipzig, ACME ", []) == "Leipzig, ACME"
+    assert support.prompt_text("qwen3-asr", None, ["ACME", "Leipzig"]) == "ACME, Leipzig"
+    assert support.prompt_text("qwen3-asr", "Ein Gespräch", ["ACME"]) == "Ein Gespräch"
     assert support.prompt_text("cohere", "anything", ["x"]) == ""
     assert support.prompt_text("granite", "anything", ["x"]) == ""
 
 
 def test_a_transcription_request_is_greedy_capped_and_names_the_language_only_when_known():
-    fields = support.transcription_fields("m", "de", "LUNA", 560)
+    fields = support.transcription_fields("m", "de", "ACME", 560)
     assert fields == {"model": "m", "response_format": "json", "temperature": "0",
-                      "max_completion_tokens": "560", "language": "de", "prompt": "LUNA"}
+                      "max_completion_tokens": "560", "language": "de", "prompt": "ACME"}
     assert "language" not in support.transcription_fields("m", None, "", 560)
     assert "prompt" not in support.transcription_fields("m", "de", "", 560)
 
 
 def test_a_granite_chunk_carries_the_audio_first_and_granite_asr_services_prompt():
-    body = support.chat_body("ibm-granite/granite-speech-5.0-2b", b"RIFF....", "de", ["LUNA", "Bautzen"], 560)
+    body = support.chat_body("ibm-granite/granite-speech-5.0-2b", b"RIFF....", "de", ["ACME", "Leipzig"], 560)
     audio, text = body["messages"][0]["content"]
     assert audio["type"] == "input_audio" and audio["input_audio"]["format"] == "wav"
     assert base64.b64decode(audio["input_audio"]["data"]) == b"RIFF...."
-    expected = granite.build_prompt("de", ["LUNA", "Bautzen"])
+    expected = granite.build_prompt("de", ["ACME", "Leipzig"])
     assert expected.startswith("<|audio|>") and text["text"] == expected[len("<|audio|>"):]
-    assert "German" in text["text"] and "Keywords: LUNA, Bautzen" in text["text"]
+    assert "German" in text["text"] and "Keywords: ACME, Leipzig" in text["text"]
     assert body["temperature"] == 0 and body["max_tokens"] == 560
 
 

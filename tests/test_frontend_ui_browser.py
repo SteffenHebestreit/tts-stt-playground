@@ -369,11 +369,11 @@ def test_engine_switch_leaves_the_panel_that_belongs_to_the_other_engine(ui):
 
 def test_custom_voice_card_shows_the_quality_from_the_normalised_catalog(ui):
     ui.api.on("GET", "/api/providers/piper/custom-voices", {"voices": [
-        {"id": "luna", "name": "luna", "language": "de_DE", "kind": "custom", "description": "high",
+        {"id": "marlene", "name": "marlene", "language": "de_DE", "kind": "custom", "description": "high",
          "raw": {"quality": "high", "language": "de_DE"}}]})
     ui.open()
     ui.page.click("#tts-tab-button")
-    ui.wait_text("#custom-voices-list", "luna")
+    ui.wait_text("#custom-voices-list", "marlene")
     assert "Quality: high" in ui.text("#custom-voices-list")
 
 
@@ -475,7 +475,7 @@ def test_a_piper_voice_is_not_sent_to_magpie(engines_ui):
 def test_switching_back_to_piper_on_the_open_tab_fills_its_custom_voices(engines_ui):
     ui = engines_ui
     ui.api.on("GET", "/api/providers/piper/custom-voices", {"voices": [
-        {"id": "luna", "name": "luna", "language": "de_DE", "kind": "custom", "description": "high",
+        {"id": "marlene", "name": "marlene", "language": "de_DE", "kind": "custom", "description": "high",
          "raw": {"quality": "high", "language": "de_DE"}}]})
     ui.open()
     ui.use_engine("magpie")
@@ -485,7 +485,7 @@ def test_switching_back_to_piper_on_the_open_tab_fills_its_custom_voices(engines
     assert not ui.page.is_visible("#custom-voices-panel")
     assert ui.api.calls_to("GET", "/api/providers/piper/custom-voices") == []
     ui.use_engine("piper")
-    ui.wait_text("#custom-voices-list", "luna")
+    ui.wait_text("#custom-voices-list", "marlene")
     assert ui.page.is_visible("#custom-voices-panel")
 
 
@@ -495,12 +495,12 @@ def test_switching_back_to_piper_on_the_open_tab_fills_its_custom_voices(engines
 def test_ids_from_the_job_table_are_encoded_in_request_urls(ui):
     hostile = "j/1?x#y"
     ui.api.on("GET", "/api/training/jobs", {"jobs": [
-        {"job_id": hostile, "status": "completed", "voice_name": "luna", "progress": 100,
+        {"job_id": hostile, "status": "completed", "voice_name": "marlene", "progress": 100,
          "deployment_target_label": "Piper shared volume", "created_at_display": "2026-01-01 10:00 UTC"}]})
     ui.api.on("DELETE", "/api/training/model/j%2F1%3Fx%23y", {"ok": True})
     ui.open()
     ui.page.click("#training-tab-button")
-    ui.wait_text("#models-list", "luna")
+    ui.wait_text("#models-list", "marlene")
     ui.page.click("#models-list [data-action=delete]")
     deadline = time.time() + TIMEOUT_MS / 1000
     while time.time() < deadline and not [c for c in ui.api.calls if c["method"] == "DELETE"]:
@@ -541,7 +541,7 @@ def _start_training(ui, statuses):
     ui.page.clock.install()
     ui.open()
     ui.page.click("#training-tab-button")
-    ui.page.fill("#training-voice-name", "luna")
+    ui.page.fill("#training-voice-name", "marlene")
     ui.page.set_input_files("#training-files", {"name": "a.wav", "mimeType": "audio/wav", "buffer": _wav()})
     ui.page.click("#start-training-button")
     ui.wait_calls("GET", "/api/training/status/job-1")
@@ -568,7 +568,7 @@ def test_progress_polling_stops_when_the_job_is_cancelled_or_interrupted(ui, fin
 def test_resuming_does_not_stack_a_second_polling_loop(ui):
     _start_training(ui, [{"status": "running", "progress": 10, "current_epoch": 1, "total_epochs": 10}])
     ui.api.on("POST", "/api/training/resume", {"job_id": "job-1"})
-    ui.page.fill("#continue-voice-name", "luna")
+    ui.page.fill("#continue-voice-name", "marlene")
     ui.page.click("#resume-training-button")
     ui.wait_calls("POST", "/api/training/resume")
     ui.page.wait_for_timeout(100)

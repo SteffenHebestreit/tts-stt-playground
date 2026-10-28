@@ -1930,7 +1930,7 @@ def _build_provider_registry(flags: Mapping[str, Any], defaults: Mapping[str, An
                         "fields": {
                             "voice_name": {
                                 "label": "Voice Model Name:",
-                                "placeholder": "e.g. luna",
+                                "placeholder": "e.g. marlene",
                             },
                             "epochs": {"label": "Epochs:"},
                             "deployment_target": {"label": "Deployment Target:"},
@@ -1951,7 +1951,7 @@ def _build_provider_registry(flags: Mapping[str, Any], defaults: Mapping[str, An
                         "title": "Voice Training",
                         "description": "Train custom voice models using VITS neural networks. Upload multiple audio files with transcripts for high-quality voice cloning.",
                         "voice_name_placeholder": "Enter a unique name for this voice model",
-                        "continue_voice_name_placeholder": "e.g. luna",
+                        "continue_voice_name_placeholder": "e.g. marlene",
                         "models_description": "Manage your trained voice models. Export to TTS to use them, download, or delete.",
                     }
                 },

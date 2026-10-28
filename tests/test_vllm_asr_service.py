@@ -65,7 +65,7 @@ def words_wav(words: int, pause_every: int = 8) -> tuple[bytes, list[int]]:
 def test_granite_transcribes_through_the_chat_endpoint_with_its_own_prompt(service):
     module = service()
     wav, levels = words_wav(20)
-    r = post(module, wav, language="de", initial_prompt="LUNA, Bautzen")
+    r = post(module, wav, language="de", initial_prompt="ACME, Leipzig")
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["text"] == expected_transcript(levels)
@@ -75,7 +75,7 @@ def test_granite_transcribes_through_the_chat_endpoint_with_its_own_prompt(servi
     requests = module._fake.requests
     assert requests and {r["path"] for r in requests} == {"/v1/chat/completions"}
     assert all(r["order"] == ["input_audio", "text"] for r in requests)
-    assert all("The speech is in German" in r["prompt"] and "Keywords: LUNA, Bautzen" in r["prompt"]
+    assert all("The speech is in German" in r["prompt"] and "Keywords: ACME, Leipzig" in r["prompt"]
                for r in requests)
     assert all(not r["prompt"].startswith("<|audio|>") for r in requests)
 
@@ -155,7 +155,7 @@ def test_a_chunk_that_stops_on_the_token_cap_is_flagged(service):
 def test_cohere_is_checked_against_the_digest_and_asked_with_its_language_and_no_prompt(service):
     module = service(**COHERE)
     wav, levels = words_wav(12)
-    r = post(module, wav, language="fr", initial_prompt="LUNA")
+    r = post(module, wav, language="fr", initial_prompt="ACME")
     assert r.status_code == 200, r.text
     assert r.json()["text"] == expected_transcript(levels)
     assert any("takes no prompt" in w for w in r.json()["warnings"])
@@ -180,12 +180,12 @@ def test_the_cohere_mirror_must_carry_the_official_weights_or_the_engine_never_s
 def test_qwen3_identifies_the_language_on_auto_and_takes_the_prompt_as_its_context(service):
     module = service(**QWEN)
     wav, levels = words_wav(8)
-    r = post(module, wav, language="auto", initial_prompt="Ein Gespräch über LUNA")
+    r = post(module, wav, language="auto", initial_prompt="Ein Gespräch über ACME")
     assert r.status_code == 200, r.text
     assert r.json()["language"] is None and r.json()["warnings"] == []
     assert r.json()["text"] == expected_transcript(levels)
     fields = module._fake.requests[0]["fields"]
-    assert "language" not in fields and fields["prompt"] == "Ein Gespräch über LUNA"
+    assert "language" not in fields and fields["prompt"] == "Ein Gespräch über ACME"
 
 
 def test_no_language_means_the_default_even_for_a_model_that_could_identify_it(service):
@@ -200,11 +200,11 @@ def test_the_german_whisper_refuses_english_and_reads_auto_as_german_with_a_warn
     refused = post(module, words_wav(4)[0], language="en")
     assert refused.status_code == 422 and "Supported: de" in refused.json()["detail"]
     assert module._fake.processes == [], "refused before anything was started"
-    r = post(module, words_wav(4)[0], language="auto", initial_prompt="Bautzen")
+    r = post(module, words_wav(4)[0], language="auto", initial_prompt="Leipzig")
     assert r.status_code == 200 and r.json()["language"] == "de"
     assert "does not identify the language" in r.json()["warnings"][0]
     fields = module._fake.requests[0]["fields"]
-    assert fields["language"] == "de" and fields["prompt"] == "Bautzen"
+    assert fields["language"] == "de" and fields["prompt"] == "Leipzig"
 
 
 @pytest.mark.parametrize("language", ["it", "German", "xx"])

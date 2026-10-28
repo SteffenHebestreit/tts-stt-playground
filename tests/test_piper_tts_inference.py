@@ -62,15 +62,15 @@ def fake_phonemizer(monkeypatch):
 def _upload_tiny_voice(svc):
     config = {
         "audio": {"sample_rate": 22050, "quality": "medium"},
-        "model_card": {"language": "de", "speaker": "luna"},
+        "model_card": {"language": "de", "speaker": "marlene"},
         "phoneme_id_map": {"<pad>": 0, "<start>": 1, "<end>": 2, "a": 3, "b": 4},
         "phonemizer_language": "de",
     }
     r = svc.client.post(
         "/upload_model",
-        files={"model_file": ("luna.onnx", _tiny_vits_like_model(), "application/octet-stream"),
-               "config_file": ("luna.json", json.dumps(config), "application/json")},
-        data={"voice_name": "luna"},
+        files={"model_file": ("marlene.onnx", _tiny_vits_like_model(), "application/octet-stream"),
+               "config_file": ("marlene.json", json.dumps(config), "application/json")},
+        data={"voice_name": "marlene"},
     )
     assert r.status_code == 200, r.text
 
@@ -86,7 +86,7 @@ def test_a_custom_voice_synthesises_a_wav_with_the_real_stack(start, monkeypatch
     monkeypatch.setattr(svc.module, "sf", sf)
     _upload_tiny_voice(svc)
 
-    r = svc.client.post("/synthesize", json={"text": "Hallo", "voice_name": "luna"})
+    r = svc.client.post("/synthesize", json={"text": "Hallo", "voice_name": "marlene"})
 
     assert r.status_code == 200
     audio, rate = _decode(r.content)
@@ -101,9 +101,9 @@ def test_speed_changes_the_length_of_the_real_audio(start, monkeypatch, fake_pho
     monkeypatch.setattr(svc.module, "sf", sf)
     _upload_tiny_voice(svc)
 
-    normal, _ = _decode(svc.client.post("/synthesize", json={"text": "Hallo", "voice_name": "luna"}).content)
+    normal, _ = _decode(svc.client.post("/synthesize", json={"text": "Hallo", "voice_name": "marlene"}).content)
     fast, _ = _decode(svc.client.post(
-        "/synthesize", json={"text": "Hallo", "voice_name": "luna", "speed": 2.0}).content)
+        "/synthesize", json={"text": "Hallo", "voice_name": "marlene", "speed": 2.0}).content)
 
     assert len(fast) == pytest.approx(len(normal) / 2, rel=0.05)
 
@@ -114,8 +114,8 @@ def test_tts_routes_a_custom_voice_through_onnx_runtime(start, monkeypatch, fake
     monkeypatch.setattr(svc.module, "sf", sf)
     _upload_tiny_voice(svc)
 
-    r = svc.client.post("/tts", json={"text": "Hallo", "voice": "luna"})
+    r = svc.client.post("/tts", json={"text": "Hallo", "voice": "marlene"})
 
     assert r.status_code == 200
-    assert r.headers["X-Voice-Used"] == "luna"
+    assert r.headers["X-Voice-Used"] == "marlene"
     assert r.content[:4] == b"RIFF"

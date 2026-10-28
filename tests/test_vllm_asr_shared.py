@@ -50,7 +50,7 @@ def _dockerfile() -> str:
     return _text(SERVICE / "Dockerfile")
 
 
-def test_the_engine_is_the_release_luna_stt_runs_on_the_nas_card():
+def test_the_engine_is_the_pinned_vllm_release():
     froms = re.findall(r"^FROM\s+(\S+)", _dockerfile(), re.M)
     assert froms == [VLLM_IMAGE]
 

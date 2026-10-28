@@ -446,7 +446,7 @@ The default set (`stt` turbo + `qwen3-asr` + `qwen3-tts` 0.6B) is about **8.1 GB
 are about **25 GB** for that set, and each optional GPU image adds several GB more. `cohere-asr` and
 `granite-asr` are about 10 GB unpacked each, but they share every layer except their own code, so the
 second one costs almost nothing more to pull. `vllm-asr` sits on `vllm/vllm-openai:v0.31.0` (32 GB
-unpacked; a NAS that runs luna-stt has it already).
+unpacked; a NAS that already runs that vLLM release has it).
 
 **vLLM-ASR is built on the NAS.** CI cannot build or publish its image (the base does not fit a
 hosted runner), so before deleting its `profiles:` line, build it once with the tag the app runs

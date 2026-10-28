@@ -162,7 +162,7 @@ def test_auto_means_the_default_language_and_says_so_while_no_language_says_noth
 
 def test_a_prompt_is_ignored_with_a_warning(service):
     module = service("cohere", **OK_WEIGHTS)
-    body = post(module, words_wav(4)[0], language="de", initial_prompt="LUNA, Bautzen").json()
+    body = post(module, words_wav(4)[0], language="de", initial_prompt="ACME, Leipzig").json()
     assert any("takes no prompt" in w for w in body["warnings"])
 
 
@@ -264,12 +264,12 @@ def test_an_empty_upload_and_an_unreadable_one_are_client_errors(service):
 def test_granite_names_the_language_and_the_keywords_in_its_prompt(service):
     module = service("granite")
     wav, levels = words_wav(16)
-    body = post(module, wav, language="de", keywords="LUNA, Bautzen").json()
+    body = post(module, wav, language="de", keywords="ACME, Leipzig").json()
     assert body["text"] == expected_transcript(levels)
     assert body["language"] == "de" and body["keywords"] == 2 and body["warnings"] == []
     prompts = {p for call in module._fake.processor_calls for p in call["prompts"]}
     assert prompts == {"USER: <|audio|>The speech is in German. Transcribe it exactly; do not translate. "
-                       "transcribe the speech with proper punctuation and capitalization. Keywords: LUNA, Bautzen"
+                       "transcribe the speech with proper punctuation and capitalization. Keywords: ACME, Leipzig"
                        "\n ASSISTANT:"}
     (download,) = module._fake.downloads
     assert download["repo_id"] == "ibm-granite/granite-speech-5.0-2b"
@@ -278,11 +278,11 @@ def test_granite_names_the_language_and_the_keywords_in_its_prompt(service):
 
 def test_the_openai_prompt_is_read_as_a_keyword_list_too(service):
     module = service("granite")
-    body = post(module, words_wav(6)[0], language="de", initial_prompt="Spot; Sphere\nStation",
-                keywords="Spot").json()
+    body = post(module, words_wav(6)[0], language="de", initial_prompt="Helm; Kafka\nRedis",
+                keywords="Helm").json()
     assert body["keywords"] == 3
     prompt = module._fake.processor_calls[0]["prompts"][0]
-    assert prompt.rstrip().endswith("Keywords: Spot, Sphere, Station\n ASSISTANT:".rstrip())
+    assert prompt.rstrip().endswith("Keywords: Helm, Kafka, Redis\n ASSISTANT:".rstrip())
 
 
 def test_too_many_keywords_are_refused_before_anything_loads(service):
@@ -303,7 +303,7 @@ def test_the_2b_refuses_italian_and_the_turboctc_takes_it(service):
 
 def test_the_turboctc_takes_no_keywords_and_says_so(service):
     module = service("granite", GRANITE_ASR_MODEL="ibm-granite/granite-speech-5.0-470m-turboctc")
-    body = post(module, words_wav(6)[0], language="de", keywords="LUNA").json()
+    body = post(module, words_wav(6)[0], language="de", keywords="ACME").json()
     assert body["keywords"] == 0
     assert any("takes no keywords" in w for w in body["warnings"])
     assert all(call["max_new_tokens"] is None for call in module._fake.generate_calls)

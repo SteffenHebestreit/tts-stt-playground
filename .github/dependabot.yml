@@ -273,7 +273,7 @@ updates:
     ignore:
       - {dependency-name: nvidia/cuda}
 
-  # vllm/vllm-openai is the engine itself (the release luna-stt runs on the NAS card): a
+  # vllm/vllm-openai is the engine itself (pinned to a release proven on the NAS card): a
   # bump changes what every model transcribes and how fast, so re-measure before merging
   # (vllm-asr-service/README.md).
   - package-ecosystem: docker
