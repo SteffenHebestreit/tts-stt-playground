@@ -16,7 +16,7 @@ aiofiles==25.1.0
 
 fastapi==0.162.0
 uvicorn[standard]==0.54.0
-pydantic==2.14.1
+pydantic==2.14.2
 python-multipart==0.0.32
 
 # torch.onnx.export(dynamo=False) raises "Module onnx is not installed!" without
@@ -24,4 +24,4 @@ python-multipart==0.0.32
 # onnxscript is not needed: it belongs to the torch.export-based exporter this
 # service does not use.
 onnx==1.23.2
-onnxruntime==1.31.0
+onnxruntime==1.31.1
