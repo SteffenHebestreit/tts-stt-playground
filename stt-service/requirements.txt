@@ -1,6 +1,6 @@
 fastapi==0.162.0
 uvicorn[standard]==0.54.0
-python-multipart==0.0.32
+python-multipart==0.0.33
 # PyTorch - will be installed based on hardware availability in Dockerfile
 # torch>=2.1.0 (installed separately to detect hardware)
 # torchaudio>=2.1.0 (installed separately to detect hardware)
