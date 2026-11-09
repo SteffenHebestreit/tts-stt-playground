@@ -8,7 +8,7 @@
 # 470m-turboctc). Pinned exactly: the model code lives in transformers itself, so a
 # release can change what the services transcribe. Move it on purpose (Dependabot
 # proposes it) and re-run benchmarks/run_german_eval.py before merging.
-transformers==5.20.2
+transformers==5.22.1
 # Silero VAD for the pause-based chunking and the non-speech gate (transformers_asr.py).
 # 6.x ships its model inside the wheel (nothing is downloaded at run time) and needs
 # only torch.
